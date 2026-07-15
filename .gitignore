@@ -61,6 +61,7 @@ tests/integration/keys/
 tests/e2e/keys/
 tests/e2e/rig.json
 tests/e2e/coolify.env
+tests/e2e/.probe.json
 
 # Lockfile — deliberately absent, not merely unwritten
 # ---------------------------------------------------
