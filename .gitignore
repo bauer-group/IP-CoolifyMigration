@@ -61,3 +61,22 @@ tests/integration/keys/
 tests/e2e/keys/
 tests/e2e/rig.json
 tests/e2e/coolify.env
+
+# Lockfile — deliberately absent, not merely unwritten
+# ---------------------------------------------------
+# Nothing here would read it. All three CI workflows install with
+# `pip install -e ".[dev]"`, consumers get a PyPI wheel and resolve the ranges in
+# pyproject.toml themselves, and even our own setup instructions use `uv pip
+# install`, which is the pip-compatible interface and ignores a lock (only
+# `uv sync`/`uv run` consume one).
+#
+# A lock nothing consumes is worse than none: it claims a reproducibility that
+# does not exist, and it is a second source of truth beside pyproject.toml that
+# drifts in silence. Dependabot already maintains the pip ecosystem weekly from
+# pyproject; a lock would need its own update path or quietly fossilise.
+#
+# To reverse this, the lock is the small part — the work is consuming it: move
+# the workflows to `uv sync --locked`, add setup-uv, and arrange for the lock to
+# be updated. Committing a lock while CI still runs pip is the worst of both:
+# all of the cost, none of the benefit.
+uv.lock
