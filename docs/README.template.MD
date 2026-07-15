@@ -43,6 +43,9 @@ external orchestrator has none of those constraints. That is what this is.
   migrated application rebuilds from branch HEAD. We detect that and block.
 - **Server migration** — relocate the whole Coolify instance, with the `APP_KEY`
   treated as a first-class, asserted artifact rather than a lucky side effect.
+- **Proven, not assumed** — an integration rig of two real sshd containers
+  asserts that uid 999, hardlinks, xattrs, sparse files and symlinks survive an
+  actual rsync, and that a wrong `chown` is caught by verification.
 
 ## Architecture
 
@@ -70,8 +73,8 @@ export COOLIFY_URL="https://coolify.example.com"
 export COOLIFY_TOKEN="..."          # root or read:sensitive
 
 coolify-migrate doctor              # verify token scope + server reachability
-coolify-migrate plan my-project     # dry run: manifest, drift, DNS gate
-coolify-migrate run my-project --to target-server
+coolify-migrate plan my-project --to target-server   # dry run: no changes
+coolify-migrate run  my-project --to target-server
 ```
 
 Interrupted? `coolify-migrate resume <id>`. Regret it? `coolify-migrate rollback <id>`.

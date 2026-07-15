@@ -48,7 +48,7 @@ inventory. Run it before anything else.
 
 Expected output:
 
-```
+```text
 ✓ Coolify 4.0.0 reachable at https://coolify.example.com
 ✓ token can read sensitive data (root / read:sensitive)
   Servers

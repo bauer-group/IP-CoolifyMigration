@@ -4,10 +4,16 @@ Relocates a whole Coolify **instance** to a new host. This is a different proble
 from moving a project between servers, and it replaces
 [`Geczy/coolify-migration`](https://github.com/Geczy/coolify-migration).
 
-!!! warning "Status"
-    The transfer, journal, verification and SSH core are built and tested. The F2
-    command sequence is the next milestone; `coolify-migrate server run` exits
-    non-zero today rather than pretending otherwise.
+```bash
+coolify-migrate server plan --to new-host.example.com   # reads only
+coolify-migrate server run  --to new-host.example.com
+```
+
+!!! danger "This stops everything"
+    F2 stops Docker on the source — Coolify **and** every container it manages —
+    for the duration of the transfer. Unlike F1, where the outage is one project,
+    here it is the whole box. The compensation that ends it is
+    `START_SOURCE_DOCKER`, and it runs on any failure.
 
 ## What Geczy gets right (and we kept)
 
@@ -90,7 +96,35 @@ Geczy is silent on this. Two Coolify brains managing one fleet is not a
 theoretical problem. We stop the source and disable its scheduler explicitly, as
 a named step.
 
+## The sequence
+
+```text
+INIT
+PREFLIGHT        rsync + systemctl on both ends; inventory not blocked
+INVENTORY        volumes (docker volume ls + docker ps -a), bind mounts, sizes
+READ_APP_KEY     captured BEFORE anything moves        <- you cannot assert what you never saw
+STOP_SOURCE      docker down, VERIFIED                 undo: START_SOURCE_DOCKER
+TRANSFER         rsync /data/coolify + volumes + binds undo: wipe target, revoke key
+VERIFY           checksum + metadata, both ends
+INSTALL_COOLIFY  pinned to the SOURCE's version        <- MUST be after TRANSFER
+ASSERT_APP_KEY   byte-identical, or fatal
+BOOT             wait for Coolify, then decrypt-probe
+RECONCILE        compare volumes against the inventory
+FENCE_SOURCE     stop the old brain                    undo: UNFENCE_SOURCE
+```
+
+`INSTALL_COOLIFY` has no compensation on purpose: an installed Coolify on a box
+we were told was empty is inert, and uninstalling it would be a bigger
+intervention than leaving it.
+
 ## Shares with F1
 
-`transfer/`, `journal/`, `verify/`, `ssh/`, `ui/`. F2-specific: `appkey.py`,
-`fencing.py`.
+`transfer/`, `journal/`, `verify/`, `ssh/`, `engine/executor.py` (the saga is
+generic over its state machine), `engine/keys.py`, `ui/`. F2-specific:
+`server/statemachine.py`, `appkey.py`, `fencing.py`, `inventory.py`.
+
+## Rollback
+
+There is no `FINALIZE` and no delete policy: **F2 never destroys the source.** It
+is left intact but fenced, so rollback always means "start it again". That is
+Geczy's one genuinely good architectural decision, kept.

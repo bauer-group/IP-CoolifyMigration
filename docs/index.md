@@ -16,8 +16,8 @@ export COOLIFY_URL="https://coolify.example.com"
 export COOLIFY_TOKEN="..."        # MUST have root or read:sensitive
 
 coolify-migrate doctor            # verify token scope + reachability
-coolify-migrate plan my-project   # dry run: manifest, drift, DNS gate
-coolify-migrate run my-project --to target-server
+coolify-migrate plan my-project --to target-server   # dry run: no changes
+coolify-migrate run  my-project --to target-server
 ```
 
 !!! danger "The token needs `root` or `read:sensitive`"

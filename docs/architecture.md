@@ -14,7 +14,7 @@ captured snapshots. The volume-pairing algebra, the drift gates, the rollback
 planner and the compose analysis are all verified exhaustively without a Coolify
 instance, an SSH server or a Docker daemon.
 
-```
+```text
 cli (Typer)  ->  wizard / dashboard (Rich)
                       |
                  engine (saga: plan -> execute -> verify -> compensate)
@@ -67,7 +67,7 @@ the drift gate for every compose stack that builds from source.
 
 ## The F1 state machine
 
-```
+```text
 PREFLIGHT      token scope; reachability; rsync/docker present; disk vs REAL size;
                previews detected; images resolvable; REBUILD-DRIFT GATE
    |
@@ -112,7 +112,38 @@ Three orderings are deliberate and worth the argument:
 | `api/` | respx against recorded fixtures | Contract, incl. the token-scope trap |
 | `discovery/`, `transfer/` | `FakeHost` with scripted daemon output | The quiesce gate is testable without a server |
 | `engine/` | **Chaos suite** | Kill mid-COPY; assert resume and rollback converge |
+| `transfer/` | **Integration rig**: two real sshd containers | Only real rsync can prove real bytes |
 | whitelists | Scheduled CI vs upstream `openapi.json` | API drift breaks *our* CI, not your migration |
 
-The chaos suite is the differentiator. Neither predecessor has any journal,
-resume or rollback to test.
+### The chaos suite
+
+Kills the process at every state and asserts that resume and rollback converge.
+Possible only because the rollback planner is pure: `rollback_plan(completed)`
+is a total function, so "what happens if we die at COPY?" is a table test, not an
+experiment. Neither predecessor has any journal, resume or rollback to test.
+
+### The integration rig
+
+```bash
+python tests/integration/prepare.py
+docker compose -f tests/integration/docker-compose.yml up -d --wait
+pytest -m integration
+docker compose -f tests/integration/docker-compose.yml down -v
+```
+
+Two Alpine containers running real `sshd` with real `rsync`. Each test
+corresponds to a flag `coolify-mover` omits, and asserts the actual on-disk
+result: a file owned by **uid 999** stays 999; a **hardlink** pair still shares an
+inode; an **xattr** survives; a **sparse** file stays sparse; a **dangling
+symlink** is not resolved; and a wrong `chown` *is caught by verification*.
+
+This is not belt-and-braces. It immediately found a data-loss bug that no amount
+of unit testing could:
+
+> **`--files-from` turns OFF the recursion that `-a` implies.** A chunked
+> transfer was copying directory *entries* and no files — with rsync exiting 0
+> and the tree looking correct. It would have hit only the large volumes that get
+> chunked in the first place.
+
+The lesson generalises: a pure core proves the *decisions*, and only real IO
+proves the *effects*. Both are needed, and neither substitutes for the other.

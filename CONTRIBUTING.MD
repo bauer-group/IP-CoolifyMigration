@@ -20,11 +20,20 @@ make all-checks     # or: .\Make.cmd all-checks
 Runs ruff, mypy `strict`, and pytest with a **80% coverage gate**. All must pass
 before a PR.
 
-Integration tests need network or Docker and are excluded by default:
+Integration tests need Docker and are excluded by default. They stand up two
+real sshd containers and exercise real rsync — the only way to prove that a file
+owned by uid 999, with an xattr and a hardlink, actually arrives intact:
 
 ```bash
+python tests/integration/prepare.py
+docker compose -f tests/integration/docker-compose.yml up -d --wait
 pytest -m integration
+docker compose -f tests/integration/docker-compose.yml down -v
 ```
+
+The rig earns its keep: it found a data-loss bug (`--files-from` disables the
+recursion `-a` implies, so chunked transfers copied directory entries and no
+files, exiting 0) that no unit test could have caught.
 
 ## The one architectural rule
 
@@ -64,7 +73,7 @@ here name the upstream bug they prevent; that comment is the point.
 Conventional Commits, **past tense** subject, max 50 characters, no trailing
 period:
 
-```
+```text
 feat(dns): added authoritative resolver for the cutover gate
 fix(transfer): kept hardlinked trees in a single rsync stream
 docs(safety): documented the SIGKILL quiesce failure

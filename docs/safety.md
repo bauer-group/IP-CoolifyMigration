@@ -93,7 +93,7 @@ directory routinely contains one.
 Every state that mutates anything has a compensating action, journalled to disk
 with enough information to run after a total crash of your machine.
 
-```
+```text
 CREATE_TARGET  -> delete the target
 QUIESCE        -> restart the source
 COPY           -> drop the target's volumes, revoke the ephemeral key
