@@ -3,13 +3,19 @@
 ## Setup
 
 ```bash
-uv venv --python 3.12
+uv venv --python 3.14
 uv pip install -e ".[dev,docs]"
 pre-commit install
 ```
 
-Requires Python 3.12, 3.13 or 3.14. We lint and type-check against **3.12** (the
-floor of the supported range) so no 3.13+ syntax slips in, and release on 3.14.
+Requires Python 3.12, 3.13 or 3.14. **Develop on 3.14**; the CI matrix runs all
+three.
+
+ruff and mypy are pinned to **3.12** on purpose, and raising them would quietly
+end the backward compatibility rather than modernise anything: `target-version`
+and `python_version` tell those tools which version to *check against*, not
+which one you run. At 3.12 they reject 3.13+ syntax before it reaches a user on
+the floor of the range.
 
 ## Quality gates
 

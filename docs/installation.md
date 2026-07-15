@@ -4,7 +4,7 @@
 
 **On your workstation** (Windows, macOS or Linux):
 
-- Python 3.12, 3.13 or 3.14
+- Python 3.12, 3.13 or 3.14 (3.14 recommended; 3.12 is the supported floor)
 - Nothing else. You do **not** need `ssh` or `rsync` locally — rsync always runs
   *on* the Linux servers, and SSH is pure-Python (asyncssh). This is deliberate:
   routing volume data through a Windows filesystem would destroy UNIX ownership,
@@ -32,7 +32,7 @@ From source:
 ```bash
 git clone https://github.com/bauer-group/IP-CoolifyMigration
 cd IP-CoolifyMigration
-uv venv --python 3.12
+uv venv --python 3.14
 uv pip install -e ".[dev]"
 ```
 

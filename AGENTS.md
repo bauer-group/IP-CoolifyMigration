@@ -5,7 +5,7 @@ Instructions for an AI agent — or a human in a hurry — working on this repo.
 ## Fast path
 
 ```bash
-uv venv --python 3.12 && uv pip install -e ".[dev]"
+uv venv --python 3.14 && uv pip install -e ".[dev]"   # 3.12 is the floor, not the target
 make all-checks          # ruff + mypy strict + pytest (>=80% coverage)
 coolify-migrate doctor   # needs COOLIFY_URL + COOLIFY_TOKEN
 ```
