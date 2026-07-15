@@ -22,6 +22,7 @@ Exit codes
 
 from __future__ import annotations
 
+import contextlib
 import sys
 from pathlib import Path
 
@@ -49,10 +50,8 @@ def main() -> int:
 
     # 0600 or sshd refuses the key. No-op on Windows, where the rig runs the key
     # inside the containers anyway.
-    try:
+    with contextlib.suppress(OSError):
         PRIVATE.chmod(0o600)
-    except OSError:
-        pass
 
     print(f"wrote {PRIVATE}")
     print(f"wrote {PUBLIC}")

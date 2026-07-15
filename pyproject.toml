@@ -136,6 +136,7 @@ filterwarnings = [
 markers = [
     "integration: marks tests that hit external services (deselect with '-m \"not integration\"')",
     "chaos: failure-injection tests asserting resume/rollback converge (deselect with '-m \"not chaos\"')",
+    "e2e: real Coolify + two real Docker daemons; needs the rig (see tests/e2e/README.md)",
 ]
 
 [tool.coverage.run]

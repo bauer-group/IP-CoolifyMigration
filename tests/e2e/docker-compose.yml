@@ -1,0 +1,200 @@
+# =============================================================================
+#  E2E rig: a real Coolify instance and two real "servers"
+# -----------------------------------------------------------------------------
+#  WHAT  : A working Coolify (the same images its installer uses) plus two
+#          servers it manages, each with its OWN Docker daemon.
+#  WHY   : The integration rig proves rsync moves bytes correctly. It cannot
+#          prove that we drive Coolify's API correctly — that our request
+#          whitelists are right, that a created database really gets a
+#          {engine}-data-{uuid} volume, that pairing by mount_path finds it.
+#          Only a real Coolify can.
+#
+#  THE LOAD-BEARING DETAIL: server-a and server-b run docker:dind, so each has
+#  its OWN daemon and its OWN volumes. Mounting the host socket into both would
+#  be far simpler and completely worthless — both would see the same volumes and
+#  a "migration" between them would move nothing while passing every assertion.
+#
+#  RUN   : python tests/e2e/prepare.py        # writes /data/coolify/source/.env
+#          docker compose -f tests/e2e/docker-compose.yml up -d
+#          python tests/e2e/bootstrap.py      # root token + register servers
+#          pytest -m e2e
+# =============================================================================
+
+services:
+  # ── Coolify itself ────────────────────────────────────────────────────────
+  coolify:
+    image: ghcr.io/coollabsio/coolify:latest
+    container_name: bgcm_e2e_coolify
+    volumes:
+      # Exactly the binds Coolify's own prod compose uses. On Docker Desktop
+      # these resolve inside the Linux VM, which is the same thing they resolve
+      # to on a real host.
+      - type: bind
+        source: /data/coolify/source/.env
+        target: /var/www/html/.env
+        read_only: true
+      - /data/coolify/ssh:/var/www/html/storage/app/ssh
+      - /data/coolify/applications:/var/www/html/storage/app/applications
+      - /data/coolify/databases:/var/www/html/storage/app/databases
+      - /data/coolify/services:/var/www/html/storage/app/services
+      - /data/coolify/backups:/var/www/html/storage/app/backups
+    # NOTE the asymmetry, and it is not sloppiness: `env_file` is read by the
+    # compose CLI (here, on Windows), while the bind above is resolved by the
+    # daemon (inside the Linux VM). On a real Linux host both are the same file;
+    # on Docker Desktop the client cannot see the VM's filesystem, so it needs a
+    # local copy. prepare.py writes both from one source.
+    env_file:
+      - ./coolify.env
+    environment:
+      - APP_ENV=production
+      - APP_DEBUG=false
+    ports:
+      - "8000:8080"
+    healthcheck:
+      test: curl --fail http://127.0.0.1:8080/api/health || exit 1
+      interval: 5s
+      retries: 40
+      timeout: 5s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [coolify]
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: bgcm_e2e_coolify_db
+    volumes:
+      - coolify_db:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: coolify
+      POSTGRES_PASSWORD: e2e-db-password
+      POSTGRES_DB: coolify
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coolify -d coolify"]
+      interval: 3s
+      retries: 20
+      timeout: 3s
+    networks: [coolify]
+
+  redis:
+    image: redis:7-alpine
+    container_name: bgcm_e2e_coolify_redis
+    command: redis-server --save 20 1 --loglevel warning --requirepass e2e-redis-password
+    volumes:
+      - coolify_redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a e2e-redis-password ping | grep -q PONG"]
+      interval: 3s
+      retries: 20
+      timeout: 3s
+    networks: [coolify]
+
+  # ── The two managed servers ───────────────────────────────────────────────
+  # docker:dind gives each its OWN daemon. This is the whole point: with a
+  # shared daemon the migration would be a no-op that still passes.
+  server-a:
+    # 27-dind is on Alpine 3.21, whose repo index is currently inconsistent for
+    # openssh (openssh-server wants client-common p2-r0; only p1-r2 is published)
+    # and the install aborts. 28-dind is on 3.22 and resolves cleanly. Pinned
+    # rather than :dind so a future repo state cannot break the rig silently.
+    image: docker:28-dind
+    container_name: bgcm_e2e_server_a
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    volumes:
+      - ./keys:/keys:ro
+      - server_a_docker:/var/lib/docker
+    command: >
+      sh -c "
+      apk add --no-cache openssh-server rsync coreutils findutils bash curl jq &&
+      ssh-keygen -A &&
+      mkdir -p /root/.ssh && chmod 700 /root/.ssh &&
+      cp /keys/id_ed25519.pub /root/.ssh/authorized_keys &&
+      chmod 600 /root/.ssh/authorized_keys &&
+      sed -i 's/#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config &&
+      /usr/sbin/sshd &&
+      dockerd-entrypoint.sh
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "docker info >/dev/null 2>&1 && nc -z localhost 22"]
+      interval: 5s
+      retries: 30
+      timeout: 5s
+    networks: [coolify]
+
+  server-b:
+    # 27-dind is on Alpine 3.21, whose repo index is currently inconsistent for
+    # openssh (openssh-server wants client-common p2-r0; only p1-r2 is published)
+    # and the install aborts. 28-dind is on 3.22 and resolves cleanly. Pinned
+    # rather than :dind so a future repo state cannot break the rig silently.
+    image: docker:28-dind
+    container_name: bgcm_e2e_server_b
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    volumes:
+      - ./keys:/keys:ro
+      - server_b_docker:/var/lib/docker
+    command: >
+      sh -c "
+      apk add --no-cache openssh-server rsync coreutils findutils bash curl jq &&
+      ssh-keygen -A &&
+      mkdir -p /root/.ssh && chmod 700 /root/.ssh &&
+      cp /keys/id_ed25519.pub /root/.ssh/authorized_keys &&
+      chmod 600 /root/.ssh/authorized_keys &&
+      sed -i 's/#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config &&
+      /usr/sbin/sshd &&
+      dockerd-entrypoint.sh
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "docker info >/dev/null 2>&1 && nc -z localhost 22"]
+      interval: 5s
+      retries: 30
+      timeout: 5s
+    networks: [coolify]
+
+  # ── the test runner ───────────────────────────────────────────────────────
+  # Behind a profile so `up` never starts it. Runs ON the rig's network because
+  # Docker Desktop gives Windows no route to container IPs, and container IPs
+  # are exactly what Coolify hands out as the servers' addresses.
+  #
+  #   docker compose -f tests/e2e/docker-compose.yml --profile test run --rm runner
+  runner:
+    profiles: [test]
+    build:
+      # This dir, not the repo root: nothing is COPYed in (the source arrives by
+      # bind mount), so a root context would only ship .venv to the daemon.
+      context: .
+      dockerfile: runner.Dockerfile
+    container_name: bgcm_e2e_runner
+    volumes:
+      - ../..:/app
+      # For the slug contract test only: it execs into the Coolify container to
+      # ask Laravel directly. Nothing else in the rig touches the host daemon.
+      - /var/run/docker.sock:/var/run/docker.sock
+    working_dir: /app
+    environment:
+      # In here Coolify is a service name. rig.json records localhost:8000,
+      # which resolves only on the Windows side.
+      COOLIFY_URL: http://coolify:8080
+    depends_on:
+      coolify:
+        condition: service_healthy
+      server-a:
+        condition: service_healthy
+      server-b:
+        condition: service_healthy
+    networks: [coolify]
+
+volumes:
+  coolify_db:
+  coolify_redis:
+  server_a_docker:
+  server_b_docker:
+
+networks:
+  coolify:
+    name: coolify

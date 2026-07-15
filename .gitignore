@@ -54,3 +54,10 @@ htmlcov/
 # tests/integration/prepare.py. They authorise nothing but two local containers,
 # but a key in git is a key in git.
 tests/integration/keys/
+
+# ── e2e rig artefacts ───────────────────────────────────────────────────────
+# Minted per run and every one of them is a credential. The rig is reproducible
+# from prepare.py + bootstrap.py, so there is nothing here worth keeping.
+tests/e2e/keys/
+tests/e2e/rig.json
+tests/e2e/coolify.env
