@@ -137,11 +137,14 @@ class TestRollbackPlan:
         assert a == b
 
     def test_every_step_names_the_state_that_caused_it(self) -> None:
+        # `because_of` is a plain str, not State: the same machinery drives F2's
+        # own state machine. StrEnum compares equal to its value, so the
+        # assertions stay readable.
         plan = rollback_plan([State.CREATE_TARGET, State.QUIESCE, State.COPY])
-        assert all(step.because_of in State for step in plan)
+        assert all(step.because_of in {s.value for s in State} for step in plan)
         by_comp = {s.compensation: s.because_of for s in plan}
-        assert by_comp[Compensation.RESTART_SOURCE] is State.QUIESCE
-        assert by_comp[Compensation.DELETE_TARGET_RESOURCE] is State.CREATE_TARGET
+        assert by_comp[Compensation.RESTART_SOURCE] == State.QUIESCE
+        assert by_comp[Compensation.DELETE_TARGET_RESOURCE] == State.CREATE_TARGET
 
     def test_full_run_rollback_restores_source_identity(self) -> None:
         plan = rollback_plan(list(ORDER))

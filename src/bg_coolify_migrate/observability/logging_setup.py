@@ -140,7 +140,9 @@ def setup_logging(
             getattr(logging, log_level.upper(), logging.INFO)
         ),
         # NOT `file=sys.stderr`: that would freeze the current stream. See _LazyStderr.
-        logger_factory=structlog.PrintLoggerFactory(file=_LazyStderr()),
+        # _LazyStderr duck-types the write/flush that PrintLogger uses; the
+        # annotation demands a full TextIO we neither have nor need.
+        logger_factory=structlog.PrintLoggerFactory(file=_LazyStderr()),  # type: ignore[arg-type]
         cache_logger_on_first_use=True,
     )
 

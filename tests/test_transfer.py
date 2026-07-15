@@ -106,6 +106,21 @@ class TestRsyncCommand:
         assert "--relative" in cmd
         assert "base" in cmd and "pg_wal" in cmd
 
+    def test_chunked_transfer_forces_recursion(self) -> None:
+        """Regression: --files-from turns OFF the recursion that -a implies.
+
+        Without an explicit -r, a directory named in the file list is transferred
+        as a bare directory ENTRY: rsync exits 0, the tree looks right, and every
+        file inside is missing. Found by the integration rig, invisible to any
+        amount of command-string inspection.
+        """
+        cmd = build_command(_spec(paths=("base",)))
+        assert " -r " in f" {cmd} " or cmd.endswith(" -r")
+
+    def test_whole_tree_needs_no_explicit_recursion(self) -> None:
+        # -a implies -r when --files-from is absent.
+        assert "--files-from" not in build_command(_spec(paths=(".",)))
+
     def test_whole_tree_does_not_use_files_from(self) -> None:
         assert "--files-from" not in build_command(_spec(paths=(".",)))
 

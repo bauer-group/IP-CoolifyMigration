@@ -49,3 +49,8 @@ htmlcov/
 # only catches accidental --state-dir=. runs.
 /state/
 *.journal.jsonl
+
+# Integration rig: throwaway keys, generated on demand by
+# tests/integration/prepare.py. They authorise nothing but two local containers,
+# but a key in git is a key in git.
+tests/integration/keys/

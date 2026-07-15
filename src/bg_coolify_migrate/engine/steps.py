@@ -1,0 +1,547 @@
+"""The F1 step implementations.
+
+Each returns undo info to journal. The ordering and the compensations are decided
+by ``domain/statemachine.py``; this module only performs them.
+
+Every step is written so that its failure is safe: nothing here leaves a state
+that :mod:`.compensations` cannot undo, and the source is never destroyed before
+FINALIZE.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import shlex
+from typing import Any
+
+import structlog
+
+from bg_coolify_migrate.api import resources as api_resources
+from bg_coolify_migrate.api.resources import Placement
+from bg_coolify_migrate.discovery import docker, quiesce
+from bg_coolify_migrate.dns import extract as dns_extract
+from bg_coolify_migrate.dns import resolve as dns_resolve
+from bg_coolify_migrate.dns.gate import build_report, explain_why_blocking_matters
+from bg_coolify_migrate.domain.naming import VolumeEndpoint, pair_by_mount_path
+from bg_coolify_migrate.domain.plan import TransferMode
+from bg_coolify_migrate.domain.statemachine import FinalizePolicy
+from bg_coolify_migrate.engine import keys
+from bg_coolify_migrate.engine.context import MigrationContext
+from bg_coolify_migrate.engine.planner import build_manifest, stack_labels
+from bg_coolify_migrate.errors import (
+    DnsGateBlocked,
+    PreflightError,
+    RebuildDriftBlocked,
+    TransferError,
+    VerificationError,
+)
+from bg_coolify_migrate.transfer import rsync, verify
+from bg_coolify_migrate.transfer.partition import PathEntry, plan_transfer, suggest_parallelism
+
+log = structlog.get_logger(__name__)
+
+
+async def step_init(ctx: MigrationContext) -> dict[str, Any]:
+    return {
+        "project": ctx.plan.project,
+        "environment": ctx.plan.environment,
+        "source_server": ctx.plan.source_server.name,
+        "target_server": ctx.plan.target_server.name,
+        "resources": [r.snapshot.name for r in ctx.plan.resources],
+    }
+
+
+async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
+    """Everything that must be true before we touch anything.
+
+    Runs before CREATE_TARGET and long before QUIESCE, because discovering a
+    missing rsync after the source is stopped converts a preflight failure into
+    an outage.
+    """
+    await ctx.api.assert_can_read_sensitive()
+
+    for host, label in ((ctx.source_host, "source"), (ctx.target_host, "target")):
+        await rsync.preflight(host, label=label)
+        if not await host.which("docker"):
+            raise PreflightError(f"docker is not installed on the {label} server")
+
+    # Previews are not stopped by Coolify's stop endpoint, so they would keep
+    # writing during the copy. Refuse now rather than corrupt later.
+    if not ctx.delete_previews:
+        await quiesce.assert_previews_absent(ctx.source_host, label_filters=stack_labels(ctx.plan))
+
+    # Proportional disk check against the ACTUAL payload.
+    required = int(ctx.plan.total_bytes * ctx.settings.disk_headroom_factor)
+    free = await ctx.target_host.free_bytes("/var/lib/docker")
+    if free < required:
+        raise PreflightError(
+            f"target has {free / 1024**3:.1f} GB free but needs "
+            f"{required / 1024**3:.1f} GB "
+            f"({ctx.plan.total_bytes / 1024**3:.1f} GB payload x "
+            f"{ctx.settings.disk_headroom_factor})",
+            hint="Free space on the target, or lower DISK_HEADROOM_FACTOR knowingly.",
+        )
+
+    # The drift gate.
+    blocked = [
+        r for r in ctx.plan.resources if r.drift is not None and r.drift.is_blocked
+    ]
+    if blocked and not ctx.accept_rebuild_drift:
+        lines = [
+            f"  {r.snapshot.name}: {f.summary}" for r in blocked for f in r.drift.blocking  # type: ignore[union-attr]
+        ]
+        raise RebuildDriftBlocked(
+            "the target would rebuild different code than the source is running:\n"
+            + "\n".join(lines),
+            hint=(
+                "Coolify's git_commit_sha cannot pin a deploy: the job resolves "
+                "`git ls-remote` and overwrites it. Either deploy the source from current "
+                "HEAD first so the two agree, or pass --accept-rebuild-drift to proceed "
+                "knowingly."
+            ),
+            report=[r.drift for r in blocked],
+        )
+
+    # Hard reasons only: drift was already adjudicated above and may have been
+    # accepted. Re-checking `is_blocked` here would silently un-accept it.
+    hard = [
+        f"  {r.snapshot.name}: {x}" for r in ctx.plan.resources for x in r.hard_blocking_reasons
+    ]
+    if hard:
+        raise PreflightError("the plan is blocked:\n" + "\n".join(hard))
+
+    return {"free_bytes": free, "required_bytes": required}
+
+
+async def step_plan(ctx: MigrationContext) -> dict[str, Any]:
+    return {
+        "total_bytes": ctx.plan.total_bytes,
+        "volumes": sum(len(r.manifest.to_migrate) for r in ctx.plan.resources),
+        "finalize_policy": ctx.plan.finalize_policy.value,
+    }
+
+
+async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
+    """Create every target resource, stopped, with its envs and storages.
+
+    Runs BEFORE quiesce: a failed create then costs zero downtime, and the target
+    must exist before volumes can be paired by mount path.
+    """
+    project_uuid = await api_resources.ensure_project(ctx.api, ctx.plan.project)
+    await api_resources.ensure_environment(ctx.api, project_uuid, ctx.plan.environment)
+    destination = await api_resources.resolve_destination(ctx.api, ctx.plan.target_server.uuid)
+
+    placement = Placement(
+        project_uuid=project_uuid,
+        environment_name=ctx.plan.environment,
+        server_uuid=ctx.plan.target_server.uuid,
+        destination_uuid=destination,
+    )
+
+    created: dict[str, str] = {}
+    for resource in ctx.plan.resources:
+        snapshot = resource.snapshot
+        source_full = await ctx.api.get_resource(snapshot.collection, snapshot.uuid)
+        target_uuid = await api_resources.create_resource(ctx.api, snapshot, placement, source_full)
+        created[snapshot.uuid] = target_uuid
+        ctx.target_uuids[snapshot.uuid] = target_uuid
+
+        # Journal each creation IMMEDIATELY: a crash after creating the third of
+        # five resources must still be able to delete all three.
+        ctx.journal.append(
+            "step_started",
+            state="create_target",
+            detail={"target_uuids": dict(created)},
+        )
+
+        await api_resources.copy_envs(
+            ctx.api,
+            collection=snapshot.collection,
+            source_uuid=snapshot.uuid,
+            target_uuid=target_uuid,
+        )
+        await api_resources.copy_storages(
+            ctx.api,
+            collection=snapshot.collection,
+            source_uuid=snapshot.uuid,
+            target_uuid=target_uuid,
+            kind=snapshot.kind,
+        )
+
+    return {"target_uuids": created}
+
+
+async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
+    """Stop the whole stack and prove it, by asking the daemon.
+
+    We never trust the stop endpoint: it is async, it does not touch previews,
+    and for services it works off DB rows rather than labels.
+    """
+    if ctx.delete_previews:
+        for resource in ctx.plan.resources:
+            if not resource.snapshot.has_previews:
+                continue
+            containers = await docker.list_containers(
+                ctx.source_host,
+                label_filters={"coolify.applicationId": resource.snapshot.uuid},
+            )
+            for container in containers:
+                if container.is_preview:
+                    await ctx.api.delete(
+                        f"/applications/{resource.snapshot.uuid}/previews/"
+                        f"{container.pull_request_id}"
+                    )
+
+    for resource in ctx.plan.resources:
+        await ctx.api.stop(resource.snapshot.collection, resource.snapshot.uuid)
+
+    report = await quiesce.wait_until_stopped(
+        ctx.source_host,
+        label_filters=stack_labels(ctx.plan),
+        timeout=ctx.settings.stop_timeout,
+    )
+    return {
+        "containers_stopped": len(report.containers),
+        "container_names": sorted(c.name for c in report.containers),
+        "elapsed": round(report.elapsed, 1),
+    }
+
+
+async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
+    """The authoritative manifest, taken with nothing able to write.
+
+    Pairs source to target volumes by ``mount_path`` — read back from what
+    Coolify actually created, never predicted, never derived by string-replacing
+    a uuid.
+    """
+    labels = stack_labels(ctx.plan)
+    all_containers = await docker.list_containers(ctx.source_host, label_filters=labels)
+    pairs_recorded: dict[str, list[dict[str, str]]] = {}
+
+    for resource in ctx.plan.resources:
+        snapshot = resource.snapshot
+        target_uuid = ctx.target_uuids[snapshot.uuid]
+
+        containers = [
+            c
+            for c in all_containers
+            if (c.labels.get(docker.LABEL_TYPE) is not None
+            and snapshot.uuid in str(c.labels))
+            or c.name.startswith(snapshot.uuid)
+        ] or all_containers
+
+        manifest = await build_manifest(
+            ctx.source_host,
+            containers=containers,
+            api_storages=None,
+            uuid=snapshot.uuid,
+            measure=True,
+        )
+        if manifest.is_blocked:
+            reasons = "; ".join(i.reason for i in manifest.refused)
+            raise TransferError(f"{snapshot.name}: {reasons}")
+
+        source_eps = [
+            VolumeEndpoint(name=i.source_name, mount_path=i.mount_path)
+            for i in manifest.to_migrate
+            if i.source_name
+        ]
+        target_eps = await api_resources.read_volume_endpoints(
+            ctx.api, collection=snapshot.collection, uuid=target_uuid
+        )
+
+        pairs = pair_by_mount_path(source_eps, target_eps) if source_eps else []
+        ctx.volume_pairs[snapshot.uuid] = pairs
+        pairs_recorded[snapshot.uuid] = [
+            {"source": p.source.name, "target": p.target.name, "mount_path": p.source.mount_path}
+            for p in pairs
+        ]
+
+        # Bind mounts have no docker volume; mirror them path-to-path.
+        for item in manifest.to_migrate:
+            if item.source_name is None:
+                pairs_recorded[snapshot.uuid].append(
+                    {"source": item.source_path, "target": item.source_path, "mount_path": item.mount_path}
+                )
+
+    return {"volume_pairs": pairs_recorded}
+
+
+async def _transfer_endpoint(ctx: MigrationContext) -> tuple[str, int, str | None]:
+    """Decide direct vs tunnel. Returns ``(host, port, identity_file)``.
+
+    The tunnel solves reachability, not authentication — the ephemeral key is
+    needed either way.
+    """
+    key = ctx.ephemeral_key
+    identity = key.remote_path if key else None
+    target_ip = ctx.plan.target_server.ip
+    target_port = ctx.plan.target_server.port
+
+    if ctx.plan.transfer_mode is TransferMode.TUNNEL:
+        return "localhost", ctx.tunnel_port or target_port, identity
+
+    if ctx.plan.transfer_mode is TransferMode.DIRECT:
+        return target_ip, target_port, identity
+
+    # AUTO: probe whether the source can reach the target at all.
+    probe = await ctx.source_host.run(
+        f"timeout 5 sh -c 'exec 3<>/dev/tcp/{shlex.quote(target_ip)}/{target_port}' 2>/dev/null"
+    )
+    if probe.ok:
+        log.info("transfer.mode", mode="direct", reason="source can reach target")
+        return target_ip, target_port, identity
+
+    log.info("transfer.mode", mode="tunnel", reason="source cannot reach target directly")
+    return "localhost", ctx.tunnel_port or target_port, identity
+
+
+async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
+    """Mirror every volume, byte for byte, in parallel where it is safe."""
+    ctx.ephemeral_key = await keys.install(
+        source=ctx.source_host, target=ctx.target_host, migration_id=ctx.migration_id
+    )
+    # Journal the fingerprint immediately so a crash still revokes it later.
+    ctx.journal.append(
+        "step_started",
+        state="copy",
+        detail={"key_fingerprint": ctx.ephemeral_key.fingerprint},
+    )
+
+    copied: list[str] = []
+    for resource in ctx.plan.resources:
+        for pair in ctx.volume_pairs.get(resource.snapshot.uuid, []):
+            await docker.create_volume(ctx.target_host, pair.target.name)
+            await _copy_one(ctx, pair.source_path, pair.target_path)
+            copied.append(pair.target.name)
+
+    # Nothing may have restarted mid-transfer. A `restart:` policy or a dashboard
+    # deploy would invalidate the whole copy, and neither raises on its own.
+    await quiesce.assert_still_stopped(
+        ctx.source_host,
+        label_filters=stack_labels(ctx.plan),
+        since=await quiesce.snapshot(ctx.source_host, label_filters=stack_labels(ctx.plan)),
+    )
+    return {"volumes_copied": copied, "key_fingerprint": ctx.ephemeral_key.fingerprint}
+
+
+async def _copy_one(ctx: MigrationContext, source_path: str, target_path: str) -> None:
+    host, port, identity = await _transfer_endpoint(ctx)
+
+    entries: list[PathEntry] = []
+    listing = await ctx.source_host.run(
+        f"cd {shlex.quote(source_path)} 2>/dev/null && ls -A 2>/dev/null"
+    )
+    if listing.ok:
+        for name in listing.stdout.split():
+            size, _ = await docker.path_size(ctx.source_host, f"{source_path}/{name}")
+            entries.append(PathEntry(relpath=name, bytes=size))
+
+    hardlinks = await ctx.source_host.run(
+        f"find {shlex.quote(source_path)} -type f -links +1 -print -quit 2>/dev/null"
+    )
+    has_hardlinks = bool(hardlinks.stdout.strip())
+
+    total, _ = await docker.path_size(ctx.source_host, source_path)
+    parallel = min(
+        ctx.settings.transfer_parallel,
+        suggest_parallelism(entry_count=len(entries), total_bytes=total),
+    )
+    plan = plan_transfer(
+        entries, max_parallel=parallel, has_hardlinks=has_hardlinks, total_bytes=total
+    )
+    log.info(
+        "copy.plan",
+        source=source_path,
+        chunks=plan.parallelism,
+        reason=plan.reason,
+        bytes=total,
+    )
+
+    async def run_chunk(paths: tuple[str, ...]) -> None:
+        spec = rsync.RsyncSpec(
+            source_path=source_path,
+            target_path=target_path,
+            target_host=host,
+            target_user=ctx.plan.target_server.user,
+            target_port=port,
+            identity_file=identity,
+            paths=paths,
+            compress=ctx.settings.transfer_compress,
+            bandwidth_limit_kbps=ctx.settings.transfer_bandwidth_kbps,
+        )
+        await rsync.run(ctx.source_host, spec)
+
+    await asyncio.gather(*(run_chunk(chunk.paths) for chunk in plan.chunks))
+
+
+async def step_verify(ctx: MigrationContext) -> dict[str, Any]:
+    """Content AND metadata, both sides. A content-only check cannot see a chown."""
+    total_diffs = 0
+    verified: list[str] = []
+
+    for resource in ctx.plan.resources:
+        reports = []
+        for pair in ctx.volume_pairs.get(resource.snapshot.uuid, []):
+            report = await verify.verify_volume(
+                ctx.source_host,
+                ctx.target_host,
+                source_path=pair.source_path,
+                target_path=pair.target_path,
+                parallel=ctx.settings.verify_parallel,
+            )
+            reports.append(report)
+            total_diffs += len(report.differences)
+            verified.append(pair.target.name)
+        ctx.verifications[resource.snapshot.uuid] = reports
+
+    if total_diffs:
+        details: list[str] = []
+        for reports in ctx.verifications.values():
+            for report in reports:
+                details.extend(d.describe() for d in report.differences[:5])
+        raise VerificationError(
+            f"{total_diffs} difference(s) between source and target:\n"
+            + "\n".join(f"  {d}" for d in details[:20]),
+            hint=(
+                "The target will NOT be started and its volumes will be dropped. Your "
+                "source is untouched. A metadata_differs on uid/gid means ownership "
+                "changed — exactly what stops a database from starting."
+            ),
+        )
+
+    return {"volumes_verified": verified, "differences": 0}
+
+
+async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
+    """Refuse to start the target while a live hostname points at the source."""
+    hostnames = []
+    for resource in ctx.plan.resources:
+        full = await ctx.api.get_resource(resource.snapshot.collection, resource.snapshot.uuid)
+        envs = await ctx.api.get_envs(resource.snapshot.collection, resource.snapshot.uuid)
+        hostnames.extend(
+            dns_extract.collect(
+                fqdn=full.get("fqdn"),
+                compose_domains=full.get("docker_compose_domains"),
+                envs=envs,
+                labels=None,
+            )
+        )
+
+    real = dns_extract.real_hostnames(
+        sorted({h.host: h for h in hostnames}.values(), key=lambda h: h.host)
+    )
+    if not real:
+        return {"hostnames": 0, "verdict": "no real hostnames"}
+
+    resolutions = await dns_resolve.resolve_all(real)
+    report = build_report(
+        resolutions,
+        source_ips=frozenset({ctx.plan.source_server.ip}),
+        target_ips=frozenset({ctx.plan.target_server.ip}),
+    )
+    ctx.dns_report = report
+
+    if report.is_blocked:
+        raise DnsGateBlocked(
+            "DNS still points at the source for: "
+            + ", ".join(v.hostname.host for v in report.blocked)
+            + "\n\n"
+            + explain_why_blocking_matters(),
+            hint="Cutover:\n  " + "\n  ".join(report.cutover_checklist()),
+            report=report,
+        )
+
+    return {
+        "hostnames": len(real),
+        "ready": [v.hostname.host for v in report.ready],
+        "ambiguous": [v.hostname.host for v in report.ambiguous],
+    }
+
+
+async def step_start_target(ctx: MigrationContext) -> dict[str, Any]:
+    started = []
+    for resource in ctx.plan.resources:
+        target_uuid = ctx.target_uuids[resource.snapshot.uuid]
+        await ctx.api.start(resource.snapshot.collection, target_uuid)
+        started.append(target_uuid)
+    return {"started": started}
+
+
+async def step_healthcheck(ctx: MigrationContext) -> dict[str, Any]:
+    """Wait for the target's containers to come up.
+
+    A deploy is asynchronous, so "start returned" means nothing. We poll the
+    target's daemon for the same reason we poll the source's.
+    """
+    deadline = ctx.settings.stop_timeout
+    labels = stack_labels(ctx.plan)
+    waited = 0.0
+    interval = 3.0
+
+    while waited < deadline:
+        containers = await docker.list_containers(ctx.target_host, label_filters=labels)
+        running = [c for c in containers if c.state == "running"]
+        if containers and len(running) == len(containers):
+            return {"containers": len(containers), "waited": round(waited, 1)}
+        await asyncio.sleep(interval)
+        waited += interval
+
+    containers = await docker.list_containers(ctx.target_host, label_filters=labels)
+    not_running = [c.name for c in containers if c.state != "running"]
+    raise TransferError(
+        f"target did not become healthy within {deadline:.0f}s; not running: "
+        + ", ".join(not_running or ["<no containers appeared>"]),
+        hint="Check the deployment logs in Coolify. The source is still intact.",
+    )
+
+
+async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
+    """Apply the finalize policy to the SOURCE. The only irreversible step."""
+    policy = ctx.plan.finalize_policy
+    stamp = ctx.migration_id.split("-")[-1]
+    actions: list[str] = []
+
+    for resource in ctx.plan.resources:
+        snapshot = resource.snapshot
+        if policy is FinalizePolicy.KEEP:
+            actions.append(f"kept {snapshot.name}")
+            continue
+
+        if policy is FinalizePolicy.RENAME:
+            new_name = f"{snapshot.name}-old-{stamp}"
+            await api_resources.rename(ctx.api, snapshot.collection, snapshot.uuid, new_name)
+            # Without releasing the FQDN the old proxy keeps the router rule and
+            # keeps renewing its certificate for a hostname it no longer serves.
+            await api_resources.release_fqdn(ctx.api, snapshot.collection, snapshot.uuid)
+            actions.append(f"renamed {snapshot.name} -> {new_name}")
+            continue
+
+        await ctx.api.delete_resource(snapshot.collection, snapshot.uuid, delete_volumes=True)
+        actions.append(f"deleted {snapshot.name}")
+
+    await keys.revoke(
+        source=ctx.source_host, target=ctx.target_host, migration_id=ctx.migration_id
+    )
+    return {"policy": policy.value, "actions": actions, "original_names": [
+        r.snapshot.name for r in ctx.plan.resources
+    ]}
+
+
+def build_steps() -> dict[Any, Any]:
+    from bg_coolify_migrate.domain.statemachine import State
+
+    return {
+        State.INIT: step_init,
+        State.PREFLIGHT: step_preflight,
+        State.PLAN: step_plan,
+        State.CREATE_TARGET: step_create_target,
+        State.QUIESCE: step_quiesce,
+        State.DISCOVER: step_discover,
+        State.COPY: step_copy,
+        State.VERIFY: step_verify,
+        State.DNS_GATE: step_dns_gate,
+        State.START_TARGET: step_start_target,
+        State.HEALTHCHECK: step_healthcheck,
+        State.FINALIZE: step_finalize,
+    }

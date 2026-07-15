@@ -32,7 +32,7 @@ about a system we have already lost track of.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
@@ -83,8 +83,13 @@ class FinalizePolicy(StrEnum):
 
 
 class Compensation(StrEnum):
-    """Undo actions, named so the journal is readable by a human at 3am."""
+    """Undo actions, named so the journal is readable by a human at 3am.
 
+    Shared by F1 and F2. StrEnum members hash equal to their string value, which
+    is what lets one Saga drive two different state machines without generics.
+    """
+
+    # ── F1 (project migration) ───────────────────────────────────────────────
     DELETE_TARGET_RESOURCE = "delete_target_resource"
     DROP_TARGET_VOLUMES = "drop_target_volumes"
     STOP_TARGET = "stop_target"
@@ -92,6 +97,12 @@ class Compensation(StrEnum):
     REVOKE_EPHEMERAL_KEY = "revoke_ephemeral_key"
     RESTORE_SOURCE_NAME = "restore_source_name"
     RESTORE_SOURCE_FQDN = "restore_source_fqdn"
+
+    # ── F2 (instance migration) ──────────────────────────────────────────────
+    START_SOURCE_DOCKER = "start_source_docker"
+    """The one that ends the outage. F2 stops the whole box."""
+    UNFENCE_SOURCE = "unfence_source"
+    WIPE_TARGET_DATA = "wipe_target_data"
 
 
 #: Execution order. ``DONE`` is terminal and has no successor.
@@ -132,12 +143,16 @@ _IRREVERSIBLE = State.FINALIZE
 
 
 class RollbackStep(BaseModel):
-    """One compensating action to run, with the state that necessitated it."""
+    """One compensating action to run, with the state that necessitated it.
+
+    ``because_of`` is a plain string rather than :class:`State` so the same
+    machinery serves F2's own state machine (see ``server/statemachine.py``).
+    """
 
     model_config = ConfigDict(frozen=True)
 
     compensation: Compensation
-    because_of: State
+    because_of: str
 
 
 def next_state(current: State) -> State:
@@ -171,8 +186,15 @@ def compensations_for(state: State) -> tuple[Compensation, ...]:
     return _COMPENSATION.get(state, ())
 
 
-def rollback_plan(completed: Sequence[State]) -> tuple[RollbackStep, ...]:
+def rollback_plan_for(
+    completed: Sequence[str],
+    *,
+    order: Sequence[str],
+    compensation_map: Mapping[str, tuple[Compensation, ...]],
+) -> tuple[RollbackStep, ...]:
     """Compensations for a set of completed states, in reverse completion order.
+
+    Generic over the state machine so F1 and F2 share it.
 
     Reverse order is not cosmetic: the target resource must be stopped before its
     volumes are dropped, and its volumes must be dropped before the resource is
@@ -182,19 +204,31 @@ def rollback_plan(completed: Sequence[State]) -> tuple[RollbackStep, ...]:
     replayed after a crash may contain either.
 
     Args:
-        completed: States that finished successfully.
+        completed: State values that finished successfully.
+        order: The machine's execution order.
+        compensation_map: State value -> its undo actions.
 
     Returns:
         Steps to execute in order. Empty if nothing had side effects.
     """
-    seen = {s for s in completed if s in _COMPENSATION}
+    seen = {str(s) for s in completed if str(s) in compensation_map}
     steps: list[RollbackStep] = []
-    for state in reversed(ORDER):
-        if state not in seen:
+    for state in reversed(list(order)):
+        key = str(state)
+        if key not in seen:
             continue
-        for comp in _COMPENSATION[state]:
-            steps.append(RollbackStep(compensation=comp, because_of=state))
+        for comp in compensation_map[key]:
+            steps.append(RollbackStep(compensation=comp, because_of=key))
     return tuple(steps)
+
+
+def rollback_plan(completed: Sequence[State]) -> tuple[RollbackStep, ...]:
+    """F1's rollback plan. See :func:`rollback_plan_for`."""
+    return rollback_plan_for(
+        [s.value for s in completed],
+        order=[s.value for s in ORDER],
+        compensation_map={k.value: v for k, v in _COMPENSATION.items()},
+    )
 
 
 def requires_source_restart(completed: Sequence[State]) -> bool:

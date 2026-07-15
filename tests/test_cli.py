@@ -155,26 +155,65 @@ class TestStatus:
         assert result.exit_code == 14  # JournalError
 
 
-class TestUnimplementedCommandsAreHonest:
-    """They must fail loudly rather than pretend to have done something.
+class TestCommandsRequireCredentials:
+    """Every mutating command fails closed without a usable token.
 
-    A command that prints nothing and exits 0 is indistinguishable from a
-    successful migration, which is exactly the class of silent lie this whole
-    project exists to avoid.
+    Exit 2 (preflight) means nothing was changed - the guarantee that makes it
+    safe to script these.
     """
 
     @pytest.mark.parametrize(
         "argv",
         [
-            ["plan", "shop"],
-            ["run", "shop", "--to", "new-host"],
-            ["resume", "mig-001"],
-            ["rollback", "mig-001"],
+            ["plan", "shop", "--to", "new-host"],
+            ["run", "shop", "--to", "new-host", "--yes"],
             ["server", "plan", "--to", "new-host"],
-            ["server", "run", "--to", "new-host"],
+            ["server", "run", "--to", "new-host", "--yes"],
         ],
     )
-    def test_exits_nonzero(self, argv: list[str]) -> None:
+    def test_exits_2_without_credentials(self, argv: list[str]) -> None:
         result = runner.invoke(app, argv)
+        assert result.exit_code == 2
+        assert "COOLIFY_URL" in result.stderr
+
+
+class TestResumeAndRollbackNeedAPlan:
+    """They refuse rather than re-plan against a world that has since moved.
+
+    A plan is a fact about the decision we made; re-deriving it after the fact
+    could disagree with what was actually created, and then the rollback would
+    delete the wrong things.
+    """
+
+    def test_resume_without_a_plan_fails(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("STATE_DIR", str(tmp_path / "state"))
+        monkeypatch.setenv("COOLIFY_URL", HOST)
+        monkeypatch.setenv("COOLIFY_TOKEN", "tok")
+        result = runner.invoke(app, ["resume", "mig-001"])
         assert result.exit_code != 0
-        assert "not yet implemented" in result.stdout
+        assert "no saved plan" in result.stderr
+
+    def test_rollback_without_a_plan_fails(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("STATE_DIR", str(tmp_path / "state"))
+        monkeypatch.setenv("COOLIFY_URL", HOST)
+        monkeypatch.setenv("COOLIFY_TOKEN", "tok")
+        result = runner.invoke(app, ["rollback", "mig-001"])
+        assert result.exit_code != 0
+        assert "no saved plan" in result.stderr
+
+
+class TestRunValidation:
+    def test_invalid_finalize_policy_is_rejected(self) -> None:
+        result = runner.invoke(app, ["run", "shop", "--to", "x", "--finalize", "obliterate"])
+        assert result.exit_code == 2
+        assert "keep|rename|delete" in result.stderr
+
+    @pytest.mark.parametrize("policy", ["keep", "rename", "delete"])
+    def test_valid_policies_get_past_parsing(self, policy: str) -> None:
+        # No credentials, so it stops at preflight - but not at the parser.
+        result = runner.invoke(app, ["run", "shop", "--to", "x", "--finalize", policy, "--yes"])
+        assert "keep|rename|delete" not in result.stderr

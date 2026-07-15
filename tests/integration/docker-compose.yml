@@ -1,0 +1,66 @@
+# =============================================================================
+#  Integration rig: two real SSH servers with rsync
+# -----------------------------------------------------------------------------
+#  WHAT  : Two Alpine hosts running sshd, with rsync installed, sharing a key.
+#          Enough to exercise the real transfer path end to end.
+#  WHY   : The unit tests prove the volume-pairing algebra and the rsync command
+#          construction. They cannot prove that a file owned by uid 999 with an
+#          xattr and a hardlink actually arrives intact — and that is the entire
+#          promise of this tool. Only real rsync over real ssh can.
+#  RUN   : docker compose -f tests/integration/docker-compose.yml up -d
+#          pytest -m integration
+#          docker compose -f tests/integration/docker-compose.yml down -v
+# =============================================================================
+
+services:
+  source:
+    image: alpine:3.20
+    container_name: bgcm_it_source
+    ports:
+      - "2222:22"
+    volumes:
+      - ./keys:/keys:ro
+      - source_data:/data
+    command: >
+      sh -c "
+      apk add --no-cache openssh rsync coreutils findutils attr acl bash &&
+      ssh-keygen -A &&
+      mkdir -p /root/.ssh && chmod 700 /root/.ssh &&
+      cp /keys/id_ed25519.pub /root/.ssh/authorized_keys &&
+      chmod 600 /root/.ssh/authorized_keys &&
+      sed -i 's/#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config &&
+      /usr/sbin/sshd -D -e
+      "
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z localhost 22"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  target:
+    image: alpine:3.20
+    container_name: bgcm_it_target
+    ports:
+      - "2223:22"
+    volumes:
+      - ./keys:/keys:ro
+      - target_data:/data
+    command: >
+      sh -c "
+      apk add --no-cache openssh rsync coreutils findutils attr acl bash &&
+      ssh-keygen -A &&
+      mkdir -p /root/.ssh && chmod 700 /root/.ssh &&
+      cp /keys/id_ed25519.pub /root/.ssh/authorized_keys &&
+      chmod 600 /root/.ssh/authorized_keys &&
+      sed -i 's/#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config &&
+      /usr/sbin/sshd -D -e
+      "
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z localhost 22"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+volumes:
+  source_data:
+  target_data:

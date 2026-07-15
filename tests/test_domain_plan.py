@@ -151,6 +151,60 @@ class TestResourcePlanBlocking:
         assert plan.is_blocked
         assert any("preview" in r for r in plan.blocking_reasons)
 
+    def test_hard_and_drift_reasons_are_separable(self) -> None:
+        """Regression: --accept-rebuild-drift must actually work.
+
+        Drift is overridable; a refused volume and running previews are not. If
+        the two are conflated, the flag gets accepted and the migration aborts
+        two lines later on the generic check — a documented flag that does
+        nothing.
+        """
+        drift = RebuildDriftReport(
+            resource_name="app",
+            builds=True,
+            findings=(
+                DriftFinding(axis=DriftAxis.CODE, severity=Severity.BLOCK, summary="HEAD moved"),
+            ),
+        )
+        plan = ResourcePlan(snapshot=_snap(), strategy=Strategy.REBUILD, drift=drift)
+
+        assert plan.drift_blocking_reasons == ("HEAD moved",)
+        assert plan.hard_blocking_reasons == ()
+        assert plan.is_blocked  # blocked overall...
+        # ...but a caller honouring --accept-rebuild-drift finds nothing hard.
+
+    def test_hard_reasons_survive_accepting_drift(self) -> None:
+        manifest = VolumeManifest(
+            items=(
+                VolumeItem(
+                    mount_class=MountClass.ANONYMOUS,
+                    decision=Decision.REFUSE,
+                    reason="anonymous volume",
+                    source_path="/x",
+                    mount_path="/data",
+                ),
+            )
+        )
+        plan = ResourcePlan(
+            snapshot=_snap(has_previews=True), strategy=Strategy.COPY_DATA, manifest=manifest
+        )
+        # Neither of these may ever be waved through by a drift flag.
+        assert len(plan.hard_blocking_reasons) == 2
+        assert plan.drift_blocking_reasons == ()
+
+    def test_blocking_reasons_is_the_union(self) -> None:
+        drift = RebuildDriftReport(
+            resource_name="app",
+            builds=True,
+            findings=(
+                DriftFinding(axis=DriftAxis.CODE, severity=Severity.BLOCK, summary="HEAD moved"),
+            ),
+        )
+        plan = ResourcePlan(
+            snapshot=_snap(has_previews=True), strategy=Strategy.REBUILD, drift=drift
+        )
+        assert plan.blocking_reasons == plan.hard_blocking_reasons + plan.drift_blocking_reasons
+
     def test_warn_level_drift_does_not_block(self) -> None:
         drift = RebuildDriftReport(
             resource_name="app",

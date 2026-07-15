@@ -142,6 +142,29 @@ class ResourcePlan(BaseModel):
     warnings: tuple[str, ...] = ()
 
     @property
+    def hard_blocking_reasons(self) -> tuple[str, ...]:
+        """Reasons that CANNOT be overridden by any flag.
+
+        Kept apart from drift because drift is overridable (``--accept-rebuild-
+        drift``) and these are not. Conflating the two makes the flag a lie: it
+        gets accepted, and the migration aborts anyway on the generic check.
+        """
+        out: list[str] = []
+        out.extend(f"{i.source_name or i.mount_path}: {i.reason}" for i in self.manifest.refused)
+        if self.snapshot.has_previews:
+            out.append(
+                "preview deployments are running; the API's stop endpoint does not stop them "
+                "(StopApplication filters pullRequestId=0), so they would keep writing during "
+                "the copy"
+            )
+        return tuple(out)
+
+    @property
+    def drift_blocking_reasons(self) -> tuple[str, ...]:
+        """Reasons the operator may override with ``--accept-rebuild-drift``."""
+        return tuple(f.summary for f in self.drift.blocking) if self.drift else ()
+
+    @property
     def blocking_reasons(self) -> tuple[str, ...]:
         """Every reason this resource may not be migrated as planned.
 
@@ -151,17 +174,7 @@ class ResourcePlan(BaseModel):
         is the dangerous direction: a reason gets listed in the report while the
         migration proceeds anyway.
         """
-        out: list[str] = []
-        out.extend(f"{i.source_name or i.mount_path}: {i.reason}" for i in self.manifest.refused)
-        if self.drift:
-            out.extend(f.summary for f in self.drift.blocking)
-        if self.snapshot.has_previews:
-            out.append(
-                "preview deployments are running; the API's stop endpoint does not stop them "
-                "(StopApplication filters pullRequestId=0), so they would keep writing during "
-                "the copy"
-            )
-        return tuple(out)
+        return self.hard_blocking_reasons + self.drift_blocking_reasons
 
     @property
     def is_blocked(self) -> bool:

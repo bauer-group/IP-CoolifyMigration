@@ -159,11 +159,16 @@ def build_command(spec: RsyncSpec) -> str:
 
     parts = ["rsync", *flags]
 
-    # Restrict to the planned chunk. `--files-from` reads relative paths and
-    # implies --relative, so directories keep their structure under the target.
+    # Restrict to the planned chunk.
+    #
+    # `-r` is NOT redundant next to `-a`: **--files-from turns OFF the recursion
+    # that -a implies**. Without it a directory named in the list is transferred
+    # as a bare directory ENTRY — rsync exits 0, the tree looks right, and every
+    # file inside is missing. A silent partial copy, on exactly the large volumes
+    # that get chunked in the first place.
     if tuple(spec.paths) != (".",):
         listing = "\n".join(spec.paths)
-        parts += ["--files-from=-", "--relative"]
+        parts += ["--files-from=-", "--relative", "-r"]
         cmd = (
             f"printf '%s\\n' {shlex.quote(listing)} | "
             + " ".join(shlex.quote(p) if " " in p else p for p in parts)
