@@ -66,11 +66,21 @@ shape: an assumption about someone else's system, checked only against itself.
 | 12 | A 400 from `/stop` is a stop failure | Coolify decides "already stopped" from a **column a background job maintains**, so it lags the daemon and can say `exited` about a container serving traffic. Treating it as fatal aborted migrations over a stale row. Now tolerated — the daemon poll still has to see every container exited. |
 | 13 | Containers survive a stop as `exited`, so discovery can run after it | **Coolify's stop removes them**: `docker stop` then `docker rm -f`, in all three stop actions. The design's "authoritative post-stop discovery" had nothing left to inspect, so it built an empty manifest and copied nothing. The saga ran green to `finalize` and the target came up as a brand-new empty database. QUIESCE now captures mounts before stopping; DISCOVER reconciles that with `volume ls` and `/storages`, which survive. |
 | 14 | The SIGKILL guard protects the copy | It could never fire. Exit code 137 only exists on a container, and `docker stop`/`docker rm -f` leave in one SSH invocation — the record is gone within milliseconds. A database killed mid-write would have been mirrored byte-exactly as a torn snapshot, faithfully. Now read from the daemon's **event log**, where the exit code outlives the container. |
+| 15 | Rollback restarts the source with `/start` | `/start` has the stop bug in reverse: `if status contains 'running' -> 400 "already running"`, dispatching nothing. QUIESCE removed the container but the column still read "running", so the rollback's restart step 400d **while the source was down** — `ROLLBACK_FAILED`, outage un-ended. Now uses `/restart`, which has no such guard. Found by the rollback test; the single postgres test never rolled back. |
+| 16 | Service create allows `connect_to_docker_network` | It does not. `create_service` has two `$allowedFields` — line 296 (without it) and line 505 (with it) — but the rejection at line 332 validates **both** branches against 296, so a compose create carrying it 422s before 505 is reached. Our whitelist matched the wrong array. This broke the compose-service (90%) migration outright. Now dropped from create and carried via a follow-up PATCH. |
 
 Findings 5–9 and 13 each cause the same failure: **a migration that reports
 success and moves nothing**; 14 quietly permits the other one, a faithful copy
-of a corrupted database. That is the failure this tool exists to prevent, and
-it was sitting in our own code.
+of a corrupted database; 15 leaves the source dead after a rollback that was
+supposed to save it. That is the failure this tool exists to prevent, and it was
+sitting in our own code.
+
+The second wave (15, 16) came only from the **comprehensive** suite — every
+database engine, a compose service, a multi-resource project, a real rollback.
+The single postgres migration proved the happy path. It took migrating a stack
+that *fails* to find that the recovery path was broken (15), and migrating the
+compose shape the estate actually uses to find that its create was rejected
+outright (16).
 
 Finding 13 is the one worth remembering, because it is not a wrong constant or a
 misread field — it is a correct-sounding sentence in the design (*"authoritative
@@ -93,3 +103,23 @@ typo away from silently copying nothing.
   and compares byte for byte, and pins the health-check defaults against the
   live schema. Both would be circular as unit tests: they would compare our code
   against our own idea of Coolify, which is the assumption under test.
+- `test_all_engines.py` — the same round trip for **every** engine: postgres,
+  mysql, mariadb, mongodb, redis, keydb, dragonfly, clickhouse. Each stores data
+  differently (mysql bakes auth into the data dir, mongo uses two volumes, redis
+  is in-memory with a persistence config, clickhouse is columnar), so "the target
+  boots from the copied volume" is proven per engine, not assumed from postgres.
+  Slow on purpose — eight deploys and eight migrations, serial.
+- `test_drift_gate.py` — a floating-tag image (`eqalpha/keydb:latest`) must block
+  at preflight without `--accept-drift` and complete with it. This is the user's
+  own requirement, checked against a real `:latest` rather than a mocked one.
+- `test_compose_service.py` — a Postgres inside a raw docker-compose **service**,
+  through the `/services` path rather than `/databases`. Exercises the service
+  volume separator (`_`, not `-`) and the pre-stop mount capture for a compose
+  container.
+- `test_multi_resource.py` — a project holding a Postgres AND a Redis, migrated
+  as one plan, each with distinct data. Proves the n>1 case: migrating only the
+  first, or crossing one resource's volume to another's target, fails a
+  fingerprint.
+- `test_rollback.py` — injects a fault after the volumes are copied and asserts
+  the world is put back: target deleted from server-b, source still running on
+  server-a with its data intact. This is what caught finding 15.

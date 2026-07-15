@@ -139,3 +139,46 @@ async def wait_for_container(host: RemoteHost, name: str, *, timeout: float = 18
                 return
         await asyncio.sleep(3)
     raise AssertionError(f"{name} never became ready (last status: {last or 'absent'})")
+
+
+async def wait_until_healthy(host: RemoteHost, name: str, *, timeout: float = 240) -> None:
+    """Block until Coolify's health check on the container passes.
+
+    Engine-agnostic, unlike wait_for_container's pg_isready. Coolify puts a
+    health check on every managed database, so we can wait on the daemon's own
+    verdict rather than teaching this helper each engine's readiness probe.
+
+    Generous by default: mysql:8 and mongo:7 spend 40-60s on first-boot
+    initialisation, during which their health check legitimately reports
+    unhealthy. That is not a failure, it is the image initialising its data
+    directory — waiting less would flake against the slow engines only.
+    """
+    import asyncio
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    last = ""
+    while asyncio.get_running_loop().time() < deadline:
+        result = await host.run(
+            f"docker inspect -f '{{{{.State.Health.Status}}}}' {name} 2>/dev/null"
+        )
+        last = result.stdout.strip()
+        if last == "healthy":
+            return
+        await asyncio.sleep(4)
+    raise AssertionError(f"{name} never became healthy (last: {last or 'absent'})")
+
+
+async def db_exec(host: RemoteHost, container: str, argv: str, *, stdin: str | None = None) -> str:
+    """Run a command inside a database container on a rig server, checked.
+
+    Two docker-exec hops: SSH to the dind server, whose daemon runs the database.
+    `-i` and stdin when there is input, so seed strings with quotes and umlauts do
+    not have to survive two layers of shell quoting — the postgres path learned
+    that the hard way.
+    """
+    flag = "-i " if stdin is not None else ""
+    result = await host.run(
+        f"docker exec {flag}{container} {argv}", input_text=stdin, timeout=90
+    )
+    result.check()
+    return result.stdout.strip()

@@ -148,6 +148,13 @@ shipped inside a green unit suite. `tests/e2e/README.md` has the full table.
   token.
 - **`health_check_*` is readable but in no `$allowedFields`.** Sending one 422s
   the whole request. Defaults are 15/5/5/5 (not 30/30/3/30).
+- **`connect_to_docker_network` is rejected on service *create*.** There are two
+  `$allowedFields` in `create_service` — line 296 (without it) and line 505
+  (with it) — but the extra-field rejection at line 332 runs against 296 for
+  BOTH the templated and the compose branch, so 505 never applies to validation.
+  It is settable only on update. `create_service` sends it via a follow-up PATCH.
+  This broke the compose-service (90%) migration until the e2e suite hit it —
+  a source-reading whitelist that matched the wrong one of two arrays.
 - **`/stop` 400s "already stopped" off a background-maintained column** and
   dispatches nothing. It lags the daemon, so it refuses to stop containers that
   are serving traffic. Re-ask until the daemon agrees; never conclude from it
@@ -168,6 +175,15 @@ shipped inside a green unit suite. `tests/e2e/README.md` has the full table.
   The guard that makes invariant 9 mean anything reads the **daemon event log**
   after the fact (`quiesce.killed_since`), where the exit code outlives the
   container. Do not replace it with a `docker ps` check that looks equivalent.
+- **`/start` has the stop bug in reverse, and here it is dangerous.** It guards
+  on the same stale status column: `if status contains 'running' -> 400 "already
+  running"`, dispatching nothing. After QUIESCE removed the container the column
+  can still read "running", so the rollback's restart-the-source step gets a 400
+  while the source is in fact down. Swallowing it would be the worst move — it
+  would report the outage ended while leaving the source dead. The recovery path
+  therefore uses **`/restart`** (`api.restart`), whose `action_restart` carries
+  no guard and actually redeploys. Found by the e2e rollback test; the single
+  postgres test never rolled back, so it never hit this.
 
 ## Verify + ship
 
