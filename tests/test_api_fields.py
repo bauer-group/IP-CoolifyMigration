@@ -16,6 +16,7 @@ from bg_coolify_migrate.api.fields import (
     APPLICATION_UPDATE,
     DATABASE_COMMON,
     DATABASE_ENGINE_FIELDS,
+    DATABASE_HEALTH_CHECK_DEFAULTS,
     ENV_FIELDS,
     SERVICE_CREATE,
     SERVICE_CREATE_CUSTOM_COMPOSE,
@@ -25,6 +26,7 @@ from bg_coolify_migrate.api.fields import (
     STORAGE_FILE_ONLY,
     STORAGE_PERSISTENT_ONLY,
     database_allowed,
+    database_health_check_warnings,
     filter_body,
     missing_required,
     rejected_keys,
@@ -267,3 +269,52 @@ async def test_whitelists_match_upstream_openapi() -> None:
             f"openapi.json documents fields we do not whitelist for POST /services: "
             f"{sorted(missing)}. Upstream may have added fields; review api/fields.py."
         )
+
+
+class TestDatabaseHealthCheckWarnings:
+    """health_check_* is readable in every GET and settable through no endpoint.
+
+    Dropping it from the request is forced — Coolify 422s the whole create
+    otherwise. Dropping it *quietly* would not be: a source with a tuned health
+    check would come up on defaults with nobody told.
+    """
+
+    def test_silent_on_coolify_defaults(self) -> None:
+        """The overwhelmingly common case must not produce noise.
+
+        A warning on every stock database is worse than none: it teaches
+        operators that warnings from this tool are furniture.
+        """
+        source = dict(DATABASE_HEALTH_CHECK_DEFAULTS)
+        assert database_health_check_warnings(source) == []
+
+    def test_silent_when_the_source_says_nothing(self) -> None:
+        assert database_health_check_warnings({"name": "pg", "image": "postgres:16"}) == []
+
+    def test_reports_a_tuned_health_check(self) -> None:
+        warnings = database_health_check_warnings(
+            {**DATABASE_HEALTH_CHECK_DEFAULTS, "health_check_interval": 120}
+        )
+        assert len(warnings) == 1
+        # The operator needs to know what to re-apply, not merely that something
+        # was dropped.
+        assert "health_check_interval=120" in warnings[0]
+        assert "15" in warnings[0]
+
+    def test_gathers_every_deviation_into_one_warning(self) -> None:
+        warnings = database_health_check_warnings(
+            {"health_check_enabled": False, "health_check_retries": 99}
+        )
+        assert len(warnings) == 1
+        assert "health_check_enabled=False" in warnings[0]
+        assert "health_check_retries=99" in warnings[0]
+
+    def test_the_defaults_are_not_settable_anywhere(self) -> None:
+        """The reason this module drops them at all.
+
+        If a future version adds them to $allowedFields, this fails and someone
+        gets to delete the warning instead of discovering it by 422.
+        """
+        for field in DATABASE_HEALTH_CHECK_DEFAULTS:
+            assert field not in DATABASE_COMMON
+            assert field not in database_allowed("postgresql")

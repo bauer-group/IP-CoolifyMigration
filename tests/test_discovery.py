@@ -27,6 +27,7 @@ from bg_coolify_migrate.discovery.docker import (
 from bg_coolify_migrate.discovery.quiesce import (
     assert_previews_absent,
     assert_still_stopped,
+    killed_since,
     snapshot,
     wait_until_stopped,
 )
@@ -322,3 +323,78 @@ class TestAssertStillStopped:
         fake_host.on(r"docker ps", stdout=_ps_line("db", "exited"))
         fake_host.on(r"docker inspect", stdout=json.dumps({"Status": "exited", "ExitCode": 0}))
         await assert_still_stopped(fake_host, label_filters=LABELS, since=since)  # type: ignore[arg-type]
+
+
+class TestKilledSince:
+    """The SIGKILL check, which for a long while could not fire at all.
+
+    Exit code 137 lives on a container, and Coolify's stop is `docker stop`
+    followed by `docker rm -f` in one SSH invocation — so by the time anything
+    polls, the record is gone. The event log outlives the container, and that is
+    what this reads. Without it, invariant 9's "and not SIGKILLed" is a comment:
+    a database killed mid-write gets mirrored byte-exactly as a torn snapshot.
+    """
+
+    async def test_reports_a_killed_container(self) -> None:
+        host = (
+            FakeHost()
+            .on(r"date \+%s", stdout="1700000100\n")
+            .on(r"docker events", stdout="pg-1 137\n")
+        )
+        assert await killed_since(host, since=1700000000, label_filters=LABELS) == [("pg-1", 137)]
+
+    async def test_ignores_a_clean_exit(self) -> None:
+        """Exit 0 is the whole point of asking politely."""
+        host = (
+            FakeHost()
+            .on(r"date \+%s", stdout="1700000100\n")
+            .on(r"docker events", stdout="pg-1 0\n")
+        )
+        assert await killed_since(host, since=1700000000, label_filters=LABELS) == []
+
+    async def test_picks_the_killed_one_out_of_a_stack(self) -> None:
+        host = (
+            FakeHost()
+            .on(r"date \+%s", stdout="1700000100\n")
+            .on(r"docker events", stdout="app-1 0\nredis-1 0\npg-1 137\nworker-1 143\n")
+        )
+        # 143 is SIGTERM — a clean stop, not a kill.
+        assert await killed_since(host, since=1700000000, label_filters=LABELS) == [("pg-1", 137)]
+
+    async def test_survives_a_container_name_with_spaces(self) -> None:
+        """The format is `name exitCode`, so the split has to come from the right."""
+        host = (
+            FakeHost()
+            .on(r"date \+%s", stdout="1700000100\n")
+            .on(r"docker events", stdout="odd name 137\n")
+        )
+        assert await killed_since(host, since=1700000000, label_filters=LABELS) == [
+            ("odd name", 137)
+        ]
+
+    async def test_quiet_window_is_not_a_kill(self) -> None:
+        host = FakeHost().on(r"date \+%s", stdout="1700000100\n").on(r"docker events", stdout="")
+        assert await killed_since(host, since=1700000000, label_filters=LABELS) == []
+
+    async def test_refuses_when_the_event_log_cannot_be_read(self) -> None:
+        """A stop we cannot vet is a stop we do not trust.
+
+        Returning [] here would read as "nothing was killed" and let the copy
+        proceed over a data directory nobody checked.
+        """
+        host = (
+            FakeHost()
+            .on(r"date \+%s", stdout="1700000100\n")
+            .on(r"docker events", stderr="permission denied", exit_status=1)
+        )
+        with pytest.raises(QuiesceError, match="event log"):
+            await killed_since(host, since=1700000000, label_filters=LABELS)
+
+    async def test_asks_the_source_for_the_time(self) -> None:
+        """Our clock would silently narrow or widen the window if it were skewed."""
+        host = FakeHost().on(r"date \+%s", stdout="1700000100\n").on(r"docker events", stdout="")
+        await killed_since(host, since=1700000000, label_filters=LABELS)
+        events = next(c for c in host.commands if c.startswith("docker events"))
+        assert "--since 1700000000" in events
+        assert "--until 1700000100" in events
+        assert "--filter label=coolify.projectName=shop" in events

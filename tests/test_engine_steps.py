@@ -30,6 +30,7 @@ from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.engine import compensations, steps
 from bg_coolify_migrate.engine.context import EphemeralKey, MigrationContext
 from bg_coolify_migrate.errors import (
+    CoolifyApiError,
     DnsGateBlocked,
     PreflightError,
     RebuildDriftBlocked,
@@ -520,3 +521,107 @@ class TestContext:
     def test_all_target_uuids(self, ctx: MigrationContext) -> None:
         ctx.target_uuids["db1"] = "db2"
         assert ctx.all_target_uuids() == [("databases", "db2")]
+
+
+def _host_with_a_running_container() -> FakeHost:
+    """A source whose daemon still reports the stack up.
+
+    A fresh host rather than another `.on()` on the shared one: FakeHost matches
+    in insertion order, and _source_host() already answers `docker ps` with
+    nothing — so a route added afterwards never wins, and the test silently
+    exercises the already-down path instead.
+    """
+    line = json.dumps(
+        {
+            "ID": "id-pg",
+            "Names": "pg-1",
+            "State": "running",
+            "Labels": "coolify.managed=true,coolify.projectName=shop",
+        }
+    )
+    host = FakeHost()
+    host.on(r"docker ps", stdout=line)
+    host.on(r"docker inspect", stdout="running 0")
+    return host
+
+
+class TestRequestStop:
+    """Asking Coolify to stop a stack it wrongly believes is already stopped.
+
+    `POST /{kind}/{uuid}/stop` returns 400 "already stopped" — and dispatches
+    nothing — whenever the resource's `status` column contains 'exited'. That
+    column defaults to 'exited' and is advanced by ServerManagerJob every
+    minute, so it lags the daemon: shortly after a deploy Coolify refuses to
+    stop a container that is serving traffic.
+
+    Both wrong answers cost a migration. Raising aborts over a stale row.
+    Shrugging it off waits out the whole gate timeout for a stop nobody
+    requested.
+    """
+
+    async def test_stops_normally(self, ctx: MigrationContext, respx_mock: respx.Router) -> None:
+        route = respx_mock.post(f"{BASE}/databases/db1/stop").mock(
+            return_value=httpx.Response(200, json={"message": "stopping"})
+        )
+        await steps._request_stop(ctx)
+        assert route.call_count == 1
+
+    async def test_retries_while_coolify_catches_up(
+        self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A refusal is checked against the daemon, and re-asked, not believed."""
+        monkeypatch.setattr(steps, "_STOP_RETRY_INTERVAL", 0)
+        responses = [
+            httpx.Response(400, json={"message": "Database is already stopped."}),
+            httpx.Response(400, json={"message": "Database is already stopped."}),
+            httpx.Response(200, json={"message": "stopping"}),
+        ]
+        route = respx_mock.post(f"{BASE}/databases/db1/stop").mock(
+            side_effect=lambda request: responses.pop(0)
+        )
+        # The daemon says it is up, so Coolify is merely behind.
+        ctx.source_host = _host_with_a_running_container()  # type: ignore[assignment]
+
+        await steps._request_stop(ctx)
+        assert route.call_count == 3
+
+    async def test_stops_asking_once_the_daemon_agrees(
+        self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Refused AND genuinely down is the one case where the 400 was honest."""
+        monkeypatch.setattr(steps, "_STOP_RETRY_INTERVAL", 0)
+        route = respx_mock.post(f"{BASE}/databases/db1/stop").mock(
+            return_value=httpx.Response(400, json={"message": "Database is already stopped."})
+        )
+        # _source_host() already answers `docker ps` with nothing: genuinely down.
+
+        await steps._request_stop(ctx)
+        assert route.call_count == 1
+
+    async def test_gives_up_quietly_and_lets_the_gate_speak(
+        self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gate below is the one authorised to fail.
+
+        It fails with the list of containers still running, which is what an
+        operator needs. Raising here would replace that with a story about an
+        HTTP call.
+        """
+        monkeypatch.setattr(steps, "_STOP_RETRY_INTERVAL", 0)
+        monkeypatch.setattr(steps, "_STOP_REFUSAL_WINDOW", 0)
+        respx_mock.post(f"{BASE}/databases/db1/stop").mock(
+            return_value=httpx.Response(400, json={"message": "Database is already stopped."})
+        )
+        ctx.source_host = _host_with_a_running_container()  # type: ignore[assignment]
+
+        await steps._request_stop(ctx)  # must not raise
+
+    async def test_a_real_failure_still_raises(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """Only "already stopped" is tolerated; 500 is a stop that failed."""
+        respx_mock.post(f"{BASE}/databases/db1/stop").mock(
+            return_value=httpx.Response(500, json={"message": "boom"})
+        )
+        with pytest.raises(CoolifyApiError):
+            await steps._request_stop(ctx)
