@@ -52,6 +52,12 @@ Two prior tools solve this badly, and their bugs are our requirements:
 9. **Never swallow a stop failure, and never trust a stop endpoint.** Poll the
    Docker daemon by label, with `-a`, and require *every* container — previews
    included — to be `exited` and not SIGKILLed.
+   A 400 "already stopped" is not a stop failure and is not a stop: Coolify
+   reads it off a background-maintained column and dispatches nothing, so it
+   refuses stacks that are serving traffic. `api.stop()` reports that as `False`
+   and `_request_stop` re-asks until the daemon agrees. What stays forbidden is
+   concluding anything about the stack from it — the gate below still has to see
+   every container exited.
 10. **Never string-replace a UUID to derive a volume name.** Pair by
     `mount_path`. This is coolify-mover's silent data-loss bug.
 
@@ -114,6 +120,54 @@ Checked against `coollabsio/coolify@main`:
   load). ~33 fields are settable-but-unreadable.
 - Standalone DB mount path depends on the image tag (Postgres ≥18 moves to
   `/var/lib/postgresql`). Always pin `image`.
+
+### Learned the hard way, from a real instance
+
+Source-reading got the list above right. It got all of these wrong, and every one
+shipped inside a green unit suite. `tests/e2e/README.md` has the full table.
+
+- **The numeric `id` is never disclosed.** Every controller calls
+  `makeHidden(['id', 'laravel_through_key'])`. So you cannot copy Coolify's own
+  `--filter label=coolify.{kind}Id={id}` from outside — it filters on the empty
+  string, matches nothing, and reports no error. Identify containers by the
+  slugified `coolify.projectName` / `environmentName` / `resourceName` triple,
+  which `defaultLabels()` and `defaultDatabaseLabels()` both write.
+- **`slugify` must equal Laravel's `Str::slug` exactly**, because that discovery
+  depends on it. It *removes* stray characters and only then collapses runs, so
+  `a.b.c` → `abc`, and `@` → `-at-`. Locked by `test_slug_matches_laravel`
+  against the live Laravel — never "improve" it against intuition.
+- **The environment endpoint has no `databases` key.** It has one per engine
+  (`postgresqls`, `redis`, `mongodbs`, `mysqls`, `mariadbs`) — and the controller
+  eager-loads only 7 of 10 relations, so **keydb, dragonfly and clickhouse are
+  invisible there**. Cross-check `/databases`, which merges all eight.
+- **Only services carry `server_uuid`.** Applications and databases reach their
+  server through `destination` (a morphTo). Use `planner.server_uuid_of`.
+- **`is_reachable` lives under `settings`**, not at the top level.
+- **`GET /version` returns a bare string**, not JSON.
+- **The API is off instance-wide by default** — a 403 is not necessarily the
+  token.
+- **`health_check_*` is readable but in no `$allowedFields`.** Sending one 422s
+  the whole request. Defaults are 15/5/5/5 (not 30/30/3/30).
+- **`/stop` 400s "already stopped" off a background-maintained column** and
+  dispatches nothing. It lags the daemon, so it refuses to stop containers that
+  are serving traffic. Re-ask until the daemon agrees; never conclude from it
+  that a stack is down.
+- **Coolify's stop REMOVES the containers.** `docker stop` then **`docker rm -f`**
+  — StopDatabase.php:59, StopApplication.php:43, StopService.php:70. This
+  refutes the design's "authoritative post-stop discovery": once a stack is
+  quiesced there are no containers to inspect, and anonymous volumes and bind
+  mounts are recorded nowhere else. QUIESCE therefore captures the mounts before
+  it stops anything (`_capture_mounts`), and DISCOVER reconciles that capture
+  with `docker volume ls` and `/storages`, both of which survive.
+  Consequence to keep in mind everywhere: **an empty container list is
+  indistinguishable from a cleanly stopped stack.** Both read as quiesced. The
+  broken label filter above looked exactly like success for the same reason, so
+  treat "no containers" as a question, never as an answer.
+- **Exit code 137 cannot be polled for**, for the same reason: both commands go
+  out in one SSH invocation, so a SIGKILLed container exists for milliseconds.
+  The guard that makes invariant 9 mean anything reads the **daemon event log**
+  after the fact (`quiesce.killed_since`), where the exit code outlives the
+  container. Do not replace it with a `docker ps` check that looks equivalent.
 
 ## Verify + ship
 
