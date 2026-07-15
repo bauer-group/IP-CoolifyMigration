@@ -144,13 +144,24 @@ class TestServiceFields:
         assert "type" in SERVICE_CREATE
         assert "docker_compose_raw" in SERVICE_CREATE
 
-    def test_custom_compose_branch_adds_connect_to_docker_network(self) -> None:
+    def test_create_rejects_connect_to_docker_network(self) -> None:
+        """It is settable only on update, not create — either branch.
+
+        The endpoint validates both the templated and the compose branch against
+        one allowedFields (ServicesController line 296), and that list has no
+        connect_to_docker_network. The second list at line 505 sits after the
+        rejection and never applies. The e2e compose migration 422'd on this.
+        """
         assert "connect_to_docker_network" not in SERVICE_CREATE
-        assert "connect_to_docker_network" in SERVICE_CREATE_CUSTOM_COMPOSE
+        assert "connect_to_docker_network" not in SERVICE_CREATE_CUSTOM_COMPOSE
+        # There is no compose-only create field: the two lists are identical.
+        assert SERVICE_CREATE_CUSTOM_COMPOSE == SERVICE_CREATE
 
     def test_service_compose_is_updatable(self) -> None:
-        # Unlike applications, PATCH /services DOES accept docker_compose_raw.
+        # Unlike applications, PATCH /services DOES accept docker_compose_raw,
+        # and it is the only place connect_to_docker_network can be set.
         assert "docker_compose_raw" in SERVICE_UPDATE
+        assert "connect_to_docker_network" in SERVICE_UPDATE
 
     def test_update_cannot_move_a_service_between_servers(self) -> None:
         # Resources cannot be relocated via PATCH — that is why the tool creates
@@ -264,7 +275,13 @@ async def test_whitelists_match_upstream_openapi() -> None:
 
     documented = body_props("/services", "post")
     if documented:
-        missing = documented - SERVICE_CREATE_CUSTOM_COMPOSE
+        # openapi documents connect_to_docker_network for POST /services, but the
+        # controller validates it out at line 332 (see SERVICE_CREATE_CUSTOM_COMPOSE).
+        # The arrays are the enforcement; the schema is documentation. Where they
+        # disagree the arrays win, and this is the recorded exception — verified
+        # against the running instance by the e2e compose-service migration.
+        openapi_only = {"connect_to_docker_network"}
+        missing = documented - SERVICE_CREATE_CUSTOM_COMPOSE - openapi_only
         assert not missing, (
             f"openapi.json documents fields we do not whitelist for POST /services: "
             f"{sorted(missing)}. Upstream may have added fields; review api/fields.py."

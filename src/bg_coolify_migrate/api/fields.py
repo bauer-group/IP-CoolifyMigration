@@ -166,8 +166,16 @@ SERVICE_CREATE: frozenset[str] = frozenset(
     }
 )
 
-#: The custom-compose branch accepts one extra field the templated branch does not.
-SERVICE_CREATE_CUSTOM_COMPOSE: frozenset[str] = SERVICE_CREATE | {"connect_to_docker_network"}
+#: Identical to SERVICE_CREATE — the compose branch has NO extra create field.
+#:
+#: This once added ``connect_to_docker_network``, read from a second
+#: ``$allowedFields`` at ServicesController line 505. That list is real, but it
+#: sits AFTER the extra-field rejection at line 332, which validates *both*
+#: branches against the first list (line 296) — the one without it. So a compose
+#: create carrying ``connect_to_docker_network`` is rejected 422 before line 505
+#: is ever reached. The field is settable only on update; ``create_service``
+#: carries it with a follow-up PATCH. Found by the e2e compose-service migration.
+SERVICE_CREATE_CUSTOM_COMPOSE: frozenset[str] = SERVICE_CREATE
 
 #: PATCH /v1/services/{uuid}. Unlike applications, compose IS updatable here.
 SERVICE_UPDATE: frozenset[str] = frozenset(

@@ -211,6 +211,14 @@ async def create_service(
     uuid = (created or {}).get("uuid")
     if not uuid:
         raise CoolifyApiError(f"creating service {snapshot.name!r} returned no uuid", body=created)
+
+    # connect_to_docker_network is rejected on create (validated out at line 332)
+    # but settable on update. Carry it explicitly, so a source that had the
+    # service on the predefined network does not silently come up off it. Only
+    # when true — the default is false, and a redundant PATCH is just risk.
+    if source.get("connect_to_docker_network"):
+        await api.patch(f"/services/{uuid}", {"connect_to_docker_network": True})
+
     log.info("api.service.created", name=snapshot.name, uuid=uuid, custom_compose=is_custom)
     return str(uuid)
 
