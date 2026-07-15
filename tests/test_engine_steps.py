@@ -442,20 +442,31 @@ class TestCompensations:
     ) -> None:
         await compensations.undo_create_target(ctx, {})
 
-    async def test_restart_source_starts_every_resource(
+    async def test_restart_source_uses_restart_not_start(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
-        # The compensation that ends the outage.
-        route = respx_mock.post(f"{BASE}/databases/db1/start").mock(
+        """The compensation that ends the outage must use /restart, not /start.
+
+        /start guards on Coolify's status column, which lags the daemon: after
+        QUIESCE removed the container the column can still read "running", and
+        /start then 400s "already running" while the source is in fact down.
+        /restart carries no such guard. The e2e rollback test caught this; a
+        /start here would leave the source dead and the outage un-ended.
+        """
+        start = respx_mock.post(f"{BASE}/databases/db1/start").mock(
+            return_value=httpx.Response(400, json={"message": "Database is already running."})
+        )
+        restart = respx_mock.post(f"{BASE}/databases/db1/restart").mock(
             return_value=httpx.Response(200, json={})
         )
         await compensations.undo_quiesce(ctx, {})
-        assert route.called
+        assert restart.called, "the source was not restarted"
+        assert not start.called, "used /start, which the stale status column defeats"
 
     async def test_restart_failure_is_reported_not_swallowed(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
-        respx_mock.post(f"{BASE}/databases/db1/start").mock(return_value=httpx.Response(500))
+        respx_mock.post(f"{BASE}/databases/db1/restart").mock(return_value=httpx.Response(500))
         with pytest.raises(RuntimeError, match="could not restart"):
             await compensations.undo_quiesce(ctx, {})
 

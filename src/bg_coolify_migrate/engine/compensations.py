@@ -56,7 +56,13 @@ async def undo_quiesce(ctx: MigrationContext, undo_info: dict[str, Any]) -> None
     failures: list[str] = []
     for resource in ctx.plan.resources:
         try:
-            await ctx.api.start(resource.snapshot.collection, resource.snapshot.uuid)
+            # restart, NOT start. QUIESCE removed the container (docker rm -f),
+            # but Coolify's status column lags and can still read "running", and
+            # /start refuses with 400 "already running" while the source is in
+            # fact down. /restart carries no such guard and actually brings it
+            # back. Found by the e2e rollback test — the single postgres test
+            # never rolled back, so it never hit this.
+            await ctx.api.restart(resource.snapshot.collection, resource.snapshot.uuid)
             log.info("compensate.source_restarted", name=resource.snapshot.name)
         except Exception as exc:
             failures.append(f"{resource.snapshot.name}: {exc}")

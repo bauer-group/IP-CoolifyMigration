@@ -342,6 +342,29 @@ class CoolifyClient:
     async def start(self, collection: str, uuid: str) -> Any:
         return await self.post(f"/{collection}/{uuid}/start")
 
+    async def restart(self, collection: str, uuid: str) -> Any:
+        """Bring a resource up, whatever Coolify believes its state is.
+
+        Use this, not ``start``, to recover a source after a failed migration.
+        ``/start`` guards on the status column::
+
+            if (str($database->status)->contains('running')) {
+                return response()->json(['message' => 'Database is already running.'], 400);
+            }
+
+        and that column is advanced by a background job, so it lags the daemon.
+        After QUIESCE — which is ``docker stop`` then ``docker rm -f`` — the
+        container is gone but the column can still read "running", and ``/start``
+        then refuses to act while the source is in fact down. Swallowing that 400
+        would be the worst possible move: it reports the source recovered while
+        leaving it dead.
+
+        ``/restart`` (``action_restart``) carries no such guard — it dispatches
+        Restart* unconditionally, which for a removed container simply deploys
+        it. This is why the rollback path that ends the outage uses restart.
+        """
+        return await self.post(f"/{collection}/{uuid}/restart")
+
     async def stop(self, collection: str, uuid: str) -> bool:
         """Request a stop. Returns whether Coolify actually dispatched one.
 
