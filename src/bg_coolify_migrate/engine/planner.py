@@ -285,12 +285,47 @@ async def build_manifest(
     return VolumeManifest(items=tuple(sized), warnings=manifest.warnings)
 
 
+def resource_images(snapshot: ResourceSnapshot) -> tuple[str, ...]:
+    """Every image reference this resource will pull. PURE.
+
+    We build the target with the SAME references, so these are exactly what the
+    target will resolve — possibly to a different image than the source runs.
+    """
+    images: list[str] = []
+    if snapshot.image:
+        images.append(snapshot.image)
+    if snapshot.docker_compose_raw:
+        try:
+            doc = compose_mod.parse(snapshot.docker_compose_raw)
+        except compose_mod.ComposeError:
+            return tuple(images)
+        for body in compose_mod.services(doc).values():
+            image = body.get("image")
+            # A service that BUILDs has no upstream tag to drift on; its `image`
+            # names the build output.
+            if image and not body.get("build"):
+                images.append(str(image))
+    return tuple(dict.fromkeys(images))
+
+
 async def assess_drift(
     source_host: RemoteHost, snapshot: ResourceSnapshot
 ) -> RebuildDriftReport | None:
-    """Compare what runs against what the target would build."""
+    """Compare what the target will run against what the source runs."""
+    images = resource_images(snapshot)
+    is_database = snapshot.kind is ResourceKind.DATABASE
+
     if not snapshot.builds:
-        return None
+        # Not building does not mean not drifting: a floating image tag still
+        # resolves at deploy time.
+        if not images:
+            return None
+        return assess_rebuild_drift(
+            resource_name=snapshot.name,
+            builds=False,
+            images=images,
+            is_database=is_database,
+        )
 
     head_commit: str | None = None
     if snapshot.git_repository and snapshot.git_branch:
@@ -305,6 +340,8 @@ async def assess_drift(
         builds=True,
         running_commit=snapshot.running_commit,
         head_commit=head_commit,
+        images=images,
+        is_database=is_database,
     )
 
 

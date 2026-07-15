@@ -190,7 +190,7 @@ async def run_migration(
     plan: MigrationPlan,
     *,
     migration_id: str | None = None,
-    accept_rebuild_drift: bool = False,
+    accept_drift: bool = False,
     delete_previews: bool = False,
     on_state: Callable[[State], Awaitable[None]] | None = None,
 ) -> RunResult:
@@ -213,7 +213,7 @@ async def run_migration(
             migration_id=mid,
             source_host=source_host,
             target_host=target_host,
-            accept_rebuild_drift=accept_rebuild_drift,
+            accept_drift=accept_drift,
             delete_previews=delete_previews,
         )
         result = await _execute(ctx, start_from=State.INIT, on_state=on_state)
@@ -227,7 +227,7 @@ async def resume_migration(
     plan: MigrationPlan,
     migration_id: str,
     *,
-    accept_rebuild_drift: bool = False,
+    accept_drift: bool = False,
     on_state: Callable[[State], Awaitable[None]] | None = None,
 ) -> RunResult:
     """Continue a blocked or interrupted migration.
@@ -256,7 +256,7 @@ async def resume_migration(
             migration_id=migration_id,
             source_host=source_host,
             target_host=target_host,
-            accept_rebuild_drift=accept_rebuild_drift,
+            accept_drift=accept_drift,
         )
         # Rehydrate what earlier states recorded, so compensations and later
         # steps see the same world.

@@ -108,6 +108,41 @@ def choose_finalize_policy() -> FinalizePolicy:
     return FinalizePolicy(choice)
 
 
+def confirm_drift(plan: MigrationPlan) -> bool:
+    """Ask about anything the target may run that the source does not.
+
+    Separate from :func:`confirm_plan` and asked FIRST, because it is a different
+    kind of question. "Do you want to migrate?" is about intent; "is postgres:16
+    resolving to a newer minor acceptable for your data?" is about compatibility,
+    and only the operator can answer it.
+
+    We do not refuse — new image versions and moved branches are normal. We make
+    the question concrete and let them decide.
+    """
+    undecided = [r for r in plan.resources if r.needs_confirmation]
+    if not undecided:
+        return True
+
+    console = get_console()
+    console.print(
+        "\n[warn]The target will be built exactly as the source is configured, "
+        "but it may not end up running exactly the same thing:[/warn]\n"
+    )
+    for resource in undecided:
+        panel = report_mod.drift_panel(resource.drift) if resource.drift else None
+        if panel is not None:
+            console.print(panel)
+
+    console.print(
+        "Your data is copied byte-exactly either way, and your source stays untouched "
+        "until the very last step.",
+        style="muted",
+    )
+    return bool(
+        _ask(questionary.confirm("Continue with the above?", default=False, style=_STYLE))
+    )
+
+
 def confirm_plan(plan: MigrationPlan) -> bool:
     """Show the plan and ask. Returns False if the operator declines."""
     console = get_console()
@@ -123,9 +158,6 @@ def confirm_plan(plan: MigrationPlan) -> bool:
                     resource.manifest, title=f"Volumes - {resource.snapshot.name}"
                 )
             )
-        panel = report_mod.drift_panel(resource.drift) if resource.drift else None
-        if panel is not None:
-            renderables.append(panel)
 
     warnings = report_mod.warnings_panel(plan)
     if warnings is not None:
@@ -147,7 +179,12 @@ def confirm_plan(plan: MigrationPlan) -> bool:
         f"[count]{human_bytes(plan.total_bytes)}[/count] to "
         f"[host]{plan.target_server.name}[/host].",
     )
-    return bool(_ask(questionary.confirm("Proceed?", default=False, style=_STYLE)))
+    if not bool(_ask(questionary.confirm("Proceed?", default=False, style=_STYLE))):
+        return False
+
+    # Asked last, so the operator has seen the whole plan before adjudicating the
+    # compatibility question.
+    return confirm_drift(plan)
 
 
 def confirm_destructive(plan: MigrationPlan) -> bool:

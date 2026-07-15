@@ -69,7 +69,14 @@ class MigrationContext:
     #: Set by the DNS gate so the report can render it even when we stop early.
     dns_report: object | None = None
 
-    accept_rebuild_drift: bool = False
+    accept_drift: bool = False
+    """The operator has already answered the compatibility question.
+
+    Set by --accept-drift, or by the wizard once they confirm. Drift is never a
+    refusal — we build the target as the source is configured and report what
+    could still differ — but unattended we cannot ask, so an unanswered question
+    stops the run rather than deciding for them."""
+
     delete_previews: bool = False
 
     @property

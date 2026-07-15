@@ -1,30 +1,44 @@
-"""Drift detection: rebuild drift, and configuration drift.
+"""Drift detection: what the target will be that the source is not.
 
 PURE module: no IO.
 
-Two different problems share this module because both are "the target will not be
-what the source is":
+**The design rule: we build the target exactly as the source is configured, then
+report what could still differ and let the operator decide.**
 
-**1. Rebuild drift** — Coolify rebuilds a git-backed application on the target,
-and a rebuild is not a migration. ``git_commit_sha`` cannot prevent this:
-``check_git_if_build_needed()`` resolves ``git ls-remote refs/heads/<branch>``
-and overwrites the commit (``ApplicationDeploymentJob.php:2329-2349``), and the
-API never sets the ``rollback:`` flag that would bypass it. So drift must be
-*detected and gated*, never assumed away. Three axes:
+This is deliberately advisory rather than obstructive. New image versions and
+moved branches are *normal*; whether they are compatible is a judgement about a
+specific stack, and the operator has context we do not. So drift produces
+warnings and a question, never a refusal. The one thing we owe them is that the
+question is *concrete* — "may pull a newer image" is not actionable, "may cross a
+major version and refuse to start on the copied data" is.
 
-* ``CODE`` — branch HEAD has moved since the running image was built. Blocks:
-  byte-exact data would land under different code, and if that code has already
-  applied migrations to the data you have a genuine corruption scenario.
+Four axes:
+
+* ``IMAGE`` — a floating tag (``latest``, ``16``). The target pulls the same tag
+  the source uses, which may now resolve to a different image. For a database
+  crossing a major, the byte-exactly copied data directory can be unreadable by
+  the newer engine.
+* ``CODE`` — branch HEAD has moved since the running image was built.
+  ``git_commit_sha`` cannot prevent this: ``check_git_if_build_needed()``
+  resolves ``git ls-remote refs/heads/<branch>`` and overwrites the commit
+  (``ApplicationDeploymentJob.php:2329-2349``), and the API never sets the
+  ``rollback:`` flag that would bypass it. So it is reported, not prevented.
 * ``TOPOLOGY`` — for ``build_pack=dockercompose`` the compose is re-read from
-  git on every deploy. A renamed/added/removed volume means the old->new mapping
-  computed from the source is quietly wrong. **Blocks** — this is data loss.
+  git on every deploy, so the target may declare different volumes.
 * ``BASE_IMAGE`` — Coolify forces ``docker build --pull``, so unpinned ``FROM``
-  tags refresh on every build. Unfixable from here, so it only *warns*; the
-  honest statement is that a rebuild is never byte-identical.
+  tags refresh on every build.
 
-**2. Configuration drift** — after creating the target we diff it against the
-source and PATCH what is patchable. What cannot be reconciled is reported rather
-than silently lost, which is the whole bargain of the API-only constraint.
+Note what is NOT here: a hard gate on topology. ``naming.pair_by_mount_path`` is
+the real protection and it is strictly better — it pairs by mount path, so a
+volume *renamed* in git still maps correctly (a fingerprint comparison would
+have blocked that harmless case), while a volume genuinely added, removed or
+re-pathed raises ``VolumePairingError`` at DISCOVER. The precise check lives
+where the decision is made.
+
+**Configuration drift** is a separate concern that shares the module: after
+creating the target we diff it against the source and PATCH what is patchable.
+What cannot be reconciled is reported rather than silently lost, which is the
+whole bargain of the API-only constraint.
 """
 
 from __future__ import annotations
@@ -33,6 +47,8 @@ from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
+
+from bg_coolify_migrate.domain import images as image_mod
 
 #: Fields that MUST differ between source and target and are therefore excluded
 #: from configuration drift. Diffing them would drown the real signal in noise.
@@ -126,6 +142,7 @@ RECOVERABLE_FROM_DOCKER: frozenset[str] = frozenset(
 
 
 class DriftAxis(StrEnum):
+    IMAGE = "image"
     CODE = "code"
     TOPOLOGY = "topology"
     BASE_IMAGE = "base_image"
@@ -133,8 +150,18 @@ class DriftAxis(StrEnum):
 
 class Severity(StrEnum):
     OK = "ok"
+
+    NOTICE = "notice"
+    """Worth saying, not worth interrupting for. A patch-floating tag."""
+
     WARN = "warn"
+    """The operator should decide before proceeding. Prompts interactively;
+    needs ``--accept-drift`` when unattended."""
+
     BLOCK = "block"
+    """Reserved. Nothing in this module produces it: drift is a judgement about
+    the operator's stack, not ours to refuse. Real inconsistencies (an unpaired
+    volume) are caught where they are detected, not here."""
 
 
 class DriftFinding(BaseModel):
@@ -149,7 +176,7 @@ class DriftFinding(BaseModel):
 
 
 class RebuildDriftReport(BaseModel):
-    """Whether migrating this resource would ship different code than it runs."""
+    """What the target may end up running that the source is not."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -159,19 +186,31 @@ class RebuildDriftReport(BaseModel):
 
     @property
     def severity(self) -> Severity:
-        if any(f.severity is Severity.BLOCK for f in self.findings):
-            return Severity.BLOCK
-        if any(f.severity is Severity.WARN for f in self.findings):
-            return Severity.WARN
+        for level in (Severity.BLOCK, Severity.WARN, Severity.NOTICE):
+            if any(f.severity is level for f in self.findings):
+                return level
         return Severity.OK
 
     @property
-    def is_blocked(self) -> bool:
-        return self.severity is Severity.BLOCK
+    def needs_decision(self) -> tuple[DriftFinding, ...]:
+        """Findings the operator should adjudicate before we proceed.
+
+        Not "blocking": we do not refuse. We ask. Unattended, ``--accept-drift``
+        answers the question in advance.
+        """
+        return tuple(f for f in self.findings if f.severity in (Severity.BLOCK, Severity.WARN))
 
     @property
-    def blocking(self) -> tuple[DriftFinding, ...]:
-        return tuple(f for f in self.findings if f.severity is Severity.BLOCK)
+    def requires_confirmation(self) -> bool:
+        return bool(self.needs_decision)
+
+    @property
+    def notices(self) -> tuple[DriftFinding, ...]:
+        return tuple(f for f in self.findings if f.severity is Severity.NOTICE)
+
+    def summary_lines(self) -> list[str]:
+        """One line per finding, for a report or a prompt."""
+        return [f"{f.axis.value}: {f.summary}" for f in self.findings]
 
 
 class ConfigDriftReport(BaseModel):
@@ -192,6 +231,67 @@ class ConfigDriftReport(BaseModel):
         return not self.unreconciled and not self.unknown
 
 
+def assess_image_drift(
+    *, resource_name: str, images: tuple[str, ...], is_database: bool = False
+) -> tuple[DriftFinding, ...]:
+    """Classify the image tags this resource will pull. PURE.
+
+    We build the target with the SAME image reference the source uses. That is
+    the correct thing to do — but a tag is a pointer, so "the same reference" can
+    still mean "a different image".
+
+    A moving tag on a database is the case worth stopping for: we copy the data
+    directory byte-exactly, and a newer MAJOR engine may simply refuse to read
+    it. Nothing is lost (the source is untouched), but the operator should know
+    before, not from a healthcheck failure after.
+    """
+    findings: list[DriftFinding] = []
+
+    for image in images:
+        ref = image_mod.parse(image)
+        note = image_mod.risk_note(ref, is_database=is_database)
+        if note is None:
+            continue
+
+        moving = ref.stability is image_mod.TagStability.MOVING
+        findings.append(
+            DriftFinding(
+                axis=DriftAxis.IMAGE,
+                # A moving tag on a database can make the data unreadable; a patch
+                # bump is routine. Do not spend the operator's attention equally.
+                severity=Severity.WARN if (moving and is_database) else Severity.NOTICE,
+                summary=(
+                    f"{ref.raw} is a moving tag; the target may pull a newer major version"
+                    if moving
+                    else f"{ref.raw} may resolve to a newer image than the source runs"
+                ),
+                detail=note,
+                source_value=ref.effective_tag,
+                target_value=ref.effective_tag,
+            )
+        )
+
+        if is_database and not image_mod.mount_path_is_guessable(image):
+            # Coolify's own trap, not ours: the created hook regexes the tag to
+            # choose the volume mount path and silently takes the pre-18 path
+            # when it finds no number.
+            findings.append(
+                DriftFinding(
+                    axis=DriftAxis.IMAGE,
+                    severity=Severity.WARN,
+                    summary=f"Coolify cannot read a version out of {ref.raw}",
+                    detail=(
+                        "Coolify picks a Postgres volume's mount path by regexing the tag for a "
+                        "number, defaulting to the pre-18 path when it finds none. With this tag "
+                        "it will guess — and guess wrong if the image is actually 18+. Pin the "
+                        "tag to a version (e.g. postgres:16) to remove the guess."
+                    ),
+                )
+            )
+
+    return tuple(findings)
+
+
 def assess_rebuild_drift(
     *,
     resource_name: str,
@@ -201,16 +301,22 @@ def assess_rebuild_drift(
     running_topology: str | None = None,
     head_topology: str | None = None,
     unpinned_base_images: tuple[str, ...] = (),
+    images: tuple[str, ...] = (),
+    is_database: bool = False,
 ) -> RebuildDriftReport:
-    """Assess whether a rebuild on the target would ship something different.
+    """Assess what the target may run that the source does not.
+
+    Advisory throughout. Nothing here refuses a migration: whether a newer image
+    or a newer commit is compatible is a judgement about the operator's stack.
+    We make the question concrete and let them answer it.
 
     Args:
         resource_name: For the report.
         builds: Whether this resource actually builds — from
             ``kinds.always_builds`` OR ``compose.builds_from_source``. A resource
-            that does not build cannot drift, so everything else is skipped.
+            that does not build cannot drift on code, but its IMAGES still can.
         running_commit: The commit of the image the source is ACTUALLY running,
-            read from the container's image tag ``{uuid}:{sha}``. This is the only
+            read from the container's image tag ``{uuid}:{sha}``. The only
             trustworthy source: ``git_commit_sha`` is not updated by a normal
             deploy, and ``SOURCE_COMMIT`` is user-overridable and falls back to
             the literal string ``'unknown'``.
@@ -219,28 +325,38 @@ def assess_rebuild_drift(
         running_topology: ``compose.topology_fingerprint`` of the compose in use.
         head_topology: ``compose.topology_fingerprint`` of the compose at HEAD.
         unpinned_base_images: ``FROM`` references without a digest.
-
-    Returns:
-        A report whose ``is_blocked`` decides whether the migration may proceed.
+        images: Image references this resource will pull.
+        is_database: Raises the stakes of a moving tag — data directories are not
+            compatible across engine majors.
     """
+    findings: list[DriftFinding] = list(
+        assess_image_drift(resource_name=resource_name, images=images, is_database=is_database)
+    )
+
     if not builds:
-        return RebuildDriftReport(resource_name=resource_name, builds=False)
+        return RebuildDriftReport(
+            resource_name=resource_name, builds=False, findings=tuple(findings)
+        )
 
-    findings: list[DriftFinding] = []
-
-    # Axis 1: code.
+    # Axis: code.
+    #
+    # THREE states, not two: both known and equal (silent), both known and
+    # different (ask), one unknown (ask, for a different reason). Flattening the
+    # first two into a single condition makes the CLEAN case fall through to the
+    # "cannot compare" branch.
     if running_commit and head_commit:
         if running_commit != head_commit:
             findings.append(
                 DriftFinding(
                     axis=DriftAxis.CODE,
-                    severity=Severity.BLOCK,
+                    severity=Severity.WARN,
                     summary="branch HEAD has moved since the running image was built",
                     detail=(
-                        "The target would rebuild from HEAD, not from the commit currently "
-                        "running. Coolify's git_commit_sha cannot pin this: the deploy job "
-                        "resolves `git ls-remote` and overwrites it. The mirrored data belongs "
-                        "to the running commit."
+                        "The target rebuilds from HEAD, not from the commit currently running — "
+                        "Coolify's git_commit_sha cannot pin a deploy, because the job resolves "
+                        "`git ls-remote` and overwrites it. Your data is copied byte-exactly and "
+                        "would then run under this newer code. Usually fine; worth a thought if "
+                        "the delta contains schema migrations."
                     ),
                     source_value=running_commit,
                     target_value=head_commit,
@@ -250,40 +366,44 @@ def assess_rebuild_drift(
         findings.append(
             DriftFinding(
                 axis=DriftAxis.CODE,
-                severity=Severity.BLOCK,
+                severity=Severity.WARN,
                 summary="cannot compare the running commit against branch HEAD",
                 detail=(
-                    "One side is unknown, so drift cannot be ruled out. Refusing rather than "
-                    "assuming they match."
+                    "One side is unknown, so we cannot tell you whether the target would build "
+                    "the code that is running. Proceeding is reasonable; we just cannot say it "
+                    "is identical."
                 ),
                 source_value=running_commit,
                 target_value=head_commit,
             )
         )
 
-    # Axis 2: topology. The data-loss axis.
+    # Axis: topology. Advisory only — pair_by_mount_path is the real check, and a
+    # more precise one: it maps a renamed volume correctly and raises on one that
+    # is genuinely added, removed or re-pathed.
     if running_topology and head_topology and running_topology != head_topology:
         findings.append(
             DriftFinding(
                 axis=DriftAxis.TOPOLOGY,
-                severity=Severity.BLOCK,
-                summary="the compose in git declares different volumes than the running stack",
+                severity=Severity.WARN,
+                summary="the compose in git differs from the one the stack is running",
                 detail=(
                     "build_pack=dockercompose re-reads the compose from git on every deploy, so "
-                    "the target would materialise a different set of volumes. The old->new "
-                    "mapping computed from the source would be wrong and data would land nowhere."
+                    "the target may declare different services or volumes. A renamed volume is "
+                    "handled correctly (we pair by mount path), but one that was added, removed "
+                    "or re-pathed will stop the migration at DISCOVER rather than guess."
                 ),
                 source_value=running_topology[:12],
                 target_value=head_topology[:12],
             )
         )
 
-    # Axis 3: base images. Cannot be fixed from here; be honest about it.
+    # Axis: base images.
     if unpinned_base_images:
         findings.append(
             DriftFinding(
                 axis=DriftAxis.BASE_IMAGE,
-                severity=Severity.WARN,
+                severity=Severity.NOTICE,
                 summary=f"{len(unpinned_base_images)} unpinned base image(s) will be re-pulled",
                 detail=(
                     "Coolify forces `docker build --pull`, so floating FROM tags refresh on every "

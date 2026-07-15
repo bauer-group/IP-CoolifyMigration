@@ -130,19 +130,22 @@ class TestResourcePlanBlocking:
         assert plan.is_blocked
         assert any("anonymous" in r for r in plan.blocking_reasons)
 
-    def test_drift_blocks(self) -> None:
+    def test_drift_asks_rather_than_blocks(self) -> None:
+        # We build the target as the source is configured and report what
+        # could still differ. Whether that is compatible is the operator's call.
         drift = RebuildDriftReport(
             resource_name="app",
             builds=True,
             findings=(
                 DriftFinding(
-                    axis=DriftAxis.CODE, severity=Severity.BLOCK, summary="HEAD moved"
+                    axis=DriftAxis.CODE, severity=Severity.WARN, summary="HEAD moved"
                 ),
             ),
         )
         plan = ResourcePlan(snapshot=_snap(), strategy=Strategy.REBUILD, drift=drift)
-        assert plan.is_blocked
-        assert "HEAD moved" in plan.blocking_reasons
+        assert plan.is_blocked is False
+        assert plan.needs_confirmation is True
+        assert "HEAD moved" in plan.drift_decisions
 
     def test_previews_block(self) -> None:
         # Verified: POST /applications/{uuid}/stop does not stop preview
@@ -151,29 +154,28 @@ class TestResourcePlanBlocking:
         assert plan.is_blocked
         assert any("preview" in r for r in plan.blocking_reasons)
 
-    def test_hard_and_drift_reasons_are_separable(self) -> None:
-        """Regression: --accept-rebuild-drift must actually work.
+    def test_hard_reasons_and_drift_decisions_are_separate(self) -> None:
+        """Regression: --accept-drift must actually work.
 
-        Drift is overridable; a refused volume and running previews are not. If
-        the two are conflated, the flag gets accepted and the migration aborts
-        two lines later on the generic check — a documented flag that does
-        nothing.
+        Drift is a question the operator answers; a refused volume and running
+        previews are not. If the two are conflated, the flag gets accepted and
+        the migration aborts two lines later on a generic check — a documented
+        flag that does nothing.
         """
         drift = RebuildDriftReport(
             resource_name="app",
             builds=True,
             findings=(
-                DriftFinding(axis=DriftAxis.CODE, severity=Severity.BLOCK, summary="HEAD moved"),
+                DriftFinding(axis=DriftAxis.CODE, severity=Severity.WARN, summary="HEAD moved"),
             ),
         )
         plan = ResourcePlan(snapshot=_snap(), strategy=Strategy.REBUILD, drift=drift)
 
-        assert plan.drift_blocking_reasons == ("HEAD moved",)
+        assert plan.drift_decisions == ("HEAD moved",)
         assert plan.hard_blocking_reasons == ()
-        assert plan.is_blocked  # blocked overall...
-        # ...but a caller honouring --accept-rebuild-drift finds nothing hard.
+        assert plan.is_blocked is False
 
-    def test_hard_reasons_survive_accepting_drift(self) -> None:
+    def test_hard_reasons_are_not_a_question(self) -> None:
         manifest = VolumeManifest(
             items=(
                 VolumeItem(
@@ -190,33 +192,37 @@ class TestResourcePlanBlocking:
         )
         # Neither of these may ever be waved through by a drift flag.
         assert len(plan.hard_blocking_reasons) == 2
-        assert plan.drift_blocking_reasons == ()
+        assert plan.drift_decisions == ()
+        assert plan.is_blocked is True
 
-    def test_blocking_reasons_is_the_union(self) -> None:
+    def test_blocking_reasons_are_hard_reasons_only(self) -> None:
         drift = RebuildDriftReport(
             resource_name="app",
             builds=True,
             findings=(
-                DriftFinding(axis=DriftAxis.CODE, severity=Severity.BLOCK, summary="HEAD moved"),
+                DriftFinding(axis=DriftAxis.CODE, severity=Severity.WARN, summary="HEAD moved"),
             ),
         )
         plan = ResourcePlan(
             snapshot=_snap(has_previews=True), strategy=Strategy.REBUILD, drift=drift
         )
-        assert plan.blocking_reasons == plan.hard_blocking_reasons + plan.drift_blocking_reasons
+        assert plan.blocking_reasons == plan.hard_blocking_reasons
+        assert "HEAD moved" not in plan.blocking_reasons
 
-    def test_warn_level_drift_does_not_block(self) -> None:
+    def test_notice_level_drift_needs_no_decision(self) -> None:
+        # A patch-floating tag is worth saying, not worth interrupting for.
         drift = RebuildDriftReport(
             resource_name="app",
             builds=True,
             findings=(
                 DriftFinding(
-                    axis=DriftAxis.BASE_IMAGE, severity=Severity.WARN, summary="unpinned FROM"
+                    axis=DriftAxis.BASE_IMAGE, severity=Severity.NOTICE, summary="unpinned FROM"
                 ),
             ),
         )
         plan = ResourcePlan(snapshot=_snap(), strategy=Strategy.REBUILD, drift=drift)
         assert plan.is_blocked is False
+        assert plan.needs_confirmation is False
 
 
 class TestMigrationPlan:

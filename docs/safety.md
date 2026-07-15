@@ -118,11 +118,18 @@ compensation.
 
 Stated plainly rather than papered over.
 
-- **A rebuild is never byte-identical.** `git_commit_sha` does not pin a deploy:
-  `check_git_if_build_needed()` resolves `git ls-remote refs/heads/{branch}` and
-  overwrites it, and the API never sets the `rollback:` flag that would bypass
-  that. On top of which `docker build --pull` is forced, so unpinned `FROM` tags
-  refresh on every build. We detect and gate the drift; we cannot remove it.
+- **A rebuild is never byte-identical, and a tag is not a version.**
+  `git_commit_sha` does not pin a deploy: `check_git_if_build_needed()` resolves
+  `git ls-remote refs/heads/{branch}` and overwrites it, and the API never sets
+  the `rollback:` flag that would bypass it. `docker build --pull` is forced, so
+  unpinned `FROM` tags refresh on every build. And `postgres:latest` resolves to
+  whatever it points at today.
+
+  We do not try to prevent any of this — we build the target exactly as the
+  source is configured, then say what could still differ and let you decide. The
+  question we owe you is a concrete one: not "may pull a newer image" but "may
+  cross a major version and refuse to start on the copied data". See
+  [drift](troubleshooting.md#drift-needs-my-decision-exit-4).
 - **~25 `ApplicationSetting` fields are unreadable over the API.**
   `GET /applications/{uuid}` does not eager-load the `settings` relation, yet
   several of those fields are settable — a write-only asymmetry. We recover what

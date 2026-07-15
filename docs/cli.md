@@ -25,7 +25,7 @@ These are a stable contract; script against them.
 | `0` | Success |
 | `2` | Preflight failed — **nothing was changed** |
 | `3` | DNS gate blocked — resumable |
-| `4` | Rebuild drift blocked — resumable with `--accept-rebuild-drift` |
+| `4` | Drift needs your decision — re-run interactively, or `--accept-drift` |
 | `5` | Quiesce failed — the stack would not stop cleanly |
 | `6` | Transfer failed — rolled back |
 | `7` | Verification failed — rolled back, target **not** started |
@@ -34,8 +34,9 @@ These are a stable contract; script against them.
 | `10` | Token lacks `root` / `read:sensitive` |
 | `14` | Journal error |
 
-Codes 3 and 4 are **not failures**. They are deliberate, resumable stops: fix the
-world, then run `coolify-migrate resume <id>`.
+Codes 3 and 4 are **not failures**. Code 3 is a deliberate, resumable stop: flip
+DNS, then `coolify-migrate resume <id>`. Code 4 only appears unattended — it means
+we had a question and no way to ask it.
 
 ## Why `plan` is worth running
 

@@ -82,28 +82,30 @@ async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
             hint="Free space on the target, or lower DISK_HEADROOM_FACTOR knowingly.",
         )
 
-    # The drift gate.
-    blocked = [
-        r for r in ctx.plan.resources if r.drift is not None and r.drift.is_blocked
-    ]
-    if blocked and not ctx.accept_rebuild_drift:
+    # Drift is a question, not a wall. We build the target exactly as the source
+    # is configured; whether a newer image or a newer commit is compatible is a
+    # judgement about this stack, and the operator has context we do not.
+    #
+    # Interactively the wizard has already shown these and asked. Unattended we
+    # cannot ask, so an unanswered question is a stop — resumable, not a failure.
+    undecided = [r for r in ctx.plan.resources if r.needs_confirmation]
+    if undecided and not ctx.accept_drift:
         lines = [
-            f"  {r.snapshot.name}: {f.summary}" for r in blocked for f in r.drift.blocking  # type: ignore[union-attr]
+            f"  {r.snapshot.name}: {d}" for r in undecided for d in r.drift_decisions
         ]
         raise RebuildDriftBlocked(
-            "the target would rebuild different code than the source is running:\n"
-            + "\n".join(lines),
+            "the target may not run exactly what the source runs:\n" + "\n".join(lines),
             hint=(
-                "Coolify's git_commit_sha cannot pin a deploy: the job resolves "
-                "`git ls-remote` and overwrites it. Either deploy the source from current "
-                "HEAD first so the two agree, or pass --accept-rebuild-drift to proceed "
-                "knowingly."
+                "This is usually fine — new image versions and moved branches are normal. "
+                "Only you can say whether it is compatible for this stack.\n"
+                "Re-run interactively to see the detail and answer, or pass --accept-drift "
+                "to proceed.\n"
+                "Nothing has been changed."
             ),
-            report=[r.drift for r in blocked],
+            report=[r.drift for r in undecided],
         )
 
-    # Hard reasons only: drift was already adjudicated above and may have been
-    # accepted. Re-checking `is_blocked` here would silently un-accept it.
+    # Hard reasons: these are not judgements and no flag overrides them.
     hard = [
         f"  {r.snapshot.name}: {x}" for r in ctx.plan.resources for x in r.hard_blocking_reasons
     ]

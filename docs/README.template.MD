@@ -39,8 +39,10 @@ external orchestrator has none of those constraints. That is what this is.
 - **DNS gate** — extracts every Traefik/Caddy hostname and refuses to start the
   target while DNS still resolves to the old server, with an actionable cutover
   checklist.
-- **Drift gate** — Coolify's `git_commit_sha` does not pin a deploy, so a
-  migrated application rebuilds from branch HEAD. We detect that and block.
+- **Honest about drift** — the target is built exactly as the source is
+  configured, but a tag is a pointer and a branch moves. We detect a floating
+  `latest` that could cross a database major, or a HEAD that has moved, and put
+  the concrete question to you rather than deciding for you.
 - **Server migration** — relocate the whole Coolify instance, with the `APP_KEY`
   treated as a first-class, asserted artifact rather than a lucky side effect.
 - **Proven, not assumed** — an integration rig of two real sshd containers

@@ -163,7 +163,7 @@ class TestPreflight:
         with pytest.raises(PreflightError, match="free but needs"):
             await steps.step_preflight(ctx)
 
-    async def test_drift_blocks_by_default(
+    async def test_drift_asks_before_proceeding(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
         respx_mock.get(f"{BASE}/security/keys").mock(
@@ -173,7 +173,7 @@ class TestPreflight:
             resource_name="web",
             builds=True,
             findings=(
-                DriftFinding(axis=DriftAxis.CODE, severity=Severity.BLOCK, summary="HEAD moved"),
+                DriftFinding(axis=DriftAxis.CODE, severity=Severity.WARN, summary="HEAD moved"),
             ),
         )
         ctx.plan = _plan(
@@ -184,10 +184,10 @@ class TestPreflight:
         with pytest.raises(RebuildDriftBlocked, match="HEAD moved"):
             await steps.step_preflight(ctx)
 
-    async def test_drift_can_be_accepted_explicitly(
+    async def test_accept_drift_answers_the_question_in_advance(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
-        # Never implicit.
+        # Never implicit: unattended we cannot ask, so we stop instead.
         respx_mock.get(f"{BASE}/security/keys").mock(
             return_value=httpx.Response(200, json=[{"private_key": "x"}])
         )
@@ -195,7 +195,7 @@ class TestPreflight:
             resource_name="web",
             builds=True,
             findings=(
-                DriftFinding(axis=DriftAxis.CODE, severity=Severity.BLOCK, summary="HEAD moved"),
+                DriftFinding(axis=DriftAxis.CODE, severity=Severity.WARN, summary="HEAD moved"),
             ),
         )
         ctx.plan = _plan(
@@ -205,7 +205,7 @@ class TestPreflight:
                 ),
             )
         )
-        ctx.accept_rebuild_drift = True
+        ctx.accept_drift = True
         await steps.step_preflight(ctx)  # must not raise
 
     async def test_previews_block(self, ctx: MigrationContext, respx_mock: respx.Router) -> None:

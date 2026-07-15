@@ -81,6 +81,10 @@ decision, the decision is in the wrong layer.
 - **Handling a new resource shape?** Extend `domain/kinds.py`. Remember "does it
   build?" is NOT a property of the kind — read it from the compose (`build:` vs
   `image:`) via `domain/compose.py`.
+- **Tempted to block on drift?** Don't. We build the target exactly as the source
+  is configured and report what could still differ; whether that is compatible is
+  the operator's judgement about their stack. Blocking belongs to things that are
+  not judgements (a refused volume, live previews, DNS pointing at the source).
 - **Touching the transfer?** Every rsync flag in `transfer/rsync.py::BASE_FLAGS`
   is there for a reason documented in the module docstring. Removing one is a
   data-integrity change.

@@ -138,20 +138,21 @@ class TestManifestTable:
 
 
 class TestDriftPanel:
-    def test_none_when_not_building(self) -> None:
+    def test_none_when_there_is_nothing_to_say(self) -> None:
         assert drift_panel(RebuildDriftReport(resource_name="db", builds=False)) is None
+        assert drift_panel(None) is None
 
     def test_none_when_clean(self) -> None:
         assert drift_panel(RebuildDriftReport(resource_name="app", builds=True)) is None
 
-    def test_blocked_drift_renders(self) -> None:
+    def test_a_decision_is_framed_as_a_decision_not_a_refusal(self) -> None:
         report = RebuildDriftReport(
             resource_name="app",
             builds=True,
             findings=(
                 DriftFinding(
                     axis=DriftAxis.CODE,
-                    severity=Severity.BLOCK,
+                    severity=Severity.WARN,
                     summary="branch HEAD has moved",
                     source_value="aaa111",
                     target_value="bbb222",
@@ -159,23 +160,23 @@ class TestDriftPanel:
             ),
         )
         out = render(drift_panel(report))
-        assert "BLOCKED" in out
+        assert "your decision" in out
         assert "aaa111" in out
         assert "bbb222" in out
 
-    def test_warning_drift_renders_without_blocking(self) -> None:
+    def test_a_notice_is_framed_as_information(self) -> None:
         report = RebuildDriftReport(
             resource_name="app",
             builds=True,
             findings=(
                 DriftFinding(
-                    axis=DriftAxis.BASE_IMAGE, severity=Severity.WARN, summary="unpinned FROM"
+                    axis=DriftAxis.BASE_IMAGE, severity=Severity.NOTICE, summary="unpinned FROM"
                 ),
             ),
         )
         out = render(drift_panel(report))
-        assert "warning" in out
-        assert "BLOCKED" not in out
+        assert "for information" in out
+        assert "your decision" not in out
 
 
 class TestDnsRendering:

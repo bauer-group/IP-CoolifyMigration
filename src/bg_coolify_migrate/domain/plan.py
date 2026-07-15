@@ -160,25 +160,36 @@ class ResourcePlan(BaseModel):
         return tuple(out)
 
     @property
-    def drift_blocking_reasons(self) -> tuple[str, ...]:
-        """Reasons the operator may override with ``--accept-rebuild-drift``."""
-        return tuple(f.summary for f in self.drift.blocking) if self.drift else ()
+    def drift_decisions(self) -> tuple[str, ...]:
+        """Things the operator should adjudicate before we proceed.
+
+        NOT blocking. We build the target exactly as the source is configured and
+        then say what could still differ — a moved branch, a floating tag. Whether
+        that is compatible is a judgement about their stack, so we ask rather than
+        refuse. ``--accept-drift`` answers it in advance when unattended.
+        """
+        return tuple(f.summary for f in self.drift.needs_decision) if self.drift else ()
 
     @property
     def blocking_reasons(self) -> tuple[str, ...]:
-        """Every reason this resource may not be migrated as planned.
+        """Every reason this resource may not be migrated, full stop.
 
-        The SINGLE source of truth for blocking. :attr:`is_blocked` is derived
-        from it rather than re-deriving the conditions, because two parallel
-        implementations of "is this blocked?" drift apart — and the failure mode
-        is the dangerous direction: a reason gets listed in the report while the
-        migration proceeds anyway.
+        Only hard reasons: drift is a question, not a refusal. The SINGLE source
+        of truth for blocking — :attr:`is_blocked` is derived from it rather than
+        re-deriving the conditions, because two parallel implementations of "is
+        this blocked?" drift apart, and the dangerous direction is the one where a
+        reason is listed in the report while the migration proceeds anyway.
         """
-        return self.hard_blocking_reasons + self.drift_blocking_reasons
+        return self.hard_blocking_reasons
 
     @property
     def is_blocked(self) -> bool:
         return bool(self.blocking_reasons)
+
+    @property
+    def needs_confirmation(self) -> bool:
+        """True if there is drift the operator should look at before we run."""
+        return bool(self.drift_decisions)
 
 
 class MigrationPlan(BaseModel):

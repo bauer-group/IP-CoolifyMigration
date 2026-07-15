@@ -53,26 +53,44 @@ def manifest_table(manifest: VolumeManifest, *, title: str = "Volumes") -> Table
     return table
 
 
-def drift_panel(report: RebuildDriftReport) -> Panel | None:
-    """Render a rebuild-drift verdict, or ``None`` when there is nothing to say."""
-    if not report.builds or report.severity is Severity.OK:
+_SEVERITY_STYLE = {
+    Severity.BLOCK: "err",
+    Severity.WARN: "warn",
+    Severity.NOTICE: "muted",
+    Severity.OK: "ok",
+}
+
+
+def drift_panel(report: RebuildDriftReport | None) -> Panel | None:
+    """Render what the target may run that the source does not.
+
+    ``None`` when there is nothing worth saying. Never framed as a refusal: we
+    build the target as configured and report what could still differ, because
+    whether that is compatible is the operator's call.
+    """
+    if report is None or report.severity is Severity.OK:
         return None
 
     table = Table.grid(padding=(0, 2))
     table.add_column(style="bold")
     table.add_column()
     for finding in report.findings:
-        style = "err" if finding.severity is Severity.BLOCK else "warn"
-        table.add_row(Text(finding.axis.value, style=style), finding.summary)
-        if finding.source_value or finding.target_value:
-            table.add_row("", Text(f"  running: {finding.source_value}", style="muted"))
-            table.add_row("", Text(f"  would build: {finding.target_value}", style="muted"))
+        table.add_row(
+            Text(finding.axis.value, style=_SEVERITY_STYLE[finding.severity]), finding.summary
+        )
+        if finding.source_value and finding.target_value and finding.source_value != finding.target_value:
+            table.add_row("", Text(f"  source runs: {finding.source_value}", style="muted"))
+            table.add_row("", Text(f"  target gets: {finding.target_value}", style="muted"))
         if finding.detail:
             table.add_row("", Text(finding.detail, style="muted"))
 
-    border = "err" if report.is_blocked else "warn"
-    title = "Rebuild drift — BLOCKED" if report.is_blocked else "Rebuild drift — warning"
-    return Panel(table, title=title, border_style=border, title_align="left")
+    needs = report.requires_confirmation
+    return Panel(
+        table,
+        title=f"{report.resource_name} — {'your decision' if needs else 'for information'}",
+        border_style="warn" if needs else "muted",
+        title_align="left",
+    )
 
 
 def dns_table(report: DnsGateReport) -> Table:

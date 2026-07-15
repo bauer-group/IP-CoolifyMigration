@@ -32,29 +32,59 @@ A CDN or reverse proxy (typically Cloudflare's orange cloud) is in front. DNS
 then tells us nothing about where the origin points, so we surface it rather than
 guess. Check the CDN's origin setting before starting the target.
 
-## Rebuild drift blocked me (exit 4)
+## Drift needs my decision (exit 4)
 
-The target would rebuild from branch HEAD, which is not what the source is
-running — so byte-exact data would land under different code. If that code has
-already applied migrations to the data, the mismatch is real corruption.
+Not a failure, and not a refusal. **We build the target exactly as the source is
+configured** — same image reference, same branch. But a tag is a pointer and a
+branch moves, so "the same configuration" can still produce something different.
+Whether that is compatible is a judgement about *your* stack, so we ask.
 
-Options, in order of preference:
+You only see exit 4 when we could not ask, i.e. `--yes` in a pipe or CI. Either:
 
-1. Deploy the source from current HEAD first, so the two agree, then migrate.
-2. Accept it consciously: `--accept-rebuild-drift`.
+1. Re-run interactively — you get the detail and a prompt; or
+2. Answer in advance: `--accept-drift`.
 
-You cannot pin the commit: `git_commit_sha` is settable but the deploy job
-resolves `git ls-remote refs/heads/{branch}` and overwrites it. We report the
-drift rather than pretend to prevent it.
+Nothing has been changed when this fires.
 
-### "the compose in git declares different volumes"
+### "postgres:latest is a moving tag"
 
-Topology drift, and the reason this blocks hard rather than warning. Coolify
-re-reads a `dockercompose` application's compose from git on every deploy, so the
-target would materialise a *different* volume set than the source has. The
-old→new mapping would then be silently wrong and your data would land nowhere.
+The one worth pausing on. We copy the data directory byte-exactly and then start
+whatever `latest` resolves to *now*. If that crossed a major version, the engine
+will refuse to read the data — "database files are incompatible with server".
 
-Reconcile the compose in git with what is deployed, then retry.
+Your source is untouched either way, so the worst case is a failed healthcheck
+and a rollback. But it is cheaper to know first. Pin the tag (`postgres:16`) if
+you want the question to go away permanently.
+
+### "postgres:16 may resolve to a newer image"
+
+A notice, not a question. `16` picks up minor releases, which share an on-disk
+format. Routine.
+
+### "Coolify cannot read a version out of postgres:latest"
+
+Coolify's trap, not ours. Its `created` hook picks the volume mount path by
+regexing the tag for a number, defaulting to the pre-18 path when it finds none —
+so an unversioned tag that actually resolves to 18+ gets the wrong path. Pin the
+tag to a version to remove the guess.
+
+### "branch HEAD has moved"
+
+The target rebuilds from HEAD, not from the commit currently running. You cannot
+pin it: `git_commit_sha` is settable, but the deploy job resolves
+`git ls-remote refs/heads/{branch}` and overwrites it. We report it rather than
+pretend to prevent it.
+
+Usually fine. Worth a thought if the delta contains schema migrations, since the
+data is byte-exact and the code is not. If you want them to agree, deploy the
+source from current HEAD first, then migrate.
+
+### "the compose in git differs from the one the stack is running"
+
+Advisory. A volume **renamed** in git still maps correctly — we pair by mount
+path, not by name. One that was genuinely added, removed or re-pathed stops the
+migration at DISCOVER with a `VolumePairingError` rather than guessing, which is
+the precise check and the one that matters.
 
 ## Quiesce failed: SIGKILL (exit 5)
 

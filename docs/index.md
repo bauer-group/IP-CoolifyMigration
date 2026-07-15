@@ -34,8 +34,9 @@ coolify-migrate run  my-project --to target-server
 - **Byte-exact.** `rsync -aHAXS --numeric-ids`. Never `chown`.
 - **Verified.** SHA-256 *and* metadata manifests on both sides.
 - **Reversible.** The source is never destroyed until you say so.
-- **Gated.** It refuses to start a target whose DNS still points at the old
-  server, and refuses to migrate an app that would rebuild different code.
+- **Gated where it counts.** It refuses to start a target whose DNS still points
+  at the old server — that one is not a judgement call. Where it *is* a judgement
+  call (a floating tag, a moved branch) it asks instead.
 
 ## Where to go next
 

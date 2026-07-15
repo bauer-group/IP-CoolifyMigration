@@ -11,7 +11,7 @@ Exit codes are a contract (see docs/cli.md). They are stable and scriptable:
   0  success
   2  preflight failed (nothing was changed)
   3  DNS gate blocked - resumable
-  4  rebuild drift blocked - resumable after --accept-rebuild-drift
+  4  drift needs your decision - resumable, or pass --accept-drift
   5  quiesce failed (the stack would not stop cleanly)
   6  transfer failed (rolled back)
   7  verification failed (rolled back; the target was NOT started)
@@ -293,10 +293,14 @@ def run(
     finalize: Annotated[
         str, typer.Option(help="keep|rename|delete - what happens to the source.")
     ] = "rename",
-    accept_rebuild_drift: Annotated[
+    accept_drift: Annotated[
         bool,
         typer.Option(
-            help="Proceed even though the target would rebuild different code. Never implicit."
+            help=(
+                "Answer the compatibility question in advance: proceed even though the "
+                "target may pull a newer image or build a newer commit. Needed only when "
+                "unattended - interactively we show the detail and ask."
+            )
         ),
     ] = False,
     delete_previews: Annotated[
@@ -324,7 +328,7 @@ def run(
                 environment=environment,
                 target=to,
                 policy=policy,
-                accept_rebuild_drift=accept_rebuild_drift,
+                accept_drift=accept_drift,
                 delete_previews=delete_previews,
                 assume_yes=yes,
             )
@@ -342,7 +346,7 @@ async def _run(
     environment: str,
     target: str,
     policy: FinalizePolicy,
-    accept_rebuild_drift: bool,
+    accept_drift: bool,
     delete_previews: bool,
     assume_yes: bool,
 ) -> int:
@@ -365,10 +369,15 @@ async def _run(
                     style="err",
                 )
                 return 2
+            # confirm_plan asks about drift too, so a yes here IS the answer to
+            # the compatibility question. Without carrying it through, preflight
+            # would ask again and abort — the operator would have answered into
+            # the void.
             if not wizard.confirm_plan(migration_plan):
                 return 0
             if not wizard.confirm_destructive(migration_plan):
                 return 0
+            accept_drift = True
         elif migration_plan.is_blocked:
             from bg_coolify_migrate.ui import report as report_mod
 
@@ -385,7 +394,7 @@ async def _run(
                 settings,
                 migration_plan,
                 migration_id=migration_id,
-                accept_rebuild_drift=accept_rebuild_drift,
+                accept_drift=accept_drift,
                 delete_previews=delete_previews,
                 on_state=reporter.on_state,
             )
@@ -406,7 +415,7 @@ async def _run(
 @app.command()
 def resume(
     migration_id: Annotated[str, typer.Argument(help="From `coolify-migrate status`.")],
-    accept_rebuild_drift: Annotated[bool, typer.Option()] = False,
+    accept_drift: Annotated[bool, typer.Option()] = False,
     log_level: Annotated[str, typer.Option()] = "INFO",
     log_format: Annotated[str, typer.Option()] = "console",
 ) -> None:
@@ -417,14 +426,14 @@ def resume(
     """
     settings = _settings(log_level, log_format)
     try:
-        code = asyncio.run(_resume(settings, migration_id, accept_rebuild_drift))
+        code = asyncio.run(_resume(settings, migration_id, accept_drift))
     except MigrationError as exc:
         _fail(exc)
         return
     raise typer.Exit(code)
 
 
-async def _resume(settings: Settings, migration_id: str, accept_rebuild_drift: bool) -> int:
+async def _resume(settings: Settings, migration_id: str, accept_drift: bool) -> int:
     from bg_coolify_migrate.api.client import CoolifyClient
     from bg_coolify_migrate.engine.runner import load_plan, resume_migration
     from bg_coolify_migrate.ui import dashboard, run_report
@@ -443,7 +452,7 @@ async def _resume(settings: Settings, migration_id: str, accept_rebuild_drift: b
                 settings,
                 migration_plan,
                 migration_id,
-                accept_rebuild_drift=accept_rebuild_drift,
+                accept_drift=accept_drift,
                 on_state=reporter.on_state,
             )
         elapsed = time.monotonic() - started
