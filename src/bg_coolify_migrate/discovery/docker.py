@@ -39,6 +39,9 @@ LABEL_MANAGED = "coolify.managed"
 LABEL_TYPE = "coolify.type"
 LABEL_PROJECT = "coolify.projectName"
 LABEL_ENVIRONMENT = "coolify.environmentName"
+#: Str::slug of the resource's name. The one per-resource handle the API
+#: will actually give us — the numeric ids in coolify.{kind}Id are hidden.
+LABEL_RESOURCE = "coolify.resourceName"
 LABEL_PR_ID = "coolify.pullRequestId"
 
 

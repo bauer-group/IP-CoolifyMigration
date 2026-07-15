@@ -23,8 +23,13 @@ from typing import Any
 import structlog
 
 from bg_coolify_migrate.api.client import CoolifyClient
+from bg_coolify_migrate.api.fields import database_health_check_warnings
 from bg_coolify_migrate.discovery import docker
-from bg_coolify_migrate.discovery.docker import LABEL_ENVIRONMENT, LABEL_PROJECT
+from bg_coolify_migrate.discovery.docker import (
+    LABEL_ENVIRONMENT,
+    LABEL_PROJECT,
+    LABEL_RESOURCE,
+)
 from bg_coolify_migrate.domain import compose as compose_mod
 from bg_coolify_migrate.domain.drift import RebuildDriftReport, assess_rebuild_drift
 from bg_coolify_migrate.domain.kinds import (
@@ -34,10 +39,14 @@ from bg_coolify_migrate.domain.kinds import (
     always_builds,
     classify,
     git_auth,
-    label_id_key,
     may_build,
 )
-from bg_coolify_migrate.domain.manifest import DockerVolume, VolumeManifest, reconcile
+from bg_coolify_migrate.domain.manifest import (
+    DockerMount,
+    DockerVolume,
+    VolumeManifest,
+    reconcile,
+)
 from bg_coolify_migrate.domain.naming import slugify
 from bg_coolify_migrate.domain.plan import (
     MigrationPlan,
@@ -103,39 +112,144 @@ async def find_project(api: CoolifyClient, name_or_uuid: str) -> dict[str, Any]:
     )
 
 
+#: Coolify's environment endpoint groups databases by engine, one key each, and
+#: the plurals are irregular (`redis`, not `redises`; `dragonflies`, not
+#: `dragonflys`). There is no `databases` key — the Environment model has a
+#: databases() method, but the API controller never calls it.
+_ENGINE_KEYS = (
+    "postgresqls",
+    "redis",
+    "mongodbs",
+    "mysqls",
+    "mariadbs",
+    "keydbs",
+    "dragonflies",
+    "clickhouses",
+)
+
+
+def server_uuid_of(resource: dict[str, Any]) -> str | None:
+    """The uuid of the server a resource runs on, whatever shape it arrived in.
+
+    The three kinds hang their server off different relations, so there is no one
+    field to read:
+
+    * Service       — ``server()`` belongsTo, so ``server`` / ``server_uuid``
+    * Application   — ``destination()`` morphTo only; server via the destination
+    * Standalone DB — same as Application
+
+    The destination is a StandaloneDocker or a SwarmDocker (hence morphTo), and
+    both belong to a server. Reading ``server_uuid`` alone — which is what this
+    used to do — finds nothing on an application or a database, and the migration
+    stops at "could not determine the source server" for the two kinds that
+    matter most.
+
+    Returns None when only ``destination.server_id`` is available; the caller
+    resolves that against /servers, since it needs an API round trip.
+    """
+    direct = resource.get("server_uuid")
+    if direct:
+        return str(direct)
+
+    server = resource.get("server")
+    if isinstance(server, dict) and server.get("uuid"):
+        return str(server["uuid"])
+
+    destination = resource.get("destination")
+    if isinstance(destination, dict):
+        nested = destination.get("server")
+        if isinstance(nested, dict) and nested.get("uuid"):
+            return str(nested["uuid"])
+    return None
+
+
+async def resolve_server(api: CoolifyClient, resource: dict[str, Any]) -> dict[str, Any] | None:
+    """The server record a resource runs on, resolving by id if need be."""
+    uuid = server_uuid_of(resource)
+    if uuid:
+        return await api.get_server(uuid)
+
+    # Nothing nested: fall back to the numeric id on the destination. Present
+    # even when the relation was not eager-loaded.
+    destination = resource.get("destination")
+    server_id = destination.get("server_id") if isinstance(destination, dict) else None
+    if server_id is None:
+        return None
+    for server in await api.list_servers():
+        if server.get("id") == server_id:
+            return server
+    return None
+
+
 async def environment_resources(
     api: CoolifyClient, project_uuid: str, environment: str
 ) -> list[tuple[str, dict[str, Any]]]:
     """``(collection, resource)`` for everything in one environment.
 
-    Tolerates the two shapes Coolify's project endpoint has returned: resources
-    grouped under ``applications``/``services``/``databases``, or a flat list
-    with a ``type``.
+    Reads the environment endpoint and then cross-checks databases against the
+    flat ``/databases`` list. The second pass is not belt-and-braces, it is the
+    only way to see three of the eight engines:
+
+        $environment->load(['applications', 'postgresqls', 'redis',
+                            'mongodbs', 'mysqls', 'mariadbs', 'services']);
+
+    That is the whole eager-load in ProjectController. `keydbs`, `dragonflies`
+    and `clickhouses` are relations on the model that the controller forgets, so
+    the endpoint simply never mentions them — no key, no error. Trusting it alone
+    means a project with a ClickHouse migrates and leaves the ClickHouse behind,
+    which is precisely the silent loss this tool exists to prevent. `/databases`
+    goes through `$project->databases()`, which merges all eight.
+
+    We read the per-engine keys anyway rather than skipping straight to the flat
+    list: they are cheap, they are authoritative for the five that do load, and
+    if upstream ever fixes the eager-load we pick the rest up without a change.
     """
     detail = await api.get(f"/projects/{project_uuid}/{environment}")
     if not isinstance(detail, dict):
         raise PreflightError(f"environment {environment!r} not found in project {project_uuid}")
 
     out: list[tuple[str, dict[str, Any]]] = []
-    for collection in ("applications", "services", "databases"):
+    seen: set[str] = set()
+
+    def take(collection: str, resource: object) -> None:
+        if not isinstance(resource, dict):
+            return
+        uuid = str(resource.get("uuid", ""))
+        if not uuid or uuid in seen:
+            return
+        seen.add(uuid)
+        out.append((collection, resource))
+
+    for collection in ("applications", "services"):
         for resource in detail.get(collection) or []:
-            if isinstance(resource, dict):
-                out.append((collection, resource))
+            take(collection, resource)
+
+    # `databases` for the shapes that have it; the per-engine keys for the shape
+    # this Coolify actually returns.
+    for key in ("databases", *_ENGINE_KEYS):
+        for resource in detail.get(key) or []:
+            take("databases", resource)
+
+    environment_id = detail.get("id")
+    if environment_id is not None:
+        for resource in await api.get("/databases") or []:
+            if isinstance(resource, dict) and resource.get("environment_id") == environment_id:
+                take("databases", resource)
 
     if out:
         return out
 
-    # Flat shape fallback.
+    # Flat shape fallback, for versions that answer with one typed list.
     for resource in detail.get("resources") or []:
         if not isinstance(resource, dict):
             continue
         kind = str(resource.get("type", ""))
         if "database" in kind or kind in {e.value for e in DatabaseEngine}:
-            out.append(("databases", resource))
+            take("databases", resource)
         elif kind == "service":
-            out.append(("services", resource))
+            take("services", resource)
         else:
-            out.append(("applications", resource))
+            take("applications", resource)
     return out
 
 
@@ -154,14 +268,46 @@ def _engine_of(collection: str, resource: dict[str, Any]) -> DatabaseEngine | No
     return None
 
 
+def resource_labels(*, project: str, environment: str, name: str) -> dict[str, str]:
+    """Label filter identifying ONE resource's containers on the daemon.
+
+    Coolify's own code finds containers with `--filter label=coolify.{kind}Id={id}`,
+    and copying that from outside is a trap: every API controller calls
+    `makeHidden(['id', ...])`, so the numeric id is never disclosed — not with a
+    root token, not with read:sensitive, not ever. Filtering on it means
+    filtering on the empty string, which matches nothing and reports no error.
+    The stack looks like it has no volumes and the migration moves nothing.
+
+    What every managed container does carry, from `defaultLabels()` and
+    `defaultDatabaseLabels()` alike, is the slugified project / environment /
+    resource-name triple. That is visible from outside and is what we use.
+
+    Slugified with our own slugify, which has to agree with Laravel's Str::slug
+    byte for byte — see test_slug_matches_laravel in the e2e suite, because a
+    disagreement here means a filter that silently matches nothing.
+    """
+    return {
+        LABEL_PROJECT: slugify(project),
+        LABEL_ENVIRONMENT: slugify(environment),
+        LABEL_RESOURCE: slugify(name),
+    }
+
+
 async def snapshot_resource(
     api: CoolifyClient,
     source_host: RemoteHost,
     *,
     collection: str,
     resource: dict[str, Any],
-) -> tuple[ResourceSnapshot, list[docker.Container]]:
-    """Capture everything the planner needs about one resource."""
+    project: str,
+    environment: str,
+) -> tuple[ResourceSnapshot, list[docker.Container], dict[str, Any]]:
+    """Capture everything the planner needs about one resource.
+
+    Returns the snapshot, its containers, and the full API record — the last so
+    callers can read fields the snapshot does not model without fetching the same
+    resource again.
+    """
     uuid = str(resource["uuid"])
     full = await api.get_resource(collection, uuid)
 
@@ -183,8 +329,8 @@ async def snapshot_resource(
         except compose_mod.ComposeError as exc:
             log.warning("planner.compose_unparseable", uuid=uuid, error=str(exc)[:200])
 
-    containers = await docker.list_containers(
-        source_host, label_filters={label_id_key(kind): str(full.get("id", ""))}
+    containers = await resource_containers(
+        source_host, project=project, environment=environment, name=str(full.get("name", ""))
     )
     base = [c for c in containers if not c.is_preview]
     running_image = await docker.image_of(source_host, base[0].id or base[0].name) if base else None
@@ -210,13 +356,40 @@ async def snapshot_resource(
         builds=builds,
         has_previews=any(c.is_preview for c in containers),
     )
-    return snapshot, containers
+    return snapshot, containers, full
+
+
+async def resource_containers(
+    source_host: RemoteHost, *, project: str, environment: str, name: str
+) -> list[docker.Container]:
+    """Every container of one resource, running or not (`docker ps -a`)."""
+    return await docker.list_containers(
+        source_host,
+        label_filters=resource_labels(project=project, environment=environment, name=name),
+    )
+
+
+async def inspect_all_mounts(
+    source_host: RemoteHost, containers: list[docker.Container]
+) -> list[DockerMount]:
+    """Every mount declared by these containers.
+
+    Split out of build_manifest because of *when* it has to run. Coolify's stop
+    is `docker stop` followed by **`docker rm -f`** — in StopDatabase,
+    StopApplication and StopService alike — so once a stack is quiesced its
+    containers are gone, and with them the only record of anonymous volumes and
+    bind mounts. This must be called while they still exist.
+    """
+    mounts: list[DockerMount] = []
+    for container in containers:
+        mounts.extend(await docker.inspect_mounts(source_host, container.id or container.name))
+    return mounts
 
 
 async def build_manifest(
     source_host: RemoteHost,
     *,
-    containers: list[docker.Container],
+    mounts: list[DockerMount],
     api_storages: dict[str, Any] | None,
     uuid: str,
     measure: bool = True,
@@ -225,10 +398,10 @@ async def build_manifest(
 
     docker inspect is the truth, the API is the intent, `volume ls` is the
     residue. Each alone misses something — see domain/manifest.py.
+
+    Takes mounts rather than containers precisely because the caller may no
+    longer have any: see inspect_all_mounts.
     """
-    mounts = []
-    for container in containers:
-        mounts.extend(await docker.inspect_mounts(source_host, container.id or container.name))
 
     volumes: list[DockerVolume] = []
     try:
@@ -372,15 +545,17 @@ async def build_plan(
     source_server: dict[str, Any] | None = None
 
     for collection, resource in resources:
-        snapshot, containers = await snapshot_resource(
-            api, source_host, collection=collection, resource=resource
+        snapshot, containers, full = await snapshot_resource(
+            api,
+            source_host,
+            collection=collection,
+            resource=resource,
+            project=project,
+            environment=environment,
         )
 
         if source_server is None:
-            full = await api.get_resource(collection, snapshot.uuid)
-            server_uuid = full.get("server_uuid") or (full.get("server") or {}).get("uuid")
-            if server_uuid:
-                source_server = await api.get_server(str(server_uuid))
+            source_server = await resolve_server(api, full)
 
         api_storages: dict[str, Any] | None = None
         try:
@@ -390,7 +565,7 @@ async def build_plan(
 
         manifest = await build_manifest(
             source_host,
-            containers=containers,
+            mounts=await inspect_all_mounts(source_host, containers),
             api_storages=api_storages,
             uuid=snapshot.uuid,
             measure=measure,
@@ -406,6 +581,9 @@ async def build_plan(
                 "Coolify re-dumps compose through Yaml::dump(Yaml::parse(...)); "
                 "comments and formatting will be lost on the target"
             )
+
+        if collection == "databases":
+            warnings.extend(database_health_check_warnings(full))
 
         plans.append(
             ResourcePlan(

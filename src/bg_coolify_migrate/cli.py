@@ -143,11 +143,19 @@ async def _doctor(settings: Settings) -> None:
         table.add_column("IP", style="host")
         table.add_column("Reachable")
         for server in servers:
+            # is_reachable lives under settings, not at the top level. Reading it
+            # from the top silently rendered "unknown" for every server, always.
+            reachable = CoolifyClient.server_is_reachable(server)
+            status = (
+                "[ok]yes[/ok]"
+                if reachable
+                else ("[err]no[/err]" if reachable is False else "[warn]unknown[/warn]")
+            )
             table.add_row(
                 str(server.get("name", "?")),
                 str(server.get("uuid", "?")),
                 str(server.get("ip", "?")),
-                "[ok]yes[/ok]" if server.get("is_reachable") else "[warn]unknown[/warn]",
+                status,
             )
         console.print(table)
 
@@ -243,6 +251,7 @@ async def _build(api: object, settings: Settings, project: str, environment: str
         build_plan,
         environment_resources,
         find_project,
+        resolve_server,
         server_ref,
     )
     from bg_coolify_migrate.engine.runner import ssh_target_for
@@ -259,11 +268,11 @@ async def _build(api: object, settings: Settings, project: str, environment: str
 
     collection, first = resources[0]
     full = await api.get_resource(collection, str(first["uuid"]))  # type: ignore[attr-defined]
-    server_uuid = full.get("server_uuid") or (full.get("server") or {}).get("uuid")
-    if not server_uuid:
+    source_server = await resolve_server(api, full)  # type: ignore[arg-type]
+    if source_server is None:
         raise PreflightError("the API did not report a server for these resources")
 
-    source = server_ref(await api.get_server(str(server_uuid)))  # type: ignore[attr-defined]
+    source = server_ref(source_server)
     ssh = await ssh_target_for(api, source)  # type: ignore[arg-type]
 
     async with RemoteHost.connect(

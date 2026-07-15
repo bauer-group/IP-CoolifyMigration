@@ -83,20 +83,59 @@ _TRANSLITERATE = str.maketrans(
 )
 
 
-def slugify(value: str) -> str:
-    """Approximate Laravel's ``Str::slug($value, '-')``.
+def _ascii(value: str) -> str:
+    """Laravel's ``Str::ascii``, near enough: transliterate, then drop the rest.
 
-    Coolify derives service volume names via ``Str::slug()``, so we must match it
-    to predict names. Used for *prediction and cross-checking only* — never as
-    the authority. The authority is always what Coolify actually created, read
-    back from the API and paired by mount path.
+    The explicit table comes first because NFKD has no opinion on characters that
+    are not decomposable accents — it passes `ß` straight through, and the
+    ascii-encode then deletes it outright, turning `Grüße` into `grue`.
     """
     transliterated = value.translate(_TRANSLITERATE)
     normalised = unicodedata.normalize("NFKD", transliterated)
-    ascii_only = normalised.encode("ascii", "ignore").decode("ascii")
-    lowered = ascii_only.lower()
-    hyphenated = re.sub(r"[^a-z0-9]+", "-", lowered)
-    return hyphenated.strip("-")
+    return normalised.encode("ascii", "ignore").decode("ascii")
+
+
+def slugify(value: str, separator: str = "-") -> str:
+    """Laravel's ``Str::slug($value, '-')``, ported step for step.
+
+    Load-bearing, and not only for predicting volume names: container discovery
+    filters on `coolify.projectName` / `coolify.environmentName` /
+    `coolify.resourceName`, which Coolify writes through this exact function. A
+    slug that differs by one character matches no containers, and `docker ps`
+    answers an empty list rather than an error — so the stack looks like it has
+    no volumes and the migration cheerfully moves nothing.
+
+    Mirrors the original's order, which is where the subtlety lives::
+
+        $title = static::ascii($title, $language);
+        $title = preg_replace('![_]+!u', '-', $title);          // flip
+        $title = str_replace('@', '-at-', $title);              // dictionary
+        $title = preg_replace('![^-\\pL\\pN\\s]+!u', '', lower($title));
+        $title = preg_replace('![-\\s]+!u', '-', $title);
+        return trim($title, '-');
+
+    Note step four **removes** unwanted characters instead of replacing them, and
+    only then does step five collapse runs. `a.b.c` becomes `abc`, not `a-b-c` —
+    they coincide only when the stripped character happens to sit next to
+    whitespace, which is why `Straße & Co` agrees either way and hid this.
+
+    Verified against the running Laravel by test_slug_matches_laravel in the e2e
+    suite. A unit test here could only check this against our own idea of
+    Str::slug, which is the assumption that needs checking.
+    """
+    text = _ascii(value)
+
+    flip = "_" if separator == "-" else "-"
+    text = re.sub(f"[{re.escape(flip)}]+", separator, text)
+
+    # Laravel's default dictionary. Not decoration: `me@host` slugs to
+    # `me-at-host`, and dropping the `at` silently mismatches the label.
+    text = text.replace("@", f"{separator}at{separator}")
+
+    quoted = re.escape(separator)
+    text = re.sub(rf"[^{quoted}a-z0-9\s]+", "", text.lower())
+    text = re.sub(rf"[{quoted}\s]+", separator, text)
+    return text.strip(separator)
 
 
 def database_volume_name(engine: DatabaseEngine, uuid: str) -> str:

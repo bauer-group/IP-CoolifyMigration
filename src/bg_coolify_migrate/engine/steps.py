@@ -26,11 +26,17 @@ from bg_coolify_migrate.domain.naming import VolumeEndpoint, pair_by_mount_path
 from bg_coolify_migrate.domain.plan import TransferMode
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.engine import keys
-from bg_coolify_migrate.engine.context import MigrationContext
-from bg_coolify_migrate.engine.planner import build_manifest, stack_labels
+from bg_coolify_migrate.engine.context import MigrationContext, serialise_mounts
+from bg_coolify_migrate.engine.planner import (
+    build_manifest,
+    inspect_all_mounts,
+    resource_containers,
+    stack_labels,
+)
 from bg_coolify_migrate.errors import (
     DnsGateBlocked,
     PreflightError,
+    QuiesceError,
     RebuildDriftBlocked,
     TransferError,
     VerificationError,
@@ -90,9 +96,7 @@ async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
     # cannot ask, so an unanswered question is a stop — resumable, not a failure.
     undecided = [r for r in ctx.plan.resources if r.needs_confirmation]
     if undecided and not ctx.accept_drift:
-        lines = [
-            f"  {r.snapshot.name}: {d}" for r in undecided for d in r.drift_decisions
-        ]
+        lines = [f"  {r.snapshot.name}: {d}" for r in undecided for d in r.drift_decisions]
         raise RebuildDriftBlocked(
             "the target may not run exactly what the source runs:\n" + "\n".join(lines),
             hint=(
@@ -194,19 +198,175 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
                         f"{container.pull_request_id}"
                     )
 
-    for resource in ctx.plan.resources:
-        await ctx.api.stop(resource.snapshot.collection, resource.snapshot.uuid)
+    # Capture the mounts while the containers still exist. Coolify's stop is
+    # `docker stop` then `docker rm -f`, so this is the last moment anyone can
+    # ask a container what it had mounted.
+    await _capture_mounts(ctx)
+
+    # The source's clock, not ours: it is the window for the event-log check
+    # below, and a skewed workstation would silently shrink it.
+    since = await quiesce.now_on(ctx.source_host)
+
+    await _request_stop(ctx)
 
     report = await quiesce.wait_until_stopped(
         ctx.source_host,
         label_filters=stack_labels(ctx.plan),
         timeout=ctx.settings.stop_timeout,
     )
+
+    # "Every container is gone" is not "every container shut down cleanly", and
+    # after a Coolify stop the containers are always gone. The exit codes only
+    # survive in the daemon's event log, so that is where we look.
+    killed = await quiesce.killed_since(
+        ctx.source_host, since=since, label_filters=stack_labels(ctx.plan)
+    )
+    if killed:
+        names = ", ".join(sorted(name for name, _ in killed))
+        raise QuiesceError(
+            f"container(s) were SIGKILLed rather than stopping cleanly: {names}",
+            hint=(
+                "Exit code 137 means the stop grace period elapsed and Docker killed the "
+                "process. A killed database has not flushed, so its volume is a torn "
+                "snapshot, and mirroring it byte-exactly would give you a faithful copy "
+                "of the tear.\n"
+                "Raise the stop grace period on the resource in Coolify and retry. "
+                "Nothing has been copied."
+            ),
+        )
+
     return {
         "containers_stopped": len(report.containers),
         "container_names": sorted(c.name for c in report.containers),
         "elapsed": round(report.elapsed, 1),
     }
+
+
+#: How long to keep re-asking Coolify to stop a stack it believes is already
+#: down. The refresh comes from ServerManagerJob, scheduled `everyMinute()`
+#: (Console/Kernel.php), so this is three ticks: enough for a refresh to land
+#: even if we arrive just after one and the queue is briefly behind. Not a round
+#: number picked for comfort — 90s was, and it fell between ticks.
+_STOP_REFUSAL_WINDOW = 180.0
+_STOP_RETRY_INTERVAL = 5.0
+
+
+async def _storages_or_none(
+    ctx: MigrationContext, collection: str, uuid: str
+) -> dict[str, Any] | None:
+    """The API's declared storages, or None if it will not say.
+
+    Worth re-reading after the stop even though nothing has changed: unlike the
+    containers, this endpoint still answers, and it carries the mount_path that
+    pairing turns on.
+    """
+    try:
+        return await ctx.api.get_storages(collection, uuid)
+    except Exception as exc:
+        log.debug("discover.storages_unavailable", uuid=uuid, error=str(exc)[:120])
+        return None
+
+
+async def _capture_mounts(ctx: MigrationContext) -> None:
+    """Record every container mount before the stop erases the containers.
+
+    Coolify does not merely stop a stack, it removes it — `docker rm -f` in
+    StopDatabase, StopApplication and StopService alike. So the post-stop
+    discovery the design calls for cannot read mounts off containers: there are
+    none. Anonymous volumes and bind mounts appear in no API, which makes this
+    the only record of them that will exist a few seconds from now.
+
+    Refuses to proceed on finding nothing, because "no containers" and "wrong
+    label filter" look identical from here, and the difference is a migration
+    that copies nothing and says it worked.
+    """
+    for resource in ctx.plan.resources:
+        snapshot = resource.snapshot
+        containers = await resource_containers(
+            ctx.source_host,
+            project=ctx.plan.project,
+            environment=ctx.plan.environment,
+            name=snapshot.name,
+        )
+        if not containers:
+            raise PreflightError(
+                f"{snapshot.name}: no containers found on {ctx.plan.source_server.name} "
+                "before stopping it",
+                hint=(
+                    "The stack must be running for its volumes to be discoverable — "
+                    "Coolify removes containers when it stops them, so this is the only "
+                    "chance to see what they mounted.\n"
+                    "Either the resource is already stopped (start it, then migrate), or "
+                    "its containers do not carry the labels we filter on."
+                ),
+            )
+        mounts = await inspect_all_mounts(ctx.source_host, containers)
+        ctx.pre_stop_mounts[snapshot.uuid] = mounts
+        log.info(
+            "quiesce.mounts_captured",
+            resource=snapshot.name,
+            containers=len(containers),
+            mounts=len(mounts),
+        )
+
+    # Journal it before the stop. The context dies with the process and the
+    # containers die with the stop, so after a crash this record is the only
+    # description of them that exists anywhere — a resume cannot go and look.
+    ctx.journal.append(
+        "step_started",
+        state="quiesce",
+        detail={"pre_stop_mounts": serialise_mounts(ctx.pre_stop_mounts)},
+    )
+
+
+async def _request_stop(ctx: MigrationContext) -> None:
+    """Ask Coolify to stop every resource, coping with its stale status column.
+
+    `POST /{kind}/{uuid}/stop` returns 400 "already stopped" — **without
+    dispatching anything** — whenever the resource's `status` column contains
+    'exited' or 'stopped'. That column defaults to 'exited' and is advanced by a
+    background job, so it lags the daemon: shortly after a deploy Coolify will
+    refuse to stop a container that is serving traffic, and no amount of waiting
+    afterwards helps, because no stop was ever requested.
+
+    So a refusal is checked against the daemon rather than believed. If the
+    containers really are down, we are finished. If they are not, Coolify is
+    merely behind, and we re-ask until it catches up.
+
+    Gives up quietly at the window's end rather than raising: the gate that
+    follows is the one authorised to fail, and it fails with the list of
+    containers still running — which is what the operator needs to see. Failing
+    here would replace that with a story about an API call.
+    """
+    pending = [(r.snapshot.collection, r.snapshot.uuid) for r in ctx.plan.resources]
+    deadline = asyncio.get_running_loop().time() + _STOP_REFUSAL_WINDOW
+
+    while True:
+        refused = [
+            (collection, uuid)
+            for collection, uuid in pending
+            if not await ctx.api.stop(collection, uuid)
+        ]
+        if not refused:
+            return
+
+        report = await quiesce.snapshot(ctx.source_host, label_filters=stack_labels(ctx.plan))
+        if report.is_quiesced:
+            log.info("quiesce.already_down", resources=len(refused))
+            return
+
+        if asyncio.get_running_loop().time() >= deadline:
+            log.warning(
+                "quiesce.stop_refused",
+                resources=[uuid for _, uuid in refused],
+                running=sorted(c.name for c in report.running),
+                detail="Coolify reports these stopped; the daemon disagrees",
+            )
+            return
+
+        log.debug("quiesce.stop_refused_retrying", running=len(report.running))
+        await asyncio.sleep(_STOP_RETRY_INTERVAL)
+        pending = refused
 
 
 async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
@@ -216,26 +376,37 @@ async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
     Coolify actually created, never predicted, never derived by string-replacing
     a uuid.
     """
-    labels = stack_labels(ctx.plan)
-    all_containers = await docker.list_containers(ctx.source_host, label_filters=labels)
     pairs_recorded: dict[str, list[dict[str, str]]] = {}
 
     for resource in ctx.plan.resources:
         snapshot = resource.snapshot
         target_uuid = ctx.target_uuids[snapshot.uuid]
 
-        containers = [
-            c
-            for c in all_containers
-            if (c.labels.get(docker.LABEL_TYPE) is not None
-            and snapshot.uuid in str(c.labels))
-            or c.name.startswith(snapshot.uuid)
-        ] or all_containers
+        # The containers are gone — Coolify removed them as it stopped them — so
+        # the mounts come from QUIESCE's capture. `docker volume ls` and the API
+        # both survive the stop and are re-read here, which is what keeps this
+        # authoritative rather than a replay: a volume that vanished during the
+        # stop, or one created late, still shows up now.
+        mounts = ctx.pre_stop_mounts.get(snapshot.uuid)
+        if mounts is None:
+            # Defaulting to [] here would rebuild the exact bug this capture
+            # exists to fix: an empty manifest copies nothing and says so to
+            # nobody. The containers are gone by now, so there is no recovering
+            # this — say what happened instead of inventing an answer.
+            raise TransferError(
+                f"{snapshot.name}: no pre-stop mount capture available",
+                hint=(
+                    "QUIESCE records what each container had mounted before Coolify "
+                    "removes it, and DISCOVER cannot re-derive it afterwards. If this "
+                    "is a resumed run, its journal predates the capture.\n"
+                    "Roll back and start again: `coolify-migrate rollback <id>`."
+                ),
+            )
 
         manifest = await build_manifest(
             ctx.source_host,
-            containers=containers,
-            api_storages=None,
+            mounts=mounts,
+            api_storages=await _storages_or_none(ctx, snapshot.collection, snapshot.uuid),
             uuid=snapshot.uuid,
             measure=True,
         )
@@ -254,6 +425,20 @@ async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
 
         pairs = pair_by_mount_path(source_eps, target_eps) if source_eps else []
         ctx.volume_pairs[snapshot.uuid] = pairs
+
+        # An unpaired source volume is data we were asked to move and did not.
+        # Silence here is what "migrated successfully, moved nothing" is made of.
+        unpaired = {e.name for e in source_eps} - {p.source.name for p in pairs}
+        if unpaired:
+            raise TransferError(
+                f"{snapshot.name}: no target volume matches {sorted(unpaired)}",
+                hint=(
+                    "Volumes are paired by mount_path, read back from what Coolify "
+                    "actually created on the target. A source volume with no partner "
+                    "would be left behind silently, so this stops instead.\n"
+                    f"Target volumes seen: {sorted(e.mount_path for e in target_eps)}"
+                ),
+            )
         pairs_recorded[snapshot.uuid] = [
             {"source": p.source.name, "target": p.target.name, "mount_path": p.source.mount_path}
             for p in pairs
@@ -263,7 +448,11 @@ async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
         for item in manifest.to_migrate:
             if item.source_name is None:
                 pairs_recorded[snapshot.uuid].append(
-                    {"source": item.source_path, "target": item.source_path, "mount_path": item.mount_path}
+                    {
+                        "source": item.source_path,
+                        "target": item.source_path,
+                        "mount_path": item.mount_path,
+                    }
                 )
 
     return {"volume_pairs": pairs_recorded}
@@ -310,6 +499,11 @@ async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
         detail={"key_fingerprint": ctx.ephemeral_key.fingerprint},
     )
 
+    # What the source looks like BEFORE the transfer, to compare against
+    # afterwards. Taking this at the end instead — which is what the first cut
+    # did — compares the state to itself and can never disagree.
+    before = await quiesce.snapshot(ctx.source_host, label_filters=stack_labels(ctx.plan))
+
     copied: list[str] = []
     for resource in ctx.plan.resources:
         for pair in ctx.volume_pairs.get(resource.snapshot.uuid, []):
@@ -320,9 +514,7 @@ async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
     # Nothing may have restarted mid-transfer. A `restart:` policy or a dashboard
     # deploy would invalidate the whole copy, and neither raises on its own.
     await quiesce.assert_still_stopped(
-        ctx.source_host,
-        label_filters=stack_labels(ctx.plan),
-        since=await quiesce.snapshot(ctx.source_host, label_filters=stack_labels(ctx.plan)),
+        ctx.source_host, label_filters=stack_labels(ctx.plan), since=before
     )
     return {"volumes_copied": copied, "key_fingerprint": ctx.ephemeral_key.fingerprint}
 
@@ -522,12 +714,12 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
         await ctx.api.delete_resource(snapshot.collection, snapshot.uuid, delete_volumes=True)
         actions.append(f"deleted {snapshot.name}")
 
-    await keys.revoke(
-        source=ctx.source_host, target=ctx.target_host, migration_id=ctx.migration_id
-    )
-    return {"policy": policy.value, "actions": actions, "original_names": [
-        r.snapshot.name for r in ctx.plan.resources
-    ]}
+    await keys.revoke(source=ctx.source_host, target=ctx.target_host, migration_id=ctx.migration_id)
+    return {
+        "policy": policy.value,
+        "actions": actions,
+        "original_names": [r.snapshot.name for r in ctx.plan.resources],
+    }
 
 
 def build_steps() -> dict[Any, Any]:

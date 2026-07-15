@@ -17,6 +17,14 @@ Three verified Coolify behaviours make "call stop and proceed" unsafe:
    ``StopService`` stops ``"{$application->name}-{$service->uuid}"`` built from
    the parsed model. A compose container Coolify never parsed into a
    ``ServiceApplication``/``ServiceDatabase`` row is therefore never stopped.
+4. **A stop REMOVES the containers** — ``docker stop`` then ``docker rm -f``, in
+   StopDatabase, StopApplication and StopService alike. Two consequences run
+   through this module. Polling can never catch a container sitting at
+   ``exited (137)``, because both commands go out in one SSH invocation and the
+   record is gone milliseconds later — so the SIGKILL check reads the daemon's
+   event log instead (:func:`killed_since`). And "no containers" stops being
+   evidence of anything: it is what a quiesced stack looks like, and equally
+   what a mistyped label filter looks like.
 
 So we never trust the endpoint. We ask the daemon, by label, with ``-a``, and we
 require **every** container — previews included — to be genuinely stopped.
@@ -151,6 +159,13 @@ async def wait_until_stopped(
         elapsed = time.monotonic() - started
         report = QuiesceReport(containers=report.containers, elapsed=elapsed)
 
+        # Opportunistic: this fires only if we happen to poll while a killed
+        # container still exists. Against a Coolify-issued stop we almost never
+        # will — `docker stop` and `docker rm -f` go out in one SSH invocation,
+        # so the exited(137) record lives for milliseconds. The check that can
+        # actually be relied on is killed_since(), which reads the event log
+        # after the fact; the caller runs it once the gate is satisfied. This
+        # stays because it costs nothing and catches a kill from elsewhere.
         if report.killed:
             names = ", ".join(sorted(c.name for c in report.killed))
             raise QuiesceError(
@@ -229,3 +244,62 @@ async def assert_still_stopped(
                 "The stack was modified mid-transfer; the copy cannot be trusted."
             ),
         )
+
+#: Docker's SIGKILL exit code: 128 + SIGKILL(9).
+SIGKILL_EXIT = 137
+
+
+async def now_on(host: RemoteHost) -> int:
+    """The source's own clock, as a unix timestamp.
+
+    Ours would do for `docker events --since` only if the two machines agreed on
+    the time, and a skewed workstation would silently narrow or widen the window.
+    Ask the machine whose event log we are about to read.
+    """
+    result = await host.run_checked("date +%s")
+    return int(result.stdout.strip())
+
+
+async def killed_since(
+    host: RemoteHost, *, since: int, label_filters: dict[str, str]
+) -> list[tuple[str, int]]:
+    """Containers of this stack that died of SIGKILL since `since`.
+
+    Reads the daemon's event log rather than the containers, because there are no
+    containers: Coolify's stop is `docker stop` followed by `docker rm -f`, so by
+    the time we could inspect an exit code the record has been deleted. The event
+    log outlives the container and still carries `exitCode`.
+
+    This is what keeps "and not SIGKILLed" in the invariant enforceable. A
+    database that was killed rather than asked to stop has not flushed, and
+    mirroring its data directory byte-exactly only gives you a faithful copy of
+    the tear.
+    """
+    until = await now_on(host)
+    filters = " ".join(
+        f"--filter label={key}={value}" for key, value in sorted(label_filters.items())
+    )
+    result = await host.run(
+        f"docker events --since {since} --until {until} "
+        f"--filter type=container --filter event=die {filters} "
+        "--format '{{.Actor.Attributes.name}} {{.Actor.Attributes.exitCode}}'"
+    )
+    if not result.ok:
+        # Never silently: a stop we cannot vet is a stop we do not trust.
+        raise QuiesceError(
+            "could not read the docker event log to check for SIGKILLed containers",
+            hint=(
+                "The event log is the only place an exit code survives — Coolify removes "
+                "containers as it stops them. Without it we cannot tell a clean shutdown "
+                "from a killed one, and copying a killed database's volume mirrors the "
+                "tear faithfully.\n"
+                f"docker events said: {result.stderr.strip()[:200]}"
+            ),
+        )
+
+    killed: list[tuple[str, int]] = []
+    for line in result.stdout.splitlines():
+        name, _, code = line.strip().rpartition(" ")
+        if name and code.isdigit() and int(code) == SIGKILL_EXIT:
+            killed.append((name, int(code)))
+    return killed

@@ -57,13 +57,51 @@ DATABASE_COMMON: frozenset[str] = frozenset(
         "limits_cpus",
         "limits_cpuset",
         "limits_cpu_shares",
-        "health_check_enabled",
-        "health_check_interval",
-        "health_check_timeout",
-        "health_check_retries",
-        "health_check_start_period",
+        # NOT health_check_*. They come back in every GET, and the obvious move is
+        # to send them on. Coolify lists them in no $allowedFields — not on create,
+        # not on update — so any request carrying one is rejected wholesale with
+        # 422 and nothing is created at all.
+        #
+        # Readable, never settable: the mirror image of the settings gap on
+        # applications. Unsettable is not the same as unimportant, so the planner
+        # reports a source whose health check deviates rather than quietly
+        # dropping it — see database_health_check_warnings below.
     }
 )
+
+#: Readable in a GET, settable through no endpoint. Values are Coolify's column
+#: defaults, read out of the live schema rather than inferred — the first draft
+#: guessed 30/30/3/30 and got four of five wrong, which would have warned on
+#: every stock database and taught operators to skip warnings.
+#: test_health_check_defaults_match_schema keeps them honest.
+DATABASE_HEALTH_CHECK_DEFAULTS: dict[str, object] = {
+    "health_check_enabled": True,
+    "health_check_interval": 15,
+    "health_check_timeout": 5,
+    "health_check_retries": 5,
+    "health_check_start_period": 5,
+}
+
+
+def database_health_check_warnings(source: dict[str, object]) -> list[str]:
+    """Warn about health-check settings the API cannot carry to the target.
+
+    Empty when the source runs Coolify's defaults, which is the overwhelmingly
+    common case — no point taxing every migration with a warning about a setting
+    nobody touched.
+    """
+    deviations = [
+        f"{field}={source[field]!r} (target will get {default!r})"
+        for field, default in DATABASE_HEALTH_CHECK_DEFAULTS.items()
+        if field in source and source[field] != default
+    ]
+    if not deviations:
+        return []
+    return [
+        "health check settings cannot be migrated — Coolify accepts them on no "
+        "endpoint, so the target starts with defaults. Re-apply by hand: "
+        + ", ".join(deviations)
+    ]
 
 #: Engine-specific credential/config fields, keyed by API path segment.
 DATABASE_ENGINE_FIELDS: dict[str, frozenset[str]] = {

@@ -78,6 +78,7 @@ class CoolifyClient:
             follow_redirects=False,
         )
         self._can_read_sensitive: bool | None = None
+        self._probe_reason: str = "unprobed"
 
     async def __aenter__(self) -> Self:
         return self
@@ -95,14 +96,19 @@ class CoolifyClient:
 
     # ── transport ────────────────────────────────────────────────────────────
 
-    async def _request(
+    async def _raw(
         self,
         method: str,
         path: str,
         *,
         json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
-    ) -> Any:
+    ) -> httpx.Response:
+        """Perform the request with retries; return the response undecoded.
+
+        Exists because ``/version`` answers in plain text while everything else
+        answers in JSON.
+        """
         attempt = 0
         while True:
             attempt += 1
@@ -127,16 +133,28 @@ class CoolifyClient:
             if response.status_code >= 400:
                 raise _to_error(method, path, response)
 
-            if not response.content:
-                return None
-            try:
-                return response.json()
-            except ValueError as exc:
-                raise CoolifyApiError(
-                    f"{method} {path} returned non-JSON body",
-                    status_code=response.status_code,
-                    body=response.text[:200],
-                ) from exc
+            return response
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        """Perform the request and decode its JSON body."""
+        response = await self._raw(method, path, json=json, params=params)
+        if not response.content:
+            return None
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise CoolifyApiError(
+                f"{method} {path} returned non-JSON body",
+                status_code=response.status_code,
+                body=response.text[:200],
+            ) from exc
 
     async def _backoff(self, attempt: int, *, reason: str, floor: float | None = None) -> None:
         # Full jitter: a fleet of retries must not synchronise into a thundering
@@ -162,28 +180,47 @@ class CoolifyClient:
 
     # ── capability probe ─────────────────────────────────────────────────────
 
-    async def can_read_sensitive(self) -> bool:
-        """Whether the token carries ``root`` or ``read:sensitive``.
+    async def probe_sensitive(self) -> tuple[bool, str]:
+        """Probe the token's ability to read secrets. Returns ``(ok, reason)``.
 
-        Probed by asking for security keys and checking whether ``private_key``
-        survives the sanitizer. This is a genuine capability test rather than a
-        claim about the token: we cannot introspect abilities through the API, so
-        we observe the middleware's behaviour instead.
+        We cannot introspect a token's abilities through the API, so we observe
+        the middleware's behaviour instead: ask for security keys and see whether
+        ``private_key`` survives the sanitizer.
 
-        Falls back to ``False`` when there are no keys to inspect — an
-        indeterminate probe must not read as a pass.
+        THREE outcomes, not two — and conflating the last two is a lie that costs
+        someone half an hour:
+
+        * a key with ``private_key``      -> the token can read secrets
+        * a key without it               -> the token definitely cannot
+        * no keys at all                 -> we could not tell
+
+        The last is still fail-closed, because an indeterminate probe must never
+        read as a pass. But the *reason* has to be the true one, or the operator
+        goes and re-issues a token that was never the problem.
         """
         if self._can_read_sensitive is not None:
-            return self._can_read_sensitive
+            return self._can_read_sensitive, self._probe_reason
 
         keys = await self.get("/security/keys")
         if not isinstance(keys, list) or not keys:
-            log.warning("api.probe.indeterminate", reason="no security keys to probe")
             self._can_read_sensitive = False
-            return False
+            self._probe_reason = "indeterminate"
+            log.warning("api.probe.indeterminate", reason="no ssh keys exist to probe against")
+            return False, "indeterminate"
 
-        self._can_read_sensitive = any("private_key" in k for k in keys if isinstance(k, dict))
-        return self._can_read_sensitive
+        ok = any("private_key" in k for k in keys if isinstance(k, dict))
+        self._can_read_sensitive = ok
+        self._probe_reason = "confirmed" if ok else "denied"
+        return ok, self._probe_reason
+
+    async def can_read_sensitive(self) -> bool:
+        """Whether the token carries ``root`` or ``read:sensitive``.
+
+        Fails closed on an indeterminate probe. See :meth:`probe_sensitive` for
+        why the distinction matters.
+        """
+        ok, _ = await self.probe_sensitive()
+        return ok
 
     async def assert_can_read_sensitive(self) -> None:
         """Fail closed unless the token can read secrets.
@@ -212,14 +249,54 @@ class CoolifyClient:
     # ── reads ────────────────────────────────────────────────────────────────
 
     async def version(self) -> str:
-        result = await self.get("/version")
-        return str(result) if not isinstance(result, dict) else str(result.get("version", result))
+        """The instance's Coolify version.
+
+        Special-cased because ``GET /v1/version`` returns a BARE STRING —
+        ``4.1.2``, not ``{"version": "4.1.2"}`` and not even a quoted JSON
+        string. Every other endpoint returns JSON, so this one cannot go through
+        the normal decode path.
+
+        (This was found by the e2e rig against a real instance. The unit test
+        mocked it as JSON — an assumption checked against itself.)
+        """
+        response = await self._raw("GET", "/version")
+        text = response.text.strip().strip('"')
+        if text.startswith("{"):
+            # Tolerate a future version that returns a JSON object.
+            try:
+                parsed = response.json()
+            except ValueError:
+                return text
+            if isinstance(parsed, dict):
+                return str(parsed.get("version", text))
+        return text
 
     async def list_servers(self) -> list[dict[str, Any]]:
         return _as_list(await self.get("/servers"))
 
     async def get_server(self, uuid: str) -> dict[str, Any]:
         return _as_dict(await self.get(f"/servers/{uuid}"))
+
+    @staticmethod
+    def server_is_reachable(server: dict[str, Any]) -> bool | None:
+        """Whether Coolify can SSH to this server.
+
+        NOT a top-level field: it lives under ``settings.is_reachable``. Servers
+        are the one endpoint that eager-loads its settings relation
+        (``server_by_uuid`` does ``$server->load(['settings'])``), and reading it
+        from the top level silently yields None forever.
+
+        Returns None when the key is absent — "we do not know" is not "no".
+        """
+        settings = server.get("settings")
+        if isinstance(settings, dict) and "is_reachable" in settings:
+            return bool(settings["is_reachable"])
+        return None
+
+    @staticmethod
+    def server_is_coolify_host(server: dict[str, Any]) -> bool:
+        """Whether Coolify itself runs on this server. Used by F2."""
+        return bool(server.get("is_coolify_host"))
 
     async def list_projects(self) -> list[dict[str, Any]]:
         return _as_list(await self.get("/projects"))
@@ -251,9 +328,7 @@ class CoolifyClient:
 
     # ── writes ───────────────────────────────────────────────────────────────
 
-    async def set_envs_bulk(
-        self, collection: str, uuid: str, entries: list[dict[str, Any]]
-    ) -> Any:
+    async def set_envs_bulk(self, collection: str, uuid: str, entries: list[dict[str, Any]]) -> Any:
         """Upsert environment variables, matched by ``key``.
 
         The body key is literally ``data`` (``$request->get('data')``); anything
@@ -267,8 +342,13 @@ class CoolifyClient:
     async def start(self, collection: str, uuid: str) -> Any:
         return await self.post(f"/{collection}/{uuid}/start")
 
-    async def stop(self, collection: str, uuid: str) -> Any:
-        """Request a stop.
+    async def stop(self, collection: str, uuid: str) -> bool:
+        """Request a stop. Returns whether Coolify actually dispatched one.
+
+        A False return is not a failure — it is Coolify declining to act because
+        it believes the resource is already down. The caller must decide whether
+        to believe it (see the note below); it is never grounds to proceed as if
+        the stack were quiesced.
 
         **This returns before anything has stopped** — every stop endpoint is a
         `dispatch(...)`. Worse, for applications it does NOT stop preview
@@ -278,8 +358,38 @@ class CoolifyClient:
 
         Callers MUST verify with the label-based quiesce gate in
         ``discovery.quiesce``; never trust this call's return.
+
+        The False case is a 400, and it deserves precision because treating it as
+        an error and treating it as success are both wrong. Coolify decides it
+        from a database column::
+
+            if (str($database->status)->contains('stopped') ||
+                str($database->status)->contains('exited')) {
+                return response()->json(['message' => 'Database is already stopped.'], 400);
+            }
+            StopDatabase::dispatch($database, $dockerCleanup);   // never reached
+
+        The column defaults to 'exited' and is advanced by a background job, so
+        it lags the daemon — right after a deploy it reads "exited" about a
+        container that is serving traffic. Raising here aborts a migration over a
+        stale row.
+
+        But note where the `return` sits: **no stop is dispatched**. So a caller
+        that shrugs this off and waits for the containers to exit waits for
+        something nobody asked for, and burns its whole gate timeout doing it.
+        Hence bool rather than a swallowed exception — the caller has to look.
         """
-        return await self.post(f"/{collection}/{uuid}/stop")
+        try:
+            await self.post(f"/{collection}/{uuid}/stop")
+            return True
+        except CoolifyApiError as exc:
+            # Matched on the body, not the message: the wording differs per kind
+            # ("Database is already stopped.", "Service is already stopped.", ...)
+            # but all of them carry this phrase.
+            if exc.status_code == 400 and "already stopped" in str(exc.body).lower():
+                log.debug("api.stop.refused_as_stopped", collection=collection, uuid=uuid)
+                return False
+            raise
 
     async def delete_resource(
         self, collection: str, uuid: str, *, delete_volumes: bool = False
@@ -310,10 +420,23 @@ def _to_error(method: str, path: str, response: httpx.Response) -> CoolifyApiErr
         body = response.text[:400]
 
     hint: str | None = None
+    message = str(body.get("message", "")) if isinstance(body, dict) else str(body)
+
     if response.status_code == 401:
         hint = "Check COOLIFY_TOKEN. Coolify tokens are instance-specific."
     elif response.status_code == 403:
-        hint = "The token lacks the ability for this call (needs write/deploy, or root)."
+        # Coolify returns 403 for BOTH "your token cannot do this" and "the API
+        # is switched off instance-wide", and the two need opposite fixes.
+        # Guessing sends the operator to re-issue a token that was never the
+        # problem. It tells us which in the body — read it.
+        if "API is disabled" in message:
+            hint = (
+                "The instance has its API switched off. Enable it in Coolify under "
+                "Settings > API, or call GET /api/v1/enable with a write token.\n"
+                "This is instance-wide and off by default; your token is fine."
+            )
+        else:
+            hint = "The token lacks the ability for this call (needs write/deploy, or root)."
     elif response.status_code == 422:
         # Coolify names the offending field, which is the single most useful
         # thing when a whitelist in api/fields.py has drifted from upstream.

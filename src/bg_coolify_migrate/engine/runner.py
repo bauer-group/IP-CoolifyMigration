@@ -18,7 +18,7 @@ from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.domain.plan import MigrationPlan, ServerRef, TransferMode
 from bg_coolify_migrate.domain.statemachine import State
 from bg_coolify_migrate.engine.compensations import build_compensations
-from bg_coolify_migrate.engine.context import MigrationContext
+from bg_coolify_migrate.engine.context import MigrationContext, deserialise_mounts
 from bg_coolify_migrate.engine.executor import RunResult, Saga
 from bg_coolify_migrate.engine.steps import build_steps
 from bg_coolify_migrate.errors import MigrationError
@@ -261,6 +261,12 @@ async def resume_migration(
         # Rehydrate what earlier states recorded, so compensations and later
         # steps see the same world.
         ctx.target_uuids.update(journal.undo_info(State.CREATE_TARGET.value).get("target_uuids", {}))
+        # Without this a resume past QUIESCE discovers from no mounts, and an
+        # empty manifest copies nothing without complaining. The containers were
+        # removed by the stop, so the journal is the only copy left.
+        ctx.pre_stop_mounts.update(
+            deserialise_mounts(journal.undo_info(State.QUIESCE.value).get("pre_stop_mounts"))
+        )
 
         result = await _execute(ctx, start_from=State.INIT, on_state=on_state)
         log.info("migration.resumed", id=migration_id, outcome=result.outcome.value)

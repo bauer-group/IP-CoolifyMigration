@@ -37,6 +37,13 @@ async def _source_ssh(api: CoolifyClient, settings: Settings) -> SshTarget:
     from bg_coolify_migrate.engine.planner import server_ref
 
     for server in await api.list_servers():
+        # Coolify marks its own host explicitly. Sniffing for a loopback ip was a
+        # guess that happens to work on a default install and fails on any
+        # instance whose self-record uses a real address.
+        if CoolifyClient.server_is_coolify_host(server):
+            return await ssh_target_for(api, server_ref(server))
+
+    for server in await api.list_servers():
         ip = str(server.get("ip", ""))
         if ip in ("127.0.0.1", "localhost", "host.docker.internal"):
             return await ssh_target_for(api, server_ref(server))
@@ -44,8 +51,9 @@ async def _source_ssh(api: CoolifyClient, settings: Settings) -> SshTarget:
     raise PreflightError(
         "could not find Coolify's own server record",
         hint=(
-            "F2 migrates the host Coolify runs ON. None of the registered servers has "
-            "ip 127.0.0.1/localhost, so this instance does not manage itself."
+            "F2 migrates the host Coolify runs ON. No registered server is marked "
+            "is_coolify_host, and none has a loopback address, so this instance does "
+            "not appear to manage itself."
         ),
     )
 

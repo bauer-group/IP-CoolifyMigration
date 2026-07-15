@@ -27,6 +27,24 @@ from bg_coolify_migrate.domain.naming import (
 
 
 class TestSlugify:
+    """Regression cases only. The authority is elsewhere, deliberately.
+
+    This class used to claim it matched Laravel's Str::slug and assert
+    `dots.and.dots` -> `dots-and-dots`. Laravel returns `dotsanddots`: it strips
+    characters that are not the separator, a letter, a number or whitespace, and
+    only then collapses runs. The expectations here were transcribed from the
+    same misunderstanding as the implementation, so they agreed with it for the
+    life of the project and proved nothing.
+
+    Container discovery filters on these slugs, so being wrong here means
+    matching no containers, and `docker ps` returns an empty list rather than an
+    error — a migration that succeeds and moves nothing.
+
+    The real check is tests/e2e/test_label_contract.py, which asks the running
+    Laravel. What is left here is a fast guard on cases it has already settled;
+    when the two disagree, the e2e test is right.
+    """
+
     @pytest.mark.parametrize(
         ("raw", "expected"),
         [
@@ -34,15 +52,21 @@ class TestSlugify:
             ("With Spaces", "with-spaces"),
             ("UPPER", "upper"),
             ("under_score", "under-score"),
-            ("dots.and.dots", "dots-and-dots"),
             ("multiple   spaces", "multiple-spaces"),
             ("--leading-trailing--", "leading-trailing"),
-            ("Grüße", "grusse"),
             ("café", "cafe"),
-            ("a/b\\c", "a-b-c"),
+            # NFKD alone drops the eszett rather than expanding it, turning this
+            # into "grue". Hence the explicit transliteration table.
+            ("Grüße", "grusse"),
+            # Stripped, not separated — the case that exposed the whole mistake.
+            ("dots.and.dots", "dotsanddots"),
+            ("a/b\\c", "abc"),
+            ("api.example.com", "apiexamplecom"),
+            # Laravel's default dictionary, which we had missed entirely.
+            ("me@example.com", "me-at-examplecom"),
         ],
     )
-    def test_matches_laravel_str_slug(self, raw: str, expected: str) -> None:
+    def test_agrees_with_laravel_on_settled_cases(self, raw: str, expected: str) -> None:
         assert slugify(raw) == expected
 
 
