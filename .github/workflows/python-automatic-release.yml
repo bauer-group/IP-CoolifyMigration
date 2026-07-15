@@ -1,0 +1,37 @@
+# =============================================================================
+#  🐍 CI/CD Pipeline (Automatic Release)
+# -----------------------------------------------------------------------------
+#  WHAT         : Semantic-release on every push to main: version bump, tag,
+#                 changelog, build, publish, and regeneration of README.MD /
+#                 SECURITY.MD from their templates.
+#  WHEN         : Push to main; manual dispatch.
+#  PRODUCES     : A GitHub release, a git tag vX.Y.Z, and a PyPI publish.
+#  REQUIREMENTS : Org secrets, inherited.
+#  PERMISSIONS  : Delegated to the reusable workflow.
+# =============================================================================
+name: 🐍 CI/CD Pipeline (Automatic Release)
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['docs/**', '*.md', '*.MD']
+  workflow_dispatch:
+    inputs:
+      skip-pypi:
+        description: 'Build and tag but do not publish to PyPI'
+        type: boolean
+        default: false
+
+jobs:
+  release:
+    uses: bauer-group/automation-templates/.github/workflows/python-semantic-release.yml@main
+    with:
+      python-version: '3.14'
+      run-tests: true
+      run-security-scan: true
+      security-engine: 'both'
+      build-local-wheel: true
+      skip-pypi: ${{ inputs.skip-pypi || false }}
+      update-documentation: true
+      update-security-policy: true
+    secrets: inherit

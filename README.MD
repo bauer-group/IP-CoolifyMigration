@@ -1,0 +1,94 @@
+<!-- AUTO-GENERATED FILE. DO NOT EDIT. Edit docs/README.template.MD instead. Generated 2026-07-15. -->
+# BAUER GROUP - Coolify Migration Toolkit
+
+[![PyPI](https://img.shields.io/pypi/v/bg-coolify-migrate.svg)](https://pypi.org/project/bg-coolify-migrate/)
+[![Python](https://img.shields.io/pypi/pyversions/bg-coolify-migrate.svg)](https://pypi.org/project/bg-coolify-migrate/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Tests](https://github.com/bauer-group/IP-CoolifyMigration/actions/workflows/tests.yml/badge.svg)](https://github.com/bauer-group/IP-CoolifyMigration/actions/workflows/tests.yml)
+
+> **Today, Tomorrow, Together** | Building Better Software Together
+
+Moves a Coolify **project — with its data —** between servers, and relocates a
+whole Coolify instance to a new host. Failsafe, resumable, and rollback-capable.
+
+Coolify can clone a resource to another server but deliberately will not move the
+data. `VolumeCloneJob` and `CloneMe`'s `cloneVolumeData` flag exist upstream, but
+PR #4777 shipped them **disabled**. The maintainer's stated blockers — permission
+damage, job-queue spam at 50+ resources, no progress tracking, large-volume
+failures — are all consequences of running inside Coolify's Laravel queue. An
+external orchestrator has none of those constraints. That is what this is.
+
+## Repository Information
+
+- **Version:** 0.1.0
+- **Repository:** bauer-group/IP-CoolifyMigration
+- **Branch:** main
+- **Architecture:** Pure-logic cores with thin IO shells; saga engine with a
+  crash-safe journal
+
+## Features
+
+- **Application-unaware mirroring** — a cleanly stopped stack makes a volume just
+  bytes. No per-engine logic, no supported-database allowlist. Postgres, MySQL,
+  MariaDB, MongoDB, Redis, KeyDB, Dragonfly, ClickHouse and anything else you run
+  are all handled the same way, because none of them are special once stopped.
+- **Byte-exact** — `rsync -aHAXS --numeric-ids`, parallelised, with SHA-256 and
+  metadata verification on both sides. Never `chown`.
+- **Failsafe** — every step has a compensating action, journalled to disk. The
+  source is never destroyed until you explicitly say so, so rollback is always
+  available. `resume` reconciles against reality, not against the journal.
+- **DNS gate** — extracts every Traefik/Caddy hostname and refuses to start the
+  target while DNS still resolves to the old server, with an actionable cutover
+  checklist.
+- **Drift gate** — Coolify's `git_commit_sha` does not pin a deploy, so a
+  migrated application rebuilds from branch HEAD. We detect that and block.
+- **Server migration** — relocate the whole Coolify instance, with the `APP_KEY`
+  treated as a first-class, asserted artifact rather than a lucky side effect.
+
+## Architecture
+
+| Layer | Role |
+| ----- | ---- |
+| `domain/` | Pure logic: classification, compose analysis, volume pairing, drift, state machine |
+| `api/` | Coolify REST client with per-endpoint request whitelists |
+| `discovery/` | Docker + API reconciliation; the label-based quiesce gate |
+| `transfer/` | asyncssh, rsync planning, checksum verification |
+| `journal/` | Append-only crash-safe state |
+| `dns/` | FQDN extraction, authoritative resolution, cutover gate |
+| `ui/` | Rich dashboard, wizard, and a plain non-TTY fallback |
+
+> **Requires a Coolify API token with `root` or `read:sensitive`.** Without it,
+> Coolify's `ApiSensitiveData` middleware silently omits `value`, `real_value`
+> and `docker_compose_raw` from responses — no error, no redaction marker. The
+> tool probes for this at startup and fails closed.
+
+## Quick start
+
+```bash
+pip install bg-coolify-migrate
+
+export COOLIFY_URL="https://coolify.example.com"
+export COOLIFY_TOKEN="..."          # root or read:sensitive
+
+coolify-migrate doctor              # verify token scope + server reachability
+coolify-migrate plan my-project     # dry run: manifest, drift, DNS gate
+coolify-migrate run my-project --to target-server
+```
+
+Interrupted? `coolify-migrate resume <id>`. Regret it? `coolify-migrate rollback <id>`.
+
+## Server migration
+
+```bash
+coolify-migrate server plan --to new-host.example.com
+coolify-migrate server run  --to new-host.example.com
+```
+
+## Documentation
+
+See [`docs/`](docs/): installation, configuration, cli, architecture, safety,
+server-migration, troubleshooting.
+
+## License
+
+MIT © BAUER GROUP

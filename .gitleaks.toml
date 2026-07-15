@@ -1,0 +1,33 @@
+# Gitleaks configuration.
+#
+# This repo documents credential HANDLING extensively, so the docs and tests are
+# full of things shaped like secrets that are not. The allowlist below keeps the
+# signal useful; it must never be widened to cover src/.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documentation, tests and placeholders"
+paths = [
+  '''tests/''',
+  '''docs/''',
+  '''\.md$''',
+  '''\.MD$''',
+  '''\.env\.example$''',
+]
+regexes = [
+  '''CHANGE_ME[A-Z0-9_]*''',
+  # Example values used in docstrings explaining what NOT to log.
+  '''hunter2''',
+  '''-----BEGIN[A-Z ]*PRIVATE KEY-----\n?abc''',
+  '''base64:A{40,}''',
+  # Coolify's own field names, quoted in comments explaining the API.
+  '''(postgres|mysql|mariadb|redis|keydb|dragonfly|clickhouse_admin)_password''',
+]
+stopwords = [
+  "example",
+  "placeholder",
+  "redacted",
+  "sample",
+]

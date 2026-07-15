@@ -1,0 +1,28 @@
+# =============================================================================
+#  🔒 Security Management
+# -----------------------------------------------------------------------------
+#  WHAT         : Secret scanning (gitleaks + GitGuardian) and dependency review.
+#  WHEN         : Push, PR, and weekly.
+#  PRODUCES     : Security findings; fails the build on a leaked credential.
+#  WHY IT MATTERS HERE : this repo's users hold a Coolify root token, SSH private
+#                 keys and APP_KEY. A credential committed here is a fleet-wide
+#                 incident, not a repo-scoped one.
+#  PERMISSIONS  : Delegated to the reusable workflow.
+# =============================================================================
+name: 🔒 Security Management
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+jobs:
+  security:
+    uses: bauer-group/automation-templates/.github/workflows/security-management.yml@main
+    with:
+      security-engine: 'both'
+    secrets: inherit

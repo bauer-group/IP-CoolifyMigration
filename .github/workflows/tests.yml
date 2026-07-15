@@ -1,0 +1,85 @@
+# =============================================================================
+#  🧪 Tests
+# -----------------------------------------------------------------------------
+#  WHAT         : Lint (ruff), type-check (mypy strict), and run the test suite
+#                 across every supported Python version.
+#  WHEN         : Every push to main and every pull request touching code.
+#  PRODUCES     : A pass/fail gate. Coverage is enforced at >= 80% via pyproject.
+#  REQUIREMENTS : None. No secrets, no network (integration tests are excluded).
+#  PERMISSIONS  : contents: read only.
+# =============================================================================
+name: 🧪 Tests
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['docs/**', '*.md', '*.MD']
+  pull_request:
+    branches: [main]
+    paths-ignore: ['docs/**', '*.md', '*.MD']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: 🔍 Quality (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12', '3.13', '3.14']
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 📦 Cache pip
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: pip-${{ runner.os }}-${{ matrix.python-version }}-
+
+      - name: 📦 Install
+        run: pip install -e ".[dev]"
+
+      - name: 🎨 Lint (ruff)
+        run: ruff check src tests
+
+      - name: 🔎 Type-check (mypy strict)
+        run: mypy src/bg_coolify_migrate
+
+      # Integration tests need network and Docker; they run in their own job.
+      - name: 🧪 Test
+        run: pytest -q -m "not integration" --cov=src/bg_coolify_migrate --cov-report=term-missing
+
+  docs-current:
+    name: 📄 Generated docs are current
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      # README.MD / SECURITY.MD are generated from docs/*.template.MD. A stale
+      # generated file means the template and the published doc disagree, and the
+      # published one is what people read.
+      - name: 📄 Check
+        run: python scripts/generate-docs.py --check

@@ -1,0 +1,19 @@
+# =============================================================================
+#  🏷️ PR Labeler
+# -----------------------------------------------------------------------------
+#  WHAT         : Applies path- and content-based labels to pull requests.
+#  WHEN         : PR opened/synchronised.
+#  PRODUCES     : Labels used by triage and the changelog.
+#  PERMISSIONS  : Delegated. Uses pull_request_target, which is safe here because
+#                 the reusable workflow does NOT check out untrusted code.
+# =============================================================================
+name: 🏷️ PR Labeler
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  label:
+    uses: bauer-group/automation-templates/.github/workflows/pr-labeler.yml@main
+    secrets: inherit

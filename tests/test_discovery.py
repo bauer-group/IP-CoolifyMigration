@@ -1,0 +1,324 @@
+"""Tests for docker introspection and the quiesce gate.
+
+The quiesce gate is the correctness foundation of the whole tool: everything else
+rests on the claim that nothing is writing while we copy. If that claim is false,
+byte-exact verification is meaningless — we would have verified a torn snapshot
+faithfully.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from bg_coolify_migrate.discovery.docker import (
+    Container,
+    _parse_labels,
+    container_labels,
+    image_of,
+    inspect_mounts,
+    inspect_state,
+    list_containers,
+    list_volumes,
+    path_size,
+    volume_exists,
+)
+from bg_coolify_migrate.discovery.quiesce import (
+    assert_previews_absent,
+    assert_still_stopped,
+    snapshot,
+    wait_until_stopped,
+)
+from bg_coolify_migrate.errors import QuiesceError
+from tests.conftest import FakeHost
+
+
+def _ps_line(name: str, state: str, labels: str = "") -> str:
+    return json.dumps({"ID": f"id-{name}", "Names": name, "State": state, "Labels": labels})
+
+
+LABELS = {"coolify.projectName": "shop", "coolify.environmentName": "production"}
+
+
+class TestParseLabels:
+    def test_simple(self) -> None:
+        assert _parse_labels("a=1,b=2") == {"a": "1", "b": "2"}
+
+    def test_value_containing_equals(self) -> None:
+        # Traefik rules contain '='; splitting on every '=' would corrupt them.
+        parsed = _parse_labels("traefik.http.routers.r.rule=Host(`a.com`),x=1")
+        assert parsed["traefik.http.routers.r.rule"] == "Host(`a.com`)"
+        assert parsed["x"] == "1"
+
+    def test_empty(self) -> None:
+        assert _parse_labels("") == {}
+
+
+class TestListContainers:
+    async def test_uses_dash_a_to_include_stopped(self, fake_host: FakeHost) -> None:
+        # Geczy uses bare `docker ps`, so a stopped container's volume is silently
+        # skipped and never even reported. Coolify's own code uses -a; so do we.
+        fake_host.on(r"docker ps", stdout=_ps_line("web", "running"))
+        await list_containers(fake_host, label_filters=LABELS)  # type: ignore[arg-type]
+        assert "docker ps -a" in fake_host.commands[0]
+
+    async def test_applies_every_label_filter(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker ps", stdout="")
+        await list_containers(fake_host, label_filters=LABELS)  # type: ignore[arg-type]
+        cmd = fake_host.commands[0]
+        assert "coolify.projectName=shop" in cmd
+        assert "coolify.environmentName=production" in cmd
+
+    async def test_parses_containers(self, fake_host: FakeHost) -> None:
+        fake_host.on(
+            r"docker ps",
+            stdout="\n".join(
+                [
+                    _ps_line("web", "running", "coolify.managed=true"),
+                    _ps_line("db", "exited", "coolify.managed=true"),
+                ]
+            ),
+        )
+        containers = await list_containers(fake_host, label_filters=LABELS)  # type: ignore[arg-type]
+        assert [c.name for c in containers] == ["web", "db"]
+        assert containers[1].is_stopped
+
+    async def test_unparseable_line_is_skipped_not_fatal(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker ps", stdout="{not json}\n" + _ps_line("web", "running"))
+        containers = await list_containers(fake_host, label_filters=LABELS)  # type: ignore[arg-type]
+        assert len(containers) == 1
+
+
+class TestContainerProperties:
+    @pytest.mark.parametrize("state", ["exited", "created", "dead"])
+    def test_stopped_states(self, state: str) -> None:
+        assert Container(id="i", name="n", state=state, labels={}).is_stopped
+
+    @pytest.mark.parametrize("state", ["running", "restarting", "paused"])
+    def test_running_states(self, state: str) -> None:
+        assert not Container(id="i", name="n", state=state, labels={}).is_stopped
+
+    def test_preview_detection(self) -> None:
+        base = Container(id="i", name="n", state="running", labels={"coolify.pullRequestId": "0"})
+        preview = Container(id="i", name="n", state="running", labels={"coolify.pullRequestId": "7"})
+        assert base.is_preview is False
+        assert preview.is_preview is True
+
+    def test_missing_pr_label_means_base_deploy(self) -> None:
+        assert Container(id="i", name="n", state="running", labels={}).is_preview is False
+
+    def test_malformed_pr_label_means_base_deploy(self) -> None:
+        c = Container(id="i", name="n", state="running", labels={"coolify.pullRequestId": "x"})
+        assert c.is_preview is False
+
+    def test_sigkill_detection(self) -> None:
+        # 137 = SIGKILL: the stop timeout was hit. A killed database has not
+        # flushed, so its volume is a torn snapshot.
+        killed = Container(id="i", name="n", state="exited", labels={}, exit_code=137)
+        clean = Container(id="i", name="n", state="exited", labels={}, exit_code=0)
+        assert killed.was_killed is True
+        assert clean.was_killed is False
+
+
+class TestInspect:
+    async def test_state_and_exit_code(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker inspect .*State", stdout=json.dumps({"Status": "exited", "ExitCode": 0}))
+        assert await inspect_state(fake_host, "c1") == ("exited", 0)  # type: ignore[arg-type]
+
+    async def test_state_unparseable(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker inspect .*State", stdout="nonsense")
+        assert await inspect_state(fake_host, "c1") == ("unknown", None)  # type: ignore[arg-type]
+
+    async def test_mounts(self, fake_host: FakeHost) -> None:
+        fake_host.on(
+            r"docker inspect .*Mounts",
+            stdout=json.dumps(
+                [
+                    {
+                        "Type": "volume",
+                        "Name": "pg-data",
+                        "Source": "/var/lib/docker/volumes/pg-data/_data",
+                        "Destination": "/var/lib/postgresql/data",
+                        "RW": True,
+                    },
+                    {
+                        "Type": "bind",
+                        "Source": "/srv/config",
+                        "Destination": "/etc/app",
+                        "RW": False,
+                    },
+                ]
+            ),
+        )
+        mounts = await inspect_mounts(fake_host, "c1")  # type: ignore[arg-type]
+        assert len(mounts) == 2
+        assert mounts[0].name == "pg-data"
+        assert mounts[1].type == "bind"
+
+    async def test_mounts_unparseable_returns_empty(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker inspect .*Mounts", stdout="{{bad")
+        assert await inspect_mounts(fake_host, "c1") == []  # type: ignore[arg-type]
+
+    async def test_image_of_gives_the_deployed_commit(self, fake_host: FakeHost) -> None:
+        # The image tag IS the commit by construction, which makes it the only
+        # trustworthy record of what is actually running.
+        fake_host.on(r"docker inspect .*Config.Image", stdout="k8sgw04ggc8s:a1b2c3d\n")
+        assert await image_of(fake_host, "c1") == "k8sgw04ggc8s:a1b2c3d"  # type: ignore[arg-type]
+
+    async def test_image_of_failure_returns_none(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker inspect", exit_status=1)
+        assert await image_of(fake_host, "c1") is None  # type: ignore[arg-type]
+
+    async def test_container_labels(self, fake_host: FakeHost) -> None:
+        # How we recover settings the API refuses to return.
+        fake_host.on(
+            r"docker inspect .*Config.Labels",
+            stdout=json.dumps({"traefik.http.routers.r.rule": "Host(`a.com`)"}),
+        )
+        labels = await container_labels(fake_host, "c1")  # type: ignore[arg-type]
+        assert labels["traefik.http.routers.r.rule"] == "Host(`a.com`)"
+
+
+class TestVolumes:
+    async def test_list_volumes(self, fake_host: FakeHost) -> None:
+        fake_host.on(
+            r"docker volume ls",
+            stdout=json.dumps({"Name": "v1", "Driver": "local", "Labels": "coolify.managed=true"}),
+        )
+        volumes = await list_volumes(fake_host)  # type: ignore[arg-type]
+        assert volumes[0].name == "v1"
+        assert volumes[0].labels["coolify.managed"] == "true"
+
+    async def test_volume_exists(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker volume inspect", exit_status=0)
+        assert await volume_exists(fake_host, "v1") is True  # type: ignore[arg-type]
+
+    async def test_volume_missing(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker volume inspect", exit_status=1)
+        assert await volume_exists(fake_host, "v1") is False  # type: ignore[arg-type]
+
+
+class TestPathSize:
+    async def test_reports_bytes_and_count(self, fake_host: FakeHost) -> None:
+        # Sizes drive a PROPORTIONAL disk check. Geczy's fixed 1 GB floor never
+        # compares against the total it just computed.
+        fake_host.on(r"du -sk", stdout="2048\n")
+        fake_host.on(r"find .* -type f", stdout="17\n")
+        assert await path_size(fake_host, "/vol") == (2048 * 1024, 17)  # type: ignore[arg-type]
+
+    async def test_missing_path_is_zero_not_a_crash(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"du -sk", exit_status=1)
+        fake_host.on(r"find", exit_status=1)
+        assert await path_size(fake_host, "/nope") == (0, 0)  # type: ignore[arg-type]
+
+
+class TestQuiesceSnapshot:
+    async def test_resolves_exit_codes_for_stopped_containers(self, fake_host: FakeHost) -> None:
+        # `docker ps` does not report exit codes, and we must distinguish a clean
+        # stop from a SIGKILL at the timeout.
+        fake_host.on(r"docker ps", stdout=_ps_line("db", "exited"))
+        fake_host.on(r"docker inspect", stdout=json.dumps({"Status": "exited", "ExitCode": 0}))
+        report = await snapshot(fake_host, label_filters=LABELS)  # type: ignore[arg-type]
+        assert report.is_quiesced
+        assert report.containers[0].exit_code == 0
+
+    async def test_running_container_is_not_quiesced(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker ps", stdout=_ps_line("web", "running"))
+        report = await snapshot(fake_host, label_filters=LABELS)  # type: ignore[arg-type]
+        assert report.is_quiesced is False
+        assert len(report.running) == 1
+
+
+class TestPreviewGate:
+    async def test_previews_block(self, fake_host: FakeHost) -> None:
+        # Verified: POST /applications/{uuid}/stop does NOT stop previews
+        # (StopApplication filters pullRequestId=0), so they keep writing.
+        fake_host.on(r"docker ps", stdout=_ps_line("web-pr-7", "running", "coolify.pullRequestId=7"))
+        with pytest.raises(QuiesceError, match="preview deployment"):
+            await assert_previews_absent(fake_host, label_filters=LABELS)  # type: ignore[arg-type]
+
+    async def test_error_explains_why_and_how_to_fix(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker ps", stdout=_ps_line("web-pr-7", "running", "coolify.pullRequestId=7"))
+        with pytest.raises(QuiesceError) as exc:
+            await assert_previews_absent(fake_host, label_filters=LABELS)  # type: ignore[arg-type]
+        assert "pullRequestId=0" in str(exc.value)
+        assert "--delete-previews" in str(exc.value)
+
+    async def test_no_previews_passes(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker ps", stdout=_ps_line("web", "running", "coolify.pullRequestId=0"))
+        fake_host.on(r"docker inspect", stdout=json.dumps({"Status": "running", "ExitCode": None}))
+        await assert_previews_absent(fake_host, label_filters=LABELS)  # type: ignore[arg-type]
+
+
+class TestWaitUntilStopped:
+    async def test_already_stopped_returns_immediately(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker ps", stdout=_ps_line("db", "exited"))
+        fake_host.on(r"docker inspect", stdout=json.dumps({"Status": "exited", "ExitCode": 0}))
+        report = await wait_until_stopped(fake_host, label_filters=LABELS, timeout=1)  # type: ignore[arg-type]
+        assert report.is_quiesced
+
+    async def test_sigkill_is_fatal_not_a_warning(self, fake_host: FakeHost) -> None:
+        # Mirroring an unflushed data directory byte-exactly just gives you a
+        # faithful copy of corruption.
+        fake_host.on(r"docker ps", stdout=_ps_line("db", "exited"))
+        fake_host.on(r"docker inspect", stdout=json.dumps({"Status": "exited", "ExitCode": 137}))
+        with pytest.raises(QuiesceError, match="SIGKILLed"):
+            await wait_until_stopped(fake_host, label_filters=LABELS, timeout=1)  # type: ignore[arg-type]
+
+    async def test_sigkill_error_explains_the_consequence(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker ps", stdout=_ps_line("db", "exited"))
+        fake_host.on(r"docker inspect", stdout=json.dumps({"Status": "exited", "ExitCode": 137}))
+        with pytest.raises(QuiesceError) as exc:
+            await wait_until_stopped(fake_host, label_filters=LABELS, timeout=1)  # type: ignore[arg-type]
+        assert "has not flushed" in str(exc.value)
+
+    async def test_timeout_raises_naming_the_stragglers(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker ps", stdout=_ps_line("stubborn", "running"))
+        with pytest.raises(QuiesceError, match="stubborn"):
+            await wait_until_stopped(
+                fake_host,  # type: ignore[arg-type]
+                label_filters=LABELS,
+                timeout=0.01,
+                poll_interval=0.001,
+            )
+
+    async def test_empty_stack_is_quiesced(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker ps", stdout="")
+        report = await wait_until_stopped(fake_host, label_filters=LABELS, timeout=1)  # type: ignore[arg-type]
+        assert report.is_quiesced
+
+
+class TestAssertStillStopped:
+    async def test_restart_during_copy_is_detected(self, fake_host: FakeHost) -> None:
+        # A container with restart: unless-stopped can be brought back by the
+        # daemon mid-transfer. Neither predecessor checks; nothing would raise.
+        before = FakeHost()
+        before.on(r"docker ps", stdout=_ps_line("db", "exited"))
+        before.on(r"docker inspect", stdout=json.dumps({"Status": "exited", "ExitCode": 0}))
+        since = await snapshot(before, label_filters=LABELS)  # type: ignore[arg-type]
+
+        fake_host.on(r"docker ps", stdout=_ps_line("db", "running"))
+        with pytest.raises(QuiesceError, match="restarted during the copy"):
+            await assert_still_stopped(fake_host, label_filters=LABELS, since=since)  # type: ignore[arg-type]
+
+    async def test_changed_container_set_is_detected(self, fake_host: FakeHost) -> None:
+        before = FakeHost()
+        before.on(r"docker ps", stdout=_ps_line("db", "exited"))
+        before.on(r"docker inspect", stdout=json.dumps({"Status": "exited", "ExitCode": 0}))
+        since = await snapshot(before, label_filters=LABELS)  # type: ignore[arg-type]
+
+        fake_host.on(r"docker ps", stdout=_ps_line("something-else", "exited"))
+        fake_host.on(r"docker inspect", stdout=json.dumps({"Status": "exited", "ExitCode": 0}))
+        with pytest.raises(QuiesceError, match="set of containers changed"):
+            await assert_still_stopped(fake_host, label_filters=LABELS, since=since)  # type: ignore[arg-type]
+
+    async def test_unchanged_passes(self, fake_host: FakeHost) -> None:
+        before = FakeHost()
+        before.on(r"docker ps", stdout=_ps_line("db", "exited"))
+        before.on(r"docker inspect", stdout=json.dumps({"Status": "exited", "ExitCode": 0}))
+        since = await snapshot(before, label_filters=LABELS)  # type: ignore[arg-type]
+
+        fake_host.on(r"docker ps", stdout=_ps_line("db", "exited"))
+        fake_host.on(r"docker inspect", stdout=json.dumps({"Status": "exited", "ExitCode": 0}))
+        await assert_still_stopped(fake_host, label_filters=LABELS, since=since)  # type: ignore[arg-type]

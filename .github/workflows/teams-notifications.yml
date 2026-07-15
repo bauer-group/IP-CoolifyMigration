@@ -1,0 +1,23 @@
+# =============================================================================
+#  📢 Teams Notifications
+# -----------------------------------------------------------------------------
+#  WHAT         : Posts releases and failures to Microsoft Teams.
+#  WHEN         : Release published; workflow failures.
+#  PRODUCES     : A Teams message.
+#  PERMISSIONS  : Deliberately NOT pinned. Setting `permissions: {}` here would
+#                 strip the read scopes the called workflow requests, and it
+#                 would fail. Documented exception to the least-privilege rule.
+# =============================================================================
+name: 📢 Teams Notifications
+
+on:
+  release:
+    types: [published]
+  workflow_run:
+    workflows: ['🐍 CI/CD Pipeline (Automatic Release)', '🧪 Tests']
+    types: [completed]
+
+jobs:
+  notify:
+    uses: bauer-group/automation-templates/.github/workflows/teams-notifications.yml@main
+    secrets: inherit

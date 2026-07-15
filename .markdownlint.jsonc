@@ -1,0 +1,14 @@
+{
+  // Line length: prose is hard-wrapped at ~88 but tables and code blocks are not.
+  "MD013": false,
+  // Inline HTML: needed for the generated-file banners.
+  "MD033": false,
+  // Code block style: MkDocs Material uses fenced blocks with attributes.
+  "MD046": false,
+  // List marker spacing: conflicts with MkDocs Material's nested lists.
+  "MD030": false,
+  // Emphasis style: we use both * and _ deliberately in prose.
+  "MD050": false,
+  // Link fragments: MkDocs generates anchors markdownlint cannot see.
+  "MD051": false
+}

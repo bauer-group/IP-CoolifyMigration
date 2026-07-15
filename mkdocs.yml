@@ -1,0 +1,44 @@
+site_name: BAUER GROUP - Coolify Migration Toolkit
+site_description: Failsafe, resumable Coolify project and instance migration
+repo_url: https://github.com/bauer-group/IP-CoolifyMigration
+repo_name: bauer-group/IP-CoolifyMigration
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle: { icon: material/brightness-7, name: Switch to dark mode }
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle: { icon: material/brightness-4, name: Switch to light mode }
+
+validation:
+  anchors: warn
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - tables
+  - toc: { permalink: true }
+
+nav:
+  - Home: index.md
+  - Get started:
+      - Installation: installation.md
+      - Configuration: configuration.md
+  - Guides:
+      - CLI: cli.md
+      - Safety model: safety.md
+      - Server migration: server-migration.md
+      - Troubleshooting: troubleshooting.md
+  - Reference:
+      - Architecture: architecture.md
+      - Why this exists: why.md

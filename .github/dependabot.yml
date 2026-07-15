@@ -1,0 +1,30 @@
+version: 2
+
+updates:
+  # ── GitHub Actions ───────────────────────────────────────────────────────
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "06:30"
+      timezone: "Etc/UTC"
+    commit-message:
+      prefix: "chore(ci)"
+    labels: ["dependencies", "github-actions", "dependabot"]
+    groups:
+      actions-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # ── Python ───────────────────────────────────────────────────────────────
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule: { interval: "weekly", day: "sunday", time: "06:30", timezone: "Etc/UTC" }
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+    labels: ["dependencies", "python", "dependabot"]
+    versioning-strategy: increase-if-necessary
+    groups:
+      python-minor-patch:
+        update-types: ["minor", "patch"]

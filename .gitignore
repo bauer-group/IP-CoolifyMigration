@@ -1,0 +1,51 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+.benchmarks/
+
+# Type checking / linting
+.mypy_cache/
+.ruff_cache/
+
+# Docs
+/site
+
+# IDE
+.vscode/
+.claude/
+.idea/
+
+# Secrets & local config — NEVER commit these.
+# A Coolify root token can read every secret of every project in the team.
+.env
+.env.*
+!.env.example
+!.env.template
+.pypirc
+
+# Runtime state. Migration journals contain resource UUIDs and host addresses;
+# they belong in the user state dir (platformdirs), never in the repo. This entry
+# only catches accidental --state-dir=. runs.
+/state/
+*.journal.jsonl

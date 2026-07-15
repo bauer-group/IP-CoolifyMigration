@@ -1,0 +1,25 @@
+# =============================================================================
+#  🤖 Issue AI Summary
+# -----------------------------------------------------------------------------
+#  WHAT         : Summarises new issues for triage.
+#  WHEN         : Issue opened.
+#  PRODUCES     : A summary comment.
+#  PERMISSIONS  : issues/pull-requests write, contents read, models read.
+#                 pull_request_target is safe: no untrusted checkout.
+# =============================================================================
+name: 🤖 Issue AI Summary
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+  models: read
+
+jobs:
+  summary:
+    uses: bauer-group/automation-templates/.github/workflows/modules-ai-issue-summary.yml@main
+    secrets: inherit

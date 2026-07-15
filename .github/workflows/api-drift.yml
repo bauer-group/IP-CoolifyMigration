@@ -1,0 +1,45 @@
+# =============================================================================
+#  🔭 Coolify API Drift Watch
+# -----------------------------------------------------------------------------
+#  WHAT         : Re-validates our per-endpoint request whitelists (api/fields.py)
+#                 against Coolify's live openapi.json on `main`.
+#  WHEN         : Weekly, and on demand.
+#  PRODUCES     : An issue when upstream adds a field we do not send.
+#  WHY          : Coolify enforces $allowedFields and 422s on anything unknown,
+#                 and our whitelists are transcribed from its source. When
+#                 upstream changes, we want OUR ci to break — not someone's
+#                 production migration, mid-cutover, with the source stopped.
+#  REQUIREMENTS : None (public raw.githubusercontent.com).
+#  PERMISSIONS  : contents: read, issues: write.
+# =============================================================================
+name: 🔭 Coolify API Drift Watch
+
+on:
+  schedule:
+    - cron: '30 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  drift:
+    name: 🔭 Check upstream API
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: 📦 Install
+        run: pip install -e ".[dev]"
+
+      - name: 🔭 Compare whitelists against upstream openapi.json
+        id: drift
+        run: pytest -q -m integration tests/test_api_fields.py
