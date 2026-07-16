@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.5.2 (2026-07-16)
+
+### Bug Fixes
+
+- **engine**: Freed source custom domains before create (409)
+  ([`9ab11c6`](https://github.com/bauer-group/IP-CoolifyMigration/commit/9ab11c634989020fdabb9f5b8c3a852acc7fa500))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`e726fd0`](https://github.com/bauer-group/IP-CoolifyMigration/commit/e726fd0ed80f49f2c05783216d0b983993349784))
+
+
 ## v2.5.1 (2026-07-16)
 
 ### Bug Fixes
