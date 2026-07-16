@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.4.2 (2026-07-16)
+
+### Bug Fixes
+
+- **api**: Remapped compose per-service domains
+  ([`a21513e`](https://github.com/bauer-group/IP-CoolifyMigration/commit/a21513ebbe6ec55a197e17ed86aa7bf5b43aaeb3))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`1a16985`](https://github.com/bauer-group/IP-CoolifyMigration/commit/1a16985c148da330e032f95252761e55f41d0965))
+
+
 ## v2.4.1 (2026-07-16)
 
 ### Bug Fixes
