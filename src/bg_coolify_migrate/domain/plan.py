@@ -76,6 +76,59 @@ class ServerRef(BaseModel):
     port: int = 22
 
 
+class ProjectPlacement(BaseModel):
+    """Where one project/environment currently runs. For the `list` command.
+
+    Discovery only — no volume, drift or manifest data. Its whole job is to let an
+    operator see project *names* and the server they live on before naming one in
+    `plan`/`run`.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    project: str
+    project_uuid: str
+    """Shown in every view so a project can be named to `plan`/`run` by uuid — the
+    only unambiguous handle when a name carries spaces, slashes or other specials."""
+    environment: str
+    server_uuid: str
+    """The server the resources run on. Empty when it could not be resolved from
+    the API — surfaced as "unknown", never silently attributed to a host."""
+    resources: int
+
+
+class ProjectListing(BaseModel):
+    """Every placement, plus the full server set.
+
+    Servers are carried so the view can show a host that has *no* projects — a
+    candidate migration target is exactly what an operator wants to see.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    placements: tuple[ProjectPlacement, ...] = ()
+    servers: tuple[ServerRef, ...] = ()
+
+
+class ResourceRow(BaseModel):
+    """One migratable resource, for `list <project>`.
+
+    The uuid is the point: it is what `plan`/`run` accept for an unambiguous
+    ``project/environment/<uuid>`` selection when two resources share a name.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    environment: str
+    name: str
+    uuid: str
+    kind: str
+    """The Coolify collection — application | service | database — not the fine kind."""
+    server: str
+    """Server name, or empty when it could not be resolved."""
+    server_uuid: str
+
+
 class ResourceSnapshot(BaseModel):
     """Captured facts about one source resource.
 
@@ -193,7 +246,14 @@ class ResourcePlan(BaseModel):
 
 
 class MigrationPlan(BaseModel):
-    """The whole unit of work: one project/environment, atomically."""
+    """The unit of work: the resources of one environment, migrated atomically.
+
+    The resource is the atom — environments and projects only decide *which*
+    resources a plan carries. A whole-environment plan holds every resource in the
+    environment; a resource-scoped plan holds exactly one, and ``selected_resources``
+    records that so the quiesce gates watch only it and leave its siblings running.
+    A whole-project migration is several of these plans, one per environment.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -204,6 +264,15 @@ class MigrationPlan(BaseModel):
     resources: tuple[ResourcePlan, ...] = ()
     finalize_policy: FinalizePolicy = FinalizePolicy.RENAME
     transfer_mode: TransferMode = TransferMode.AUTO
+    selected_resources: tuple[str, ...] = ()
+    """Resource names this plan was deliberately narrowed to. Empty means the whole
+    environment — the quiesce gates then watch the stack. Non-empty means a scoped
+    run: the gates watch only these, so siblings left running do not make the stop
+    gate wait forever or the restart check trip."""
+
+    @property
+    def is_resource_scoped(self) -> bool:
+        return bool(self.selected_resources)
 
     @property
     def total_bytes(self) -> int:

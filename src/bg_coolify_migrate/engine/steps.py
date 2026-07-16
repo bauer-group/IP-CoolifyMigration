@@ -30,8 +30,8 @@ from bg_coolify_migrate.engine.context import MigrationContext, serialise_mounts
 from bg_coolify_migrate.engine.planner import (
     build_manifest,
     inspect_all_mounts,
+    observed_labels,
     resource_containers,
-    stack_labels,
 )
 from bg_coolify_migrate.errors import (
     DnsGateBlocked,
@@ -74,7 +74,7 @@ async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
     # Previews are not stopped by Coolify's stop endpoint, so they would keep
     # writing during the copy. Refuse now rather than corrupt later.
     if not ctx.delete_previews:
-        await quiesce.assert_previews_absent(ctx.source_host, label_filters=stack_labels(ctx.plan))
+        await quiesce.assert_previews_absent(ctx.source_host, label_filters=observed_labels(ctx.plan))
 
     # Proportional disk check against the ACTUAL payload.
     required = int(ctx.plan.total_bytes * ctx.settings.disk_headroom_factor)
@@ -211,7 +211,7 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
 
     report = await quiesce.wait_until_stopped(
         ctx.source_host,
-        label_filters=stack_labels(ctx.plan),
+        label_filters=observed_labels(ctx.plan),
         timeout=ctx.settings.stop_timeout,
     )
 
@@ -219,7 +219,7 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
     # after a Coolify stop the containers are always gone. The exit codes only
     # survive in the daemon's event log, so that is where we look.
     killed = await quiesce.killed_since(
-        ctx.source_host, since=since, label_filters=stack_labels(ctx.plan)
+        ctx.source_host, since=since, label_filters=observed_labels(ctx.plan)
     )
     if killed:
         names = ", ".join(sorted(name for name, _ in killed))
@@ -350,7 +350,7 @@ async def _request_stop(ctx: MigrationContext) -> None:
         if not refused:
             return
 
-        report = await quiesce.snapshot(ctx.source_host, label_filters=stack_labels(ctx.plan))
+        report = await quiesce.snapshot(ctx.source_host, label_filters=observed_labels(ctx.plan))
         if report.is_quiesced:
             log.info("quiesce.already_down", resources=len(refused))
             return
@@ -502,7 +502,7 @@ async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
     # What the source looks like BEFORE the transfer, to compare against
     # afterwards. Taking this at the end instead — which is what the first cut
     # did — compares the state to itself and can never disagree.
-    before = await quiesce.snapshot(ctx.source_host, label_filters=stack_labels(ctx.plan))
+    before = await quiesce.snapshot(ctx.source_host, label_filters=observed_labels(ctx.plan))
 
     copied: list[str] = []
     for resource in ctx.plan.resources:
@@ -514,7 +514,7 @@ async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
     # Nothing may have restarted mid-transfer. A `restart:` policy or a dashboard
     # deploy would invalidate the whole copy, and neither raises on its own.
     await quiesce.assert_still_stopped(
-        ctx.source_host, label_filters=stack_labels(ctx.plan), since=before
+        ctx.source_host, label_filters=observed_labels(ctx.plan), since=before
     )
     return {"volumes_copied": copied, "key_fingerprint": ctx.ephemeral_key.fingerprint}
 
@@ -669,7 +669,7 @@ async def step_healthcheck(ctx: MigrationContext) -> dict[str, Any]:
     target's daemon for the same reason we poll the source's.
     """
     deadline = ctx.settings.stop_timeout
-    labels = stack_labels(ctx.plan)
+    labels = observed_labels(ctx.plan)
     waited = 0.0
     interval = 3.0
 

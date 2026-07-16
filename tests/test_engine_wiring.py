@@ -5,8 +5,15 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
 import pytest
+import respx
 
+from bg_coolify_migrate.api.client import CoolifyClient
+from bg_coolify_migrate.discovery.docker import (
+    LABEL_ENVIRONMENT,
+    LABEL_RESOURCE,
+)
 from bg_coolify_migrate.domain.kinds import DatabaseEngine, ResourceKind
 from bg_coolify_migrate.domain.plan import (
     MigrationPlan,
@@ -16,12 +23,32 @@ from bg_coolify_migrate.domain.plan import (
     Strategy,
 )
 from bg_coolify_migrate.engine import keys
-from bg_coolify_migrate.engine.planner import _engine_of, decode_compose, server_ref, stack_labels
+from bg_coolify_migrate.engine.planner import (
+    _engine_of,
+    decode_compose,
+    find_project,
+    list_placements,
+    list_project_resources,
+    observed_labels,
+    project_environments,
+    server_ref,
+    stack_labels,
+)
 from bg_coolify_migrate.engine.runner import load_plan, make_migration_id, plan_path, save_plan
 from bg_coolify_migrate.errors import MigrationError
 from tests.conftest import FakeHost
 
 COMPOSE = "services:\n  web:\n    image: nginx\n"
+
+_HOST = "https://coolify.example.com"
+_BASE = f"{_HOST}/api/v1"
+
+
+@pytest.fixture
+async def api():  # type: ignore[no-untyped-def]
+    client = CoolifyClient(_HOST, "tok", max_retries=0)
+    yield client
+    await client.aclose()
 
 
 class TestDecodeCompose:
@@ -257,3 +284,218 @@ class TestEphemeralKeys:
 
     async def test_revoke_tolerates_a_missing_host(self) -> None:
         await keys.revoke(source=None, target=None, migration_id="m1")
+
+
+class TestListPlacements:
+    """`list` is discovery: it must map every project to the server it lives on,
+    surface empty servers as migration targets, and never silently drop a project
+    whose server it could not resolve."""
+
+    @respx.mock
+    async def test_groups_projects_and_keeps_empty_servers(self, api: CoolifyClient) -> None:
+        respx.get(f"{_BASE}/servers").mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {"uuid": "s1", "name": "prod-1", "ip": "10.0.0.1", "id": 1},
+                    {"uuid": "s2", "name": "spare", "ip": "10.0.0.2", "id": 2},
+                ],
+            )
+        )
+        respx.get(f"{_BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx.get(f"{_BASE}/projects/p1").mock(
+            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+        )
+        # No "id" on the env detail, so environment_resources does not scan /databases.
+        respx.get(f"{_BASE}/projects/p1/production").mock(
+            return_value=httpx.Response(200, json={"applications": [{"uuid": "a1", "server_uuid": "s1"}]})
+        )
+
+        listing = await list_placements(api)
+
+        assert {s.name for s in listing.servers} == {"prod-1", "spare"}
+        assert len(listing.placements) == 1
+        placement = listing.placements[0]
+        assert placement.project == "shop"
+        assert placement.environment == "production"
+        assert placement.server_uuid == "s1"
+        assert placement.resources == 1
+
+    @respx.mock
+    async def test_falls_back_to_get_resource_for_the_server(self, api: CoolifyClient) -> None:
+        # The environment-list record can omit the destination relation; the
+        # per-resource GET carries it. Resolving must fall back, not give up.
+        respx.get(f"{_BASE}/servers").mock(
+            return_value=httpx.Response(
+                200, json=[{"uuid": "s1", "name": "prod-1", "ip": "10.0.0.1", "id": 7}]
+            )
+        )
+        respx.get(f"{_BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "api"}])
+        )
+        respx.get(f"{_BASE}/projects/p1").mock(
+            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+        )
+        respx.get(f"{_BASE}/projects/p1/production").mock(
+            return_value=httpx.Response(200, json={"applications": [{"uuid": "a1"}]})
+        )
+        respx.get(f"{_BASE}/applications/a1").mock(
+            return_value=httpx.Response(200, json={"uuid": "a1", "destination": {"server_id": 7}})
+        )
+
+        listing = await list_placements(api)
+
+        assert listing.placements[0].server_uuid == "s1"
+
+    @respx.mock
+    async def test_environment_with_no_resources_is_skipped(self, api: CoolifyClient) -> None:
+        respx.get(f"{_BASE}/servers").mock(
+            return_value=httpx.Response(
+                200, json=[{"uuid": "s1", "name": "prod-1", "ip": "10.0.0.1", "id": 1}]
+            )
+        )
+        respx.get(f"{_BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "empty-project"}])
+        )
+        respx.get(f"{_BASE}/projects/p1").mock(
+            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+        )
+        respx.get(f"{_BASE}/projects/p1/production").mock(
+            return_value=httpx.Response(200, json={"applications": [], "services": []})
+        )
+
+        listing = await list_placements(api)
+
+        assert listing.placements == ()
+        assert {s.name for s in listing.servers} == {"prod-1"}
+
+
+class TestFindProjectHint:
+    @respx.mock
+    async def test_unknown_project_points_at_list(self, api: CoolifyClient) -> None:
+        # The old hint sent you to `doctor`, which never lists projects. Regression
+        # guard: the pointer must be to `list`, which does.
+        respx.get(f"{_BASE}/projects").mock(return_value=httpx.Response(200, json=[]))
+        with pytest.raises(MigrationError) as exc_info:
+            await find_project(api, "team/app")
+        assert "coolify-migrate list" in str(exc_info.value)
+
+
+def _plan(**kwargs: object) -> MigrationPlan:
+    ref = ServerRef(uuid="s", name="server", ip="10.0.0.1")
+    return MigrationPlan(
+        project="Shop",
+        environment="production",
+        source_server=ref,
+        target_server=ref,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+class TestObservedLabels:
+    """The seam that makes resource-scoped migration safe: which containers the
+    quiesce/health gates watch."""
+
+    def test_whole_environment_watches_the_stack(self) -> None:
+        labels = observed_labels(_plan())
+        assert LABEL_RESOURCE not in labels
+        assert LABEL_ENVIRONMENT in labels
+
+    def test_resource_scoped_watches_only_its_resource(self) -> None:
+        labels = observed_labels(_plan(selected_resources=("whistleblower-app",)))
+        assert labels[LABEL_RESOURCE] == "whistleblower-app"
+        assert LABEL_ENVIRONMENT in labels
+
+
+class TestProjectEnvironments:
+    @respx.mock
+    async def test_returns_name_and_environments(self, api: CoolifyClient) -> None:
+        respx.get(f"{_BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx.get(f"{_BASE}/projects/p1").mock(
+            return_value=httpx.Response(
+                200, json={"environments": [{"name": "production"}, {"name": "staging"}]}
+            )
+        )
+        name, environments = await project_environments(api, "shop")
+        assert name == "shop"
+        assert environments == ["production", "staging"]
+
+    @respx.mock
+    async def test_falls_back_to_production(self, api: CoolifyClient) -> None:
+        respx.get(f"{_BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx.get(f"{_BASE}/projects/p1").mock(
+            return_value=httpx.Response(200, json={"environments": []})
+        )
+        _name, environments = await project_environments(api, "shop")
+        assert environments == ["production"]
+
+
+class TestListProjectResources:
+    @respx.mock
+    async def test_lists_resources_with_uuid_kind_and_server(self, api: CoolifyClient) -> None:
+        respx.get(f"{_BASE}/servers").mock(
+            return_value=httpx.Response(
+                200, json=[{"uuid": "s1", "name": "prod-1", "ip": "10.0.0.1", "id": 1}]
+            )
+        )
+        respx.get(f"{_BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx.get(f"{_BASE}/projects/p1").mock(
+            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+        )
+        respx.get(f"{_BASE}/projects/p1/production").mock(
+            return_value=httpx.Response(
+                200, json={"applications": [{"uuid": "a1", "name": "web", "server_uuid": "s1"}]}
+            )
+        )
+        name, rows = await list_project_resources(api, "shop")
+        assert name == "shop"
+        assert len(rows) == 1
+        row = rows[0]
+        assert (row.name, row.uuid, row.kind, row.environment, row.server) == (
+            "web",
+            "a1",
+            "application",
+            "production",
+            "prod-1",
+        )
+
+
+class TestResolveJobs:
+    @respx.mock
+    async def test_whole_project_fans_out_to_every_environment(self, api: CoolifyClient) -> None:
+        from bg_coolify_migrate.cli import Selection, _resolve_jobs
+
+        respx.get(f"{_BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx.get(f"{_BASE}/projects/p1").mock(
+            return_value=httpx.Response(
+                200, json={"environments": [{"name": "production"}, {"name": "staging"}]}
+            )
+        )
+        name, jobs = await _resolve_jobs(api, Selection("shop", None, None))
+        assert name == "shop"
+        assert jobs == [("production", None), ("staging", None)]
+
+    @respx.mock
+    async def test_resource_scope_is_a_single_job(self, api: CoolifyClient) -> None:
+        from bg_coolify_migrate.cli import Selection, _resolve_jobs
+
+        respx.get(f"{_BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx.get(f"{_BASE}/projects/p1").mock(
+            return_value=httpx.Response(
+                200, json={"environments": [{"name": "production"}, {"name": "staging"}]}
+            )
+        )
+        _name, jobs = await _resolve_jobs(api, Selection("shop", "production", "web"))
+        assert jobs == [("production", "web")]

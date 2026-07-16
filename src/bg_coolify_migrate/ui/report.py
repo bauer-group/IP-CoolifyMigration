@@ -16,7 +16,12 @@ from rich.text import Text
 from bg_coolify_migrate.dns.gate import DnsGateReport, Verdict
 from bg_coolify_migrate.domain.drift import RebuildDriftReport, Severity
 from bg_coolify_migrate.domain.manifest import Decision, VolumeManifest
-from bg_coolify_migrate.domain.plan import MigrationPlan
+from bg_coolify_migrate.domain.plan import (
+    MigrationPlan,
+    ProjectListing,
+    ProjectPlacement,
+    ResourceRow,
+)
 from bg_coolify_migrate.ui.console import human_bytes
 
 _DECISION_STYLE = {
@@ -132,9 +137,10 @@ def plan_summary(plan: MigrationPlan) -> Panel:
     grid = Table.grid(padding=(0, 2))
     grid.add_column(style="bold")
     grid.add_column()
-    grid.add_row("Project", f"{plan.project} / {plan.environment}")
-    grid.add_row("From", f"{plan.source_server.name} ({plan.source_server.ip})")
-    grid.add_row("To", f"{plan.target_server.name} ({plan.target_server.ip})")
+    # Text, not markup: names may carry '[' etc. and must not be parsed as tags.
+    grid.add_row("Project", Text(f"{plan.project} / {plan.environment}"))
+    grid.add_row("From", Text(f"{plan.source_server.name} ({plan.source_server.ip})"))
+    grid.add_row("To", Text(f"{plan.target_server.name} ({plan.target_server.ip})"))
     grid.add_row("Resources", str(len(plan.resources)))
     grid.add_row("Data", human_bytes(plan.total_bytes))
     grid.add_row("On success", plan.finalize_policy.value)
@@ -158,7 +164,7 @@ def resources_table(plan: MigrationPlan) -> Table:
             Text("BLOCKED", style="err") if resource.is_blocked else Text("ready", style="ok")
         )
         table.add_row(
-            resource.snapshot.name,
+            Text(resource.snapshot.name),
             resource.snapshot.kind.value,
             resource.strategy.value,
             str(len(resource.manifest.to_migrate)),
@@ -222,3 +228,155 @@ def plain_plan(plan: MigrationPlan) -> str:
     for warning in plan.warnings:
         lines.append(f"warning: {warning}")
     return "\n".join(lines)
+
+
+# ── project listing (the `list` command) ─────────────────────────────────────
+
+
+def _group_by_server(listing: ProjectListing) -> dict[str, list[ProjectPlacement]]:
+    grouped: dict[str, list[ProjectPlacement]] = {}
+    for placement in listing.placements:
+        grouped.setdefault(placement.server_uuid, []).append(placement)
+    for items in grouped.values():
+        items.sort(key=lambda p: (p.project.lower(), p.environment))
+    return grouped
+
+
+def _resource_word(count: int) -> str:
+    return "resource" if count == 1 else "resources"
+
+
+def _placement_line(placement: ProjectPlacement) -> Text:
+    # Text.append renders literally (no markup parsing), so a project or environment
+    # named e.g. "api [v2]" is shown as-is instead of throwing a MarkupError.
+    line = Text("  ")
+    line.append(placement.project)
+    line.append(" / ", style="muted")
+    line.append(placement.environment)
+    line.append(f"   {placement.resources} {_resource_word(placement.resources)}", style="muted")
+    if placement.project_uuid:
+        line.append(f"   [{placement.project_uuid}]", style="muted")
+    return line
+
+
+def listing_group(listing: ProjectListing) -> Group:
+    """Projects grouped under the server they run on. Rich, for a TTY."""
+    grouped = _group_by_server(listing)
+    lines: list[Text] = []
+
+    for server in sorted(listing.servers, key=lambda s: s.name.lower()):
+        header = Text()
+        header.append(server.name, style="host")
+        if server.ip:
+            header.append(f"  ({server.ip})", style="muted")
+        lines.append(header)
+
+        items = grouped.pop(server.uuid, [])
+        if not items:
+            lines.append(Text("  (no projects)", style="muted"))
+        lines.extend(_placement_line(p) for p in items)
+        lines.append(Text(""))
+
+    # Placements whose server did not resolve to a known host are never dropped:
+    # an unplaceable project is exactly what an operator needs to notice.
+    orphans = sorted(
+        (p for items in grouped.values() for p in items),
+        key=lambda p: (p.project.lower(), p.environment),
+    )
+    if orphans:
+        lines.append(Text("unknown server", style="warn"))
+        lines.extend(_placement_line(p) for p in orphans)
+
+    return Group(*lines)
+
+
+def plain_listing(listing: ProjectListing) -> str:
+    r"""Tab-separated ``server<TAB>project<TAB>project_uuid<TAB>environment<TAB>resources``.
+
+    Greppable for CI, and the uuid column lets a script drive ``plan``/``run`` by
+    uuid. An empty server is one row with ``-`` placeholders.
+    """
+    grouped = _group_by_server(listing)
+    rows: list[str] = []
+    for server in sorted(listing.servers, key=lambda s: s.name.lower()):
+        items = grouped.pop(server.uuid, [])
+        if not items:
+            rows.append(f"{server.name}\t-\t-\t-\t0")
+        rows.extend(
+            f"{server.name}\t{p.project}\t{p.project_uuid}\t{p.environment}\t{p.resources}"
+            for p in items
+        )
+    rows.extend(
+        f"?\t{p.project}\t{p.project_uuid}\t{p.environment}\t{p.resources}"
+        for p in (p for items in grouped.values() for p in items)
+    )
+    return "\n".join(rows)
+
+
+def listing_dicts(listing: ProjectListing) -> list[dict[str, object]]:
+    """Flat placement records for ``--json``. Empty servers are omitted."""
+    name = {s.uuid: s.name for s in listing.servers}
+    ip = {s.uuid: s.ip for s in listing.servers}
+    return [
+        {
+            "server": name.get(p.server_uuid, ""),
+            "server_uuid": p.server_uuid,
+            "server_ip": ip.get(p.server_uuid, ""),
+            "project": p.project,
+            "project_uuid": p.project_uuid,
+            "environment": p.environment,
+            "resources": p.resources,
+        }
+        for p in listing.placements
+    ]
+
+
+# ── resource listing (`list <project>`) ──────────────────────────────────────
+
+
+def resource_rows_table(project: str, rows: list[ResourceRow]) -> Table:
+    """One row per resource, with the uuid to select it unambiguously.
+
+    Cells are :class:`Text`, not markup: a resource literally named ``api [v2]``
+    must render, not raise a ``MarkupError``.
+    """
+    table = Table(
+        title=Text(f"Resources in {project}"), show_lines=False, title_justify="left"
+    )
+    table.add_column("Environment", style="muted")
+    table.add_column("Resource", style="bold")
+    table.add_column("Kind")
+    table.add_column("UUID", style="muted")
+    table.add_column("Server", style="host")
+    for row in sorted(rows, key=lambda r: (r.environment, r.name.lower())):
+        table.add_row(
+            Text(row.environment),
+            Text(row.name),
+            Text(row.kind),
+            Text(row.uuid),
+            Text(row.server or "?"),
+        )
+    return table
+
+
+def plain_resource_rows(rows: list[ResourceRow]) -> str:
+    r"""Tab-separated ``environment<TAB>resource<TAB>kind<TAB>uuid<TAB>server``."""
+    return "\n".join(
+        f"{r.environment}\t{r.name}\t{r.kind}\t{r.uuid}\t{r.server or '?'}"
+        for r in sorted(rows, key=lambda r: (r.environment, r.name.lower()))
+    )
+
+
+def resource_row_dicts(rows: list[ResourceRow]) -> list[dict[str, object]]:
+    """Flat resource records for ``--json``."""
+    return [
+        {
+            "environment": r.environment,
+            "name": r.name,
+            "uuid": r.uuid,
+            "kind": r.kind,
+            "server": r.server,
+            "server_uuid": r.server_uuid,
+        }
+        for r in rows
+    ]

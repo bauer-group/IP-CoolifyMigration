@@ -25,15 +25,18 @@ Exit codes are a contract (see docs/cli.md). They are stable and scriptable:
 import asyncio
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
 import typer
+from rich.markup import escape
+from rich.text import Text
 
 from bg_coolify_migrate import __version__
-from bg_coolify_migrate.domain.plan import TransferMode
+from bg_coolify_migrate.domain.plan import MigrationPlan, TransferMode
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
-from bg_coolify_migrate.errors import MigrationError
+from bg_coolify_migrate.errors import MigrationError, PreflightError
 from bg_coolify_migrate.observability.logging_setup import setup_logging
 from bg_coolify_migrate.settings.base import Settings
 from bg_coolify_migrate.ui.console import get_console, is_interactive
@@ -58,8 +61,13 @@ app.add_typer(server_app, name="server")
 
 
 def _fail(exc: MigrationError) -> None:
-    """Render an error and exit with its documented code."""
-    get_console(stderr=True).print(f"[err]error:[/err] {exc}")
+    """Render an error and exit with its documented code.
+
+    The message is assembled as literal Text, not markup: an error that names a
+    resource - ``no resource named 'api [v2]'`` - must not itself throw a
+    MarkupError on the ``[v2]``.
+    """
+    get_console(stderr=True).print(Text.assemble(("error: ", "err"), str(exc)))
     raise typer.Exit(exc.exit_code)
 
 
@@ -165,87 +173,376 @@ async def _doctor(settings: Settings) -> None:
     console.print(f"[ok]OK[/ok] state dir: [path]{settings.resolved_state_dir()}[/path]")
 
 
-# ── plan ─────────────────────────────────────────────────────────────────────
+# ── list ─────────────────────────────────────────────────────────────────────
 
 
-@app.command()
-def plan(
-    project: Annotated[str, typer.Argument(help="Project name or uuid.")],
-    to: Annotated[str, typer.Option(help="Target server name or uuid.")],
-    environment: Annotated[str, typer.Option(help="Environment name.")] = "production",
-    output: Annotated[Path | None, typer.Option(help="Write the plan JSON here.")] = None,
-    log_level: Annotated[str, typer.Option()] = "INFO",
-    log_format: Annotated[str, typer.Option()] = "console",
+@app.command("list")
+def list_projects(
+    project: Annotated[
+        str | None,
+        typer.Argument(help="Drill into one project: list its resources with uuids."),
+    ] = None,
+    server: Annotated[
+        str | None,
+        typer.Option("--server", "-s", help="Only show projects on this server (name or uuid)."),
+    ] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
+    log_level: Annotated[str, typer.Option(help="DEBUG|INFO|WARNING|ERROR")] = "INFO",
+    log_format: Annotated[str, typer.Option(help="console|json")] = "console",
 ) -> None:
-    """Produce a migration plan. Reads only - nothing is changed.
+    """List projects and their server, or one project's resources.
 
-    Exercises preflight, discovery, volume pairing, the drift gate and the DNS
-    gate. If `plan` is clean, `run` has already had its risky decisions made.
+    Discovery for `plan` and `run`. With no argument: every project, its
+    environment(s) and where they live, grouped by server. With a project: each
+    resource's name, uuid, kind, environment and server - the uuid is what you pass
+    for an unambiguous `project/environment/<uuid>` selection. Reads only; needs no
+    `read:sensitive` scope.
     """
     settings = _settings(log_level, log_format)
     try:
-        asyncio.run(_plan(settings, project, environment, to, output))
+        if project is not None:
+            asyncio.run(_list_resources(settings, project, as_json))
+        else:
+            asyncio.run(_list(settings, server, as_json))
     except MigrationError as exc:
         _fail(exc)
 
 
-async def _plan(
-    settings: Settings,
-    project: str,
-    environment: str,
-    target: str,
-    output: Path | None,
-) -> None:
-    from rich.console import Group, RenderableType
-
+async def _list_resources(settings: Settings, project: str, as_json: bool) -> None:
     from bg_coolify_migrate.api.client import CoolifyClient
+    from bg_coolify_migrate.engine.planner import list_project_resources
     from bg_coolify_migrate.ui import report as report_mod
 
     console = get_console()
     url, token = settings.require_coolify()
 
     async with CoolifyClient(url, token, verify=settings.coolify_verify_tls) as api:
-        await api.assert_can_read_sensitive()
-        migration_plan = await _build(api, settings, project, environment, target)
+        if is_interactive() and not as_json:
+            with console.status(Text(f"Scanning {project}...")):
+                project_name, rows = await list_project_resources(api, project)
+        else:
+            project_name, rows = await list_project_resources(api, project)
 
-    if output:
-        output.write_text(migration_plan.model_dump_json(indent=2), encoding="utf-8", newline="\n")
-        console.print(f"[ok]OK[/ok] plan written to [path]{output}[/path]")
+    if as_json:
+        console.print_json(json.dumps(report_mod.resource_row_dicts(rows)))
+        return
+    if not rows:
+        console.print(Text(f"no resources in {project_name}", style="muted"))
+        return
+    if is_interactive():
+        console.print(report_mod.resource_rows_table(project_name, rows))
+    else:
+        console.print(report_mod.plain_resource_rows(rows))
+
+
+async def _list(settings: Settings, server_filter: str | None, as_json: bool) -> None:
+    from bg_coolify_migrate.api.client import CoolifyClient
+    from bg_coolify_migrate.domain.plan import ProjectListing
+    from bg_coolify_migrate.engine.planner import list_placements
+    from bg_coolify_migrate.ui import report as report_mod
+
+    console = get_console()
+    url, token = settings.require_coolify()
+
+    async with CoolifyClient(url, token, verify=settings.coolify_verify_tls) as api:
+        if is_interactive() and not as_json:
+            with console.status("Scanning projects..."):
+                listing = await list_placements(api)
+        else:
+            listing = await list_placements(api)
+
+    if server_filter is not None:
+        matches = [s for s in listing.servers if server_filter in (s.name, s.uuid)]
+        if not matches:
+            raise PreflightError(
+                f"no server named {server_filter!r}",
+                hint="Run `coolify-migrate list` without --server to see every server.",
+            )
+        keep = {s.uuid for s in matches}
+        listing = ProjectListing(
+            placements=tuple(p for p in listing.placements if p.server_uuid in keep),
+            servers=tuple(matches),
+        )
+
+    if as_json:
+        console.print_json(json.dumps(report_mod.listing_dicts(listing)))
+        return
+
+    if not listing.servers and not listing.placements:
+        console.print("no servers or projects visible", style="muted")
+        return
+
+    if is_interactive():
+        console.print(report_mod.listing_group(listing))
+    else:
+        console.print(report_mod.plain_listing(listing))
+
+
+# ── selection: project[/environment[/resource]] ──────────────────────────────
+
+
+@dataclass(frozen=True)
+class Selection:
+    """A parsed migration scope.
+
+    The resource is the atom; environment and project are aggregations over it:
+
+    * ``environment is None``          -> the whole project (every environment)
+    * ``environment`` set, ``resource`` None -> the whole environment
+    * both set                         -> one resource
+    """
+
+    project: str
+    environment: str | None
+    resource: str | None
+
+
+def _parse_selector(selector: str, environment_override: str | None) -> Selection:
+    """Parse ``project[/environment[/resource]]``. Each segment is a name or uuid."""
+    parts = selector.split("/")
+    if len(parts) > 3 or any(not part.strip() for part in parts):
+        raise PreflightError(
+            f"invalid selector {selector!r}",
+            hint=(
+                "Use project, project/environment, or project/environment/resource - "
+                "e.g. bauer-group, bauer-group/production, or "
+                "bauer-group/production/whistleblower-app."
+            ),
+        )
+    project = parts[0].strip()
+    environment = parts[1].strip() if len(parts) >= 2 else None
+    resource = parts[2].strip() if len(parts) == 3 else None
+
+    if environment_override is not None:
+        if environment is not None and environment != environment_override:
+            raise PreflightError(
+                "the environment was given twice",
+                hint="Put it in the selector path OR in --environment, not both.",
+            )
+        environment = environment_override
+    return Selection(project=project, environment=environment, resource=resource)
+
+
+async def _resolve_selection(
+    api: object, selector: str | None, target: str | None, environment_override: str | None
+) -> tuple[Selection, str]:
+    """Return ``(Selection, target_server)``. Parses the selector, or picks on a TTY."""
+    from bg_coolify_migrate.ui import wizard
+
+    if selector is not None:
+        selection = _parse_selector(selector, environment_override)
+        if target is None:
+            if not is_interactive():
+                raise PreflightError(
+                    "--to is required",
+                    hint="Name the target server, or run in a terminal to pick one.",
+                )
+            target = wizard.choose_server(await api.list_servers(), message="Target server?")  # type: ignore[attr-defined]
+        return selection, target
 
     if not is_interactive():
-        console.print(report_mod.plain_plan(migration_plan))
-    else:
-        renderables: list[RenderableType] = [
-            report_mod.plan_summary(migration_plan),
-            report_mod.resources_table(migration_plan),
-        ]
-        for resource in migration_plan.resources:
-            if resource.manifest.items:
-                renderables.append(
-                    report_mod.manifest_table(
-                        resource.manifest, title=f"Volumes - {resource.snapshot.name}"
+        raise PreflightError(
+            "provide a selector: project, project/environment, or project/environment/resource",
+            hint=(
+                "Run `coolify-migrate list` for projects, or `list <project>` for its "
+                "resources. In a terminal you can omit the selector to pick interactively."
+            ),
+        )
+    return await _pick(api, target)
+
+
+async def _pick(api: object, target: str | None) -> tuple[Selection, str]:
+    """The interactive picker: project -> environment -> resource -> target server."""
+    from bg_coolify_migrate.engine.planner import environment_resources
+    from bg_coolify_migrate.ui import wizard
+
+    projects = await api.list_projects()  # type: ignore[attr-defined]
+    project_name = wizard.choose_project(projects)
+    project = next((p for p in projects if str(p.get("name")) == project_name), None)
+    if project is None:  # pragma: no cover - defensive; the name came from this list
+        raise PreflightError(f"project {project_name!r} is no longer visible")
+    project_uuid = str(project["uuid"])
+
+    detail = await api.get_project(project_uuid)  # type: ignore[attr-defined]
+    environments = [
+        str(env["name"])
+        for env in detail.get("environments") or []
+        if isinstance(env, dict) and env.get("name")
+    ]
+    environment = wizard.choose_scope_environment(environments)
+
+    resource: str | None = None
+    if environment is not None:
+        resources = await environment_resources(api, project_uuid, environment)  # type: ignore[arg-type]
+        resource = wizard.choose_scope_resource(resources)
+
+    if target is None:
+        target = wizard.choose_server(await api.list_servers(), message="Target server?")  # type: ignore[attr-defined]
+
+    return Selection(project=project_name, environment=environment, resource=resource), target
+
+
+async def _resolve_jobs(
+    api: object, selection: Selection
+) -> tuple[str, list[tuple[str, str | None]]]:
+    """Expand a selection into ``(project_name, [(environment, resource|None), ...])``.
+
+    A whole-project selection fans out to one job per environment; each job is then
+    a normal environment/resource migration.
+    """
+    from bg_coolify_migrate.engine.planner import project_environments
+
+    project_name, all_environments = await project_environments(api, selection.project)  # type: ignore[arg-type]
+    environments = [selection.environment] if selection.environment is not None else all_environments
+    return project_name, [(environment, selection.resource) for environment in environments]
+
+
+# ── plan ─────────────────────────────────────────────────────────────────────
+
+
+_SELECTOR_HELP = (
+    "project, project/environment, or project/environment/resource - name or uuid "
+    "at each level. Omit in a terminal to pick interactively."
+)
+
+
+@app.command()
+def plan(
+    selector: Annotated[str | None, typer.Argument(help=_SELECTOR_HELP)] = None,
+    to: Annotated[
+        str | None, typer.Option(help="Target server (name or uuid). Omit in a terminal to pick.")
+    ] = None,
+    environment: Annotated[
+        str | None, typer.Option(help="Environment override when the selector names only a project.")
+    ] = None,
+    output: Annotated[
+        Path | None, typer.Option(help="Write the plan JSON here (single-scope only).")
+    ] = None,
+    log_level: Annotated[str, typer.Option(help="DEBUG|INFO|WARNING|ERROR")] = "INFO",
+    log_format: Annotated[str, typer.Option(help="console|json")] = "console",
+) -> None:
+    """Produce a migration plan. Reads only - nothing is changed.
+
+    Scope it with the selector: a project (all environments), a project/environment,
+    or a project/environment/resource. Exercises preflight, discovery, volume
+    pairing, the drift gate and the DNS gate. If `plan` is clean, `run` has already
+    had its risky decisions made.
+    """
+    settings = _settings(log_level, log_format)
+    try:
+        asyncio.run(_plan(settings, selector, to, environment, output))
+    except MigrationError as exc:
+        _fail(exc)
+
+
+async def _plan(
+    settings: Settings,
+    selector: str | None,
+    target: str | None,
+    environment_override: str | None,
+    output: Path | None,
+) -> None:
+    from bg_coolify_migrate.api.client import CoolifyClient
+    from bg_coolify_migrate.ui import wizard
+
+    console = get_console()
+    url, token = settings.require_coolify()
+
+    plans: list[MigrationPlan] = []
+    async with CoolifyClient(url, token, verify=settings.coolify_verify_tls) as api:
+        await api.assert_can_read_sensitive()
+        try:
+            selection, resolved_target = await _resolve_selection(
+                api, selector, target, environment_override
+            )
+        except wizard.Cancelled:
+            console.print("aborted", style="muted")
+            return
+        project_name, jobs = await _resolve_jobs(api, selection)
+
+        for job_environment, job_resource in jobs:
+            try:
+                plans.append(
+                    await _build(
+                        api, settings, selection.project, job_environment, resolved_target, job_resource
                     )
                 )
-            panel = report_mod.drift_panel(resource.drift) if resource.drift else None
-            if panel is not None:
-                renderables.append(panel)
-        warnings = report_mod.warnings_panel(migration_plan)
-        if warnings is not None:
-            renderables.append(warnings)
-        blocking = report_mod.blocking_panel(migration_plan)
-        if blocking is not None:
-            renderables.append(blocking)
-        console.print(Group(*renderables))
+            except PreflightError as exc:
+                # An empty environment in a whole-project scan is normal - note and
+                # keep going rather than failing the whole listing.
+                console.print(
+                    Text(f"skip {project_name}/{job_environment}: {exc}", style="muted")
+                )
 
-    if migration_plan.is_blocked:
+    if not plans:
+        raise PreflightError(
+            f"nothing to plan for {project_name}",
+            hint="No resources matched the selection.",
+        )
+
+    if output:
+        if len(plans) == 1:
+            output.write_text(plans[0].model_dump_json(indent=2), encoding="utf-8", newline="\n")
+            console.print(f"[ok]OK[/ok] plan written to [path]{output}[/path]")
+        else:
+            console.print(
+                "[warn]--output is ignored for a whole-project plan (multiple environments)."
+                "[/warn]"
+            )
+
+    for migration_plan in plans:
+        _render_plan(migration_plan)
+
+    if any(migration_plan.is_blocked for migration_plan in plans):
         raise typer.Exit(2)
 
 
-async def _build(api: object, settings: Settings, project: str, environment: str, target: str):  # type: ignore[no-untyped-def]
-    """Open SSH to the source and build the plan.
+def _render_plan(migration_plan: MigrationPlan) -> None:
+    from rich.console import Group, RenderableType
 
-    The source server is only known after we resolve the project's resources, so
-    we resolve it first with a throwaway lookup, then connect.
+    from bg_coolify_migrate.ui import report as report_mod
+
+    console = get_console()
+    if not is_interactive():
+        console.print(report_mod.plain_plan(migration_plan))
+        return
+
+    renderables: list[RenderableType] = [
+        report_mod.plan_summary(migration_plan),
+        report_mod.resources_table(migration_plan),
+    ]
+    for resource in migration_plan.resources:
+        if resource.manifest.items:
+            renderables.append(
+                report_mod.manifest_table(
+                    resource.manifest, title=f"Volumes - {resource.snapshot.name}"
+                )
+            )
+        panel = report_mod.drift_panel(resource.drift) if resource.drift else None
+        if panel is not None:
+            renderables.append(panel)
+    warnings = report_mod.warnings_panel(migration_plan)
+    if warnings is not None:
+        renderables.append(warnings)
+    blocking = report_mod.blocking_panel(migration_plan)
+    if blocking is not None:
+        renderables.append(blocking)
+    console.print(Group(*renderables))
+
+
+async def _build(
+    api: object,
+    settings: Settings,
+    project: str,
+    environment: str,
+    target: str,
+    only_resource: str | None = None,
+) -> MigrationPlan:
+    """Open SSH to the source and build the plan for one environment.
+
+    The source server is only known after we resolve the environment's resources,
+    so we resolve it first with a throwaway lookup, then connect. ``only_resource``
+    narrows the plan (and the source lookup) to a single resource.
     """
     from bg_coolify_migrate.engine.planner import (
         build_plan,
@@ -255,16 +552,23 @@ async def _build(api: object, settings: Settings, project: str, environment: str
         server_ref,
     )
     from bg_coolify_migrate.engine.runner import ssh_target_for
-    from bg_coolify_migrate.errors import PreflightError
     from bg_coolify_migrate.transfer.ssh import RemoteHost
 
     project_data = await find_project(api, project)  # type: ignore[arg-type]
     resources = await environment_resources(api, str(project_data["uuid"]), environment)  # type: ignore[arg-type]
     if not resources:
-        raise PreflightError(
-            f"no resources in {project}/{environment}",
-            hint="Check the environment name (default: production).",
-        )
+        raise PreflightError(f"no resources in {project}/{environment}")
+    if only_resource is not None:
+        resources = [
+            (collection, resource)
+            for collection, resource in resources
+            if only_resource in (resource.get("name"), resource.get("uuid"))
+        ]
+        if not resources:
+            raise PreflightError(
+                f"no resource named {only_resource!r} in {project}/{environment}",
+                hint=f"Run `coolify-migrate list {project}` to see its resources.",
+            )
 
     collection, first = resources[0]
     full = await api.get_resource(collection, str(first["uuid"]))  # type: ignore[attr-defined]
@@ -287,6 +591,7 @@ async def _build(api: object, settings: Settings, project: str, environment: str
             project=project,
             environment=environment,
             target_server=target,
+            only_resource=only_resource,
             transfer_mode=TransferMode(settings.transfer_mode),
         )
 
@@ -296,9 +601,13 @@ async def _build(api: object, settings: Settings, project: str, environment: str
 
 @app.command()
 def run(
-    project: Annotated[str, typer.Argument(help="Project name or uuid.")],
-    to: Annotated[str, typer.Option(help="Target server name or uuid.")],
-    environment: Annotated[str, typer.Option()] = "production",
+    selector: Annotated[str | None, typer.Argument(help=_SELECTOR_HELP)] = None,
+    to: Annotated[
+        str | None, typer.Option(help="Target server (name or uuid). Omit in a terminal to pick.")
+    ] = None,
+    environment: Annotated[
+        str | None, typer.Option(help="Environment override when the selector names only a project.")
+    ] = None,
     finalize: Annotated[
         str, typer.Option(help="keep|rename|delete - what happens to the source.")
     ] = "rename",
@@ -316,16 +625,20 @@ def run(
         bool, typer.Option(help="Delete preview deployments first (they block the copy).")
     ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
-    log_level: Annotated[str, typer.Option()] = "INFO",
-    log_format: Annotated[str, typer.Option()] = "console",
+    log_level: Annotated[str, typer.Option(help="DEBUG|INFO|WARNING|ERROR")] = "INFO",
+    log_format: Annotated[str, typer.Option(help="console|json")] = "console",
 ) -> None:
-    """Execute a migration."""
+    """Execute a migration.
+
+    Scope it with the selector, exactly like `plan`: a resource, a whole
+    environment, or a whole project (every environment, migrated in turn).
+    """
     settings = _settings(log_level, log_format)
     try:
         policy = FinalizePolicy(finalize)
     except ValueError:
         get_console(stderr=True).print(
-            f"[err]error:[/err] --finalize must be keep|rename|delete, got {finalize!r}"
+            Text(f"error: --finalize must be keep|rename|delete, got {finalize!r}", style="err")
         )
         raise typer.Exit(2) from None
 
@@ -333,9 +646,9 @@ def run(
         code = asyncio.run(
             _run(
                 settings,
-                project=project,
-                environment=environment,
+                selector=selector,
                 target=to,
+                environment_override=environment,
                 policy=policy,
                 accept_drift=accept_drift,
                 delete_previews=delete_previews,
@@ -351,9 +664,9 @@ def run(
 async def _run(
     settings: Settings,
     *,
-    project: str,
-    environment: str,
-    target: str,
+    selector: str | None,
+    target: str | None,
+    environment_override: str | None,
     policy: FinalizePolicy,
     accept_drift: bool,
     delete_previews: bool,
@@ -362,71 +675,147 @@ async def _run(
     from bg_coolify_migrate.api.client import CoolifyClient
     from bg_coolify_migrate.engine.runner import make_migration_id, run_migration
     from bg_coolify_migrate.ui import dashboard, run_report, wizard
+    from bg_coolify_migrate.ui import report as report_mod
 
     console = get_console()
     url, token = settings.require_coolify()
 
     async with CoolifyClient(url, token, verify=settings.coolify_verify_tls) as api:
         await api.assert_can_read_sensitive()
-        migration_plan = await _build(api, settings, project, environment, target)
-        migration_plan = migration_plan.model_copy(update={"finalize_policy": policy})
+        try:
+            selection, resolved_target = await _resolve_selection(
+                api, selector, target, environment_override
+            )
+        except wizard.Cancelled:
+            console.print("aborted", style="muted")
+            return 0
+        project_name, jobs = await _resolve_jobs(api, selection)
+
+        plans: list[MigrationPlan] = []
+        for job_environment, job_resource in jobs:
+            try:
+                plan = await _build(
+                    api, settings, selection.project, job_environment, resolved_target, job_resource
+                )
+                plans.append(plan.model_copy(update={"finalize_policy": policy}))
+            except PreflightError as exc:
+                console.print(
+                    Text(f"skip {project_name}/{job_environment}: {exc}", style="muted")
+                )
+
+        if not plans:
+            console.print(Text(f"error: nothing to migrate for {project_name}", style="err"))
+            return 2
 
         if not assume_yes:
             if not is_interactive():
                 console.print(
-                    "[err]error:[/err] refusing to run unattended without --yes",
-                    style="err",
+                    "[err]error:[/err] refusing to run unattended without --yes", style="err"
                 )
                 return 2
-            # confirm_plan asks about drift too, so a yes here IS the answer to
-            # the compatibility question. Without carrying it through, preflight
-            # would ask again and abort — the operator would have answered into
+            # A yes here IS the answer to the drift/compatibility question, so we
+            # carry accept_drift through; otherwise preflight would ask again into
             # the void.
-            if not wizard.confirm_plan(migration_plan):
-                return 0
-            if not wizard.confirm_destructive(migration_plan):
+            try:
+                if not _confirm_plans(plans):
+                    return 0
+            except wizard.Cancelled:
+                console.print("aborted", style="muted")
                 return 0
             accept_drift = True
-        elif migration_plan.is_blocked:
-            from bg_coolify_migrate.ui import report as report_mod
-
-            console.print(report_mod.plain_plan(migration_plan))
-            return 2
-
-        migration_id = make_migration_id(migration_plan.project, migration_plan.environment)
-        started = time.monotonic()
-
-        reporter = dashboard.build(title=f"{migration_plan.project}/{migration_plan.environment}")
-        with reporter:
-            result = await run_migration(
-                api,
-                settings,
-                migration_plan,
-                migration_id=migration_id,
-                accept_drift=accept_drift,
-                delete_previews=delete_previews,
-                on_state=reporter.on_state,
-            )
-
-        elapsed = time.monotonic() - started
-        if is_interactive():
-            console.print(
-                run_report.outcome_panel(result, migration_id=migration_id, elapsed=elapsed)
-            )
         else:
-            console.print(run_report.plain_result(result, migration_id=migration_id))
-        return result.exit_code
+            blocked = [migration_plan for migration_plan in plans if migration_plan.is_blocked]
+            if blocked:
+                for migration_plan in blocked:
+                    console.print(report_mod.plain_plan(migration_plan))
+                return 2
+
+        worst = 0
+        for migration_plan in plans:
+            migration_id = make_migration_id(migration_plan.project, migration_plan.environment)
+            started = time.monotonic()
+            reporter = dashboard.build(
+                title=f"{migration_plan.project}/{migration_plan.environment}"
+            )
+            with reporter:
+                result = await run_migration(
+                    api,
+                    settings,
+                    migration_plan,
+                    migration_id=migration_id,
+                    accept_drift=accept_drift,
+                    delete_previews=delete_previews,
+                    on_state=reporter.on_state,
+                )
+            elapsed = time.monotonic() - started
+            if is_interactive():
+                console.print(
+                    run_report.outcome_panel(result, migration_id=migration_id, elapsed=elapsed)
+                )
+            else:
+                console.print(run_report.plain_result(result, migration_id=migration_id))
+
+            if result.exit_code != 0:
+                worst = result.exit_code
+                if len(plans) > 1:
+                    console.print(
+                        Text(
+                            f"stopping: {migration_plan.environment} failed "
+                            f"(exit {result.exit_code}); later environments were not started.",
+                            style="warn",
+                        )
+                    )
+                break
+        return worst
+
+
+def _confirm_plans(plans: list[MigrationPlan]) -> bool:
+    """Confirm one or many plans. A single scope reuses the full plan wizard."""
+    from bg_coolify_migrate.ui import report as report_mod
+    from bg_coolify_migrate.ui import wizard
+
+    if len(plans) == 1:
+        if not wizard.confirm_plan(plans[0]):
+            return False
+        return wizard.confirm_destructive(plans[0])
+
+    # Whole-project: show each environment's plan, then one confirmation.
+    console = get_console()
+    console.print(
+        f"\n[bold]Whole-project migration:[/bold] {escape(plans[0].project)} - "
+        f"{len(plans)} environment(s)"
+    )
+    for migration_plan in plans:
+        console.print(report_mod.plan_summary(migration_plan))
+        console.print(report_mod.resources_table(migration_plan))
+
+    if any(migration_plan.is_blocked for migration_plan in plans):
+        console.print(
+            "\n[err]At least one environment is blocked.[/err] Nothing has been changed."
+        )
+        return False
+
+    import questionary
+
+    proceed = questionary.confirm(
+        f"Migrate all {len(plans)} environment(s) of {plans[0].project}?", default=False
+    ).ask()
+    if not proceed:
+        return False
+    return all(wizard.confirm_destructive(migration_plan) for migration_plan in plans)
 
 
 # ── resume / rollback ────────────────────────────────────────────────────────
 
 
-@app.command()
+@app.command(no_args_is_help=True)
 def resume(
     migration_id: Annotated[str, typer.Argument(help="From `coolify-migrate status`.")],
-    accept_drift: Annotated[bool, typer.Option()] = False,
-    log_level: Annotated[str, typer.Option()] = "INFO",
-    log_format: Annotated[str, typer.Option()] = "console",
+    accept_drift: Annotated[
+        bool, typer.Option(help="Proceed past the drift gate without asking (for unattended runs).")
+    ] = False,
+    log_level: Annotated[str, typer.Option(help="DEBUG|INFO|WARNING|ERROR")] = "INFO",
+    log_format: Annotated[str, typer.Option(help="console|json")] = "console",
 ) -> None:
     """Continue a blocked or interrupted migration.
 
@@ -474,12 +863,12 @@ async def _resume(settings: Settings, migration_id: str, accept_drift: bool) -> 
         return result.exit_code
 
 
-@app.command()
+@app.command(no_args_is_help=True)
 def rollback(
     migration_id: Annotated[str, typer.Argument(help="From `coolify-migrate status`.")],
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
-    log_level: Annotated[str, typer.Option()] = "INFO",
-    log_format: Annotated[str, typer.Option()] = "console",
+    log_level: Annotated[str, typer.Option(help="DEBUG|INFO|WARNING|ERROR")] = "INFO",
+    log_format: Annotated[str, typer.Option(help="console|json")] = "console",
 ) -> None:
     """Undo a migration.
 
@@ -511,9 +900,9 @@ async def _rollback(settings: Settings, migration_id: str, assume_yes: bool) -> 
             console.print("[err]error:[/err] refusing to roll back unattended without --yes")
             return 2
         console.print(
-            f"Rolling back [bold]{migration_id}[/bold] will delete the target resources "
-            f"created on [host]{migration_plan.target_server.name}[/host] and restart "
-            f"[host]{migration_plan.source_server.name}[/host]."
+            f"Rolling back [bold]{escape(migration_id)}[/bold] will delete the target "
+            f"resources created on [host]{escape(migration_plan.target_server.name)}[/host] "
+            f"and restart [host]{escape(migration_plan.source_server.name)}[/host]."
         )
         if not questionary.confirm("Proceed?", default=False).ask():
             return 0
@@ -534,8 +923,8 @@ async def _rollback(settings: Settings, migration_id: str, assume_yes: bool) -> 
 def status(
     migration_id: Annotated[str | None, typer.Argument(help="Show one migration.")] = None,
     as_json: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
-    log_level: Annotated[str, typer.Option()] = "INFO",
-    log_format: Annotated[str, typer.Option()] = "console",
+    log_level: Annotated[str, typer.Option(help="DEBUG|INFO|WARNING|ERROR")] = "INFO",
+    log_format: Annotated[str, typer.Option(help="console|json")] = "console",
 ) -> None:
     """List migrations, or show one in detail."""
     from rich.table import Table
@@ -587,10 +976,10 @@ def status(
 # ── server (F2) ──────────────────────────────────────────────────────────────
 
 
-@server_app.command("plan")
+@server_app.command("plan", no_args_is_help=True)
 def server_plan(
     to: Annotated[str, typer.Option(help="Target host (ip or dns name).")],
-    log_level: Annotated[str, typer.Option()] = "INFO",
+    log_level: Annotated[str, typer.Option(help="DEBUG|INFO|WARNING|ERROR")] = "INFO",
 ) -> None:
     """Inventory a whole-instance migration. Reads only."""
     settings = _settings(log_level, "console")
@@ -613,14 +1002,14 @@ async def _server_plan(settings: Settings, target: str) -> None:
         raise typer.Exit(2)
 
 
-@server_app.command("run")
+@server_app.command("run", no_args_is_help=True)
 def server_run(
     to: Annotated[str, typer.Option(help="Target host (ip or dns name).")],
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
     force_overwrite: Annotated[
         bool, typer.Option(help="Proceed even if the destination is not empty. Dangerous.")
     ] = False,
-    log_level: Annotated[str, typer.Option()] = "INFO",
+    log_level: Annotated[str, typer.Option(help="DEBUG|INFO|WARNING|ERROR")] = "INFO",
 ) -> None:
     """Migrate the Coolify instance to a new host.
 
@@ -681,7 +1070,7 @@ def main() -> None:
     try:
         app()
     except MigrationError as exc:  # pragma: no cover - defence in depth
-        get_console(stderr=True).print(f"[err]error:[/err] {exc}")
+        get_console(stderr=True).print(Text.assemble(("error: ", "err"), str(exc)))
         sys.exit(exc.exit_code)
 
 

@@ -14,6 +14,7 @@ from typing import Any
 
 import questionary
 from rich.console import Group, RenderableType
+from rich.markup import escape
 
 from bg_coolify_migrate.domain.plan import MigrationPlan
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
@@ -77,6 +78,45 @@ def choose_environment(environments: list[str]) -> str:
     return str(
         _ask(questionary.select("Which environment?", choices=environments, style=_STYLE))
     )
+
+
+#: Sentinel value for the "everything at this level" choice. A plain ``None``
+#: cannot be used: ``_ask`` treats ``None`` as a Ctrl+C, and here it is a real,
+#: selectable answer meaning "the whole project / the whole environment".
+_ALL = "\x00__all__"
+
+
+def choose_scope_environment(environments: list[str]) -> str | None:
+    """Pick one environment, or the whole project. Returns the name, or None for all.
+
+    The migration atom is the resource; this is one layer of the selector the
+    picker offers when no ``project/environment/resource`` path was given.
+    """
+    choices = [questionary.Choice(title=e, value=e) for e in environments]
+    choices.append(
+        questionary.Choice(title="- all environments (migrate the whole project)", value=_ALL)
+    )
+    answer = questionary.select("Which environment?", choices=choices, style=_STYLE).ask()
+    if answer is None:
+        raise Cancelled
+    return None if answer == _ALL else str(answer)
+
+
+def choose_scope_resource(resources: list[tuple[str, dict[str, Any]]]) -> str | None:
+    """Pick one resource, or the whole environment. Returns the name, or None for all.
+
+    ``resources`` is the ``(collection, record)`` list from ``environment_resources``.
+    """
+    choices = [
+        questionary.Choice(title="- all resources (migrate the whole environment)", value=_ALL)
+    ]
+    for _collection, record in resources:
+        name = str(record.get("name") or record.get("uuid") or "?")
+        choices.append(questionary.Choice(title=name, value=name))
+    answer = questionary.select("Which resource?", choices=choices, style=_STYLE).ask()
+    if answer is None:
+        raise Cancelled
+    return None if answer == _ALL else str(answer)
 
 
 def choose_finalize_policy() -> FinalizePolicy:
@@ -173,11 +213,12 @@ def confirm_plan(plan: MigrationPlan) -> bool:
         console.print("\n[err]This migration cannot proceed.[/err] Nothing has been changed.")
         return False
 
+    # escape(): names may carry '[' etc.; only our own [host]/[count] tags are markup.
     console.print(
-        f"\nThis will STOP {plan.project}/{plan.environment} on "
-        f"[host]{plan.source_server.name}[/host] and move "
+        f"\nThis will STOP {escape(plan.project)}/{escape(plan.environment)} on "
+        f"[host]{escape(plan.source_server.name)}[/host] and move "
         f"[count]{human_bytes(plan.total_bytes)}[/count] to "
-        f"[host]{plan.target_server.name}[/host].",
+        f"[host]{escape(plan.target_server.name)}[/host].",
     )
     if not bool(_ask(questionary.confirm("Proceed?", default=False, style=_STYLE))):
         return False
@@ -200,8 +241,8 @@ def confirm_destructive(plan: MigrationPlan) -> bool:
     console = get_console()
     console.print(
         f"\n[err]--finalize delete[/err] will DELETE the source resources and their "
-        f"volumes on [host]{plan.source_server.name}[/host] after the target is verified.\n"
-        "This is the only irreversible step. Everything else can be rolled back.",
+        f"volumes on [host]{escape(plan.source_server.name)}[/host] after the target is "
+        "verified.\nThis is the only irreversible step. Everything else can be rolled back.",
     )
     typed = _ask(
         questionary.text(

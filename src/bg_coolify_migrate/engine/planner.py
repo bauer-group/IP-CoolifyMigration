@@ -50,14 +50,17 @@ from bg_coolify_migrate.domain.manifest import (
 from bg_coolify_migrate.domain.naming import slugify
 from bg_coolify_migrate.domain.plan import (
     MigrationPlan,
+    ProjectListing,
+    ProjectPlacement,
     ResourcePlan,
+    ResourceRow,
     ResourceSnapshot,
     ServerRef,
     TransferMode,
     select_strategy,
 )
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
-from bg_coolify_migrate.errors import PreflightError
+from bg_coolify_migrate.errors import MigrationError, PreflightError
 from bg_coolify_migrate.transfer.ssh import RemoteHost
 
 log = structlog.get_logger(__name__)
@@ -113,7 +116,10 @@ async def find_project(api: CoolifyClient, name_or_uuid: str) -> dict[str, Any]:
             return project
     raise PreflightError(
         f"no project named {name_or_uuid!r}",
-        hint="Run `coolify-migrate doctor` to see visible projects.",
+        hint=(
+            "Run `coolify-migrate list` to see every project and the server it runs on. "
+            "The name is the project's, not `team/app` — pass just the project name."
+        ),
     )
 
 
@@ -256,6 +262,139 @@ async def environment_resources(
         else:
             take("applications", resource)
     return out
+
+
+def _server_uuid_from_record(record: dict[str, Any], uuid_by_id: dict[Any, str]) -> str | None:
+    """Server uuid for a resource record, without an extra API round trip.
+
+    ``server_uuid_of`` reads the three relation shapes; this adds the numeric
+    ``destination.server_id`` fallback resolved against a prebuilt id->uuid map, so
+    a whole listing needs one ``/servers`` call rather than one ``get_server`` per
+    resource.
+    """
+    uuid = server_uuid_of(record)
+    if uuid:
+        return uuid
+    destination = record.get("destination")
+    server_id = destination.get("server_id") if isinstance(destination, dict) else None
+    if server_id is not None:
+        return uuid_by_id.get(server_id)
+    return None
+
+
+async def list_placements(api: CoolifyClient) -> ProjectListing:
+    """Enumerate every project/environment and the server it runs on. Reads only.
+
+    This is discovery for ``plan``/``run``: an operator cannot name a project they
+    cannot see. ``doctor`` proves the token and lists servers; this answers the
+    other half — *what* can I migrate, and *from where*.
+
+    Reuses :func:`environment_resources`, so the count is the authoritative one
+    (it catches the three database engines Coolify's environment endpoint forgets).
+    Deliberately does NOT require ``read:sensitive``: names and servers are not
+    secret, and forcing the scope here would make simple discovery fail closed.
+    """
+    raw_servers = await api.list_servers()
+    servers = tuple(server_ref(s) for s in raw_servers)
+    uuid_by_id = {
+        s["id"]: str(s["uuid"]) for s in raw_servers if s.get("id") is not None and s.get("uuid")
+    }
+
+    placements: list[ProjectPlacement] = []
+    for project in await api.list_projects():
+        project_uuid = str(project.get("uuid", ""))
+        if not project_uuid:
+            continue
+        project_name = str(project.get("name", project_uuid))
+
+        detail = await api.get_project(project_uuid)
+        env_names = [
+            str(env["name"])
+            for env in detail.get("environments") or []
+            if isinstance(env, dict) and env.get("name")
+        ] or ["production"]
+
+        for environment in env_names:
+            try:
+                resources = await environment_resources(api, project_uuid, environment)
+            except MigrationError:
+                # A missing environment or a transient read is not fatal to the
+                # whole listing — skip this one, keep enumerating the rest.
+                continue
+            if not resources:
+                continue
+
+            collection, first = resources[0]
+            server_uuid = _server_uuid_from_record(first, uuid_by_id)
+            if server_uuid is None:
+                # The environment-list record can omit the destination relation;
+                # the per-resource GET carries it. One extra call, only on miss.
+                full = await api.get_resource(collection, str(first.get("uuid", "")))
+                server_uuid = _server_uuid_from_record(full, uuid_by_id)
+
+            placements.append(
+                ProjectPlacement(
+                    project=project_name,
+                    project_uuid=project_uuid,
+                    environment=environment,
+                    server_uuid=server_uuid or "",
+                    resources=len(resources),
+                )
+            )
+
+    return ProjectListing(placements=tuple(placements), servers=servers)
+
+
+async def list_project_resources(
+    api: CoolifyClient, name_or_uuid: str
+) -> tuple[str, list[ResourceRow]]:
+    """Every resource of one project, across environments. Reads only.
+
+    The drill-down behind ``list <project>``: it surfaces resource names AND uuids
+    so an operator can name one for ``plan``/``run`` — by uuid when two resources in
+    different environments share a name. ``kind`` is the coarse collection, which
+    needs no per-resource fetch; the server is resolved like :func:`list_placements`.
+    """
+    raw_servers = await api.list_servers()
+    name_by_uuid = {str(s.get("uuid")): str(s.get("name", "?")) for s in raw_servers}
+    uuid_by_id = {
+        s["id"]: str(s["uuid"]) for s in raw_servers if s.get("id") is not None and s.get("uuid")
+    }
+
+    project_data = await find_project(api, name_or_uuid)
+    project_name = str(project_data.get("name", name_or_uuid))
+    project_uuid = str(project_data["uuid"])
+
+    detail = await api.get_project(project_uuid)
+    env_names = [
+        str(env["name"])
+        for env in detail.get("environments") or []
+        if isinstance(env, dict) and env.get("name")
+    ] or ["production"]
+
+    rows: list[ResourceRow] = []
+    for environment in env_names:
+        try:
+            resources = await environment_resources(api, project_uuid, environment)
+        except MigrationError:
+            continue
+        for collection, record in resources:
+            server_uuid = _server_uuid_from_record(record, uuid_by_id)
+            if server_uuid is None:
+                full = await api.get_resource(collection, str(record.get("uuid", "")))
+                server_uuid = _server_uuid_from_record(full, uuid_by_id)
+            rows.append(
+                ResourceRow(
+                    environment=environment,
+                    name=str(record.get("name") or record.get("uuid") or "?"),
+                    uuid=str(record.get("uuid", "")),
+                    # Singularise the collection for display: applications -> application.
+                    kind=collection[:-1] if collection.endswith("s") else collection,
+                    server=name_by_uuid.get(server_uuid or "", ""),
+                    server_uuid=server_uuid or "",
+                )
+            )
+    return project_name, rows
 
 
 def _engine_of(collection: str, resource: dict[str, Any]) -> DatabaseEngine | None:
@@ -530,11 +669,17 @@ async def build_plan(
     project: str,
     environment: str,
     target_server: str,
+    only_resource: str | None = None,
     finalize_policy: FinalizePolicy = FinalizePolicy.RENAME,
     transfer_mode: TransferMode = TransferMode.AUTO,
     measure: bool = True,
 ) -> MigrationPlan:
-    """Produce the complete plan. Reads only."""
+    """Produce the complete plan. Reads only.
+
+    ``only_resource`` (a resource name or uuid) narrows the plan to a single
+    resource; the whole environment is planned otherwise. The narrowing is what
+    makes resource-scoped migration safe — see :func:`observed_labels`.
+    """
     project_data = await find_project(api, project)
     project_uuid = str(project_data["uuid"])
     target = await find_server(api, target_server)
@@ -545,6 +690,18 @@ async def build_plan(
             f"no resources in {project}/{environment}",
             hint="Check the environment name (default: production).",
         )
+
+    if only_resource is not None:
+        resources = [
+            (collection, resource)
+            for collection, resource in resources
+            if only_resource in (resource.get("name"), resource.get("uuid"))
+        ]
+        if not resources:
+            raise PreflightError(
+                f"no resource named {only_resource!r} in {project}/{environment}",
+                hint=f"Run `coolify-migrate list {project}` to see its resources.",
+            )
 
     plans: list[ResourcePlan] = []
     source_server: dict[str, Any] | None = None
@@ -614,7 +771,28 @@ async def build_plan(
         resources=tuple(plans),
         finalize_policy=finalize_policy,
         transfer_mode=transfer_mode,
+        # The matched resource's real name, not the user's input, so the label
+        # filter slugifies exactly what Coolify wrote onto the containers.
+        selected_resources=tuple(p.snapshot.name for p in plans) if only_resource else (),
     )
+
+
+async def project_environments(api: CoolifyClient, name_or_uuid: str) -> tuple[str, list[str]]:
+    """A project's real name and its environment names. Reads only.
+
+    Returns ``(project_name, [environment_name, ...])`` — the enumerator a
+    whole-project migration expands over. Falls back to ``["production"]`` for a
+    project whose environments the API does not report, so the default path still
+    works.
+    """
+    project_data = await find_project(api, name_or_uuid)
+    detail = await api.get_project(str(project_data["uuid"]))
+    environments = [
+        str(env["name"])
+        for env in detail.get("environments") or []
+        if isinstance(env, dict) and env.get("name")
+    ]
+    return str(project_data.get("name", name_or_uuid)), environments or ["production"]
 
 
 def stack_labels(plan: MigrationPlan) -> dict[str, str]:
@@ -626,3 +804,20 @@ def stack_labels(plan: MigrationPlan) -> dict[str, str]:
         LABEL_PROJECT: slugify(plan.project),
         LABEL_ENVIRONMENT: slugify(plan.environment),
     }
+
+
+def observed_labels(plan: MigrationPlan) -> dict[str, str]:
+    """Label filter the quiesce/health gates must watch for this plan.
+
+    A resource-scoped run watches ONLY its resource: the siblings it deliberately
+    leaves running would otherwise make the stop gate wait out its timeout, or trip
+    the mid-copy restart check. A whole-environment run watches the stack, exactly
+    as before — so nothing about an unscoped migration changes.
+    """
+    if plan.selected_resources:
+        return resource_labels(
+            project=plan.project,
+            environment=plan.environment,
+            name=plan.selected_resources[0],
+        )
+    return stack_labels(plan)

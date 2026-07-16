@@ -1,6 +1,4 @@
-<!-- AUTO-GENERATED FILE. DO NOT EDIT. Edit docs/README.template.MD instead. -->
-<!-- Generated on 2026-07-16 09:42:47 UTC -->
-
+<!-- AUTO-GENERATED FILE. DO NOT EDIT. Edit docs/README.template.MD instead. Generated 2026-07-16. -->
 # BAUER GROUP - Coolify Migration Toolkit
 
 [![PyPI](https://img.shields.io/pypi/v/bg-coolify-migrate.svg)](https://pypi.org/project/bg-coolify-migrate/)
@@ -22,9 +20,9 @@ external orchestrator has none of those constraints. That is what this is.
 
 ## Repository Information
 
-- **Version:** v1.0.2
+- **Version:** 1.0.2
 - **Repository:** bauer-group/IP-CoolifyMigration
-- **Branch:** main
+- **Branch:** HEAD
 - **Architecture:** Pure-logic cores with thin IO shells; saga engine with a
   crash-safe journal
 
@@ -79,10 +77,17 @@ pip install bg-coolify-migrate
 export COOLIFY_URL="https://coolify.example.com"
 export COOLIFY_TOKEN="..."          # root or read:sensitive
 
-coolify-migrate doctor              # verify token scope + server reachability
-coolify-migrate plan my-project --to target-server   # dry run: no changes
-coolify-migrate run  my-project --to target-server
+coolify-migrate doctor                 # verify token scope + server reachability
+coolify-migrate list                   # projects + the server each runs on
+coolify-migrate list my-project        # that project's resources, with uuids
+
+# Scope with a selector: project / project/environment / project/environment/resource
+coolify-migrate plan my-project --to target-server              # whole project (dry run)
+coolify-migrate run  my-project/production --to target-server   # one environment
+coolify-migrate run  my-project/production/api --to target-server  # one resource
 ```
+
+Omit the selector in a terminal and `plan`/`run` open an interactive picker.
 
 Interrupted? `coolify-migrate resume <id>`. Regret it? `coolify-migrate rollback <id>`.
 

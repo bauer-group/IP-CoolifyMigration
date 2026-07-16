@@ -54,11 +54,19 @@ export COOLIFY_URL="https://coolify.example.com"
 export COOLIFY_TOKEN="..."          # MUST have root or read:sensitive
 
 coolify-migrate doctor                                # verify token + reachability
-coolify-migrate plan my-project --to target-server    # dry run: no changes
-coolify-migrate run  my-project --to target-server
+coolify-migrate list                                  # projects + their server
+coolify-migrate list my-project                       # its resources, with uuids
+
+# Selector depth = scope: project / project/environment / project/environment/resource
+coolify-migrate plan my-project --to target-server              # whole project (dry run)
+coolify-migrate run  my-project/production --to target-server   # one environment
+coolify-migrate run  my-project/production/api --to target-server  # one resource
 ```
 
-Run `doctor` first — it proves the token can actually read secrets before
+`list` shows every project and the server it lives on; `list <project>` drills
+into its resources (with uuids) so you can name one. Omit the selector in a
+terminal to pick interactively. Run `doctor` first — it proves the token can
+actually read secrets before
 anything is touched. See [Installation](installation.md#verify) for the full
 `doctor` contract and [CLI reference](cli.md) for every command and exit code.
 

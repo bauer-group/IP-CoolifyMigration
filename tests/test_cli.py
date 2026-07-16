@@ -6,6 +6,7 @@ asserted explicitly rather than just "did it fail".
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
@@ -14,7 +15,8 @@ import respx
 from typer.testing import CliRunner
 
 from bg_coolify_migrate import __version__
-from bg_coolify_migrate.cli import app
+from bg_coolify_migrate.cli import Selection, _parse_selector, app
+from bg_coolify_migrate.errors import MigrationError
 from bg_coolify_migrate.journal.store import Journal
 from bg_coolify_migrate.observability.logging_setup import reset_logging
 from bg_coolify_migrate.settings.base import reset_settings_cache
@@ -52,6 +54,26 @@ class TestBasics:
         # not an error.
         result = runner.invoke(app, [])
         assert "Usage" in result.stdout
+
+    def test_error_output_tolerates_brackets_in_a_name(self) -> None:
+        # A resource named `api [v2]` reaches the error path as `no resource named
+        # 'api [v2]'`; the '[v2]' must not itself throw a Rich MarkupError.
+        import typer
+
+        from bg_coolify_migrate.cli import _fail
+        from bg_coolify_migrate.errors import PreflightError
+
+        with pytest.raises(typer.Exit):
+            _fail(PreflightError("no resource named 'api [v2]'"))
+
+    @pytest.mark.parametrize("command", ["resume", "rollback", "server"])
+    def test_bare_leaf_command_shows_help_not_a_terse_error(self, command: str) -> None:
+        # A bare command used to answer "Missing argument '…'." — orientation for an
+        # operator who does not yet know the arguments should be the help. (plan/run
+        # are excluded: with no selector on a TTY they open the interactive picker.)
+        result = runner.invoke(app, [command])
+        assert "Usage" in result.stdout
+        assert "Missing argument" not in result.stdout
 
     def test_server_subcommand_help(self) -> None:
         result = runner.invoke(app, ["server", "--help"])
@@ -153,6 +175,149 @@ class TestStatus:
         monkeypatch.setenv("STATE_DIR", str(tmp_path / "state"))
         result = runner.invoke(app, ["status", "nope"])
         assert result.exit_code == 14  # JournalError
+
+
+class TestList:
+    """`list` answers "what can I migrate, and from where" — the discovery step
+    that `doctor` (servers only) and `status` (migrations only) never covered."""
+
+    def _mock_instance(self) -> None:
+        respx.get(f"{BASE}/servers").mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {"uuid": "s1", "name": "prod-1", "ip": "10.0.0.1", "id": 1},
+                    {"uuid": "s2", "name": "spare", "ip": "10.0.0.2", "id": 2},
+                ],
+            )
+        )
+        respx.get(f"{BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx.get(f"{BASE}/projects/p1").mock(
+            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+        )
+        respx.get(f"{BASE}/projects/p1/production").mock(
+            return_value=httpx.Response(
+                200, json={"applications": [{"uuid": "a1", "server_uuid": "s1"}]}
+            )
+        )
+
+    def test_needs_credentials_like_the_others(self) -> None:
+        result = runner.invoke(app, ["list"])
+        assert result.exit_code == 2
+        assert "COOLIFY_URL" in result.stderr
+
+    @respx.mock
+    def test_lists_projects_with_their_server(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COOLIFY_URL", HOST)
+        monkeypatch.setenv("COOLIFY_TOKEN", "tok")
+        self._mock_instance()
+        result = runner.invoke(app, ["list"])
+        assert result.exit_code == 0
+        assert "shop" in result.stdout
+        assert "production" in result.stdout
+        assert "prod-1" in result.stdout
+        # An empty server is still shown — it is a candidate migration target.
+        assert "spare" in result.stdout
+
+    @respx.mock
+    def test_json_is_machine_readable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COOLIFY_URL", HOST)
+        monkeypatch.setenv("COOLIFY_TOKEN", "tok")
+        self._mock_instance()
+        result = runner.invoke(app, ["list", "--json"])
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout)
+        assert payload == [
+            {
+                "server": "prod-1",
+                "server_uuid": "s1",
+                "server_ip": "10.0.0.1",
+                "project": "shop",
+                "project_uuid": "p1",
+                "environment": "production",
+                "resources": 1,
+            }
+        ]
+
+    @respx.mock
+    def test_server_filter_narrows_to_one_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COOLIFY_URL", HOST)
+        monkeypatch.setenv("COOLIFY_TOKEN", "tok")
+        self._mock_instance()
+        result = runner.invoke(app, ["list", "--server", "prod-1"])
+        assert result.exit_code == 0
+        assert "shop" in result.stdout
+        assert "spare" not in result.stdout
+
+    @respx.mock
+    def test_unknown_server_filter_exits_2(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COOLIFY_URL", HOST)
+        monkeypatch.setenv("COOLIFY_TOKEN", "tok")
+        self._mock_instance()
+        result = runner.invoke(app, ["list", "--server", "does-not-exist"])
+        assert result.exit_code == 2
+        assert "no server named" in result.stderr
+
+
+class TestSelector:
+    """`project[/environment[/resource]]` - the three scopes, cleanly selectable."""
+
+    def test_project_only_is_the_whole_project(self) -> None:
+        assert _parse_selector("shop", None) == Selection("shop", None, None)
+
+    def test_project_environment(self) -> None:
+        assert _parse_selector("shop/production", None) == Selection("shop", "production", None)
+
+    def test_project_environment_resource(self) -> None:
+        assert _parse_selector("shop/production/web", None) == Selection("shop", "production", "web")
+
+    def test_environment_override_fills_a_bare_project(self) -> None:
+        assert _parse_selector("shop", "staging") == Selection("shop", "staging", None)
+
+    def test_environment_given_twice_is_rejected(self) -> None:
+        with pytest.raises(MigrationError, match="twice"):
+            _parse_selector("shop/production", "staging")
+
+    def test_too_many_segments_is_rejected(self) -> None:
+        with pytest.raises(MigrationError, match="invalid selector"):
+            _parse_selector("a/b/c/d", None)
+
+    def test_empty_segment_is_rejected(self) -> None:
+        with pytest.raises(MigrationError, match="invalid selector"):
+            _parse_selector("shop//web", None)
+
+
+class TestListResources:
+    """`list <project>` drills into one project's resources, surfacing uuids for an
+    unambiguous project/environment/<uuid> selection."""
+
+    @respx.mock
+    def test_shows_resource_names_and_uuids(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COOLIFY_URL", HOST)
+        monkeypatch.setenv("COOLIFY_TOKEN", "tok")
+        respx.get(f"{BASE}/servers").mock(
+            return_value=httpx.Response(
+                200, json=[{"uuid": "s1", "name": "prod-1", "ip": "10.0.0.1", "id": 1}]
+            )
+        )
+        respx.get(f"{BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx.get(f"{BASE}/projects/p1").mock(
+            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+        )
+        respx.get(f"{BASE}/projects/p1/production").mock(
+            return_value=httpx.Response(
+                200, json={"applications": [{"uuid": "a1", "name": "web", "server_uuid": "s1"}]}
+            )
+        )
+        result = runner.invoke(app, ["list", "shop"])
+        assert result.exit_code == 0
+        assert "web" in result.stdout
+        assert "a1" in result.stdout  # the uuid, for selection
+        assert "prod-1" in result.stdout
 
 
 class TestCommandsRequireCredentials:

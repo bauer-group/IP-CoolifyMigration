@@ -252,3 +252,74 @@ class TestPlainPlan:
 
     def test_includes_warnings(self) -> None:
         assert "warning: postgres: compose comments will be lost" in plain_plan(_plan())
+
+
+class TestMarkupSafety:
+    """Coolify names may contain '[' etc.; rendering them must render the text, not
+    raise a Rich MarkupError (a real crash class we hit on help text and selectors)."""
+
+    @staticmethod
+    def _render(renderable: object) -> str:
+        import io
+
+        console = Console(file=io.StringIO(), width=200, no_color=True, theme=THEME)
+        console.print(renderable)
+        return console.file.getvalue()  # type: ignore[attr-defined]
+
+    def test_plan_render_tolerates_brackets(self) -> None:
+        plan = MigrationPlan(
+            project="shop [staging]",
+            environment="prod [1]",
+            source_server=ServerRef(uuid="s1", name="old [eu]", ip="1.1.1.1"),
+            target_server=ServerRef(uuid="s2", name="new [us]", ip="2.2.2.2"),
+            resources=(
+                ResourcePlan(
+                    snapshot=ResourceSnapshot(
+                        uuid="a1",
+                        name="api [v2]",
+                        collection="databases",
+                        kind=ResourceKind.DATABASE,
+                    ),
+                    strategy=Strategy.RECREATE_ONLY,
+                ),
+            ),
+        )
+        out = self._render(plan_summary(plan)) + self._render(resources_table(plan))
+        assert "api [v2]" in out
+        assert "shop [staging]" in out
+
+    def test_resource_listing_tolerates_brackets(self) -> None:
+        from bg_coolify_migrate.domain.plan import ResourceRow
+        from bg_coolify_migrate.ui.report import resource_rows_table
+
+        rows = [
+            ResourceRow(
+                environment="prod [1]",
+                name="api [v2]",
+                uuid="u1",
+                kind="application",
+                server="srv [x]",
+                server_uuid="s1",
+            )
+        ]
+        assert "api [v2]" in self._render(resource_rows_table("proj [x]", rows))
+
+    def test_grouped_listing_tolerates_brackets_and_shows_uuid(self) -> None:
+        from bg_coolify_migrate.domain.plan import ProjectListing, ProjectPlacement
+        from bg_coolify_migrate.ui.report import listing_group
+
+        listing = ProjectListing(
+            servers=(ServerRef(uuid="s1", name="srv [x]", ip="1.1.1.1"),),
+            placements=(
+                ProjectPlacement(
+                    project="shop [x]",
+                    project_uuid="p1",
+                    environment="prod [1]",
+                    server_uuid="s1",
+                    resources=1,
+                ),
+            ),
+        )
+        out = self._render(listing_group(listing))
+        assert "shop [x]" in out
+        assert "p1" in out  # the uuid, so you can select the project by uuid
