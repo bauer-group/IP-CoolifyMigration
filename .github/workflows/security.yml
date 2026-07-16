@@ -22,7 +22,8 @@ on:
 
 jobs:
   security:
-    uses: bauer-group/automation-templates/.github/workflows/security-management.yml@main
+    uses: bauer-group/automation-templates/.github/workflows/modules-security-scan.yml@main
     with:
-      security-engine: 'both'
+      scan-engine: 'both'
+      scan-type: 'all'
     secrets: inherit
