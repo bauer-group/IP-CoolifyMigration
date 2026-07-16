@@ -33,5 +33,9 @@ jobs:
       build-local-wheel: true
       skip-pypi: ${{ inputs.skip-pypi || false }}
       update-documentation: true
-      update-security-policy: true
+      # SECURITY.MD is rendered by scripts/generate-docs.py from our own
+      # docs/SECURITY.template.MD. The org generator drives off a different
+      # config + placeholder contract we don't use, so it hard-failed the
+      # release with "template not found". We own this file; keep it off.
+      update-security-policy: false
     secrets: inherit
