@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__version__ = "2.5.4"
+__version__ = "2.5.5"
 
 # Name -> submodule, resolved on first attribute access.
 _LAZY: dict[str, str] = {

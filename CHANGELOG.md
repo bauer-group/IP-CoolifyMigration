@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.5.5 (2026-07-16)
+
+### Bug Fixes
+
+- **api**: Kept a domain-less stack domain-less
+  ([`ab097d2`](https://github.com/bauer-group/IP-CoolifyMigration/commit/ab097d2a23f17d561e7c4a2aea3eba5753678ff7))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`5ae15ab`](https://github.com/bauer-group/IP-CoolifyMigration/commit/5ae15ab14c4dacadab59df5e9b12b1d7ee5a8354))
+
+
 ## v2.5.4 (2026-07-16)
 
 ### Bug Fixes
