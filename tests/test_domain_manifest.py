@@ -157,6 +157,47 @@ class TestApiCrossCheck:
         )
         assert manifest.warnings == ()
 
+    def test_declared_storage_with_an_existing_volume_is_migrated_not_skipped(self) -> None:
+        # The GlobaLeaks data-loss case: Coolify declares a persistent storage and
+        # its docker volume exists, but no (running) container mounts it — the
+        # stack's containers are gone. The API is the intent and the volume is the
+        # data, so it MUST be migrated, not warned-and-skipped.
+        manifest = reconcile(
+            docker_mounts=[],
+            api_storages=[
+                ApiStorage(kind="persistent", name="u1_data", mount_path="/var/globaleaks")
+            ],
+            docker_volumes=[DockerVolume(name="u1_data")],
+            uuid_prefixes=frozenset({"u1"}),
+        )
+        assert len(manifest.to_migrate) == 1
+        item = manifest.to_migrate[0]
+        assert item.source_name == "u1_data"
+        assert item.mount_path == "/var/globaleaks"
+        assert item.source_path == "/var/lib/docker/volumes/u1_data/_data"
+        # and it is NOT also reported as an orphan
+        assert manifest.warnings == ()
+
+    def test_declared_persistent_storage_without_a_volume_still_warns(self) -> None:
+        # No volume on disk means nothing to migrate — keep the surfacing warning.
+        manifest = reconcile(
+            docker_mounts=[],
+            api_storages=[ApiStorage(kind="persistent", name="ghost", mount_path="/ghost")],
+            docker_volumes=[],
+        )
+        assert manifest.to_migrate == ()
+        assert any("no container currently mounts" in w for w in manifest.warnings)
+
+    def test_file_storage_is_not_fabricated_into_a_volume_migration(self) -> None:
+        # A file storage is not a docker volume; the safety net must only fire for
+        # persistent volumes, never turn a like-named file mount into a volume copy.
+        manifest = reconcile(
+            docker_mounts=[],
+            api_storages=[ApiStorage(kind="file", name="cfg", mount_path="/etc/x.conf")],
+            docker_volumes=[DockerVolume(name="cfg")],
+        )
+        assert manifest.to_migrate == ()
+
 
 class TestOrphanDetection:
     def test_unattached_coolify_volume_warns(self) -> None:

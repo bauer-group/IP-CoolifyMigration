@@ -259,20 +259,50 @@ def reconcile(
             migrating_names.add(m.name)
 
     # 2. API storages — intent Docker cannot show us.
-    #    A declared storage with no live mount means the compose and Coolify's
-    #    parsed view disagree; that is worth surfacing but is not itself data.
     docker_paths = {m.destination for m in docker_mounts}
+    volumes_by_name = {v.name: v for v in docker_volumes}
     for s in api_storages:
         if s.content_is_placeholder:
             warnings.append(
                 f"file mount at {s.mount_path!r} exceeds the API's 5 MiB content cap "
                 "(or is binary); it will be mirrored with rsync instead of recreated via the API"
             )
-        if s.mount_path not in docker_paths:
-            warnings.append(
-                f"Coolify declares a {s.kind} storage at {s.mount_path!r} that no container "
-                "currently mounts; it will not be migrated"
+        if s.mount_path in docker_paths:
+            continue  # a live mount already covers it (step 1 is the truth)
+
+        # No container mounts it. But if Coolify DECLARES a persistent storage and
+        # its docker volume actually EXISTS, that is data, not noise — migrate it.
+        # This is the safety net for a stack whose containers are gone (a stopped
+        # compose app runs `compose down`, keeping only its volumes) or that
+        # discovery otherwise missed: the API is the intent, `volume ls` is the
+        # residue, and together they are unambiguous. Skipping it silently lost a
+        # live database (GlobaLeaks: 14 MB the plan reported as 0 B).
+        volume = volumes_by_name.get(s.name) if s.name else None
+        if s.kind == "persistent" and volume is not None:
+            items.append(
+                VolumeItem(
+                    mount_class=MountClass.NAMED,
+                    decision=Decision.MIGRATE,
+                    reason=(
+                        "declared persistent storage whose volume exists; migrated even "
+                        "though no container currently mounts it"
+                    ),
+                    source_name=s.name,
+                    source_path=volume_data_path(s.name) if s.name else s.mount_path,
+                    mount_path=s.mount_path,
+                    discovered_from=frozenset(
+                        {DiscoverySource.COOLIFY_API, DiscoverySource.DOCKER_VOLUME_LS}
+                    ),
+                )
             )
+            if s.name:
+                migrating_names.add(s.name)
+            continue
+
+        warnings.append(
+            f"Coolify declares a {s.kind} storage at {s.mount_path!r} that no container "
+            "currently mounts; it will not be migrated"
+        )
 
     # 3. docker volume ls — orphans.
     for v in docker_volumes:

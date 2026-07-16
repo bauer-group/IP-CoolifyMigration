@@ -673,6 +673,13 @@ async def build_plan(
     """
     project_data = await find_project(api, project)
     project_uuid = str(project_data["uuid"])
+    # The label filter that discovers a resource's containers slugifies the
+    # project NAME (Coolify writes coolify.projectName=Str::slug(name)). `project`
+    # here may be a UUID — a resource-scoped run resolves to (project_uuid, ...) —
+    # so we MUST slugify the resolved name, not the raw arg. Getting this wrong
+    # matched no containers, so a volume-bearing stack looked empty and its data
+    # was silently left behind. Found migrating GlobaLeaks by uuid.
+    project_name = str(project_data.get("name") or project)
     target = await find_server(api, target_server)
     # find_server matches against the LIST endpoint, which does not eager-load the
     # `settings` relation (only server-by-uuid does — same reason is_reachable
@@ -710,7 +717,7 @@ async def build_plan(
             source_host,
             collection=collection,
             resource=resource,
-            project=project,
+            project=project_name,
             environment=environment,
         )
 
@@ -771,7 +778,7 @@ async def build_plan(
         target_ref = target_ref.model_copy(update={"wildcard_domain": target_wildcard})
 
     return MigrationPlan(
-        project=str(project_data.get("name", project)),
+        project=project_name,
         environment=environment,
         source_server=source_ref,
         target_server=target_ref,

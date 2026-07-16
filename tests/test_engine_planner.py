@@ -158,3 +158,66 @@ class TestServerRef:
         # The LIST endpoint does not eager-load settings; a missing relation must
         # not crash, it just means "no wildcard known here".
         assert server_ref({"uuid": "u", "ip": "10.0.0.1"}).wildcard_domain == ""
+
+
+# ── build_plan uses the project NAME for the discovery filter ─────────────────
+# Regression for a silent data-loss bug: a resource-scoped run resolves to
+# (project_uuid, ...), and build_plan passed that raw uuid to the container label
+# filter. Coolify labels containers with coolify.projectName=Str::slug(NAME), so
+# slug(uuid) matched nothing, the running stack looked empty, and its volume was
+# left behind (found migrating GlobaLeaks by uuid).
+
+
+class TestBuildPlanProjectName:
+    async def test_discovery_uses_resolved_name_not_the_uuid(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from bg_coolify_migrate.engine import planner
+
+        captured: dict[str, str] = {}
+
+        class _Stop(Exception):
+            pass
+
+        async def fake_find_project(api: Any, project: str) -> dict[str, Any]:
+            # `project` arrives as the UUID for a resource-scoped run.
+            assert project == "PROJ-UUID"
+            return {"uuid": "PROJ-UUID", "name": "01. BAUER GROUP - Prod"}
+
+        async def fake_find_server(api: Any, name: str) -> dict[str, Any]:
+            return {"uuid": "SRV", "name": name, "ip": "1.2.3.4"}
+
+        async def fake_env_resources(
+            api: Any, project_uuid: str, environment: str
+        ) -> list[tuple[str, dict[str, Any]]]:
+            return [("applications", {"uuid": "r1", "name": "app"})]
+
+        async def spy_snapshot(
+            api: Any, source_host: Any, *, collection: str, resource: Any,
+            project: str, environment: str,
+        ) -> None:
+            captured["project"] = project
+            captured["environment"] = environment
+            raise _Stop()
+
+        monkeypatch.setattr(planner, "find_project", fake_find_project)
+        monkeypatch.setattr(planner, "find_server", fake_find_server)
+        monkeypatch.setattr(planner, "environment_resources", fake_env_resources)
+        monkeypatch.setattr(planner, "snapshot_resource", spy_snapshot)
+
+        class FakeApi:
+            async def get_server(self, uuid: str) -> dict[str, Any]:
+                return {"uuid": "SRV", "name": "srv", "ip": "1.2.3.4", "settings": {}}
+
+        with pytest.raises(_Stop):
+            await planner.build_plan(
+                FakeApi(),  # type: ignore[arg-type]
+                object(),  # type: ignore[arg-type]
+                project="PROJ-UUID",
+                environment="production",
+                target_server="srv",
+            )
+
+        # The label filter must slugify the NAME, never the uuid.
+        assert captured["project"] == "01. BAUER GROUP - Prod"
+        assert captured["environment"] == "production"
