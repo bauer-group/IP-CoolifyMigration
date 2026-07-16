@@ -543,6 +543,18 @@ async def create_application(
     # but the create route validates + decodes them as base64.
     _encode_base64_fields(body)
 
+    # A domain-less stack (e.g. one reached only through a cloudflared tunnel)
+    # must STAY domain-less. Coolify auto-generates a wildcard/sslip.io domain
+    # when none is given (autogenerate_domain defaults to true), which would plant
+    # a URL the source never had. Suppress it ONLY when the SOURCE itself had no
+    # domains — not when we merely dropped a server-bound URL we could not remap
+    # (no target wildcard), where the sslip.io fallback is the wanted behaviour.
+    source_has_domains = bool(source.get("fqdn")) or bool(
+        _parse_compose_domains(source.get("docker_compose_domains"))
+    )
+    if not source_has_domains:
+        body["autogenerate_domain"] = False
+
     required = frozenset({"project_uuid", "server_uuid"}) | APPLICATION_ROUTE_REQUIRED[segment]
     _check(body, required, f"application {snapshot.name!r} via {route}")
 

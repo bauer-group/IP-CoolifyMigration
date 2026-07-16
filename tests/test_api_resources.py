@@ -483,6 +483,118 @@ class TestCreateApplication:
         # `domains` must never be sent for a dockercompose app.
         assert "domains" not in body
 
+    async def test_compose_carries_multiple_service_urls_and_an_empty_one(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # The MinIO shape: two services with custom URLs, one with none.
+        import json
+
+        route = respx_mock.post(f"{BASE}/applications/public").mock(
+            return_value=httpx.Response(201, json={"uuid": "a2"})
+        )
+        snapshot = ResourceSnapshot(
+            uuid="a1", name="minio", collection="applications",
+            kind=ResourceKind.APP_GIT_COMPOSE,
+            git_repository="https://github.com/x/y", git_branch="main", git_auth=GitAuth.PUBLIC,
+        )
+        await create_resource(
+            api, snapshot, _placement_wc(),
+            {
+                "git_repository": "https://github.com/x/y", "git_branch": "main",
+                "build_pack": "dockercompose",
+                "docker_compose_domains": json.dumps(
+                    {
+                        "minio-server": {"domain": "https://assets.bauer-group.com"},
+                        "admin-console": {"domain": "https://console.assets.bauer-group.com"},
+                        "minio-init": {"domain": ""},
+                    }
+                ),
+            },
+        )
+        body = json.loads(route.calls[0].request.read())
+        # Both custom URLs carried, the empty service preserved as blank.
+        assert body["docker_compose_domains"] == [
+            {"name": "minio-server", "domain": "https://assets.bauer-group.com"},
+            {"name": "admin-console", "domain": "https://console.assets.bauer-group.com"},
+            {"name": "minio-init", "domain": ""},
+        ]
+        # Domains were sent, so we must NOT suppress auto-generation.
+        assert "autogenerate_domain" not in body
+
+    async def test_domainless_compose_stack_suppresses_autogenerate(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # A stack reached only via a cloudflared tunnel has no domains and must
+        # stay domain-less — Coolify must not auto-generate one.
+        import json
+
+        route = respx_mock.post(f"{BASE}/applications/public").mock(
+            return_value=httpx.Response(201, json={"uuid": "a2"})
+        )
+        snapshot = ResourceSnapshot(
+            uuid="a1", name="tunnel", collection="applications",
+            kind=ResourceKind.APP_GIT_COMPOSE,
+            git_repository="https://github.com/x/y", git_branch="main", git_auth=GitAuth.PUBLIC,
+        )
+        await create_resource(
+            api, snapshot, _placement_wc(),
+            {
+                "git_repository": "https://github.com/x/y", "git_branch": "main",
+                "build_pack": "dockercompose",
+                # no docker_compose_domains at all
+            },
+        )
+        body = json.loads(route.calls[0].request.read())
+        assert body["autogenerate_domain"] is False
+        assert "docker_compose_domains" not in body
+        assert "domains" not in body
+
+    async def test_domained_app_does_not_suppress_autogenerate(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        import json
+
+        route = respx_mock.post(f"{BASE}/applications/public").mock(
+            return_value=httpx.Response(201, json={"uuid": "a2"})
+        )
+        await create_resource(
+            api, _git_build_snapshot(), _placement_wc(),
+            {
+                "git_repository": "https://github.com/x/y", "git_branch": "main",
+                "build_pack": "nixpacks", "fqdn": "https://shop.example.com",
+            },
+        )
+        body = json.loads(route.calls[0].request.read())
+        assert body["domains"] == "https://shop.example.com"
+        assert "autogenerate_domain" not in body  # a domain is set; leave the default
+
+    async def test_dropped_server_bound_url_still_allows_autogenerate_fallback(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # Source HAD a server-bound URL, but the target has no wildcard to place it
+        # on -> we drop it, and Coolify's sslip.io fallback should still be allowed
+        # (this is NOT a genuinely domain-less stack).
+        import json
+
+        route = respx_mock.post(f"{BASE}/applications/public").mock(
+            return_value=httpx.Response(201, json={"uuid": "a2"})
+        )
+        placement = Placement(
+            project_uuid="p", environment_name="production", server_uuid="s",
+            source_wildcard="app.0046-20.cloud.bauer-group.com", target_wildcard=None,
+        )
+        await create_resource(
+            api, _git_build_snapshot(), placement,
+            {
+                "git_repository": "https://github.com/x/y", "git_branch": "main",
+                "build_pack": "nixpacks",
+                "fqdn": "https://x.app.0046-20.cloud.bauer-group.com",
+            },
+        )
+        body = json.loads(route.calls[0].request.read())
+        assert "domains" not in body  # dropped: could not remap
+        assert "autogenerate_domain" not in body  # source HAD a domain -> allow fallback
+
     async def test_missing_git_fields_raise_before_the_round_trip(
         self, api: CoolifyClient
     ) -> None:
