@@ -33,6 +33,7 @@ nav:
   - Home: index.md
   - Get started:
       - Installation: installation.md
+      - Quickstart (venv): quickstart.md
       - Configuration: configuration.md
   - Guides:
       - CLI: cli.md
