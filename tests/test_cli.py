@@ -355,6 +355,73 @@ class TestListResources:
         ]
 
 
+class TestUuidSelection:
+    """`plan`/`run` accept a uuid at the project and resource levels (the ones `list`
+    prints uuids for); the environment is always a name - Coolify has no env uuid."""
+
+    def _settings(self, monkeypatch: pytest.MonkeyPatch) -> object:
+        from bg_coolify_migrate.settings.base import Settings
+
+        monkeypatch.setenv("COOLIFY_URL", HOST)
+        monkeypatch.setenv("COOLIFY_TOKEN", "tok")
+        return Settings()
+
+    @respx.mock
+    async def test_project_uuid_resolves_to_its_name_and_environments(self, api: object) -> None:
+        from bg_coolify_migrate.cli import Selection, _resolve_jobs
+
+        respx.get(f"{BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "prj-9f2a", "name": "bauer-group"}])
+        )
+        respx.get(f"{BASE}/projects/prj-9f2a").mock(
+            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+        )
+        name, jobs = await _resolve_jobs(api, Selection("prj-9f2a", None, None))
+        assert name == "bauer-group"  # resolved from the uuid
+        assert jobs == [("production", None)]
+
+    @respx.mock
+    async def test_resource_uuid_is_matched_not_treated_as_a_name(
+        self, api: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A real resource uuid gets PAST the name/uuid filter and only fails later,
+        # at source-server resolution - proving the uuid matched the resource.
+        from bg_coolify_migrate.cli import _build
+
+        settings = self._settings(monkeypatch)
+        respx.get(f"{BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx.get(f"{BASE}/projects/p1/production").mock(
+            return_value=httpx.Response(
+                200, json={"applications": [{"uuid": "rsc-1a", "name": "web"}]}
+            )
+        )
+        respx.get(f"{BASE}/applications/rsc-1a").mock(
+            return_value=httpx.Response(200, json={"uuid": "rsc-1a"})  # no server relation
+        )
+        with pytest.raises(MigrationError, match="did not report a server"):
+            await _build(api, settings, "shop", "production", "target", "rsc-1a")
+
+    @respx.mock
+    async def test_unknown_resource_uuid_is_rejected_clearly(
+        self, api: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from bg_coolify_migrate.cli import _build
+
+        settings = self._settings(monkeypatch)
+        respx.get(f"{BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx.get(f"{BASE}/projects/p1/production").mock(
+            return_value=httpx.Response(
+                200, json={"applications": [{"uuid": "rsc-1a", "name": "web"}]}
+            )
+        )
+        with pytest.raises(MigrationError, match="no resource named 'nope'"):
+            await _build(api, settings, "shop", "production", "target", "nope")
+
+
 class TestCommandsRequireCredentials:
     """Every mutating command fails closed without a usable token.
 
