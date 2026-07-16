@@ -210,35 +210,62 @@ async def step_assert_app_key(ctx: ServerContext) -> dict[str, Any]:
 
 
 async def step_boot(ctx: ServerContext) -> dict[str, Any]:
-    """Wait for Coolify to come up, then prove decryption actually works.
+    """Wait for Coolify to be READY, then prove decryption actually works.
 
     A matching APP_KEY is necessary but not sufficient — a truncated volume can
     match the key and still be unreadable. Probing beats assuming.
+
+    "Ready", not "running". The container reports ``running`` a second after it
+    starts, but Laravel needs a good while longer to migrate, warm its cache and
+    connect to the database — and until it has, ``artisan tinker`` cannot run at
+    all. Probing on ``running`` read that not-yet-ready state as "the data is
+    corrupt" and rolled back a migration that had in fact succeeded. So we wait
+    for the container's health check to pass, and then poll the probe, treating
+    "cannot answer yet" as a reason to wait rather than to abort.
     """
     import asyncio
 
-    waited = 0.0
-    while waited < 300:
-        result = await ctx.target_host.run("docker ps --filter name=coolify --format '{{.State}}'")
-        if "running" in result.stdout:
+    deadline = asyncio.get_running_loop().time() + 300
+    healthy = False
+    while asyncio.get_running_loop().time() < deadline:
+        status = await ctx.target_host.run(
+            "docker inspect -f '{{.State.Health.Status}}' coolify 2>/dev/null"
+        )
+        if status.stdout.strip() == "healthy":
+            healthy = True
             break
         await asyncio.sleep(5)
-        waited += 5
-    else:
+    if not healthy:
         raise TransferError(
-            "Coolify did not start on the target within 300s",
+            "Coolify did not become healthy on the target within 300s",
             hint="Check `docker logs coolify` there. Your source is intact and fenced-free.",
         )
 
-    if not await appkey.decrypt_probe(ctx.target_host):
-        raise appkey.AppKeyError(
-            "Coolify started but cannot decrypt its own stored values",
-            hint=(
-                "APP_KEY matches, so the key is right but the data is not readable with it. "
-                "The coolify-db volume may be incomplete. Do NOT fence the source."
-            ),
-        )
-    return {"booted": True, "waited": waited}
+    # Poll the probe: NOT_READY is transient (app still warming up even past the
+    # health check); only a probe that RAN and could not decrypt is terminal.
+    probe_deadline = asyncio.get_running_loop().time() + 300
+    while True:
+        result = await appkey.decrypt_probe(ctx.target_host)
+        if result is appkey.ProbeResult.OK:
+            break
+        if result is appkey.ProbeResult.DECRYPT_FAILED:
+            raise appkey.AppKeyError(
+                "Coolify started but cannot decrypt its own stored values",
+                hint=(
+                    "APP_KEY matches, so the key is right but the data is not readable "
+                    "with it. The coolify-db volume may be incomplete. Do NOT fence the "
+                    "source."
+                ),
+            )
+        if asyncio.get_running_loop().time() >= probe_deadline:
+            raise TransferError(
+                "Coolify became healthy but never answered the decrypt probe",
+                hint="`artisan tinker` kept failing on the target. Check `docker logs "
+                "coolify`. Your source is intact and fenced-free.",
+            )
+        await asyncio.sleep(5)
+
+    return {"booted": True}
 
 
 async def step_reconcile(ctx: ServerContext) -> dict[str, Any]:

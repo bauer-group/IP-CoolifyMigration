@@ -15,6 +15,7 @@ from bg_coolify_migrate.server import fencing
 from bg_coolify_migrate.server.appkey import (
     COOLIFY_ENV_PATH,
     AppKeyError,
+    ProbeResult,
     assert_survived,
     decrypt_probe,
     extract_app_key,
@@ -229,31 +230,66 @@ class TestAppKeySurvival:
 class TestDecryptProbe:
     async def test_ok(self, fake_host: FakeHost) -> None:
         fake_host.on(r"artisan tinker", stdout="DECRYPT_OK\n")
-        assert await decrypt_probe(fake_host) is True  # type: ignore[arg-type]
+        assert await decrypt_probe(fake_host) is ProbeResult.OK  # type: ignore[arg-type]
 
-    async def test_empty_instance_is_not_a_failure(self, fake_host: FakeHost) -> None:
+    async def test_empty_instance_is_ok(self, fake_host: FakeHost) -> None:
         fake_host.on(r"artisan tinker", stdout="NO_DATA\n")
-        assert await decrypt_probe(fake_host) is True  # type: ignore[arg-type]
+        assert await decrypt_probe(fake_host) is ProbeResult.OK  # type: ignore[arg-type]
 
-    async def test_decrypt_exception_is_a_failure(self, fake_host: FakeHost) -> None:
-        # A matching key that still cannot decrypt means something else is wrong.
+    async def test_decrypt_exception_is_terminal(self, fake_host: FakeHost) -> None:
+        # Artisan RAN and still could not decrypt — the key and data disagree.
         fake_host.on(r"artisan tinker", stdout="DecryptException: MAC is invalid\n")
-        assert await decrypt_probe(fake_host) is False  # type: ignore[arg-type]
+        assert await decrypt_probe(fake_host) is ProbeResult.DECRYPT_FAILED  # type: ignore[arg-type]
 
-    async def test_command_failure_is_a_failure(self, fake_host: FakeHost) -> None:
+    async def test_command_failure_is_not_ready_not_a_failure(self, fake_host: FakeHost) -> None:
+        """tinker could not run — the app is still booting. Transient, not corrupt.
+
+        This is the distinction that F2 got wrong: it treated "cannot answer yet"
+        as "the data is unreadable" and rolled back a successful migration one
+        second after the container reported running. Now NOT_READY, which the
+        caller polls on rather than aborting.
+        """
         fake_host.on(r"artisan tinker", exit_status=1, stderr="no such container")
-        assert await decrypt_probe(fake_host) is False  # type: ignore[arg-type]
+        assert await decrypt_probe(fake_host) is ProbeResult.NOT_READY  # type: ignore[arg-type]
 
 
 class TestFencing:
-    async def test_stop_docker_verifies_it_actually_stopped(self, fake_host: FakeHost) -> None:
-        # Geczy makes this a prompt and tolerates tar reading a live Postgres.
+    async def test_stop_docker_stops_containers_before_the_daemon(
+        self, fake_host: FakeHost
+    ) -> None:
+        """The containers must be stopped FIRST, then the daemon.
+
+        `systemctl stop docker` stops dockerd, but docker.service ships
+        KillMode=process, so the containers keep running under containerd. Stop
+        only the daemon and Postgres is still writing when the copy starts — a
+        torn snapshot of Coolify's own database. The e2e F2 migration produced
+        exactly that (pg_filenode.map missing, the target DB refusing to boot).
+        """
+        fake_host.on_sequence(
+            r"docker ps -q", [{"stdout": "abc123\ndef456\n"}, {"stdout": ""}]
+        )
+        fake_host.on(r"docker stop -t 60", exit_status=0)
         fake_host.on(r"systemctl stop docker\.socket", exit_status=0)
         fake_host.on(r"systemctl stop docker", exit_status=0)
         fake_host.on(r"systemctl is-active", stdout="inactive\n")
         await fencing.stop_docker(fake_host)  # type: ignore[arg-type]
+        assert any("docker stop -t 60" in c for c in fake_host.commands), (
+            "did not stop the containers before the daemon"
+        )
+
+    async def test_containers_still_running_after_stop_is_fatal(
+        self, fake_host: FakeHost
+    ) -> None:
+        """If a container survives the stop, copying now catches a live database."""
+        fake_host.on_sequence(
+            r"docker ps -q", [{"stdout": "abc123\n"}, {"stdout": "abc123\n"}]
+        )  # STILL running after stop
+        fake_host.on(r"docker stop -t 60", exit_status=0)
+        with pytest.raises(QuiesceError, match="still running"):
+            await fencing.stop_docker(fake_host)  # type: ignore[arg-type]
 
     async def test_docker_still_active_is_fatal(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker ps -q", stdout="")
         fake_host.on(r"systemctl stop docker\.socket", exit_status=0)
         fake_host.on(r"systemctl stop docker", exit_status=0)
         fake_host.on(r"systemctl is-active", stdout="active\n")
@@ -261,6 +297,7 @@ class TestFencing:
             await fencing.stop_docker(fake_host)  # type: ignore[arg-type]
 
     async def test_stop_failure_is_fatal(self, fake_host: FakeHost) -> None:
+        fake_host.on(r"docker ps -q", stdout="")
         fake_host.on(r"systemctl stop docker\.socket", exit_status=0)
         fake_host.on(r"systemctl stop docker", exit_status=1, stderr="unit not found")
         with pytest.raises(QuiesceError, match="could not stop Docker"):

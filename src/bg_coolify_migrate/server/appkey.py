@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import re
 import shlex
+from enum import StrEnum
 
 import structlog
 
@@ -181,12 +182,34 @@ async def add_previous_key(host: RemoteHost, previous: str) -> None:
     log.info("appkey.previous_added", fingerprint=fingerprint(previous))
 
 
-async def decrypt_probe(host: RemoteHost) -> bool:
+class ProbeResult(StrEnum):
+    """Three outcomes, and the distinction is load-bearing.
+
+    NOT_READY and DECRYPT_FAILED both mean "no decrypted value came back", but one
+    is transient and one is terminal. Conflating them is what made F2 abort a
+    successful migration: it probed one second after the container reported
+    ``running`` — long before Laravel had finished booting — so ``artisan
+    tinker`` could not run at all, and that was read as "the data is corrupt".
+    """
+
+    OK = "ok"
+    """A stored value decrypted, or there was nothing to decrypt (empty instance)."""
+    NOT_READY = "not_ready"
+    """Coolify's app is not up enough to answer yet. Retry — do not conclude."""
+    DECRYPT_FAILED = "decrypt_failed"
+    """Artisan RAN and could not read a value. Terminal: the key/data disagree."""
+
+
+async def decrypt_probe(host: RemoteHost) -> ProbeResult:
     """Prove decryption works, rather than assuming it from a matching key.
 
     Asks Coolify's own Artisan to decrypt a stored value. A matching APP_KEY that
     still cannot decrypt means something else is wrong (a truncated volume, a
     mismatched cipher), and finding that out now beats finding it out from a user.
+
+    Distinguishes "the app cannot answer yet" from "the app answered and the data
+    is unreadable" — see ProbeResult. The caller polls; only DECRYPT_FAILED is a
+    reason to abort.
     """
     result = await host.run(
         "docker exec coolify php artisan tinker --execute="
@@ -197,16 +220,15 @@ async def decrypt_probe(host: RemoteHost) -> bool:
         timeout=60,
     )
     if not result.ok:
-        log.warning("appkey.probe_failed", stderr=result.stderr[:200])
-        return False
+        # tinker itself could not run — app still booting, DB not connected yet.
+        # Transient, not evidence about the data.
+        log.debug("appkey.probe.not_ready", stderr=result.stderr[:200])
+        return ProbeResult.NOT_READY
 
-    if "DECRYPT_OK" in result.stdout:
-        log.info("appkey.probe.ok")
-        return True
-    if "NO_DATA" in result.stdout:
-        # Nothing encrypted to test against — an empty instance. Not a failure.
-        log.info("appkey.probe.no_data")
-        return True
+    if "DECRYPT_OK" in result.stdout or "NO_DATA" in result.stdout:
+        log.info("appkey.probe.ok", empty="NO_DATA" in result.stdout)
+        return ProbeResult.OK
 
+    # Artisan ran and produced neither marker: a decrypt exception. Terminal.
     log.error("appkey.probe.decrypt_failed", output=result.stdout[:200])
-    return False
+    return ProbeResult.DECRYPT_FAILED

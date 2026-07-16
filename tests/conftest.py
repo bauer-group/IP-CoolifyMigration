@@ -49,6 +49,27 @@ class FakeHost:
         self._routes.append((compiled, responder))
         return self
 
+    def on_sequence(self, pattern: str, results: list[dict[str, object]]) -> FakeHost:
+        """Answer a repeated command differently on each call — the last repeats.
+
+        For a command that is legitimately run more than once and expected to
+        change between calls, like `docker ps -q` before and after a stop.
+        """
+        compiled = re.compile(pattern)
+        queue = list(results)
+
+        def responder(command: str) -> CommandResult:
+            spec = queue.pop(0) if len(queue) > 1 else queue[0]
+            return CommandResult(
+                command=command,
+                exit_status=int(spec.get("exit_status", 0)),  # type: ignore[arg-type]
+                stdout=str(spec.get("stdout", "")),
+                stderr=str(spec.get("stderr", "")),
+            )
+
+        self._routes.append((compiled, responder))
+        return self
+
     async def run(
         self, command: str, *, timeout: float | None = None, input_text: str | None = None
     ) -> CommandResult:

@@ -80,16 +80,41 @@ async def is_fenced(host: RemoteHost) -> bool:
 
 
 async def stop_docker(host: RemoteHost) -> None:
-    """Stop the Docker daemon entirely. F2's quiesce.
+    """Quiesce the source: stop the CONTAINERS cleanly, then the daemon.
 
-    Non-negotiable and verified, unlike Geczy's prompt: tarring a live Postgres
-    data directory is one keystroke away there, and
-    ``--warning=no-file-changed`` explicitly tolerates the files changing
-    underneath it. A torn snapshot of the Coolify database means a Coolify that
-    boots into an inconsistent state.
+    The order and the container step are the whole point. `systemctl stop docker`
+    stops dockerd, but the standard docker.service ships `KillMode=process`, so
+    the containers keep running under containerd after the daemon is gone. Stop
+    the daemon alone and Postgres is STILL WRITING when the copy begins — a torn
+    snapshot of Coolify's own database, exactly what this step exists to prevent
+    and exactly what an earlier version produced (`pg_filenode.map` missing on
+    the target, the DB refusing to start). Verifying the daemon stopped is not
+    enough; the daemon was never the thing writing to the volume.
+
+    So: `docker stop` every container with a real grace period, so Postgres runs
+    its shutdown checkpoint; verify none are left running; only then stop the
+    daemon so /var/lib/docker is quiescent for the copy.
     """
     from bg_coolify_migrate.errors import QuiesceError
 
+    running = await host.run("docker ps -q")
+    ids = running.stdout.split()
+    if ids:
+        # -t 60: give Postgres time to checkpoint and flush. A SIGKILL here would
+        # leave the very tear we are trying to avoid.
+        await host.run(f"docker stop -t 60 {' '.join(ids)}", timeout=120)
+
+    still = await host.run("docker ps -q")
+    if still.stdout.strip():
+        raise QuiesceError(
+            f"containers still running on {host.target.host} after docker stop",
+            hint=(
+                "They must be stopped before /var/lib/docker is copied, or the copy "
+                "catches a live database mid-write. Something is restarting them."
+            ),
+        )
+
+    # Now the daemon, so the volume tree does not change under rsync.
     await host.run("systemctl stop docker.socket 2>/dev/null")
     result = await host.run("systemctl stop docker")
     if not result.ok:
@@ -105,7 +130,7 @@ async def stop_docker(host: RemoteHost) -> None:
             f"Docker is still active on {host.target.host} after being asked to stop",
             hint="Something is restarting it. Copying now would produce a torn snapshot.",
         )
-    log.info("fencing.docker_stopped", host=host.target.host)
+    log.info("fencing.docker_stopped", host=host.target.host, containers_stopped=len(ids))
 
 
 async def start_docker(host: RemoteHost) -> None:
