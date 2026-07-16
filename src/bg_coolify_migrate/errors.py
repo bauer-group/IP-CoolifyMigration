@@ -38,6 +38,15 @@ class PreflightError(MigrationError):
     exit_code = 2
 
 
+class EmptyEnvironment(PreflightError):
+    """An environment has no resources to migrate.
+
+    A distinct type so a whole-project run can SKIP an empty environment and carry
+    on, without also swallowing real failures (a host key not trusted, a server
+    that would not resolve) into the same "nothing to plan" bucket.
+    """
+
+
 class DnsGateBlocked(MigrationError):
     """A live FQDN still resolves to the source, so the target must not start.
 

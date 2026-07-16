@@ -484,10 +484,11 @@ class TestResolveJobs:
         )
         name, jobs = await _resolve_jobs(api, Selection("shop", None, None))
         assert name == "shop"
-        assert jobs == [("production", None), ("staging", None)]
+        # jobs are (project, environment, resource)
+        assert jobs == [("shop", "production", None), ("shop", "staging", None)]
 
     @respx.mock
-    async def test_resource_scope_is_a_single_job(self, api: CoolifyClient) -> None:
+    async def test_explicit_path_is_a_single_job(self, api: CoolifyClient) -> None:
         from bg_coolify_migrate.cli import Selection, _resolve_jobs
 
         respx.get(f"{_BASE}/projects").mock(
@@ -499,4 +500,46 @@ class TestResolveJobs:
             )
         )
         _name, jobs = await _resolve_jobs(api, Selection("shop", "production", "web"))
-        assert jobs == [("production", "web")]
+        assert jobs == [("shop", "production", "web")]
+
+    @respx.mock
+    async def test_bare_resource_uuid_resolves_to_its_project_and_environment(
+        self, api: CoolifyClient
+    ) -> None:
+        # The real bug: a bare resource uuid (copied from `list`) was parsed as a
+        # project and failed. It must resolve to the resource anywhere.
+        from bg_coolify_migrate.cli import Selection, _resolve_jobs
+
+        respx.get(f"{_BASE}/servers").mock(
+            return_value=httpx.Response(
+                200, json=[{"uuid": "s1", "name": "0047-20", "ip": "10.0.0.1", "id": 1}]
+            )
+        )
+        respx.get(f"{_BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "02. BAUER GROUP"}])
+        )
+        respx.get(f"{_BASE}/projects/p1").mock(
+            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+        )
+        respx.get(f"{_BASE}/projects/p1/production").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "applications": [
+                        {"uuid": "rsc-abc", "name": "alam00000/bentopdf", "server_uuid": "s1"}
+                    ]
+                },
+            )
+        )
+        name, jobs = await _resolve_jobs(api, Selection("rsc-abc", None, None))
+        assert name == "02. BAUER GROUP"
+        assert jobs == [("p1", "production", "rsc-abc")]  # project uuid, env, resource uuid
+
+    @respx.mock
+    async def test_unknown_bare_token_is_rejected(self, api: CoolifyClient) -> None:
+        from bg_coolify_migrate.cli import Selection, _resolve_jobs
+
+        respx.get(f"{_BASE}/servers").mock(return_value=httpx.Response(200, json=[]))
+        respx.get(f"{_BASE}/projects").mock(return_value=httpx.Response(200, json=[]))
+        with pytest.raises(MigrationError, match="no project or resource matches"):
+            await _resolve_jobs(api, Selection("does-not-exist", None, None))

@@ -378,7 +378,7 @@ class TestUuidSelection:
         )
         name, jobs = await _resolve_jobs(api, Selection("prj-9f2a", None, None))
         assert name == "bauer-group"  # resolved from the uuid
-        assert jobs == [("production", None)]
+        assert jobs == [("prj-9f2a", "production", None)]  # (project, environment, resource)
 
     @respx.mock
     async def test_resource_uuid_is_matched_not_treated_as_a_name(
@@ -420,6 +420,60 @@ class TestUuidSelection:
         )
         with pytest.raises(MigrationError, match="no resource named 'nope'"):
             await _build(api, settings, "shop", "production", "target", "nope")
+
+    @respx.mock
+    async def test_empty_environment_raises_the_skippable_type(
+        self, api: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from bg_coolify_migrate.cli import _build
+        from bg_coolify_migrate.errors import EmptyEnvironment
+
+        settings = self._settings(monkeypatch)
+        respx.get(f"{BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx.get(f"{BASE}/projects/p1/production").mock(
+            return_value=httpx.Response(200, json={"applications": [], "services": []})
+        )
+        with pytest.raises(EmptyEnvironment):
+            await _build(api, settings, "shop", "production", "target", None)
+
+
+class TestPlanSurfacesRealErrors:
+    """Regression: a real failure on a single-scope plan (host key not trusted, no
+    server) must surface - never be buried under "nothing to plan"."""
+
+    @respx.mock
+    def test_real_error_is_not_swallowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import bg_coolify_migrate.cli as cli_mod
+        from bg_coolify_migrate.errors import PreflightError
+
+        monkeypatch.setenv("COOLIFY_URL", HOST)
+        monkeypatch.setenv("COOLIFY_TOKEN", "tok")
+        # assert_can_read_sensitive passes: a security key with a private_key.
+        respx.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "k1", "private_key": "-----BEGIN"}])
+        )
+
+        async def _selection(*_a: object, **_k: object) -> object:
+            return Selection("shop", "production", "web"), "target"
+
+        async def _jobs(*_a: object, **_k: object) -> object:
+            return "shop", [("shop", "production", "web")]
+
+        async def _boom(*_a: object, **_k: object) -> object:
+            raise PreflightError(
+                "host key for root@0046-20:22 is not known and was not accepted"
+            )
+
+        monkeypatch.setattr(cli_mod, "_resolve_selection", _selection)
+        monkeypatch.setattr(cli_mod, "_resolve_jobs", _jobs)
+        monkeypatch.setattr(cli_mod, "_build", _boom)
+
+        result = runner.invoke(app, ["plan", "shop/production/web", "--to", "target"])
+        assert result.exit_code == 2
+        assert "host key" in result.stderr  # the real error, not "nothing to plan"
+        assert "nothing to plan" not in result.stderr
 
 
 class TestCommandsRequireCredentials:

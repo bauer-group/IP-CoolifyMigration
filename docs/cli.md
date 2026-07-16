@@ -30,14 +30,22 @@ higher levels just decide which resources are in scope. Pick a level with the
 | `bauer-group` | The **whole project** — every environment, every resource. |
 | `bauer-group/production` | One **environment** and all its resources (stops together). |
 | `bauer-group/production/whistleblower-app` | One **resource**; its siblings keep running. |
+| `<resource-uuid>` | The **resource** with that uuid, wherever it lives — paste it straight from `list`. |
 
-Each segment is matched by **name or uuid**, so a resource whose name is ambiguous
-can be named by uuid: `bauer-group/production/<uuid>`. `--environment` is an
-override for a bare-project selector (`plan bauer-group --environment staging`).
+Each segment is matched by **name or uuid**. A **bare token** is resolved the way
+you'd expect after copying it from `list`: if it names a project it migrates the
+whole project; otherwise it's looked up as a resource anywhere and migrates just
+that one. `--environment` overrides the environment for a bare-project selector
+(`plan bauer-group --environment staging`).
 
 Migrating one resource stops only that resource on the source; the rest of the
 environment stays up. A whole-project run migrates each environment in turn and
 stops at the first failure, leaving later environments untouched.
+
+The first time `plan`/`run` reach a server, its SSH host key is unknown and the run
+stops with a clear message rather than trusting blindly. Verify the fingerprint,
+then pass **`--trust-host-key`** to record it (trust on first use). Host-key
+checking is never disabled.
 
 ### Interactive picker
 

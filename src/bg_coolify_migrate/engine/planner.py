@@ -58,7 +58,7 @@ from bg_coolify_migrate.domain.plan import (
     select_strategy,
 )
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
-from bg_coolify_migrate.errors import MigrationError, PreflightError
+from bg_coolify_migrate.errors import EmptyEnvironment, MigrationError, PreflightError
 from bg_coolify_migrate.transfer.ssh import RemoteHost
 
 log = structlog.get_logger(__name__)
@@ -669,7 +669,7 @@ async def build_plan(
 
     resources = await environment_resources(api, project_uuid, environment)
     if not resources:
-        raise PreflightError(
+        raise EmptyEnvironment(
             f"no resources in {project}/{environment}",
             hint="Check the environment name (default: production).",
         )

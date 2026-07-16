@@ -38,7 +38,7 @@ from rich.text import Text
 from bg_coolify_migrate import __version__
 from bg_coolify_migrate.domain.plan import MigrationPlan, TransferMode
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
-from bg_coolify_migrate.errors import MigrationError, PreflightError
+from bg_coolify_migrate.errors import EmptyEnvironment, MigrationError, PreflightError
 from bg_coolify_migrate.observability.logging_setup import setup_logging
 from bg_coolify_migrate.settings.base import Settings
 from bg_coolify_migrate.ui.console import get_console, is_interactive
@@ -369,27 +369,66 @@ async def _pick(api: object, target: str | None) -> tuple[Selection, str]:
     return Selection(project=project_name, environment=environment, resource=resource), target
 
 
+async def _project_or_none(api: object, name_or_uuid: str) -> dict[str, Any] | None:
+    """The project matching a name or uuid, or None. Does not raise."""
+    for project in await api.list_projects():  # type: ignore[attr-defined]
+        if name_or_uuid in (project.get("uuid"), project.get("name")):
+            return project  # type: ignore[no-any-return]
+    return None
+
+
 async def _resolve_jobs(
     api: object, selection: Selection
-) -> tuple[str, list[tuple[str, str | None]]]:
-    """Expand a selection into ``(project_name, [(environment, resource|None), ...])``.
+) -> tuple[str, list[tuple[str, str, str | None]]]:
+    """Expand a selection into ``(display_name, [(project, environment, resource), ...])``.
 
-    A whole-project selection fans out to one job per environment; each job is then
-    a normal environment/resource migration.
+    A bare token is resolved the way an operator expects when they paste a uuid from
+    ``list``: if it names a **project** it fans out to every environment; otherwise it
+    is looked up as a **resource** anywhere and migrates just that one. An explicit
+    ``project/environment[/resource]`` path is trusted as given.
     """
-    from bg_coolify_migrate.engine.planner import project_environments
+    from bg_coolify_migrate.engine.planner import list_all_resources, project_environments
 
-    project_name, all_environments = await project_environments(api, selection.project)  # type: ignore[arg-type]
-    environments = [selection.environment] if selection.environment is not None else all_environments
-    return project_name, [(environment, selection.resource) for environment in environments]
+    # Explicit path — the environment was named, so trust project/env[/resource].
+    if selection.environment is not None:
+        name, _envs = await project_environments(api, selection.project)  # type: ignore[arg-type]
+        return name, [(selection.project, selection.environment, selection.resource)]
+
+    # Single token: a project (whole-project), or a resource anywhere?
+    project = await _project_or_none(api, selection.project)
+    if project is not None:
+        name = str(project.get("name", selection.project))
+        _n, environments = await project_environments(api, selection.project)  # type: ignore[arg-type]
+        return name, [(selection.project, environment, None) for environment in environments]
+
+    rows, _servers = await list_all_resources(api)  # type: ignore[arg-type]
+    matches = [row for row in rows if selection.project in (row.uuid, row.name)]
+    if not matches:
+        raise PreflightError(
+            f"no project or resource matches {selection.project!r}",
+            hint="Run `coolify-migrate list` to see projects and resources with their uuids.",
+        )
+    if len(matches) > 1:
+        where = ", ".join(f"{m.project}/{m.environment}" for m in matches)
+        raise PreflightError(
+            f"{selection.project!r} matches {len(matches)} resources ({where})",
+            hint="Name it by its uuid (unique), or as project/environment/<name>.",
+        )
+    row = matches[0]
+    return row.project, [(row.project_uuid, row.environment, row.uuid)]
 
 
 # ── plan ─────────────────────────────────────────────────────────────────────
 
 
 _SELECTOR_HELP = (
-    "project, project/environment, or project/environment/resource - name or uuid "
-    "at each level. Omit in a terminal to pick interactively."
+    "project, project/environment, project/environment/resource, or a resource uuid - "
+    "name or uuid. Omit in a terminal to pick interactively."
+)
+
+_TRUST_HOST_KEY_HELP = (
+    "Record an unseen SSH host key instead of refusing (trust on first use). Needed "
+    "the first time you reach a server; verify the fingerprint out of band."
 )
 
 
@@ -397,11 +436,17 @@ _SELECTOR_HELP = (
 def plan(
     selector: Annotated[str | None, typer.Argument(help=_SELECTOR_HELP)] = None,
     to: Annotated[
-        str | None, typer.Option(help="Target server (name or uuid). Omit in a terminal to pick.")
+        str | None,
+        typer.Option(
+            "--to", "--to-server", help="Target server (name or uuid). Omit in a terminal to pick."
+        ),
     ] = None,
     environment: Annotated[
         str | None, typer.Option(help="Environment override when the selector names only a project.")
     ] = None,
+    trust_host_key: Annotated[
+        bool, typer.Option("--trust-host-key", help=_TRUST_HOST_KEY_HELP)
+    ] = False,
     output: Annotated[
         Path | None, typer.Option(help="Write the plan JSON here (single-scope only).")
     ] = None,
@@ -411,13 +456,13 @@ def plan(
     """Produce a migration plan. Reads only - nothing is changed.
 
     Scope it with the selector: a project (all environments), a project/environment,
-    or a project/environment/resource. Exercises preflight, discovery, volume
-    pairing, the drift gate and the DNS gate. If `plan` is clean, `run` has already
-    had its risky decisions made.
+    a project/environment/resource, or just a resource's uuid. Exercises preflight,
+    discovery, volume pairing, the drift gate and the DNS gate. If `plan` is clean,
+    `run` has already had its risky decisions made.
     """
     settings = _settings(log_level, log_format)
     try:
-        asyncio.run(_plan(settings, selector, to, environment, output))
+        asyncio.run(_plan(settings, selector, to, environment, output, trust_host_key))
     except MigrationError as exc:
         _fail(exc)
 
@@ -428,6 +473,7 @@ async def _plan(
     target: str | None,
     environment_override: str | None,
     output: Path | None,
+    trust_host_key: bool = False,
 ) -> None:
     from bg_coolify_migrate.api.client import CoolifyClient
     from bg_coolify_migrate.ui import wizard
@@ -447,18 +493,22 @@ async def _plan(
             return
         project_name, jobs = await _resolve_jobs(api, selection)
 
-        for job_environment, job_resource in jobs:
+        for job_project, job_environment, job_resource in jobs:
             try:
                 plans.append(
                     await _build(
-                        api, settings, selection.project, job_environment, resolved_target, job_resource
+                        api, settings, job_project, job_environment, resolved_target,
+                        job_resource, trust_host_key,
                     )
                 )
-            except PreflightError as exc:
-                # An empty environment in a whole-project scan is normal - note and
-                # keep going rather than failing the whole listing.
+            except EmptyEnvironment:
+                # Only an empty environment is skippable, and only while scanning a
+                # whole project. A single scope, or any real failure (host key, no
+                # server), must surface - never be buried under "nothing to plan".
+                if len(jobs) == 1:
+                    raise
                 console.print(
-                    Text(f"skip {project_name}/{job_environment}: {exc}", style="muted")
+                    Text(f"skip {project_name}/{job_environment}: no resources", style="muted")
                 )
 
     if not plans:
@@ -524,6 +574,7 @@ async def _build(
     environment: str,
     target: str,
     only_resource: str | None = None,
+    trust_host_key: bool = False,
 ) -> MigrationPlan:
     """Open SSH to the source and build the plan for one environment.
 
@@ -544,7 +595,7 @@ async def _build(
     project_data = await find_project(api, project)  # type: ignore[arg-type]
     resources = await environment_resources(api, str(project_data["uuid"]), environment)  # type: ignore[arg-type]
     if not resources:
-        raise PreflightError(f"no resources in {project}/{environment}")
+        raise EmptyEnvironment(f"no resources in {project}/{environment}")
     if only_resource is not None:
         resources = [
             (collection, resource)
@@ -569,7 +620,7 @@ async def _build(
     async with RemoteHost.connect(
         ssh,
         known_hosts=settings.resolved_known_hosts(),
-        trust_new_host_key=settings.trust_host_key,
+        trust_new_host_key=trust_host_key or settings.trust_host_key,
         connect_timeout=settings.ssh_timeout,
     ) as source_host:
         return await build_plan(
@@ -590,7 +641,10 @@ async def _build(
 def run(
     selector: Annotated[str | None, typer.Argument(help=_SELECTOR_HELP)] = None,
     to: Annotated[
-        str | None, typer.Option(help="Target server (name or uuid). Omit in a terminal to pick.")
+        str | None,
+        typer.Option(
+            "--to", "--to-server", help="Target server (name or uuid). Omit in a terminal to pick."
+        ),
     ] = None,
     environment: Annotated[
         str | None, typer.Option(help="Environment override when the selector names only a project.")
@@ -611,14 +665,17 @@ def run(
     delete_previews: Annotated[
         bool, typer.Option(help="Delete preview deployments first (they block the copy).")
     ] = False,
+    trust_host_key: Annotated[
+        bool, typer.Option("--trust-host-key", help=_TRUST_HOST_KEY_HELP)
+    ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
     log_level: Annotated[str, typer.Option(help="DEBUG|INFO|WARNING|ERROR")] = "INFO",
     log_format: Annotated[str, typer.Option(help="console|json")] = "console",
 ) -> None:
     """Execute a migration.
 
-    Scope it with the selector, exactly like `plan`: a resource, a whole
-    environment, or a whole project (every environment, migrated in turn).
+    Scope it with the selector, exactly like `plan`: a resource (name or uuid), a
+    whole environment, or a whole project (every environment, migrated in turn).
     """
     settings = _settings(log_level, log_format)
     try:
@@ -639,6 +696,7 @@ def run(
                 policy=policy,
                 accept_drift=accept_drift,
                 delete_previews=delete_previews,
+                trust_host_key=trust_host_key,
                 assume_yes=yes,
             )
         )
@@ -657,6 +715,7 @@ async def _run(
     policy: FinalizePolicy,
     accept_drift: bool,
     delete_previews: bool,
+    trust_host_key: bool = False,
     assume_yes: bool,
 ) -> int:
     from bg_coolify_migrate.api.client import CoolifyClient
@@ -679,15 +738,20 @@ async def _run(
         project_name, jobs = await _resolve_jobs(api, selection)
 
         plans: list[MigrationPlan] = []
-        for job_environment, job_resource in jobs:
+        for job_project, job_environment, job_resource in jobs:
             try:
                 plan = await _build(
-                    api, settings, selection.project, job_environment, resolved_target, job_resource
+                    api, settings, job_project, job_environment, resolved_target,
+                    job_resource, trust_host_key,
                 )
                 plans.append(plan.model_copy(update={"finalize_policy": policy}))
-            except PreflightError as exc:
+            except EmptyEnvironment:
+                # Only skip a genuinely empty environment, and only across a whole
+                # project. Anything else (host key, no server) must surface.
+                if len(jobs) == 1:
+                    raise
                 console.print(
-                    Text(f"skip {project_name}/{job_environment}: {exc}", style="muted")
+                    Text(f"skip {project_name}/{job_environment}: no resources", style="muted")
                 )
 
         if not plans:
