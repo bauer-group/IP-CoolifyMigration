@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.1.2 (2026-07-16)
+
+### Bug Fixes
+
+- **ssh**: Interactive host-key prompt and working TOFU
+  ([`526ab0b`](https://github.com/bauer-group/IP-CoolifyMigration/commit/526ab0b28123404b9aef4675a35fefcd270982b8))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`dc49e07`](https://github.com/bauer-group/IP-CoolifyMigration/commit/dc49e07203d13f347cb83490e911612400f237df))
+
+
 ## v2.1.1 (2026-07-16)
 
 ### Bug Fixes
