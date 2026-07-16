@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.1.0 (2026-07-16)
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`cc85672`](https://github.com/bauer-group/IP-CoolifyMigration/commit/cc856725421eaa9d88dde5f4740a194c3a53939a))
+
+### Features
+
+- **cli**: Recursive listing, fixed prompt crash
+  ([`a3bb1c4`](https://github.com/bauer-group/IP-CoolifyMigration/commit/a3bb1c44535fda27b569e77e67a31948a1418cd8))
+
+
 ## v2.0.0 (2026-07-16)
 
 ### Documentation
