@@ -6,5 +6,7 @@
 # Binary / generated artefacts left untouched
 *.png binary
 *.ico binary
+
+# Generated files that are text but should not be normalised
 *.svg text eol=lf
 uv.lock text eol=lf
