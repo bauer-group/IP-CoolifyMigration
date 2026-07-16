@@ -24,12 +24,28 @@ log = structlog.get_logger(__name__)
 
 
 async def undo_create_target(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
-    """Delete the resources we created.
+    """Delete the resources we created and restore any parked source domains.
 
     ``delete_volumes=True`` is correct here and only here: these are volumes WE
     created on the target minutes ago. The source's volumes are never touched by
     a rollback.
     """
+    # Un-park FIRST and best-effort: create_target renamed the source's custom
+    # domains to free them, and the source needs its real domain back regardless
+    # of whether the target deletes cleanly. A failure here must not stop that.
+    parked: dict[str, dict[str, Any]] = undo_info.get("parked_domains") or {}
+    for source_uuid, restore_body in parked.items():
+        try:
+            collection = ctx.collection_of(source_uuid)
+            await ctx.api.update_resource(collection, source_uuid, restore_body)
+            log.info("compensate.source_domains_restored", uuid=source_uuid)
+        except Exception as exc:
+            log.error(
+                "compensate.source_domains_restore_failed",
+                uuid=source_uuid,
+                error=str(exc)[:200],
+            )
+
     target_uuids: dict[str, str] = undo_info.get("target_uuids") or {}
     if not target_uuids:
         return

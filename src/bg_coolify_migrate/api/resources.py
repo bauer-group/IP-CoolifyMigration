@@ -379,6 +379,74 @@ def _blank_compose_domains(raw: object) -> list[dict[str, str]] | None:
     return [{"name": name, "domain": ""} for name in parsed]
 
 
+def _park_hosts(domain_str: object, *, source_wildcard: str | None, tag: str) -> str:
+    """Rename the CUSTOM hosts in a comma-separated domain string. PURE.
+
+    A custom host (``speakup.bauer-group.com``) is the same on source and target,
+    so creating the target 409s while the source still holds it. Prefixing an
+    ``old-<tag>.`` marker frees the real host for the target; the source keeps
+    serving the real one until quiesce (we do not redeploy it). Server-bound hosts
+    are remapped onto the target's wildcard and never collide, so they pass
+    through untouched.
+    """
+    if not domain_str:
+        return ""
+    out: list[str] = []
+    for part in str(domain_str).split(","):
+        stripped = part.strip()
+        if not stripped:
+            continue
+        host = normalise_host(stripped)
+        if host and not dns_wildcard.under_wildcard(host, source_wildcard):
+            out.append(f"https://old-{tag}.{host}")
+        else:
+            out.append(stripped)
+    return ",".join(out)
+
+
+async def park_source_domains(
+    api: CoolifyClient,
+    snapshot: ResourceSnapshot,
+    source: dict[str, Any],
+    *,
+    source_wildcard: str | None,
+    tag: str,
+) -> dict[str, Any] | None:
+    """Free the source's custom domains so the target can claim them.
+
+    Coolify 409s ("Domain conflicts detected") when a create asks for a domain
+    another resource already holds. So before creating the target we rename the
+    source's custom domains with an ``old-<tag>`` marker (in Coolify's DB only —
+    the running source is not redeployed, so it keeps serving the real domain
+    until quiesce). Returns the body that restores the originals, for the rollback
+    compensation, or ``None`` when there was nothing custom to park.
+    """
+    if snapshot.kind is ResourceKind.APP_GIT_COMPOSE:
+        parsed = _parse_compose_domains(source.get("docker_compose_domains"))
+        if not parsed:
+            return None
+        original = [{"name": name, "domain": domain} for name, domain in parsed.items()]
+        parked = [
+            {"name": name, "domain": _park_hosts(domain, source_wildcard=source_wildcard, tag=tag)}
+            for name, domain in parsed.items()
+        ]
+        if parked == original:
+            return None
+        await api.update_resource(
+            snapshot.collection, snapshot.uuid, {"docker_compose_domains": parked}
+        )
+        log.info("api.source_domains.parked", uuid=snapshot.uuid, tag=tag)
+        return {"docker_compose_domains": original}
+
+    original_fqdn = str(source.get("fqdn") or "")
+    parked_fqdn = _park_hosts(original_fqdn, source_wildcard=source_wildcard, tag=tag)
+    if parked_fqdn == original_fqdn:
+        return None
+    await api.update_resource(snapshot.collection, snapshot.uuid, {"domains": parked_fqdn})
+    log.info("api.source_domains.parked", uuid=snapshot.uuid, tag=tag)
+    return {"domains": original_fqdn}
+
+
 def _unrewritable_server_bound(
     fqdn: str | None, *, source_wildcard: str | None, target_wildcard: str | None
 ) -> list[str]:

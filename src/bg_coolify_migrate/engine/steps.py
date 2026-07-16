@@ -148,19 +148,39 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
     )
 
     created: dict[str, str] = {}
+    parked: dict[str, dict[str, Any]] = {}
+    tag = ctx.migration_id.split("-")[-1]
+    source_wildcard = ctx.plan.source_server.wildcard_domain or None
     for resource in ctx.plan.resources:
         snapshot = resource.snapshot
         source_full = await ctx.api.get_resource(snapshot.collection, snapshot.uuid)
+
+        # Free the source's custom domains so the target can claim them — Coolify
+        # 409s on a duplicate. Journal the restore body BEFORE creating, so a
+        # failed create still un-parks them on rollback. Server-bound domains are
+        # remapped onto the target's wildcard and never collide, so park leaves
+        # them alone.
+        restore_body = await api_resources.park_source_domains(
+            ctx.api, snapshot, source_full, source_wildcard=source_wildcard, tag=tag
+        )
+        if restore_body is not None:
+            parked[snapshot.uuid] = restore_body
+            ctx.journal.append(
+                "step_started",
+                state="create_target",
+                detail={"target_uuids": dict(created), "parked_domains": dict(parked)},
+            )
+
         target_uuid = await api_resources.create_resource(ctx.api, snapshot, placement, source_full)
         created[snapshot.uuid] = target_uuid
         ctx.target_uuids[snapshot.uuid] = target_uuid
 
         # Journal each creation IMMEDIATELY: a crash after creating the third of
-        # five resources must still be able to delete all three.
+        # five resources must still be able to delete all three (and un-park).
         ctx.journal.append(
             "step_started",
             state="create_target",
-            detail={"target_uuids": dict(created)},
+            detail={"target_uuids": dict(created), "parked_domains": dict(parked)},
         )
 
         await api_resources.copy_envs(

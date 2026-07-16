@@ -767,6 +767,127 @@ class TestReleaseFqdn:
         assert not respx_mock.calls
 
 
+class TestParkHosts:
+    SRC = "app.0046-20.cloud.bauer-group.com"
+
+    def _park(self, domains: str) -> str:
+        from bg_coolify_migrate.api.resources import _park_hosts
+
+        return _park_hosts(domains, source_wildcard=self.SRC, tag="t1")
+
+    def test_custom_domain_is_marked_and_freed(self) -> None:
+        assert (
+            self._park("https://speakup.bauer-group.com")
+            == "https://old-t1.speakup.bauer-group.com"
+        )
+
+    def test_server_bound_domain_is_left_alone(self) -> None:
+        host = "https://x.app.0046-20.cloud.bauer-group.com"
+        assert self._park(host) == host
+
+    def test_only_the_custom_host_in_a_mixed_list_is_parked(self) -> None:
+        out = self._park(
+            "https://speakup.bauer-group.com,https://x.app.0046-20.cloud.bauer-group.com"
+        )
+        assert out == (
+            "https://old-t1.speakup.bauer-group.com,https://x.app.0046-20.cloud.bauer-group.com"
+        )
+
+
+class TestParkSourceDomains:
+    SRC = "app.0046-20.cloud.bauer-group.com"
+
+    async def test_compose_parks_custom_domain_and_returns_restore_body(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        import json
+
+        from bg_coolify_migrate.api.resources import park_source_domains
+
+        route = respx_mock.patch(f"{BASE}/applications/a1").mock(
+            return_value=httpx.Response(200, json={"uuid": "a1"})
+        )
+        snapshot = ResourceSnapshot(
+            uuid="a1",
+            name="wb",
+            collection="applications",
+            kind=ResourceKind.APP_GIT_COMPOSE,
+            git_auth=GitAuth.PUBLIC,
+        )
+        source = {
+            "docker_compose_domains": json.dumps(
+                {"globaleaks": {"domain": "https://speakup.bauer-group.com"}}
+            )
+        }
+        restore = await park_source_domains(
+            api, snapshot, source, source_wildcard=self.SRC, tag="t1"
+        )
+        # The source is PATCHed with the parked (freed) domain...
+        assert json.loads(route.calls[0].request.read()) == {
+            "docker_compose_domains": [
+                {"name": "globaleaks", "domain": "https://old-t1.speakup.bauer-group.com"}
+            ]
+        }
+        # ...and the restore body carries the original for rollback.
+        assert restore == {
+            "docker_compose_domains": [
+                {"name": "globaleaks", "domain": "https://speakup.bauer-group.com"}
+            ]
+        }
+
+    async def test_nothing_to_park_makes_no_call(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        import json
+
+        from bg_coolify_migrate.api.resources import park_source_domains
+
+        snapshot = ResourceSnapshot(
+            uuid="a1",
+            name="wb",
+            collection="applications",
+            kind=ResourceKind.APP_GIT_COMPOSE,
+            git_auth=GitAuth.PUBLIC,
+        )
+        # Only a server-bound domain: remapped on the target, never collides.
+        source = {
+            "docker_compose_domains": json.dumps(
+                {"web": {"domain": "https://x.app.0046-20.cloud.bauer-group.com"}}
+            )
+        }
+        restore = await park_source_domains(
+            api, snapshot, source, source_wildcard=self.SRC, tag="t1"
+        )
+        assert restore is None
+        assert not respx_mock.calls
+
+    async def test_regular_app_parks_its_fqdn_via_domains(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        import json
+
+        from bg_coolify_migrate.api.resources import park_source_domains
+
+        route = respx_mock.patch(f"{BASE}/applications/a1").mock(
+            return_value=httpx.Response(200, json={"uuid": "a1"})
+        )
+        snapshot = ResourceSnapshot(
+            uuid="a1",
+            name="web",
+            collection="applications",
+            kind=ResourceKind.APP_GIT_BUILD,
+            git_auth=GitAuth.PUBLIC,
+        )
+        restore = await park_source_domains(
+            api, snapshot, {"fqdn": "https://speakup.bauer-group.com"},
+            source_wildcard=self.SRC, tag="t1",
+        )
+        assert json.loads(route.calls[0].request.read()) == {
+            "domains": "https://old-t1.speakup.bauer-group.com"
+        }
+        assert restore == {"domains": "https://speakup.bauer-group.com"}
+
+
 class TestCopyEnvs:
     async def test_bulk_upsert_overwrites_generated_secrets(
         self, api: CoolifyClient, respx_mock: respx.Router

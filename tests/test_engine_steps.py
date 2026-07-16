@@ -805,3 +805,34 @@ class TestAwaitTargetVolumes:
             ctx, collection="applications", target_uuid="t", expected={"/var/globaleaks"}
         )
         assert eps == []
+
+
+class TestUndoParkedDomains:
+    """Rollback must un-park the source domains create_target freed."""
+
+    async def test_rollback_restores_the_parked_source_domain(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        import json
+
+        from bg_coolify_migrate.engine.compensations import undo_create_target
+
+        route = respx_mock.patch(f"{BASE}/databases/db1").mock(
+            return_value=httpx.Response(200, json={"uuid": "db1"})
+        )
+        undo_info = {
+            "target_uuids": {},
+            "parked_domains": {"db1": {"domains": "https://speakup.bauer-group.com"}},
+        }
+        await undo_create_target(ctx, undo_info)
+        assert json.loads(route.calls[0].request.read()) == {
+            "domains": "https://speakup.bauer-group.com"
+        }
+
+    async def test_no_parked_domains_makes_no_restore_call(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        from bg_coolify_migrate.engine.compensations import undo_create_target
+
+        await undo_create_target(ctx, {"target_uuids": {}})
+        assert not respx_mock.calls
