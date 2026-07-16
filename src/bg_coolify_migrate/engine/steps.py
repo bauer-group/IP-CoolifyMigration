@@ -11,6 +11,7 @@ FINALIZE.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import shlex
 from typing import Any
 
@@ -700,12 +701,43 @@ async def step_verify(ctx: MigrationContext) -> dict[str, Any]:
     return {"volumes_verified": verified, "differences": 0}
 
 
+async def _server_addresses(host: str) -> frozenset[str]:
+    """Resolve a server's ``ip`` field to actual addresses for the DNS verdict.
+
+    Coolify's ``ip`` is often a HOSTNAME (``0046-20.cloud.bauer-group.com``), and
+    a domain's A record must be compared to an address, not to a name — comparing
+    ``1.2.3.4`` to ``0046-20…`` never matches, so every custom domain would read
+    as ELSEWHERE and the gate could never fire. An IP literal is used as-is; a
+    hostname that will not resolve falls back to itself, no worse than before.
+    """
+    host = (host or "").strip()
+    if not host:
+        return frozenset()
+    try:
+        ipaddress.ip_address(host)
+        return frozenset({host})
+    except ValueError:
+        pass
+    resolution = await dns_resolve.resolve_one(
+        dns_extract.Hostname(
+            host=host, origin=dns_extract.HostnameOrigin.FQDN, is_generated=False
+        )
+    )
+    return frozenset(resolution.addresses) or frozenset({host})
+
+
 async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
-    """Refuse to start the target while a live hostname points at the source."""
+    """Refuse to start the target while a domain IT will serve still points at the source.
+
+    Reads the TARGET's domains, not the source's: create_target may have PARKED
+    the source's custom domains to free them, so the source no longer shows them.
+    What matters is what the TARGET will answer on when it starts.
+    """
     hostnames = []
     for resource in ctx.plan.resources:
-        full = await ctx.api.get_resource(resource.snapshot.collection, resource.snapshot.uuid)
-        envs = await ctx.api.get_envs(resource.snapshot.collection, resource.snapshot.uuid)
+        target_uuid = ctx.target_uuids[resource.snapshot.uuid]
+        full = await ctx.api.get_resource(resource.snapshot.collection, target_uuid)
+        envs = await ctx.api.get_envs(resource.snapshot.collection, target_uuid)
         hostnames.extend(
             dns_extract.collect(
                 fqdn=full.get("fqdn"),
@@ -721,10 +753,15 @@ async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
     if not real:
         return {"hostnames": 0, "verdict": "no real hostnames"}
 
-    # Server-bound URLs (under the SOURCE server's wildcard) are rewritten onto
-    # the target's wildcard at create — they never cut over, so we do not resolve
-    # them (they would resolve to the source forever and read as CUTOVER_NEEDED).
-    # They still enter the report as SERVER_BOUND, for the operator to see.
+    # Coolify's server `ip` is often a hostname; resolve both sides to addresses so
+    # a domain's A record is compared to an address, not a name.
+    source_ips = await _server_addresses(ctx.plan.source_server.ip)
+    target_ips = await _server_addresses(ctx.plan.target_server.ip)
+
+    # A target-wildcard URL already resolves to the target (READY); a custom domain
+    # still resolves to the source (CUTOVER_NEEDED). Keep the source-wildcard skip
+    # so anything still under the SOURCE wildcard is not resolved into a false
+    # cutover (it moved to the target's wildcard).
     src_wildcard = ctx.plan.source_server.wildcard_domain or None
     custom = [h for h in real if not dns_wildcard.under_wildcard(h.host, src_wildcard)]
     bound = [h for h in real if dns_wildcard.under_wildcard(h.host, src_wildcard)]
@@ -733,8 +770,8 @@ async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
     resolutions.extend(Resolution(hostname=h, addresses=()) for h in bound)
     report = build_report(
         resolutions,
-        source_ips=frozenset({ctx.plan.source_server.ip}),
-        target_ips=frozenset({ctx.plan.target_server.ip}),
+        source_ips=source_ips,
+        target_ips=target_ips,
         source_wildcard=src_wildcard,
     )
     ctx.dns_report = report

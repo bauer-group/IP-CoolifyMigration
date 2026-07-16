@@ -318,6 +318,8 @@ class TestDnsGate:
     async def test_blocks_when_dns_points_at_the_source(
         self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # The gate reads the TARGET's domains; point it at the mocked resource.
+        ctx.target_uuids["db1"] = "db1"
         respx_mock.get(f"{BASE}/databases/db1").mock(
             return_value=httpx.Response(200, json={"uuid": "db1", "fqdn": "https://shop.example.com"})
         )
@@ -346,6 +348,7 @@ class TestDnsGate:
     async def test_passes_when_dns_points_at_the_target(
         self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        ctx.target_uuids["db1"] = "db1"
         respx_mock.get(f"{BASE}/databases/db1").mock(
             return_value=httpx.Response(200, json={"uuid": "db1", "fqdn": "https://shop.example.com"})
         )
@@ -367,6 +370,7 @@ class TestDnsGate:
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
         # A database with no domain cannot block a cutover.
+        ctx.target_uuids["db1"] = "db1"
         respx_mock.get(f"{BASE}/databases/db1").mock(
             return_value=httpx.Response(200, json={"uuid": "db1"})
         )
@@ -390,6 +394,7 @@ class TestDnsGate:
                 wildcard_domain="app.0047-20.cloud.bauer-group.com",
             ),
         )
+        ctx.target_uuids["db1"] = "db1"
         respx_mock.get(f"{BASE}/databases/db1").mock(
             return_value=httpx.Response(
                 200,
@@ -414,6 +419,7 @@ class TestDnsGate:
         # parallel (propagation lags), so a custom domain on the source warns
         # instead of blocking.
         ctx.accept_dns = True
+        ctx.target_uuids["db1"] = "db1"
         respx_mock.get(f"{BASE}/databases/db1").mock(
             return_value=httpx.Response(200, json={"uuid": "db1", "fqdn": "https://shop.example.com"})
         )
@@ -433,6 +439,52 @@ class TestDnsGate:
         # Must NOT raise.
         result = await steps.step_dns_gate(ctx)
         assert result["cutover_accepted"] == ["shop.example.com"]
+
+    async def test_hostname_server_ip_is_resolved_so_a_custom_domain_gates(
+        self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Coolify's server `ip` is a HOSTNAME here. The gate must resolve it to an
+        # address, else the custom domain's A record is compared to a name, never
+        # matches, and the cutover is silently missed.
+        from bg_coolify_migrate.dns.extract import Hostname, HostnameOrigin
+        from bg_coolify_migrate.dns.gate import Resolution
+
+        ctx.plan = _plan(
+            source_server=ServerRef(uuid="s1", name="old", ip="0046-20.cloud.bauer-group.com"),
+            target_server=ServerRef(uuid="s2", name="new", ip="0047-20.cloud.bauer-group.com"),
+        )
+        ctx.target_uuids["db1"] = "db1"
+        respx_mock.get(f"{BASE}/databases/db1").mock(
+            return_value=httpx.Response(
+                200, json={"uuid": "db1", "fqdn": "https://speakup.bauer-group.com"}
+            )
+        )
+        respx_mock.get(f"{BASE}/databases/db1/envs").mock(return_value=httpx.Response(200, json=[]))
+
+        server_ips = {
+            "0046-20.cloud.bauer-group.com": "1.1.1.1",
+            "0047-20.cloud.bauer-group.com": "2.2.2.2",
+        }
+
+        async def fake_resolve_one(hostname, config=None):  # type: ignore[no-untyped-def]
+            return Resolution(hostname, (server_ips[hostname.host],))
+
+        async def fake_resolve_all(hostnames, config=None):  # type: ignore[no-untyped-def]
+            # The custom domain still points at the SOURCE server's resolved IP.
+            return [
+                Resolution(
+                    Hostname("speakup.bauer-group.com", HostnameOrigin.FQDN, False),
+                    ("1.1.1.1",),
+                    ttl=300,
+                )
+            ]
+
+        monkeypatch.setattr("bg_coolify_migrate.dns.resolve.resolve_one", fake_resolve_one)
+        monkeypatch.setattr("bg_coolify_migrate.dns.resolve.resolve_all", fake_resolve_all)
+
+        with pytest.raises(DnsGateBlocked) as exc:
+            await steps.step_dns_gate(ctx)
+        assert "speakup.bauer-group.com" in str(exc.value)
 
 
 class TestVerify:

@@ -23,10 +23,13 @@ has to be enabled once.
 ## The DNS gate blocked me (exit 3)
 
 Working as designed. It is a resumable stop, not a failure — the target is created
-and its data is verified. It only ever fires for a **custom domain**
-(`shop.example.com`) that still points at the source. Server-bound URLs under a
-server's wildcard (`pdf-tool.app.0046-20…`) are rewritten onto the target's
-wildcard automatically and never gate — see *Domains & DNS* in the CLI reference.
+and its data is verified. The gate checks the domains the **target** will serve
+(the source's may have been parked to free a custom domain for the target) and
+compares them against the servers' **resolved** addresses (Coolify's `ip` is often
+a hostname). It only ever fires for a **custom domain** (`shop.example.com`) that
+still points at the source. Server-bound URLs under a server's wildcard
+(`pdf-tool.app.0046-20…`) are rewritten onto the target's wildcard automatically
+and never gate — see *Domains & DNS* in the CLI reference.
 
 ```bash
 # Apply the printed cutover checklist to your DNS, wait out the TTL, then:
