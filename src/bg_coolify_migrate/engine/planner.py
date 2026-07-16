@@ -87,7 +87,12 @@ def server_ref(server: dict[str, Any]) -> ServerRef:
         uuid=str(server.get("uuid", "")),
         name=str(server.get("name", "?")),
         ip=str(server.get("ip", "")),
-        user=str(server.get("user", "root")),
+        # `or "root"`, not a get-default: Coolify's localhost self-record carries
+        # user='' (empty, not missing), so `get("user", "root")` returns "" and
+        # F2 would SSH with an empty username — Permission denied. The DB column
+        # even defaults to 'root'; the record just overrides it with blank. Same
+        # shape as the port fallback right below. Found by the F2 e2e migration.
+        user=str(server.get("user") or "root"),
         port=int(server.get("port", 22) or 22),
     )
 

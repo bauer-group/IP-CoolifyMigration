@@ -105,3 +105,37 @@ def test_slugifies_every_part() -> None:
         # Dots are stripped, not turned into separators — see Str::slug.
         "coolify.resourceName": "apiexamplecom",
     }
+
+
+# ── server_ref ───────────────────────────────────────────────────────────────
+# Coolify's localhost self-record carries user='' and port can be blank. Both
+# must fall back, or F2 (and F1) SSH with an empty user / port 0.
+
+
+class TestServerRef:
+    def test_empty_user_falls_back_to_root(self) -> None:
+        """The localhost self-record has user='' — get-default does not catch it.
+
+        `get("user", "root")` returns "" because the key is present-but-empty, so
+        F2 SSHed as `@host` and got Permission denied. Coolify's own DB column
+        defaults to 'root'; the record just blanks it. Found by the F2 e2e run.
+        """
+        from bg_coolify_migrate.engine.planner import server_ref
+
+        ref = server_ref({"uuid": "u", "name": "localhost", "ip": "127.0.0.1", "user": ""})
+        assert ref.user == "root"
+
+    def test_missing_user_falls_back_to_root(self) -> None:
+        from bg_coolify_migrate.engine.planner import server_ref
+
+        assert server_ref({"uuid": "u", "ip": "10.0.0.1"}).user == "root"
+
+    def test_explicit_user_is_kept(self) -> None:
+        from bg_coolify_migrate.engine.planner import server_ref
+
+        assert server_ref({"uuid": "u", "ip": "10.0.0.1", "user": "deploy"}).user == "deploy"
+
+    def test_blank_port_falls_back_to_22(self) -> None:
+        from bg_coolify_migrate.engine.planner import server_ref
+
+        assert server_ref({"uuid": "u", "ip": "10.0.0.1", "port": 0}).port == 22
