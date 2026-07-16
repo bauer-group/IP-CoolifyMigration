@@ -128,3 +128,43 @@ generic over its state machine), `engine/keys.py`, `ui/`. F2-specific:
 There is no `FINALIZE` and no delete policy: **F2 never destroys the source.** It
 is left intact but fenced, so rollback always means "start it again". That is
 Geczy's one genuinely good architectural decision, kept.
+
+## Verified against a real instance
+
+F2 was run end to end against a real Coolify installed on a host (systemd Ubuntu,
+Docker, `install.sh`) and migrated to a second host. That run **proved**:
+
+- the full saga executes in order (preflight → inventory → read_app_key →
+  stop_source → transfer → verify → install_coolify → assert_app_key → boot);
+- **APP_KEY survives byte-identical** — the whole feature — with the source and
+  target fingerprints matching every time;
+- the inventory finds and transfers both `/data/coolify` and the docker volumes
+  (`coolify-db`, `coolify-redis` — Coolify's own database is a named volume, not
+  under `/data/coolify`);
+- on failure, the source is restarted and never fenced — rollback works.
+
+It also found three real bugs, each invisible to a mock and fixed with a
+regression test:
+
+1. **The source's containers were never stopped.** `systemctl stop docker` stops
+   the daemon, but `KillMode=process` leaves the containers running under
+   containerd, so Postgres was still writing while its volume was copied — a torn
+   `coolify-db`. Now the containers are `docker stop`ped first.
+2. **The decrypt probe ran before Coolify was ready** and read "not booted yet"
+   as "data is corrupt", rolling back a good migration. Now waits for health and
+   polls a tri-state probe.
+3. **An empty `user` on the localhost server record** was not defaulted to root,
+   so F2 SSHed as `@host`.
+
+### What the local rig cannot prove
+
+The final step — the migrated Coolify booting and *serving* the copied database —
+was not reproduced locally, and the reason is the test environment, not F2.
+Coolify's `install.sh` installs Docker on a fresh target; a local nested-Docker
+rig must instead pre-provision Docker with the `vfs` storage driver (the only one
+that survives Coolify's opaque-whiteout images under nesting), and a
+pre-installed daemon running during the volume copy does not hand the copied
+named volumes to `install.sh`'s `compose up` the way a fresh host's newly
+installed daemon does. That handoff is what a real target does natively. The
+decrypt probe (finding 2, now fixed) is exactly the guard that would catch it if
+it ever did go wrong in production.
