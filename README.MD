@@ -1,5 +1,5 @@
 <!-- AUTO-GENERATED FILE. DO NOT EDIT. Edit docs/README.template.MD instead. -->
-<!-- Generated on 2026-07-16 16:59:33 UTC -->
+<!-- Generated on 2026-07-16 17:04:54 UTC -->
 
 # BAUER GROUP - Coolify Migration Toolkit
 
@@ -22,7 +22,7 @@ external orchestrator has none of those constraints. That is what this is.
 
 ## Repository Information
 
-- **Version:** v2.2.0
+- **Version:** v2.2.1
 - **Repository:** bauer-group/IP-CoolifyMigration
 - **Branch:** main
 - **Architecture:** Pure-logic cores with thin IO shells; saga engine with a
