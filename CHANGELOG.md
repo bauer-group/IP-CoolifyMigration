@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.4.0 (2026-07-16)
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`f649bb1`](https://github.com/bauer-group/IP-CoolifyMigration/commit/f649bb139cb57fac631eeecb0063c5c9f592110d))
+
+### Features
+
+- **dns**: Added --source/--target-wildcard overrides
+  ([`24eda7c`](https://github.com/bauer-group/IP-CoolifyMigration/commit/24eda7c476264d6232afaea5be154b395d7a1d66))
+
+
 ## v2.3.0 (2026-07-16)
 
 ### Documentation
