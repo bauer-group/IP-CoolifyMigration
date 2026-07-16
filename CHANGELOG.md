@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.4.1 (2026-07-16)
+
+### Bug Fixes
+
+- **api**: Base64-encoded custom_labels on app create
+  ([`ac757a8`](https://github.com/bauer-group/IP-CoolifyMigration/commit/ac757a8aac92b7280816b9c8878c902fd2a22745))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`8ebe128`](https://github.com/bauer-group/IP-CoolifyMigration/commit/8ebe12843d4f98bc362908f8f42456caf6ac181e))
+
+
 ## v2.4.0 (2026-07-16)
 
 ### Documentation
