@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.1.4 (2026-07-16)
+
+### Bug Fixes
+
+- **ssh**: Require a known_hosts path to trust a host key
+  ([`9c9eb35`](https://github.com/bauer-group/IP-CoolifyMigration/commit/9c9eb35de891ca85ead2f774e8156dc3eb9eae59))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`9be2595`](https://github.com/bauer-group/IP-CoolifyMigration/commit/9be259542136aa7696a82084352ced6738553c9c))
+
+
 ## v2.1.3 (2026-07-16)
 
 ### Bug Fixes
