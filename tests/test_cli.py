@@ -129,7 +129,8 @@ class TestDoctorExitCodes:
         respx.get(f"{BASE}/projects").mock(
             return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
         )
-        result = runner.invoke(app, ["doctor"])
+        # --no-check-servers: this test has no real SSH server to reach.
+        result = runner.invoke(app, ["doctor", "--no-check-servers"])
         assert result.exit_code == 0
         assert "prod-1" in result.stdout
         assert "can read sensitive data" in result.stdout

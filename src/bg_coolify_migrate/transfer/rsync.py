@@ -199,19 +199,54 @@ def parse_progress(line: str) -> Progress | None:
     )
 
 
-async def preflight(host: RemoteHost, *, label: str) -> None:
-    """Assert rsync exists on a host.
+#: Package managers we know how to drive, most common first. The command both
+#: refreshes the index (where that matters) and installs rsync non-interactively.
+_RSYNC_INSTALLERS: tuple[tuple[str, str], ...] = (
+    (
+        "apt-get",
+        "DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq rsync",
+    ),
+    ("apk", "apk add --no-cache rsync"),
+    ("dnf", "dnf install -y rsync"),
+    ("yum", "yum install -y rsync"),
+    ("zypper", "zypper --non-interactive install rsync"),
+    ("pacman", "pacman -Sy --noconfirm rsync"),
+)
+
+
+async def _install(host: RemoteHost) -> bool:
+    """Install rsync with whatever package manager the host has. Returns success."""
+    for binary, command in _RSYNC_INSTALLERS:
+        if await host.which(binary):
+            await host.run(command)
+            return await host.which("rsync")
+    return False
+
+
+async def ensure_installed(host: RemoteHost, *, label: str) -> None:
+    """Make sure rsync exists on a host, installing it if it does not.
+
+    Checked (and installed) on BOTH ends before anything is stopped, because
+    discovering a missing rsync after the source is down converts a preflight
+    failure into an outage.
 
     Raises:
-        TransferError: If rsync is missing. We check both ends before stopping
-            anything, because discovering it after the source is down converts a
-            preflight failure into an outage.
+        TransferError: If rsync is absent and could not be installed automatically.
     """
-    if not await host.which("rsync"):
-        raise TransferError(
-            f"rsync is not installed on the {label} server ({host.target.host})",
-            hint="Install it: apt-get install -y rsync  /  apk add rsync",
-        )
+    if await host.which("rsync"):
+        return
+
+    log.info("rsync.installing", host=host.target.host, label=label)
+    if await _install(host):
+        log.info("rsync.installed", host=host.target.host, label=label)
+        return
+
+    raise TransferError(
+        f"rsync is missing on the {label} server ({host.target.host}) and could not be "
+        "installed automatically",
+        hint="Install it by hand: apt-get install -y rsync  /  apk add rsync",
+    )
 
 
 async def run(

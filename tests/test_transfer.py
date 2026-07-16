@@ -462,3 +462,40 @@ class TestHostKeyRecording:
 
         await RemoteHost.ensure_host_key(target, known_hosts=known_hosts, host_key_prompt=_prompt)
         assert prompted["count"] == 0
+
+
+class TestRsyncEnsureInstalled:
+    """rsync auto-installs when missing, so an operator never has to prepare the
+    servers by hand — and fails loudly only if no package manager can install it."""
+
+    async def test_noop_when_already_present(self) -> None:
+        from bg_coolify_migrate.transfer import rsync
+        from tests.conftest import FakeHost
+
+        host = FakeHost()
+        host.on(r"command -v rsync", exit_status=0)
+        await rsync.ensure_installed(host, label="source")  # no raise
+        assert not any("install" in c for c in host.commands)
+
+    async def test_installs_with_apt_when_missing(self) -> None:
+        from bg_coolify_migrate.transfer import rsync
+        from tests.conftest import FakeHost
+
+        host = FakeHost()
+        # Missing on the first check, present after the install.
+        host.on_sequence(r"command -v rsync", [{"exit_status": 1}, {"exit_status": 0}])
+        host.on(r"command -v apt-get", exit_status=0)
+        host.on(r"apt-get.*install.*rsync", exit_status=0)
+        await rsync.ensure_installed(host, label="target")
+        assert any("apt-get" in c and "rsync" in c for c in host.commands)
+
+    async def test_raises_when_no_package_manager(self) -> None:
+        from bg_coolify_migrate.errors import TransferError
+        from bg_coolify_migrate.transfer import rsync
+        from tests.conftest import FakeHost
+
+        host = FakeHost()
+        host.on(r"command -v rsync", exit_status=1)  # always missing
+        host.on(r"command -v \S+", exit_status=1)  # no package manager present
+        with pytest.raises(TransferError, match="could not be installed"):
+            await rsync.ensure_installed(host, label="source")

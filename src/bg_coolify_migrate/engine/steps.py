@@ -67,7 +67,7 @@ async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
     await ctx.api.assert_can_read_sensitive()
 
     for host, label in ((ctx.source_host, "source"), (ctx.target_host, "target")):
-        await rsync.preflight(host, label=label)
+        await rsync.ensure_installed(host, label=label)
         if not await host.which("docker"):
             raise PreflightError(f"docker is not installed on the {label} server")
 

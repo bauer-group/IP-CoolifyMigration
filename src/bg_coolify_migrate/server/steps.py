@@ -70,7 +70,7 @@ async def step_preflight(ctx: ServerContext) -> dict[str, Any]:
         )
 
     for host, label in ((ctx.source_host, "source"), (ctx.target_host, "target")):
-        await rsync.preflight(host, label=label)
+        await rsync.ensure_installed(host, label=label)
 
     if not await ctx.target_host.which("systemctl"):
         raise PreflightError(

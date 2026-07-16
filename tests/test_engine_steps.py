@@ -132,17 +132,18 @@ class TestPreflight:
     async def test_missing_rsync_fails_before_anything_stops(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
-        # Discovering this after the source is stopped turns a preflight failure
-        # into an outage.
+        # rsync auto-installs, but if it cannot (no package manager) we fail HERE,
+        # before the source is stopped - discovering it later would be an outage.
         respx_mock.get(f"{BASE}/security/keys").mock(
             return_value=httpx.Response(200, json=[{"private_key": "x"}])
         )
         host = FakeHost()
-        host.on(r"command -v rsync", exit_status=1)
+        host.on(r"command -v rsync", exit_status=1)  # missing
+        host.on(r"command -v \S+", exit_status=1)  # and no package manager to install it
         ctx.source_host = host  # type: ignore[assignment]
         from bg_coolify_migrate.errors import TransferError
 
-        with pytest.raises(TransferError, match="rsync is not installed"):
+        with pytest.raises(TransferError, match="could not be installed"):
             await steps.step_preflight(ctx)
 
     async def test_insufficient_disk_is_proportional_to_the_payload(

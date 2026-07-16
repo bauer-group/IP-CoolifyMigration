@@ -8,7 +8,7 @@ coolify-migrate --help
 
 | Command | What it does |
 | --- | --- |
-| `doctor` | Check token scope, API reachability, server inventory. **Run this first.** |
+| `doctor` | Check token scope, API reachability, and each server (rsync + docker; `--install` adds rsync). **Run this first.** |
 | `list [project]` | Recursively list every resource: server → project → environment → resource, with uuids. Reads only. |
 | `plan <selector>` | Produce a migration plan for a scope. Reads only. |
 | `run <selector> --to <server>` | Execute a migration for a scope. |

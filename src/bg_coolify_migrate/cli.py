@@ -98,27 +98,50 @@ def main_callback(
     """Coolify migration toolkit."""
 
 
+_TRUST_HOST_KEY_HELP = (
+    "Record an unseen SSH host key instead of refusing (trust on first use). For "
+    "unattended runs; interactively you are asked with the fingerprint instead."
+)
+
+
 # ── doctor ───────────────────────────────────────────────────────────────────
 
 
 @app.command()
 def doctor(
+    check_servers: Annotated[
+        bool,
+        typer.Option(
+            "--check-servers/--no-check-servers",
+            help="SSH to each reachable server and check rsync + docker.",
+        ),
+    ] = True,
+    install: Annotated[
+        bool, typer.Option("--install", help="Install rsync on servers that are missing it.")
+    ] = False,
+    trust_host_key: Annotated[
+        bool, typer.Option("--trust-host-key", help=_TRUST_HOST_KEY_HELP)
+    ] = False,
     log_level: Annotated[str, typer.Option(help="DEBUG|INFO|WARNING|ERROR")] = "INFO",
     log_format: Annotated[str, typer.Option(help="console|json")] = "console",
 ) -> None:
-    """Check the environment: token scope, API reachability, server inventory.
+    """Check the environment: token scope, API reachability, and each server.
 
-    Run this first. It proves the one thing that silently breaks everything else
-    - whether the token can actually read secrets.
+    Run this first. It proves the one thing that silently breaks everything else -
+    whether the token can read secrets - and, per reachable server, that rsync and
+    docker are present (`--install` adds a missing rsync). Accepting host keys here
+    means `plan`/`run` will not have to ask.
     """
     settings = _settings(log_level, log_format)
     try:
-        asyncio.run(_doctor(settings))
+        asyncio.run(_doctor(settings, check_servers, install, trust_host_key))
     except MigrationError as exc:
         _fail(exc)
 
 
-async def _doctor(settings: Settings) -> None:
+async def _doctor(
+    settings: Settings, check_servers: bool, install: bool, trust_host_key: bool
+) -> None:
     from rich.table import Table
 
     from bg_coolify_migrate.api.client import CoolifyClient
@@ -152,20 +175,30 @@ async def _doctor(settings: Settings) -> None:
         table.add_column("UUID", style="muted")
         table.add_column("IP", style="host")
         table.add_column("Reachable")
+        table.add_column("rsync")
+        table.add_column("docker")
         for server in servers:
             # is_reachable lives under settings, not at the top level. Reading it
             # from the top silently rendered "unknown" for every server, always.
             reachable = CoolifyClient.server_is_reachable(server)
-            status = (
-                "[ok]yes[/ok]"
+            reach = (
+                Text("yes", style="ok")
                 if reachable
-                else ("[err]no[/err]" if reachable is False else "[warn]unknown[/warn]")
+                else (Text("no", style="err") if reachable is False else Text("?", style="warn"))
             )
+            rsync_cell: Text = Text("-", style="muted")
+            docker_cell: Text = Text("-", style="muted")
+            if check_servers and reachable is not False:
+                rsync_cell, docker_cell = await _check_server_deps(
+                    api, settings, server, install, trust_host_key
+                )
             table.add_row(
-                str(server.get("name", "?")),
-                str(server.get("uuid", "?")),
-                str(server.get("ip", "?")),
-                status,
+                Text(str(server.get("name", "?"))),
+                Text(str(server.get("uuid", "?"))),
+                Text(str(server.get("ip", "?"))),
+                reach,
+                rsync_cell,
+                docker_cell,
             )
         console.print(table)
 
@@ -173,6 +206,43 @@ async def _doctor(settings: Settings) -> None:
         console.print(f"[ok]OK[/ok] {len(projects)} project(s) visible")
 
     console.print(f"[ok]OK[/ok] state dir: [path]{settings.resolved_state_dir()}[/path]")
+
+
+async def _check_server_deps(
+    api: object, settings: Settings, server: dict[str, Any], install: bool, trust_host_key: bool
+) -> tuple[Text, Text]:
+    """SSH to one server and report (rsync, docker) presence. Never raises."""
+    from bg_coolify_migrate.engine.planner import server_ref
+    from bg_coolify_migrate.engine.runner import ssh_target_for
+    from bg_coolify_migrate.transfer import rsync
+    from bg_coolify_migrate.transfer.ssh import RemoteHost
+
+    ref = server_ref(server)
+    try:
+        await _accept_host_key(api, settings, ref, trust_host_key)
+        ssh = await ssh_target_for(api, ref)  # type: ignore[arg-type]
+        async with RemoteHost.connect(
+            ssh,
+            known_hosts=settings.resolved_known_hosts(),
+            trust_new_host_key=trust_host_key or settings.trust_host_key,
+            connect_timeout=settings.ssh_timeout,
+        ) as host:
+            has_rsync = await host.which("rsync")
+            if not has_rsync and install:
+                try:
+                    await rsync.ensure_installed(host, label=str(server.get("name", "?")))
+                    rsync_cell = Text("installed", style="ok")
+                except MigrationError:
+                    rsync_cell = Text("install failed", style="err")
+            else:
+                rsync_cell = Text("yes", style="ok") if has_rsync else Text("no", style="err")
+            docker_cell = (
+                Text("yes", style="ok") if await host.which("docker") else Text("no", style="err")
+            )
+            return rsync_cell, docker_cell
+    except MigrationError as exc:
+        note = str(exc).splitlines()[0][:24]
+        return Text("?", style="warn"), Text(note, style="warn")
 
 
 # ── list ─────────────────────────────────────────────────────────────────────
@@ -462,11 +532,6 @@ async def _resolve_jobs(
 _SELECTOR_HELP = (
     "project, project/environment, project/environment/resource, or a resource uuid - "
     "name or uuid. Omit in a terminal to pick interactively."
-)
-
-_TRUST_HOST_KEY_HELP = (
-    "Record an unseen SSH host key instead of refusing (trust on first use). Needed "
-    "the first time you reach a server; verify the fingerprint out of band."
 )
 
 
