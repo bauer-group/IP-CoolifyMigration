@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.3.0 (2026-07-16)
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`0d3cfd7`](https://github.com/bauer-group/IP-CoolifyMigration/commit/0d3cfd74c76319b02592b891b281ae8ffee10a4f))
+
+### Features
+
+- **dns**: Rewrote server-bound URLs onto target
+  ([`3add035`](https://github.com/bauer-group/IP-CoolifyMigration/commit/3add035edf95eb47a6a3c7495d7797b6a069cfba))
+
+
 ## v2.2.3 (2026-07-16)
 
 ### Bug Fixes
