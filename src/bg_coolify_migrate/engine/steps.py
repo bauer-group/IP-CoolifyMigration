@@ -754,7 +754,9 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
             await api_resources.rename(ctx.api, snapshot.collection, snapshot.uuid, new_name)
             # Without releasing the FQDN the old proxy keeps the router rule and
             # keeps renewing its certificate for a hostname it no longer serves.
-            await api_resources.release_fqdn(ctx.api, snapshot.collection, snapshot.uuid)
+            await api_resources.release_fqdn(
+                ctx.api, snapshot.collection, snapshot.uuid, kind=snapshot.kind
+            )
             actions.append(f"renamed {snapshot.name} -> {new_name}")
             continue
 

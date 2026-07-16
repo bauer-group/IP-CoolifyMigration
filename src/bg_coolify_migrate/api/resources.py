@@ -28,6 +28,7 @@ loss:
 from __future__ import annotations
 
 import base64
+import json
 from typing import Any
 
 import structlog
@@ -316,6 +317,68 @@ def _remap_domains(
     return ",".join(dict.fromkeys(urls))
 
 
+def _parse_compose_domains(raw: object) -> dict[str, str]:
+    """Reduce docker_compose_domains to ``{service: "url,url"}``. PURE.
+
+    Coolify STORES and GETs this as a dict ``{service: {"domain": "url,url"}}``
+    (a JSON string), though the create route wants a different shape (see
+    :func:`_compose_domains_body`). Tolerant of a raw string or an already-decoded
+    dict, and of junk — a bad value yields ``{}``, not a crash.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    out: dict[str, str] = {}
+    for name, cfg in parsed.items():
+        if isinstance(cfg, dict):
+            out[str(name)] = str(cfg.get("domain") or "")
+        elif isinstance(cfg, str):
+            out[str(name)] = cfg
+    return out
+
+
+def _compose_domains_body(
+    raw: object, *, source_wildcard: str | None, target_wildcard: str | None
+) -> list[dict[str, str]] | None:
+    """Rewrite a compose app's per-service domains for the target create body.
+
+    The create route wants an ARRAY of ``{name, domain}`` (it 422s on ``domains``
+    for a dockercompose app). Read the source's per-service domains, remap the
+    server-bound URLs inside each onto the target's wildcard (custom domains
+    kept), and return the array. ``None`` when there is nothing to send.
+    """
+    parsed = _parse_compose_domains(raw)
+    if not parsed:
+        return None
+    return [
+        {
+            "name": name,
+            "domain": _remap_domains(
+                domain, source_wildcard=source_wildcard, target_wildcard=target_wildcard
+            ),
+        }
+        for name, domain in parsed.items()
+    ]
+
+
+def _blank_compose_domains(raw: object) -> list[dict[str, str]] | None:
+    """The docker_compose_domains array with every domain blanked. PURE.
+
+    Releasing a compose app's domains cannot go through the ``domains`` field
+    (422 for dockercompose); it is done by resubmitting each service with an
+    empty domain. ``None`` when the source had none to release.
+    """
+    parsed = _parse_compose_domains(raw)
+    if not parsed:
+        return None
+    return [{"name": name, "domain": ""} for name in parsed]
+
+
 def _unrewritable_server_bound(
     fqdn: str | None, *, source_wildcard: str | None, target_wildcard: str | None
 ) -> list[str]:
@@ -388,12 +451,21 @@ async def create_application(
         body.pop("domains", None)
 
     if snapshot.kind is ResourceKind.APP_GIT_COMPOSE:
-        # build_pack=dockercompose forces ports_exposes='80' upstream and REJECTS
-        # `domains` (docker_compose_domains is the field). Its compose — and the
-        # per-service domains inside it — are loaded from git, so both are dropped.
+        # build_pack=dockercompose loads the compose from git (drop the raw) and
+        # REJECTS `domains` — per-service domains live in docker_compose_domains,
+        # which the create route wants as an ARRAY of {name, domain}. Remap the
+        # server-bound URLs inside onto the target so the app keeps its URLs.
         body.pop("docker_compose_raw", None)
-        body.pop("docker_compose_domains", None)
         body.pop("domains", None)
+        compose_domains = _compose_domains_body(
+            source.get("docker_compose_domains"),
+            source_wildcard=placement.source_wildcard,
+            target_wildcard=placement.target_wildcard,
+        )
+        if compose_domains:
+            body["docker_compose_domains"] = compose_domains
+        else:
+            body.pop("docker_compose_domains", None)
 
     # custom_labels / custom_nginx_configuration / dockerfile come back plaintext
     # but the create route validates + decodes them as base64.
@@ -599,17 +671,29 @@ async def rename(api: CoolifyClient, collection: str, uuid: str, name: str) -> N
     log.info("api.renamed", uuid=uuid, name=name)
 
 
-async def release_fqdn(api: CoolifyClient, collection: str, uuid: str) -> None:
+async def release_fqdn(
+    api: CoolifyClient, collection: str, uuid: str, *, kind: ResourceKind | None = None
+) -> None:
     """Clear the source's domains so the old proxy stops claiming them.
 
     Without this, a kept-or-renamed source still has its FQDN, so the old host's
     Traefik keeps the router rule and keeps renewing the certificate — quietly
     consuming ACME budget for a hostname it no longer serves.
+
+    A dockercompose app is special: its ``domains`` field is rejected (422), so
+    it is released by resubmitting docker_compose_domains with blank domains.
     """
-    body: dict[str, Any] = {"domains": ""} if collection == "applications" else {}
-    if not body:
+    if collection != "applications":
         return
     try:
+        if kind is ResourceKind.APP_GIT_COMPOSE:
+            full = await api.get_resource("applications", uuid)
+            blanked = _blank_compose_domains(full.get("docker_compose_domains"))
+            if blanked is None:
+                return
+            body: dict[str, Any] = {"docker_compose_domains": blanked}
+        else:
+            body = {"domains": ""}
         await api.update_resource(collection, uuid, body)
         log.info("api.fqdn.released", uuid=uuid)
     except CoolifyApiError as exc:

@@ -155,6 +155,10 @@ proper URL — `--target-wildcard app.0047-20.cloud.bauer-group.com` (and
 `--source-wildcard` to override a missing/wrong source wildcard). Both accept the
 bare host or the `https://…` form.
 
+Docker-compose applications keep a domain **per service** (Coolify's
+`docker_compose_domains`, not `domains`); each service's URL is rewritten the
+same way, so a compose stack keeps every service's address on the new server.
+
 **Custom domains** — `shop.example.com` and the like. These are
 server-independent: they move *with* the app, by repointing their DNS record at
 the target. Because the target's proxy requests an ACME certificate the moment it

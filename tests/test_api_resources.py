@@ -443,6 +443,46 @@ class TestCreateApplication:
         body = json.loads(route.calls[0].request.read())
         assert base64.b64decode(body["custom_labels"]).decode() == labels
 
+    async def test_compose_app_remaps_docker_compose_domains_to_target(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # A compose app's per-service domains must be rewritten onto the target's
+        # wildcard and sent as the create ARRAY — not dropped (which left the
+        # target with no URL) and not via `domains` (422 for dockercompose).
+        import json
+
+        route = respx_mock.post(f"{BASE}/applications/public").mock(
+            return_value=httpx.Response(201, json={"uuid": "a2"})
+        )
+        snapshot = ResourceSnapshot(
+            uuid="a1",
+            name="pair-drop",
+            collection="applications",
+            kind=ResourceKind.APP_GIT_COMPOSE,
+            git_repository="https://github.com/x/y",
+            git_branch="main",
+            git_auth=GitAuth.PUBLIC,
+        )
+        await create_resource(
+            api,
+            snapshot,
+            _placement_wc(),
+            {
+                "git_repository": "https://github.com/x/y",
+                "git_branch": "main",
+                "build_pack": "dockercompose",
+                "docker_compose_domains": json.dumps(
+                    {"pairdrop": {"domain": "https://airdrop.app.0046-20.cloud.bauer-group.com"}}
+                ),
+            },
+        )
+        body = json.loads(route.calls[0].request.read())
+        assert body["docker_compose_domains"] == [
+            {"name": "pairdrop", "domain": "https://airdrop.app.0047-20.cloud.bauer-group.com"}
+        ]
+        # `domains` must never be sent for a dockercompose app.
+        assert "domains" not in body
+
     async def test_missing_git_fields_raise_before_the_round_trip(
         self, api: CoolifyClient
     ) -> None:
@@ -625,6 +665,106 @@ class TestEncodeBase64Fields:
 
     def test_absent_fields_are_left_absent(self) -> None:
         assert self._apply({"name": "web"}) == {"name": "web"}
+
+
+class TestComposeDomains:
+    SRC = "app.0046-20.cloud.bauer-group.com"
+    TGT = "app.0047-20.cloud.bauer-group.com"
+
+    def _raw(self) -> str:
+        import json
+
+        return json.dumps(
+            {
+                "pairdrop": {"domain": "https://airdrop.app.0046-20.cloud.bauer-group.com"},
+                "config-generator": {"domain": ""},
+            }
+        )
+
+    def test_remaps_server_bound_and_converts_to_create_array(self) -> None:
+        from bg_coolify_migrate.api.resources import _compose_domains_body
+
+        out = _compose_domains_body(self._raw(), source_wildcard=self.SRC, target_wildcard=self.TGT)
+        # Stored dict {svc: {domain}} -> create array [{name, domain}], remapped.
+        assert out == [
+            {"name": "pairdrop", "domain": "https://airdrop.app.0047-20.cloud.bauer-group.com"},
+            {"name": "config-generator", "domain": ""},
+        ]
+
+    def test_custom_domain_in_a_service_is_kept(self) -> None:
+        import json
+
+        from bg_coolify_migrate.api.resources import _compose_domains_body
+
+        raw = json.dumps({"web": {"domain": "https://shop.example.com"}})
+        out = _compose_domains_body(raw, source_wildcard=self.SRC, target_wildcard=self.TGT)
+        assert out == [{"name": "web", "domain": "https://shop.example.com"}]
+
+    def test_empty_or_unparseable_is_none(self) -> None:
+        from bg_coolify_migrate.api.resources import _compose_domains_body
+
+        assert _compose_domains_body(None, source_wildcard=self.SRC, target_wildcard=self.TGT) is None
+        assert _compose_domains_body("{bad", source_wildcard=self.SRC, target_wildcard=self.TGT) is None
+
+    def test_blank_empties_every_service_domain(self) -> None:
+        from bg_coolify_migrate.api.resources import _blank_compose_domains
+
+        assert _blank_compose_domains(self._raw()) == [
+            {"name": "pairdrop", "domain": ""},
+            {"name": "config-generator", "domain": ""},
+        ]
+
+
+class TestReleaseFqdn:
+    async def test_plain_app_clears_the_domains_field(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        import json
+
+        from bg_coolify_migrate.api.resources import release_fqdn
+
+        route = respx_mock.patch(f"{BASE}/applications/a1").mock(
+            return_value=httpx.Response(200, json={"uuid": "a1"})
+        )
+        await release_fqdn(api, "applications", "a1", kind=ResourceKind.APP_GIT_BUILD)
+        assert json.loads(route.calls[0].request.read()) == {"domains": ""}
+
+    async def test_compose_app_blanks_docker_compose_domains_not_domains(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # The `domains` field 422s for dockercompose; release must go through
+        # docker_compose_domains with blanked entries instead.
+        import json
+
+        from bg_coolify_migrate.api.resources import release_fqdn
+
+        respx_mock.get(f"{BASE}/applications/a1").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "uuid": "a1",
+                    "docker_compose_domains": json.dumps(
+                        {"pairdrop": {"domain": "https://airdrop.app.0046-20.cloud.bauer-group.com"}}
+                    ),
+                },
+            )
+        )
+        route = respx_mock.patch(f"{BASE}/applications/a1").mock(
+            return_value=httpx.Response(200, json={"uuid": "a1"})
+        )
+        await release_fqdn(api, "applications", "a1", kind=ResourceKind.APP_GIT_COMPOSE)
+        body = json.loads(route.calls[0].request.read())
+        assert body == {"docker_compose_domains": [{"name": "pairdrop", "domain": ""}]}
+        assert "domains" not in body
+
+    async def test_non_application_is_a_noop(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # Databases/services have no fqdn to release this way.
+        from bg_coolify_migrate.api.resources import release_fqdn
+
+        await release_fqdn(api, "databases", "db1")
+        assert not respx_mock.calls
 
 
 class TestCopyEnvs:
