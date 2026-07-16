@@ -10,8 +10,7 @@
 
 ## Reporting a Vulnerability
 
-Report security issues privately to **security@bauer-group.com** or via
-[GitHub Security Advisories]({{REPO_URL}}/security/advisories/new).
+Report security issues privately via [GitHub Security Advisories]({{REPO_URL}}/security/advisories/new).
 
 Please do not open a public issue for a vulnerability. We aim to acknowledge
 within 2 business days and to ship a fix or mitigation within 30 days.
