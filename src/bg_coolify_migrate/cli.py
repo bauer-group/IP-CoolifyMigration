@@ -103,6 +103,11 @@ _TRUST_HOST_KEY_HELP = (
     "unattended runs; interactively you are asked with the fingerprint instead."
 )
 
+#: The Coolify version this tool is validated against. Coolify's API contract
+#: (field shapes, container labels, create validation) shifts between releases,
+#: so a different version is flagged as untested rather than silently trusted.
+TESTED_COOLIFY_VERSION = "4.1.2"
+
 
 # ── doctor ───────────────────────────────────────────────────────────────────
 
@@ -152,6 +157,15 @@ async def _doctor(
     async with CoolifyClient(url, token, verify=settings.coolify_verify_tls) as api:
         version = await api.version()
         console.print(f"[ok]OK[/ok] Coolify {version} reachable at [path]{url}[/path]")
+        if version.strip() != TESTED_COOLIFY_VERSION:
+            console.print(
+                Text.assemble(
+                    ("WARN ", "warn"),
+                    f"validated against Coolify {TESTED_COOLIFY_VERSION}; {version.strip()} is "
+                    "untested. The API contract can differ between releases (field shapes, "
+                    "container labels, create validation) — verify a `plan` before you `run`.",
+                )
+            )
 
         # The check that matters. Without this scope every env var comes back
         # with no value at all - HTTP 200, no error, keys simply absent.

@@ -143,6 +143,45 @@ class TestDoctorExitCodes:
         result = runner.invoke(app, ["doctor"])
         assert result.exit_code == 9
 
+    def _happy_mocks(self, version: str) -> None:
+        # /version returns a BARE string on a real instance, not JSON.
+        respx.get(f"{BASE}/version").mock(return_value=httpx.Response(200, text=version))
+        respx.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "k1", "private_key": "-----BEGIN"}])
+        )
+        respx.get(f"{BASE}/servers").mock(
+            return_value=httpx.Response(
+                200, json=[{"uuid": "s1", "name": "prod-1", "ip": "10.0.0.1", "is_reachable": True}]
+            )
+        )
+        respx.get(f"{BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+
+    @respx.mock
+    def test_tested_version_prints_no_untested_warning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COOLIFY_URL", HOST)
+        monkeypatch.setenv("COOLIFY_TOKEN", "root-token")
+        self._happy_mocks("4.1.2")
+        result = runner.invoke(app, ["doctor", "--no-check-servers"])
+        assert result.exit_code == 0
+        assert "untested" not in result.stdout
+
+    @respx.mock
+    def test_untested_version_warns_but_still_exits_0(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A different Coolify release may shift the API contract; warn, don't fail.
+        monkeypatch.setenv("COOLIFY_URL", HOST)
+        monkeypatch.setenv("COOLIFY_TOKEN", "root-token")
+        self._happy_mocks("4.2.0")
+        result = runner.invoke(app, ["doctor", "--no-check-servers"])
+        assert result.exit_code == 0
+        assert "untested" in result.stdout
+        assert "4.2.0" in result.stdout
+
 
 class TestStatus:
     def test_empty_state_dir(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
