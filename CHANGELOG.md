@@ -1,6 +1,24 @@
 # CHANGELOG
 
 
+## v2.5.0 (2026-07-16)
+
+### Bug Fixes
+
+- **planner**: Discovered volumes by project name, not uuid
+  ([`99163cf`](https://github.com/bauer-group/IP-CoolifyMigration/commit/99163cffef467dd7f885d192554926949d448c70))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`d599482`](https://github.com/bauer-group/IP-CoolifyMigration/commit/d5994820db34ea5911167583d832b240de7451b8))
+
+### Features
+
+- **doctor**: Warned when the Coolify version is untested
+  ([`e5016a8`](https://github.com/bauer-group/IP-CoolifyMigration/commit/e5016a88cf0eb84c8a42f29afa0e6cf694329d67))
+
+
 ## v2.4.2 (2026-07-16)
 
 ### Bug Fixes
