@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.2.0 (2026-07-16)
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`fcc64c1`](https://github.com/bauer-group/IP-CoolifyMigration/commit/fcc64c17e9bfc7ff93845fb9493514369fc86a94))
+
+### Features
+
+- Doctor server checks and rsync auto-install
+  ([`1e226cd`](https://github.com/bauer-group/IP-CoolifyMigration/commit/1e226cda3afcb7cee8783aff195238f68c45505b))
+
+
 ## v2.1.5 (2026-07-16)
 
 ### Bug Fixes
