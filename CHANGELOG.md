@@ -1,6 +1,33 @@
 # CHANGELOG
 
 
+## v2.0.0 (2026-07-16)
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`6a944c5`](https://github.com/bauer-group/IP-CoolifyMigration/commit/6a944c5fe605e666f2ee0afca838d353f1104279))
+
+- **quickstart**: Added venv lifecycle guide
+  ([`767dbe9`](https://github.com/bauer-group/IP-CoolifyMigration/commit/767dbe9a1678f40c45b5b6be51096588f1b10711))
+
+### Features
+
+- **cli**: Added scoped migration and discovery
+  ([`50b55e8`](https://github.com/bauer-group/IP-CoolifyMigration/commit/50b55e8fe90b39ed21d72c15b64665934865dd58))
+
+### Testing
+
+- **cli**: Covered picker, selection and confirm
+  ([`eb3fac8`](https://github.com/bauer-group/IP-CoolifyMigration/commit/eb3fac8555a3565ef12649c7fec606855b8e8e41))
+
+### Breaking Changes
+
+- **cli**: `plan`/`run <project>` now migrate the whole project (every environment). They previously
+  defaulted to the `production` environment; use `<project>/production` or `--environment
+  production` for the old behaviour.
+
+
 ## v1.0.2 (2026-07-16)
 
 ### Bug Fixes
