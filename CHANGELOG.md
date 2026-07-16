@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.5.4 (2026-07-16)
+
+### Bug Fixes
+
+- **engine**: Rollback restores the source's original URL
+  ([`274a990`](https://github.com/bauer-group/IP-CoolifyMigration/commit/274a99082f3d89230ba038bf85a169ede4f383a7))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`d71b692`](https://github.com/bauer-group/IP-CoolifyMigration/commit/d71b6921e421b72436054fa9acb16fcbfc63b011))
+
+
 ## v2.5.3 (2026-07-16)
 
 ### Bug Fixes
