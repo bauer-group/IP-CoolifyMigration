@@ -64,22 +64,3 @@ jobs:
       # Integration tests need network and Docker; they run in their own job.
       - name: 🧪 Test
         run: pytest -q -m "not integration" --cov=src/bg_coolify_migrate --cov-report=term-missing
-
-  docs-current:
-    name: 📄 Generated docs are current
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: 📥 Checkout
-        uses: actions/checkout@v6
-
-      - name: 🐍 Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.14'
-
-      # README.MD / SECURITY.MD are generated from docs/*.template.MD. A stale
-      # generated file means the template and the published doc disagree, and the
-      # published one is what people read.
-      - name: 📄 Check
-        run: python scripts/generate-docs.py --check

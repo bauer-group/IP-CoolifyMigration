@@ -6,6 +6,11 @@ the `bauer-group/automation-templates` documentation workflow. This script exist
 so the same render can be produced locally (and so the working tree is valid for
 `pip install -e .`, which needs README.MD to exist before CI ever runs).
 
+`--check` is a local convenience, not a CI gate. The release workflow is the
+authority for the published docs and renders them with a different banner and a
+`v`-prefixed version, so gating CI on a byte-exact local render is a guaranteed
+false positive after every release. Do not wire `--check` into a workflow.
+
 Templates live in docs/*.template.MD and use {{PLACEHOLDER}} markers.
 
 Usage
