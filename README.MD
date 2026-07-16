@@ -1,4 +1,6 @@
-<!-- AUTO-GENERATED FILE. DO NOT EDIT. Edit docs/README.template.MD instead. Generated 2026-07-16. -->
+<!-- AUTO-GENERATED FILE. DO NOT EDIT. Edit docs/README.template.MD instead. -->
+<!-- Generated on 2026-07-16 11:34:32 UTC -->
+
 # BAUER GROUP - Coolify Migration Toolkit
 
 [![PyPI](https://img.shields.io/pypi/v/bg-coolify-migrate.svg)](https://pypi.org/project/bg-coolify-migrate/)
@@ -20,9 +22,9 @@ external orchestrator has none of those constraints. That is what this is.
 
 ## Repository Information
 
-- **Version:** 1.0.2
+- **Version:** v2.0.0
 - **Repository:** bauer-group/IP-CoolifyMigration
-- **Branch:** HEAD
+- **Branch:** main
 - **Architecture:** Pure-logic cores with thin IO shells; saga engine with a
   crash-safe journal
 
