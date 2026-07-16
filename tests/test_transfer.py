@@ -342,6 +342,22 @@ class TestHostKeyRecording:
 
         return asyncssh.generate_private_key("ssh-ed25519").convert_to_public()
 
+    def test_initial_known_hosts_selection(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        from bg_coolify_migrate.transfer.ssh import _initial_known_hosts
+
+        # No managed file + trusting -> accept any (the tests / system-default hatch).
+        # This is the case the integration suite uses and the rewrite regressed.
+        assert _initial_known_hosts(None, True) is None
+        # No file, no trust -> empty, so an unknown key is unverifiable and refused.
+        assert _initial_known_hosts(None, False) == ()
+        # A managed file that does not exist yet -> empty (record on first contact).
+        assert _initial_known_hosts(tmp_path / "nope", True) == ()
+        # An existing managed file -> always validate against it, never accept-any.
+        existing = tmp_path / "known_hosts"
+        existing.write_text("x\n", encoding="utf-8")
+        assert _initial_known_hosts(existing, True) == str(existing)
+        assert _initial_known_hosts(existing, False) == str(existing)
+
     def test_recorded_key_matches_a_port_22_connection(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         import asyncssh
 

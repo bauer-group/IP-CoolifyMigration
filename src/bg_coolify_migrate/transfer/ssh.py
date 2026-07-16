@@ -104,6 +104,21 @@ class SshTarget:
 HostKeyPrompt = Callable[[SshTarget, str], Awaitable[bool]]
 
 
+def _initial_known_hosts(known_hosts: Path | None, trust_new_host_key: bool) -> str | None | tuple[()]:
+    """The asyncssh ``known_hosts`` value for the first connect attempt.
+
+    * a managed file that exists -> validate against it;
+    * no managed file, but trusting -> ``None`` (accept any): there is nowhere to
+      record, so this is the tests / system-default escape hatch, matching the old
+      behaviour. With a managed file we NEVER pass None — an unknown key raises and
+      is then scanned, recorded and re-validated;
+    * otherwise -> ``()`` (empty): an unknown key is unverifiable and we say so.
+    """
+    if trust_new_host_key and known_hosts is None:
+        return None
+    return str(known_hosts) if known_hosts and known_hosts.exists() else ()
+
+
 def _append_known_host(known_hosts: Path, target: SshTarget, key: Any) -> None:
     """Append a host key to our managed known_hosts (OpenSSH format, deduped)."""
     entry = f"[{target.host}]:{target.port} {key.export_public_key().decode().strip()}"
@@ -170,8 +185,7 @@ class RemoteHost:
             "username": target.user,
             "port": target.port,
             "connect_timeout": connect_timeout,
-            # Never disable host key checking. If a key is unknown we say so.
-            "known_hosts": str(known_hosts) if known_hosts and known_hosts.exists() else (),
+            "known_hosts": _initial_known_hosts(known_hosts, trust_new_host_key),
         }
         if target.private_key:
             options["client_keys"] = [
