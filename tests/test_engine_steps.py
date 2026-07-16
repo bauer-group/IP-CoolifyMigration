@@ -156,7 +156,21 @@ class TestCaptureMounts:
             )
         )
         await _capture_mounts(ctx)  # no raise
-        assert ctx.pre_stop_mounts == {}  # nothing captured, nothing lost
+        # An EXPLICIT empty capture (not a missing key), so DISCOVER does not treat
+        # it as a lost capture and abort at the next step.
+        assert ctx.pre_stop_mounts == {"db1": []}
+
+    async def test_copy_is_a_noop_and_installs_no_key_without_volumes(
+        self, ctx: MigrationContext
+    ) -> None:
+        # No volume pairs -> copy must not install an ephemeral key or re-check the
+        # source; a no-data migration should not have a way to fail there.
+        from bg_coolify_migrate.engine.steps import step_copy
+
+        ctx.volume_pairs = {}
+        result = await step_copy(ctx)
+        assert result["volumes_copied"] == []
+        assert ctx.ephemeral_key is None
 
 
 class TestPreflight:

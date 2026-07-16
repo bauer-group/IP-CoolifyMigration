@@ -99,6 +99,15 @@ class SshSettingsMixin(BaseSettings):
             "an unflushed, torn volume."
         ),
     )
+    deploy_timeout: float = Field(
+        default=900.0,
+        ge=10.0,
+        description=(
+            "How long to wait for the target to come up after start. Much longer than "
+            "stop_timeout because a git-built application clones and BUILDS on the "
+            "target first, which can take many minutes."
+        ),
+    )
 
 
 class ObservabilityMixin(BaseSettings):

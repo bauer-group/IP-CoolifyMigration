@@ -306,6 +306,10 @@ async def _capture_mounts(ctx: MigrationContext) -> None:
                         "not carry the labels we filter on."
                     ),
                 )
+            # Record an EXPLICIT empty capture, not nothing: DISCOVER treats a
+            # missing key (None) as a lost capture and aborts, but an empty list
+            # correctly means "this resource had no mounts".
+            ctx.pre_stop_mounts[snapshot.uuid] = []
             log.info("quiesce.no_containers_no_volumes", resource=snapshot.name)
             continue
         mounts = await inspect_all_mounts(ctx.source_host, containers)
@@ -497,6 +501,13 @@ async def _transfer_endpoint(ctx: MigrationContext) -> tuple[str, int, str | Non
 
 async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
     """Mirror every volume, byte for byte, in parallel where it is safe."""
+    # A stateless / rebuilt resource has no volume pairs. Skip the ephemeral-key
+    # setup and the restart re-check entirely: there is nothing to copy, and doing
+    # the work anyway only adds a way for a no-data migration to fail spuriously.
+    if not any(ctx.volume_pairs.get(r.snapshot.uuid) for r in ctx.plan.resources):
+        log.info("copy.nothing", reason="no volumes to migrate")
+        return {"volumes_copied": [], "key_fingerprint": None}
+
     ctx.ephemeral_key = await keys.install(
         source=ctx.source_host, target=ctx.target_host, migration_id=ctx.migration_id
     )
@@ -674,9 +685,10 @@ async def step_healthcheck(ctx: MigrationContext) -> dict[str, Any]:
     """Wait for the target's containers to come up.
 
     A deploy is asynchronous, so "start returned" means nothing. We poll the
-    target's daemon for the same reason we poll the source's.
+    target's daemon for the same reason we poll the source's. The window is
+    deploy_timeout, not stop_timeout: a git-built app clones and builds here first.
     """
-    deadline = ctx.settings.stop_timeout
+    deadline = ctx.settings.deploy_timeout
     labels = observed_labels(ctx.plan)
     waited = 0.0
     interval = 3.0
