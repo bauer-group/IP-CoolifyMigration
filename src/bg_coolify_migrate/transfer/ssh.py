@@ -115,9 +115,28 @@ def _initial_known_hosts(known_hosts: Path | None) -> str | tuple[()]:
     return str(known_hosts) if known_hosts and known_hosts.exists() else ()
 
 
+#: The SSH default port. Its host-key entries are written WITHOUT the ``[host]:22``
+#: bracket form, because asyncssh (like OpenSSH) looks up the bare hostname for the
+#: default port — ``connection.py`` passes ``port=None`` when ``port == 22`` — so a
+#: ``[host]:22`` entry is stored under a pattern the connection never queries.
+_DEFAULT_SSH_PORT = 22
+
+
+def _known_host_line(target: SshTarget, key: Any) -> str:
+    """One OpenSSH known_hosts line for ``target``'s key.
+
+    Bare hostname on the default port, ``[host]:port`` otherwise — matching how the
+    connection looks the key up, or the recorded key is never re-verified.
+    """
+    host_field = (
+        target.host if target.port == _DEFAULT_SSH_PORT else f"[{target.host}]:{target.port}"
+    )
+    return f"{host_field} {key.export_public_key().decode().strip()}"
+
+
 def _append_known_host(known_hosts: Path, target: SshTarget, key: Any) -> None:
     """Append a host key to our managed known_hosts (OpenSSH format, deduped)."""
-    entry = f"[{target.host}]:{target.port} {key.export_public_key().decode().strip()}"
+    entry = _known_host_line(target, key)
     known_hosts.parent.mkdir(parents=True, exist_ok=True)
     existing = known_hosts.read_text(encoding="utf-8") if known_hosts.exists() else ""
     if entry.strip() in existing:
@@ -296,7 +315,7 @@ class RemoteHost:
         if known_hosts is None:
             return
         key = await cls._scan_host_key(target)
-        entry = f"[{target.host}]:{target.port} {key.export_public_key().decode().strip()}"
+        entry = _known_host_line(target, key)
         existing = known_hosts.read_text(encoding="utf-8") if known_hosts.exists() else ""
         if entry.strip() in existing:
             return  # already trusted

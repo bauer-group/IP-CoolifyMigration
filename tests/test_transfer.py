@@ -362,17 +362,28 @@ class TestHostKeyRecording:
             async with RemoteHost.connect(SshTarget(host="h"), trust_new_host_key=True):
                 pass
 
-    def test_recorded_key_matches_a_port_22_connection(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    def test_recorded_key_matches_the_way_a_connection_looks_it_up(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         import asyncssh
 
         from bg_coolify_migrate.transfer.ssh import SshTarget, _append_known_host
 
-        known_hosts = tmp_path / "known_hosts"
-        _append_known_host(known_hosts, SshTarget(host="host.example.com", port=22), self._public_key())
+        key = self._public_key()
 
-        parsed = asyncssh.import_known_hosts(known_hosts.read_text(encoding="utf-8"))
-        server_keys = parsed.match("host.example.com", "1.2.3.4", 22)[0]
-        assert server_keys, "a recorded key must be matchable, or TOFU is a no-op"
+        # Port 22: asyncssh's connection passes port=None (connection.py:
+        # `port = self._port if self._port != DEFAULT_PORT else None`), so it looks
+        # up the BARE hostname. A `[host]:22` entry would never be re-verified.
+        kh22 = tmp_path / "kh22"
+        _append_known_host(kh22, SshTarget(host="host.example.com", port=22), key)
+        parsed22 = asyncssh.import_known_hosts(kh22.read_text(encoding="utf-8"))
+        assert parsed22.match("host.example.com", "1.2.3.4", None)[0], (
+            "a port-22 key must match a bare-hostname lookup, or TOFU never re-verifies"
+        )
+
+        # A non-default port: the [host]:port form, looked up with the port.
+        kh = tmp_path / "kh2222"
+        _append_known_host(kh, SshTarget(host="host.example.com", port=2222), key)
+        parsed = asyncssh.import_known_hosts(kh.read_text(encoding="utf-8"))
+        assert parsed.match("host.example.com", "1.2.3.4", 2222)[0]
 
     async def test_trust_flag_records_without_prompting(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
         from bg_coolify_migrate.transfer.ssh import RemoteHost, SshTarget
