@@ -751,3 +751,57 @@ class TestRequestStop:
         )
         with pytest.raises(CoolifyApiError):
             await steps._request_stop(ctx)
+
+
+class TestAwaitTargetVolumes:
+    """DISCOVER must wait out the async LoadComposeFile job, not race it."""
+
+    async def test_returns_once_expected_mount_paths_appear(
+        self, ctx: MigrationContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from bg_coolify_migrate.domain.naming import VolumeEndpoint
+
+        calls = {"n": 0}
+
+        async def fake_read(api, *, collection, uuid):  # type: ignore[no-untyped-def]
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return []  # compose not loaded yet
+            return [VolumeEndpoint(name="t_data", mount_path="/var/globaleaks")]
+
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "bg_coolify_migrate.api.resources.read_volume_endpoints", fake_read
+        )
+        monkeypatch.setattr(steps.asyncio, "sleep", no_sleep)
+
+        eps = await steps._await_target_volumes(
+            ctx, collection="applications", target_uuid="t", expected={"/var/globaleaks"}
+        )
+        assert {"/var/globaleaks"} <= {e.mount_path for e in eps}
+        assert calls["n"] == 3  # polled until it appeared, no earlier
+
+    async def test_times_out_and_returns_the_incomplete_reading(
+        self, ctx: MigrationContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # If the storages never materialise, return what we have so the caller's
+        # unpaired-volume check raises the precise error (not a silent success).
+        object.__setattr__(ctx.settings, "target_storage_timeout", 9.0)
+
+        async def fake_read(api, *, collection, uuid):  # type: ignore[no-untyped-def]
+            return []
+
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "bg_coolify_migrate.api.resources.read_volume_endpoints", fake_read
+        )
+        monkeypatch.setattr(steps.asyncio, "sleep", no_sleep)
+
+        eps = await steps._await_target_volumes(
+            ctx, collection="applications", target_uuid="t", expected={"/var/globaleaks"}
+        )
+        assert eps == []

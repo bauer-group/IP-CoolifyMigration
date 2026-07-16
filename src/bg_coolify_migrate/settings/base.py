@@ -108,6 +108,17 @@ class SshSettingsMixin(BaseSettings):
             "target first, which can take many minutes."
         ),
     )
+    target_storage_timeout: float = Field(
+        default=180.0,
+        ge=5.0,
+        description=(
+            "How long DISCOVER waits for the target's declared volumes to appear "
+            "before pairing. A dockercompose target loads its compose — and thus its "
+            "persistent storages — through an async job at create, so its /storages "
+            "is empty for the first few seconds; without this wait, pairing races the "
+            "queue and a real volume is reported unpairable."
+        ),
+    )
 
 
 class ObservabilityMixin(BaseSettings):

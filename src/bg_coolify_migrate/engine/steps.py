@@ -384,6 +384,45 @@ async def _request_stop(ctx: MigrationContext) -> None:
         pending = refused
 
 
+async def _await_target_volumes(
+    ctx: MigrationContext,
+    *,
+    collection: str,
+    target_uuid: str,
+    expected: set[str],
+) -> list[VolumeEndpoint]:
+    """Poll the target's declared volumes until they cover ``expected`` mount paths.
+
+    The target of a dockercompose migration gets its persistent storages from an
+    async LoadComposeFile job dispatched at create, so a read right after create
+    can miss them. Returns as soon as every expected mount path is present, or the
+    latest reading at timeout — the caller's unpaired-volume check then produces
+    the precise, actionable error rather than a silent miss.
+    """
+    deadline = ctx.settings.target_storage_timeout
+    interval = 3.0
+    waited = 0.0
+    endpoints = await api_resources.read_volume_endpoints(
+        ctx.api, collection=collection, uuid=target_uuid
+    )
+    while not expected <= {e.mount_path for e in endpoints} and waited < deadline:
+        await asyncio.sleep(interval)
+        waited += interval
+        endpoints = await api_resources.read_volume_endpoints(
+            ctx.api, collection=collection, uuid=target_uuid
+        )
+    if not expected <= {e.mount_path for e in endpoints}:
+        log.warning(
+            "discover.target_volumes_incomplete",
+            waited=round(waited, 1),
+            expected=sorted(expected),
+            seen=sorted(e.mount_path for e in endpoints),
+        )
+    else:
+        log.info("discover.target_volumes_ready", waited=round(waited, 1))
+    return endpoints
+
+
 async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
     """The authoritative manifest, taken with nothing able to write.
 
@@ -434,9 +473,21 @@ async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
             for i in manifest.to_migrate
             if i.source_name
         ]
-        target_eps = await api_resources.read_volume_endpoints(
-            ctx.api, collection=snapshot.collection, uuid=target_uuid
-        )
+        # A dockercompose target loads its compose — and its persistent storages —
+        # via an async job at create, so /storages is empty for the first seconds.
+        # Wait for the volumes we need before pairing, or DISCOVER races the queue
+        # and reports a real volume unpairable.
+        if source_eps:
+            target_eps = await _await_target_volumes(
+                ctx,
+                collection=snapshot.collection,
+                target_uuid=target_uuid,
+                expected={e.mount_path for e in source_eps},
+            )
+        else:
+            target_eps = await api_resources.read_volume_endpoints(
+                ctx.api, collection=snapshot.collection, uuid=target_uuid
+            )
 
         pairs = pair_by_mount_path(source_eps, target_eps) if source_eps else []
         ctx.volume_pairs[snapshot.uuid] = pairs
