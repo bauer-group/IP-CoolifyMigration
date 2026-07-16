@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.2.1 (2026-07-16)
+
+### Bug Fixes
+
+- **api**: Rebuild the git URL when recreating a public app
+  ([`467c53d`](https://github.com/bauer-group/IP-CoolifyMigration/commit/467c53d4c13ca5e49693ac507fed051f868bc6e2))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`a41bdca`](https://github.com/bauer-group/IP-CoolifyMigration/commit/a41bdca77c9a13912c9acf750a51c494802ac6bb))
+
+
 ## v2.2.0 (2026-07-16)
 
 ### Documentation
