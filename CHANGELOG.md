@@ -1,9 +1,46 @@
 # CHANGELOG
 
 
-## Unreleased
+## v1.0.2 (2026-07-16)
+
+### Bug Fixes
+
+- **gitattributes**: Add comment for generated text files
+  ([`41ef22f`](https://github.com/bauer-group/IP-CoolifyMigration/commit/41ef22f7ae72f71df2a0a18fec32f3726c26390d))
+
+### Build System
+
+- Fixed changelog generation for PSR 10
+  ([`c2a7689`](https://github.com/bauer-group/IP-CoolifyMigration/commit/c2a7689bcccf92b100c58e5b2058b99dc962b59d))
+
+### Chores
+
+- **ci**: Bump actions/cache from 5 to 6
+  ([#2](https://github.com/bauer-group/IP-CoolifyMigration/pull/2),
+  [`89290f2`](https://github.com/bauer-group/IP-CoolifyMigration/commit/89290f2f13da2f3bb4f3f45da6bc5bbf952b715a))
+
+- **ci**: Bump actions/checkout from 6 to 7
+  ([#1](https://github.com/bauer-group/IP-CoolifyMigration/pull/1),
+  [`7ef96be`](https://github.com/bauer-group/IP-CoolifyMigration/commit/7ef96be9323b0b547c99cdbb22e11bf0dc1bf03b))
+
+- **deps**: Update structlog requirement
+  ([#3](https://github.com/bauer-group/IP-CoolifyMigration/pull/3),
+  [`453d7c6`](https://github.com/bauer-group/IP-CoolifyMigration/commit/453d7c6dd4af698b3829dc4a41aebaa6b055df79))
+
+- **deps**: Update structlog requirement from <26.0.0,>=24.4.0 to >=24.4.0,<27.0.0
+  ([#3](https://github.com/bauer-group/IP-CoolifyMigration/pull/3),
+  [`453d7c6`](https://github.com/bauer-group/IP-CoolifyMigration/commit/453d7c6dd4af698b3829dc4a41aebaa6b055df79))
 
 ### Continuous Integration
+
+- Added a release-asset upload workflow
+  ([`78f051e`](https://github.com/bauer-group/IP-CoolifyMigration/commit/78f051e1f51d01b53623f45d7a10160896372e0a))
+
+- Disabled the org SECURITY.MD generator
+  ([`bb97119`](https://github.com/bauer-group/IP-CoolifyMigration/commit/bb97119604bf7cefcaf39800a6a1add638c02b89))
+
+- Fixed the security-scan workflow caller
+  ([`1668417`](https://github.com/bauer-group/IP-CoolifyMigration/commit/16684177c59983304c75cd757cd8204c5eb6eee3))
 
 - Removed the conflicting doc-check gate
   ([`94427e3`](https://github.com/bauer-group/IP-CoolifyMigration/commit/94427e37bf703572e7fa04710bb4e0e0c5b62cd9))
@@ -18,6 +55,12 @@
 
 - Update vulnerability reporting instructions in SECURITY.template.MD
   ([`bcdf8d1`](https://github.com/bauer-group/IP-CoolifyMigration/commit/bcdf8d114d4d7880a69b856fcbbbff7d39215314))
+
+### Testing
+
+- Synced the e2e runner to structlog <27
+  ([#3](https://github.com/bauer-group/IP-CoolifyMigration/pull/3),
+  [`453d7c6`](https://github.com/bauer-group/IP-CoolifyMigration/commit/453d7c6dd4af698b3829dc4a41aebaa6b055df79))
 
 
 ## v1.0.1 (2026-07-16)
