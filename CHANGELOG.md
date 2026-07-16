@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.5.3 (2026-07-16)
+
+### Bug Fixes
+
+- **engine**: DNS gate reads the target and resolves server IPs
+  ([`5aadf28`](https://github.com/bauer-group/IP-CoolifyMigration/commit/5aadf2899acd1f89dbeb459c33c8d0d28c3a5568))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`056a960`](https://github.com/bauer-group/IP-CoolifyMigration/commit/056a96084cf279d8c6c2051a8e95b365849ab3db))
+
+
 ## v2.5.2 (2026-07-16)
 
 ### Bug Fixes
