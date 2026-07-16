@@ -408,6 +408,41 @@ class TestCreateApplication:
         body = json.loads(route.calls[0].request.read())
         assert body["domains"] == "https://shop.example.com"
 
+    async def test_compose_app_sends_custom_labels_base64_encoded(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # Regression: Coolify 422s a plaintext custom_labels ("should be base64
+        # encoded"). The compose app (bauer-group/pair-drop) failed here.
+        import base64
+        import json
+
+        route = respx_mock.post(f"{BASE}/applications/public").mock(
+            return_value=httpx.Response(201, json={"uuid": "a2"})
+        )
+        snapshot = ResourceSnapshot(
+            uuid="a1",
+            name="pair-drop",
+            collection="applications",
+            kind=ResourceKind.APP_GIT_COMPOSE,
+            git_repository="https://github.com/x/y",
+            git_branch="main",
+            git_auth=GitAuth.PUBLIC,
+        )
+        labels = "traefik.enable=true\ntraefik.http.routers.x.rule=Host(`a.com`)"
+        await create_resource(
+            api,
+            snapshot,
+            _placement_wc(),
+            {
+                "git_repository": "https://github.com/x/y",
+                "git_branch": "main",
+                "build_pack": "dockercompose",
+                "custom_labels": labels,
+            },
+        )
+        body = json.loads(route.calls[0].request.read())
+        assert base64.b64decode(body["custom_labels"]).decode() == labels
+
     async def test_missing_git_fields_raise_before_the_round_trip(
         self, api: CoolifyClient
     ) -> None:
@@ -550,6 +585,46 @@ class TestUnrewritableServerBound:
 
     def test_custom_domain_is_never_flagged(self) -> None:
         assert self._detect("https://shop.example.com", tgt=None) == []
+
+
+class TestEncodeBase64Fields:
+    def _apply(self, body: dict) -> dict:
+        from bg_coolify_migrate.api.resources import _encode_base64_fields
+
+        _encode_base64_fields(body)
+        return body
+
+    def test_plaintext_labels_are_base64_encoded(self) -> None:
+        import base64
+
+        labels = "traefik.enable=true\ntraefik.http.routers.x.rule=Host(`a.com`)"
+        out = self._apply({"custom_labels": labels})
+        assert base64.b64decode(out["custom_labels"]).decode() == labels
+
+    def test_all_three_fields_are_encoded(self) -> None:
+        import base64
+
+        out = self._apply(
+            {
+                "custom_labels": "a=b",
+                "custom_nginx_configuration": "server {}",
+                "dockerfile": "FROM alpine",
+            }
+        )
+        assert base64.b64decode(out["custom_labels"]).decode() == "a=b"
+        assert base64.b64decode(out["custom_nginx_configuration"]).decode() == "server {}"
+        assert base64.b64decode(out["dockerfile"]).decode() == "FROM alpine"
+
+    def test_empty_and_null_are_dropped_not_sent(self) -> None:
+        # Coolify decodes then runs a UTF-8 check that "" fails, and has()=true for
+        # a null — both 422. Neither must reach the wire.
+        out = self._apply({"custom_labels": "", "dockerfile": None, "keep": "x"})
+        assert "custom_labels" not in out
+        assert "dockerfile" not in out
+        assert out["keep"] == "x"
+
+    def test_absent_fields_are_left_absent(self) -> None:
+        assert self._apply({"name": "web"}) == {"name": "web"}
 
 
 class TestCopyEnvs:

@@ -92,6 +92,32 @@ def _encode_compose(raw: str) -> str:
     return base64.b64encode(raw.encode("utf-8")).decode("ascii")
 
 
+#: Application-create fields Coolify STORES as plaintext but VALIDATES as base64
+#: on the way in (``isBase64Encoded``), then decodes and stores. Sending the
+#: source's plaintext value verbatim is a 422 "should be base64 encoded". Same
+#: asymmetry as docker_compose_raw. custom_labels is the one that bit the compose
+#: app; the other two would 422 next for a dockerfile / custom-nginx app.
+_BASE64_CREATE_FIELDS = ("custom_labels", "custom_nginx_configuration", "dockerfile")
+
+
+def _encode_base64_fields(body: dict[str, Any]) -> None:
+    """Base64-encode the plaintext-in/base64-out create fields, in place.
+
+    An empty value is dropped, not encoded: Coolify decodes then runs a UTF-8
+    check that an empty string fails, so sending ``""`` is itself a 422.
+    """
+    for field in _BASE64_CREATE_FIELDS:
+        if field not in body:
+            continue
+        value = body[field]
+        text = "" if value is None else str(value)
+        if text.strip():
+            body[field] = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        else:
+            # None or empty: Coolify has()=true and 422s on both. Drop it.
+            body.pop(field, None)
+
+
 def _check(body: dict[str, Any], required: frozenset[str], what: str) -> None:
     missing = missing_required(body, required)
     if missing:
@@ -368,6 +394,10 @@ async def create_application(
         body.pop("docker_compose_raw", None)
         body.pop("docker_compose_domains", None)
         body.pop("domains", None)
+
+    # custom_labels / custom_nginx_configuration / dockerfile come back plaintext
+    # but the create route validates + decodes them as base64.
+    _encode_base64_fields(body)
 
     required = frozenset({"project_uuid", "server_uuid"}) | APPLICATION_ROUTE_REQUIRED[segment]
     _check(body, required, f"application {snapshot.name!r} via {route}")
