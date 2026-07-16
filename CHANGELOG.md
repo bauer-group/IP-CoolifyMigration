@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.2.2 (2026-07-16)
+
+### Bug Fixes
+
+- **engine**: Do not abort quiesce on a resource with no volumes
+  ([`03e580e`](https://github.com/bauer-group/IP-CoolifyMigration/commit/03e580e0bee3eb0d6d831c57063b4e1bb742b265))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`3a298d5`](https://github.com/bauer-group/IP-CoolifyMigration/commit/3a298d5fa2cc1e388e486f87455c27ae883000fe))
+
+
 ## v2.2.1 (2026-07-16)
 
 ### Bug Fixes
