@@ -74,6 +74,12 @@ class ServerRef(BaseModel):
     ip: str
     user: str = "root"
     port: int = 22
+    wildcard_domain: str = ""
+    """The server's wildcard base (Coolify ``settings.wildcard_domain``), e.g.
+    ``app.0046-20.cloud.bauer-group.com``. Every resource on this server gets a
+    default URL under it, and that URL is BOUND to this server — migrating a
+    resource rewrites the URL onto the target server's wildcard. Empty when the
+    server has none configured."""
 
 
 class ResourceRow(BaseModel):

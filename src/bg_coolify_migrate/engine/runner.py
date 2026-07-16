@@ -199,6 +199,7 @@ async def run_migration(
     *,
     migration_id: str | None = None,
     accept_drift: bool = False,
+    accept_dns: bool = False,
     delete_previews: bool = False,
     trust_host_key: bool = False,
     host_key_prompt: HostKeyPrompt | None = None,
@@ -231,6 +232,7 @@ async def run_migration(
             source_host=source_host,
             target_host=target_host,
             accept_drift=accept_drift,
+            accept_dns=accept_dns,
             delete_previews=delete_previews,
         )
         result = await _execute(ctx, start_from=State.INIT, on_state=on_state)
@@ -245,6 +247,7 @@ async def resume_migration(
     migration_id: str,
     *,
     accept_drift: bool = False,
+    accept_dns: bool = False,
     trust_host_key: bool = False,
     host_key_prompt: HostKeyPrompt | None = None,
     on_state: Callable[[State], Awaitable[None]] | None = None,
@@ -283,6 +286,7 @@ async def resume_migration(
             source_host=source_host,
             target_host=target_host,
             accept_drift=accept_drift,
+            accept_dns=accept_dns,
         )
         # Rehydrate what earlier states recorded, so compensations and later
         # steps see the same world.

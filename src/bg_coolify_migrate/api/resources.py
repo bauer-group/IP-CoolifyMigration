@@ -45,6 +45,8 @@ from bg_coolify_migrate.api.fields import (
     filter_body,
     missing_required,
 )
+from bg_coolify_migrate.dns import wildcard as dns_wildcard
+from bg_coolify_migrate.dns.extract import normalise_host
 from bg_coolify_migrate.domain.kinds import ResourceKind, create_route
 from bg_coolify_migrate.domain.naming import VolumeEndpoint
 from bg_coolify_migrate.domain.plan import ResourceSnapshot
@@ -63,11 +65,18 @@ class Placement:
         environment_name: str,
         server_uuid: str,
         destination_uuid: str | None = None,
+        source_wildcard: str | None = None,
+        target_wildcard: str | None = None,
     ) -> None:
         self.project_uuid = project_uuid
         self.environment_name = environment_name
         self.server_uuid = server_uuid
         self.destination_uuid = destination_uuid
+        # The source/target servers' wildcard bases, so a server-bound URL can be
+        # rewritten onto the target's wildcard at create. Not part of as_body():
+        # they drive domain rewriting, they are not create fields themselves.
+        self.source_wildcard = source_wildcard
+        self.target_wildcard = target_wildcard
 
     def as_body(self) -> dict[str, Any]:
         return {
@@ -244,6 +253,43 @@ def _public_git_url(git_repository: str) -> str:
     return f"https://github.com/{git_repository.strip('/')}"
 
 
+def _remap_domains(
+    fqdn: str | None, *, source_wildcard: str | None, target_wildcard: str | None
+) -> str:
+    """Rewrite a comma-separated fqdn onto the target server. PURE.
+
+    Server-bound URLs — those under the SOURCE server's wildcard — are rewritten
+    onto the target's wildcard (``pdf-tool.app.0046-20…`` -> ``…app.0047-20…``),
+    so the app keeps its subdomain on the new host. Custom domains are carried
+    verbatim: they are server-independent and move by a DNS cutover, which the
+    DNS gate reasons about separately. Returns a comma-separated list of full
+    URLs, or ``""`` when there is nothing to set (Coolify then auto-generates a
+    target-wildcard URL via ``autogenerate_domain``).
+    """
+    if not fqdn:
+        return ""
+    urls: list[str] = []
+    for part in str(fqdn).split(","):
+        stripped = part.strip()
+        host = normalise_host(stripped)
+        if host is None:
+            continue
+        if dns_wildcard.under_wildcard(host, source_wildcard):
+            # Server-bound: rewrite onto the target's wildcard. If the target has
+            # no wildcard we cannot place it there — drop it (carrying the
+            # source-bound host would point the target at the SOURCE) and let
+            # Coolify auto-generate a working URL via autogenerate_domain.
+            remapped = dns_wildcard.remap_host(host, source_wildcard, target_wildcard)
+            if remapped:
+                urls.append(f"https://{remapped}")
+        else:
+            # Custom (or, with no source wildcard known, treated as custom): it is
+            # server-independent and moves with the app verbatim.
+            urls.append(stripped)
+    # Dedup while preserving order — a source can list the same host twice.
+    return ",".join(dict.fromkeys(urls))
+
+
 async def create_application(
     api: CoolifyClient, snapshot: ResourceSnapshot, placement: Placement, source: dict[str, Any]
 ) -> str:
@@ -259,18 +305,33 @@ async def create_application(
     if segment == "public" and body.get("git_repository"):
         body["git_repository"] = _public_git_url(str(body["git_repository"]))
 
-    # The FQDN is decided by the DNS gate and the finalize policy, not carried
-    # over. coolify-mover copies it verbatim, producing two resources that claim
-    # the same hostname.
-    body.pop("domains", None)
+    # Rewrite the URLs onto the TARGET rather than dropping or copying them.
+    # Server-bound URLs (under the source server's wildcard) move to the target's
+    # wildcard so the app keeps its subdomain on the new host; custom domains are
+    # carried as-is (they move by DNS cutover, gated separately). coolify-mover
+    # copies fqdn verbatim, pointing two servers at the same server-bound
+    # hostname — which can never work: the wildcard binds it to one server.
+    # Read from the SOURCE, not the filtered body: Coolify stores the URL in the
+    # `fqdn` column, which is not a create input (``domains`` is) and so is
+    # filtered out of `body`.
+    target_domains = _remap_domains(
+        source.get("fqdn") or source.get("domains"),
+        source_wildcard=placement.source_wildcard,
+        target_wildcard=placement.target_wildcard,
+    )
     body.pop("fqdn", None)
+    if target_domains:
+        body["domains"] = target_domains
+    else:
+        body.pop("domains", None)
 
     if snapshot.kind is ResourceKind.APP_GIT_COMPOSE:
         # build_pack=dockercompose forces ports_exposes='80' upstream and REJECTS
-        # `domains` (docker_compose_domains is the field). Its compose is loaded
-        # from git, so sending docker_compose_raw here would not survive anyway.
+        # `domains` (docker_compose_domains is the field). Its compose — and the
+        # per-service domains inside it — are loaded from git, so both are dropped.
         body.pop("docker_compose_raw", None)
         body.pop("docker_compose_domains", None)
+        body.pop("domains", None)
 
     required = frozenset({"project_uuid", "server_uuid"}) | APPLICATION_ROUTE_REQUIRED[segment]
     _check(body, required, f"application {snapshot.name!r} via {route}")

@@ -90,6 +90,16 @@ class MigrationContext:
     could still differ — but unattended we cannot ask, so an unanswered question
     stops the run rather than deciding for them."""
 
+    accept_dns: bool = False
+    """The operator accepted a custom-domain DNS cutover.
+
+    Set by --accept-dns, or by the wizard once they confirm. The DNS gate blocks
+    by default when a custom domain still points at the source (starting the
+    target then burns the ACME rate limit); with this set it only warns and
+    proceeds, because DNS propagation lags and the operator has chosen to finish
+    the migration and cut the record over in parallel. Server-bound wildcard URLs
+    are unaffected — they are rewritten onto the target, never cut over."""
+
     delete_previews: bool = False
 
     @property

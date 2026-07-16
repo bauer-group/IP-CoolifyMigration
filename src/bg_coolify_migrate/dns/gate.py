@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from bg_coolify_migrate.dns.extract import Hostname
+from bg_coolify_migrate.dns.wildcard import under_wildcard
 
 
 class Verdict(StrEnum):
@@ -34,7 +35,7 @@ class Verdict(StrEnum):
     """Already resolves to the target. Nothing to do."""
 
     CUTOVER_NEEDED = "cutover_needed"
-    """Still resolves to the source. BLOCKS."""
+    """Still resolves to the source. A custom domain that must be repointed."""
 
     ELSEWHERE = "elsewhere"
     """Resolves to neither — typically a CDN/proxy (Cloudflare's orange cloud)
@@ -48,6 +49,12 @@ class Verdict(StrEnum):
     GENERATED = "generated"
     """A Coolify-generated *.sslip.io style name that encodes the server IP and
     therefore follows the server. Never blocks."""
+
+    SERVER_BOUND = "server_bound"
+    """A URL under the SOURCE server's wildcard base (``pdf-tool.app.0046-20…``).
+    The wildcard's DNS record binds it to that one server, so it cannot cut over
+    — it is rewritten onto the TARGET server's wildcard at create time instead.
+    The target answers on its own hostname, so this never gates."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +107,11 @@ class DnsGateReport:
     def ready(self) -> tuple[HostVerdict, ...]:
         return tuple(v for v in self.verdicts if v.verdict is Verdict.READY)
 
+    @property
+    def server_bound(self) -> tuple[HostVerdict, ...]:
+        """URLs rewritten onto the target's wildcard — reported, never gating."""
+        return tuple(v for v in self.verdicts if v.verdict is Verdict.SERVER_BOUND)
+
     def cutover_checklist(self) -> list[str]:
         """Actionable instructions, not a diagnosis.
 
@@ -125,13 +137,25 @@ def classify(
     *,
     source_ips: frozenset[str],
     target_ips: frozenset[str],
+    source_wildcard: str | None = None,
 ) -> HostVerdict:
     """Decide what one hostname's DNS state means. PURE.
 
-    The ordering matters: a generated hostname is decided before anything else,
-    because it encodes the server IP and would otherwise look like
-    ``CUTOVER_NEEDED`` forever.
+    The ordering matters: a server-bound URL (under the source server's
+    wildcard) and a generated hostname are both decided before DNS is even
+    consulted, because each encodes the server and would otherwise look like
+    ``CUTOVER_NEEDED`` forever — the first is rewritten onto the target's
+    wildcard, the second follows the server by its embedded IP.
     """
+    if source_wildcard and under_wildcard(resolution.hostname.host, source_wildcard):
+        return HostVerdict(
+            hostname=resolution.hostname,
+            verdict=Verdict.SERVER_BOUND,
+            addresses=resolution.addresses,
+            ttl=resolution.ttl,
+            detail="under the source server's wildcard; rewritten onto the target's wildcard",
+        )
+
     if resolution.hostname.is_generated:
         return HostVerdict(
             hostname=resolution.hostname,
@@ -194,10 +218,14 @@ def build_report(
     *,
     source_ips: frozenset[str],
     target_ips: frozenset[str],
+    source_wildcard: str | None = None,
 ) -> DnsGateReport:
     """Classify every hostname into one report."""
     verdicts = tuple(
-        classify(r, source_ips=source_ips, target_ips=target_ips) for r in resolutions
+        classify(
+            r, source_ips=source_ips, target_ips=target_ips, source_wildcard=source_wildcard
+        )
+        for r in resolutions
     )
     return DnsGateReport(
         verdicts=verdicts,

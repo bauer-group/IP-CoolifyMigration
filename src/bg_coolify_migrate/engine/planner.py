@@ -84,6 +84,11 @@ def decode_compose(raw: str | None) -> str | None:
 
 
 def server_ref(server: dict[str, Any]) -> ServerRef:
+    # The wildcard base lives under the eager-loaded `settings` relation
+    # (servers are the one endpoint Coolify loads it for). It is how a resource
+    # gets a default URL, and thus what we rewrite that URL onto for the target.
+    settings = server.get("settings")
+    wildcard = str(settings.get("wildcard_domain") or "") if isinstance(settings, dict) else ""
     return ServerRef(
         uuid=str(server.get("uuid", "")),
         name=str(server.get("name", "?")),
@@ -95,6 +100,7 @@ def server_ref(server: dict[str, Any]) -> ServerRef:
         # shape as the port fallback right below. Found by the F2 e2e migration.
         user=str(server.get("user") or "root"),
         port=int(server.get("port", 22) or 22),
+        wildcard_domain=wildcard,
     )
 
 
@@ -666,6 +672,13 @@ async def build_plan(
     project_data = await find_project(api, project)
     project_uuid = str(project_data["uuid"])
     target = await find_server(api, target_server)
+    # find_server matches against the LIST endpoint, which does not eager-load the
+    # `settings` relation (only server-by-uuid does — same reason is_reachable
+    # lives there). Re-fetch so target_server.wildcard_domain is populated: it is
+    # what server-bound URLs get rewritten onto.
+    target_uuid = str(target.get("uuid", ""))
+    if target_uuid:
+        target = await api.get_server(target_uuid) or target
 
     resources = await environment_resources(api, project_uuid, environment)
     if not resources:

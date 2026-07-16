@@ -135,6 +135,40 @@ healthy:
 Traefik still claims the hostname and keeps trying to renew its certificate — so
 "keep the old one around just in case" quietly costs you ACME rate limit budget.
 
+## Domains & DNS
+
+A resource answers on two kinds of hostname, and they migrate in opposite ways.
+
+**Server-bound URLs** — the default URL Coolify generates under a server's
+wildcard, e.g. `pdf-tool.app.0046-20.cloud.bauer-group.com` when the source
+server's wildcard is `app.0046-20.cloud.bauer-group.com`. The wildcard's DNS
+record binds it to that one server, so it *cannot* move. `run` **rewrites** it
+onto the target server's wildcard automatically —
+`pdf-tool.app.0047-20.cloud.bauer-group.com` — keeping the same subdomain. No
+DNS change is needed and the gate never stops for these; they show as
+`server_bound` in the DNS table.
+
+**Custom domains** — `shop.example.com` and the like. These are
+server-independent: they move *with* the app, by repointing their DNS record at
+the target. Because the target's proxy requests an ACME certificate the moment it
+starts, and that challenge is routed by DNS to whichever server the record still
+names, starting the target while the record points at the source burns the
+Let's Encrypt rate limit. So by default the **DNS gate blocks** (exit `3`,
+resumable) until the record points at the target:
+
+```bash
+coolify-migrate run pdf-tool --to 0047-20
+# -> exit 3 with a cutover checklist, IF a custom domain still points at 0046-20
+# repoint DNS, then:
+coolify-migrate resume <migration-id>
+```
+
+If you would rather finalize now and cut the record over in parallel —
+propagation can lag by the record's TTL — confirm interactively, or pass
+**`--accept-dns`** unattended. The gate then only warns; the target may serve a
+temporary certificate error until DNS catches up. `--accept-dns` affects custom
+domains only; server-bound URLs are always rewritten regardless.
+
 ## Non-TTY output
 
 Piped or in CI, output switches to line-oriented text automatically — a plan in a

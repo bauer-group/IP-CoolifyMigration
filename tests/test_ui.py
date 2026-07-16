@@ -198,6 +198,25 @@ class TestDnsRendering:
         assert "shop.example.com" in out
         assert "cutover_needed" in out
 
+    def test_every_verdict_has_a_style(self) -> None:
+        # dns_table indexes _VERDICT_STYLE[verdict]; a missing entry KeyErrors the
+        # whole dashboard exactly when that verdict appears. Guard the map here.
+        from bg_coolify_migrate.dns.gate import Verdict
+        from bg_coolify_migrate.ui.report import _VERDICT_STYLE
+
+        assert set(_VERDICT_STYLE) == set(Verdict)
+
+    def test_dns_table_renders_a_server_bound_verdict(self) -> None:
+        report = build_report(
+            [Resolution(Hostname("pdf-tool.app.0046-20.cloud.bauer-group.com", HostnameOrigin.FQDN, False), ())],
+            source_ips=frozenset({"10.0.0.1"}),
+            target_ips=frozenset({"10.0.0.2"}),
+            source_wildcard="app.0046-20.cloud.bauer-group.com",
+        )
+        out = render(dns_table(report))
+        assert "server_bound" in out
+        assert "pdf-tool.app.0046-20.cloud.bauer-group.com" in out
+
     def test_cutover_panel_is_actionable(self) -> None:
         out = render(cutover_panel(self._report()))
         assert "shop.example.com" in out

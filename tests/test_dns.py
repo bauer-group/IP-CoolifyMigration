@@ -264,6 +264,40 @@ class TestClassify:
         assert verdict.verdict is Verdict.UNRESOLVED
         assert verdict.blocks is False
 
+    def test_source_wildcard_url_is_server_bound_and_never_blocks(self) -> None:
+        # A URL under the source server's wildcard resolves to the source, but it
+        # is rewritten onto the target's wildcard at create — it must not gate.
+        verdict = classify(
+            Resolution(_h("pdf-tool.app.0046-20.cloud.bauer-group.com"), ("10.0.0.1",)),
+            source_ips=SOURCE,
+            target_ips=TARGET,
+            source_wildcard="app.0046-20.cloud.bauer-group.com",
+        )
+        assert verdict.verdict is Verdict.SERVER_BOUND
+        assert verdict.blocks is False
+
+    def test_server_bound_wins_over_cutover_even_without_resolution(self) -> None:
+        # The step does not resolve server-bound hosts (empty addresses); the
+        # wildcard check short-circuits before the "no addresses" branch.
+        verdict = classify(
+            Resolution(_h("pdf-tool.app.0046-20.cloud.bauer-group.com"), ()),
+            source_ips=SOURCE,
+            target_ips=TARGET,
+            source_wildcard="app.0046-20.cloud.bauer-group.com",
+        )
+        assert verdict.verdict is Verdict.SERVER_BOUND
+
+    def test_custom_domain_still_blocks_with_a_source_wildcard_set(self) -> None:
+        # Having a source wildcard must not make custom domains stop gating.
+        verdict = classify(
+            Resolution(_h("shop.example.com"), ("10.0.0.1",)),
+            source_ips=SOURCE,
+            target_ips=TARGET,
+            source_wildcard="app.0046-20.cloud.bauer-group.com",
+        )
+        assert verdict.verdict is Verdict.CUTOVER_NEEDED
+        assert verdict.blocks is True
+
 
 class TestReport:
     def test_blocked_when_any_hostname_points_at_source(self) -> None:

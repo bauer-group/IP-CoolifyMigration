@@ -766,6 +766,18 @@ def run(
             )
         ),
     ] = False,
+    accept_dns: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "Proceed even though a custom domain still points at the source: start "
+                "the target and finalize, then cut the DNS record over in parallel "
+                "(propagation lags). Server-bound wildcard URLs are rewritten onto the "
+                "target automatically and are unaffected. Needed only when unattended - "
+                "interactively we show the domains and ask."
+            )
+        ),
+    ] = False,
     delete_previews: Annotated[
         bool, typer.Option(help="Delete preview deployments first (they block the copy).")
     ] = False,
@@ -799,6 +811,7 @@ def run(
                 environment_override=environment,
                 policy=policy,
                 accept_drift=accept_drift,
+                accept_dns=accept_dns,
                 delete_previews=delete_previews,
                 trust_host_key=trust_host_key,
                 assume_yes=yes,
@@ -818,6 +831,7 @@ async def _run(
     environment_override: str | None,
     policy: FinalizePolicy,
     accept_drift: bool,
+    accept_dns: bool = False,
     delete_previews: bool,
     trust_host_key: bool = False,
     assume_yes: bool,
@@ -868,9 +882,11 @@ async def _run(
                     "[err]error:[/err] refusing to run unattended without --yes", style="err"
                 )
                 return 2
-            # A yes here IS the answer to the drift/compatibility question, so we
-            # carry accept_drift through; otherwise preflight would ask again into
-            # the void.
+            # A yes here IS the answer to the drift/compatibility AND the DNS
+            # cutover question, so we carry both through; otherwise the gates would
+            # ask again into the void of the live dashboard. Server-bound wildcard
+            # URLs are rewritten regardless; accept_dns only affects a custom domain
+            # that still points at the source, which the gate then warns about.
             try:
                 if not await _off_loop(_confirm_plans, plans):
                     return 0
@@ -878,6 +894,7 @@ async def _run(
                 console.print("aborted", style="muted")
                 return 0
             accept_drift = True
+            accept_dns = True
         else:
             blocked = [migration_plan for migration_plan in plans if migration_plan.is_blocked]
             if blocked:
@@ -903,6 +920,7 @@ async def _run(
                     migration_plan,
                     migration_id=migration_id,
                     accept_drift=accept_drift,
+                    accept_dns=accept_dns,
                     delete_previews=delete_previews,
                     trust_host_key=trust_host_key,
                     host_key_prompt=None,  # keys pre-accepted; never prompt under Live
@@ -975,6 +993,16 @@ def resume(
     accept_drift: Annotated[
         bool, typer.Option(help="Proceed past the drift gate without asking (for unattended runs).")
     ] = False,
+    accept_dns: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "Proceed past the DNS gate even though a custom domain still points at "
+                "the source - cut the record over in parallel. The usual resume path is "
+                "to flip DNS first, then resume with no flag (the gate then passes)."
+            )
+        ),
+    ] = False,
     trust_host_key: Annotated[
         bool, typer.Option("--trust-host-key", help=_TRUST_HOST_KEY_HELP)
     ] = False,
@@ -988,7 +1016,9 @@ def resume(
     """
     settings = _settings(log_level, log_format)
     try:
-        code = asyncio.run(_resume(settings, migration_id, accept_drift, trust_host_key))
+        code = asyncio.run(
+            _resume(settings, migration_id, accept_drift, accept_dns, trust_host_key)
+        )
     except MigrationError as exc:
         _fail(exc)
         return
@@ -996,7 +1026,11 @@ def resume(
 
 
 async def _resume(
-    settings: Settings, migration_id: str, accept_drift: bool, trust_host_key: bool = False
+    settings: Settings,
+    migration_id: str,
+    accept_drift: bool,
+    accept_dns: bool = False,
+    trust_host_key: bool = False,
 ) -> int:
     from bg_coolify_migrate.api.client import CoolifyClient
     from bg_coolify_migrate.engine.runner import load_plan, resume_migration
@@ -1021,6 +1055,7 @@ async def _resume(
                 migration_plan,
                 migration_id,
                 accept_drift=accept_drift,
+                accept_dns=accept_dns,
                 trust_host_key=trust_host_key,
                 host_key_prompt=None,
                 on_state=reporter.on_state,

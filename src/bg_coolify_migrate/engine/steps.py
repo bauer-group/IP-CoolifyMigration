@@ -21,7 +21,8 @@ from bg_coolify_migrate.api.resources import Placement
 from bg_coolify_migrate.discovery import docker, quiesce
 from bg_coolify_migrate.dns import extract as dns_extract
 from bg_coolify_migrate.dns import resolve as dns_resolve
-from bg_coolify_migrate.dns.gate import build_report, explain_why_blocking_matters
+from bg_coolify_migrate.dns import wildcard as dns_wildcard
+from bg_coolify_migrate.dns.gate import Resolution, build_report, explain_why_blocking_matters
 from bg_coolify_migrate.domain.naming import VolumeEndpoint, pair_by_mount_path
 from bg_coolify_migrate.domain.plan import TransferMode
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
@@ -142,6 +143,8 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
         environment_name=ctx.plan.environment,
         server_uuid=ctx.plan.target_server.uuid,
         destination_uuid=destination,
+        source_wildcard=ctx.plan.source_server.wildcard_domain or None,
+        target_wildcard=ctx.plan.target_server.wildcard_domain or None,
     )
 
     created: dict[str, str] = {}
@@ -647,27 +650,51 @@ async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
     if not real:
         return {"hostnames": 0, "verdict": "no real hostnames"}
 
-    resolutions = await dns_resolve.resolve_all(real)
+    # Server-bound URLs (under the SOURCE server's wildcard) are rewritten onto
+    # the target's wildcard at create — they never cut over, so we do not resolve
+    # them (they would resolve to the source forever and read as CUTOVER_NEEDED).
+    # They still enter the report as SERVER_BOUND, for the operator to see.
+    src_wildcard = ctx.plan.source_server.wildcard_domain or None
+    custom = [h for h in real if not dns_wildcard.under_wildcard(h.host, src_wildcard)]
+    bound = [h for h in real if dns_wildcard.under_wildcard(h.host, src_wildcard)]
+
+    resolutions = await dns_resolve.resolve_all(custom)
+    resolutions.extend(Resolution(hostname=h, addresses=()) for h in bound)
     report = build_report(
         resolutions,
         source_ips=frozenset({ctx.plan.source_server.ip}),
         target_ips=frozenset({ctx.plan.target_server.ip}),
+        source_wildcard=src_wildcard,
     )
     ctx.dns_report = report
 
     if report.is_blocked:
-        raise DnsGateBlocked(
-            "DNS still points at the source for: "
-            + ", ".join(v.hostname.host for v in report.blocked)
-            + "\n\n"
-            + explain_why_blocking_matters(),
-            hint="Cutover:\n  " + "\n  ".join(report.cutover_checklist()),
-            report=report,
+        blocked_hosts = ", ".join(v.hostname.host for v in report.blocked)
+        if not ctx.accept_dns:
+            # A live custom domain still points at the source. Refuse by default,
+            # but resumably: flip DNS (or pass --accept-dns) and continue.
+            raise DnsGateBlocked(
+                "DNS still points at the source for: "
+                + blocked_hosts
+                + "\n\n"
+                + explain_why_blocking_matters(),
+                hint="Cutover:\n  " + "\n  ".join(report.cutover_checklist()),
+                report=report,
+            )
+        # The operator accepted the cutover risk (custom domains only — DNS
+        # propagation lags). Proceed and finalize; the target may serve a stale
+        # certificate until DNS catches up.
+        log.warning(
+            "dns_gate.proceeding_despite_cutover",
+            hosts=[v.hostname.host for v in report.blocked],
+            hint="operator accepted DNS drift; cut the record(s) over to the target",
         )
 
     return {
         "hostnames": len(real),
+        "server_bound": [v.hostname.host for v in report.server_bound],
         "ready": [v.hostname.host for v in report.ready],
+        "cutover_accepted": [v.hostname.host for v in report.blocked] if ctx.accept_dns else [],
         "ambiguous": [v.hostname.host for v in report.ambiguous],
     }
 

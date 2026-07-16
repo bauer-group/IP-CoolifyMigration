@@ -46,6 +46,17 @@ def _placement() -> Placement:
     )
 
 
+def _placement_wc() -> Placement:
+    """A placement whose servers both carry a wildcard base — the BAUER setup."""
+    return Placement(
+        project_uuid="proj1",
+        environment_name="production",
+        server_uuid="srv2",
+        source_wildcard="app.0046-20.cloud.bauer-group.com",
+        target_wildcard="app.0047-20.cloud.bauer-group.com",
+    )
+
+
 class TestBuildEnvEntries:
     def test_copies_value_not_real_value(self) -> None:
         # real_value is an ACCESSOR that RESOLVES Coolify's magic variables. A
@@ -309,38 +320,93 @@ class TestCreateService:
             await create_resource(api, snapshot, _placement(), {})
 
 
+def _git_build_snapshot() -> ResourceSnapshot:
+    return ResourceSnapshot(
+        uuid="a1",
+        name="web",
+        collection="applications",
+        kind=ResourceKind.APP_GIT_BUILD,
+        git_repository="https://github.com/x/y",
+        git_branch="main",
+        git_auth=GitAuth.PUBLIC,
+    )
+
+
 class TestCreateApplication:
-    async def test_never_carries_the_fqdn_over(
+    async def test_rewrites_a_server_bound_url_onto_the_target_wildcard(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
-        # coolify-mover copies fqdn verbatim, producing two resources claiming
-        # the same hostname. The DNS gate and finalize policy own domains here.
+        # A URL under the source server's wildcard is bound to that server and
+        # cannot cut over; it is rewritten onto the target's wildcard so the app
+        # keeps its subdomain on the new host.
+        import json
+
         route = respx_mock.post(f"{BASE}/applications/public").mock(
             return_value=httpx.Response(201, json={"uuid": "a2"})
         )
-        snapshot = ResourceSnapshot(
-            uuid="a1",
-            name="web",
-            collection="applications",
-            kind=ResourceKind.APP_GIT_BUILD,
-            git_repository="https://github.com/x/y",
-            git_branch="main",
-            git_auth=GitAuth.PUBLIC,
+        await create_resource(
+            api,
+            _git_build_snapshot(),
+            _placement_wc(),
+            {
+                "git_repository": "https://github.com/x/y",
+                "git_branch": "main",
+                "build_pack": "nixpacks",
+                "fqdn": "https://pdf-tool.app.0046-20.cloud.bauer-group.com",
+            },
+        )
+        body = json.loads(route.calls[0].request.read())
+        assert body["domains"] == "https://pdf-tool.app.0047-20.cloud.bauer-group.com"
+        # fqdn is Coolify's stored column, not the create input — never sent.
+        assert "fqdn" not in body
+
+    async def test_carries_a_custom_domain_to_the_target(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # A custom domain is server-independent: it moves with the app and is set
+        # on the target verbatim (the DNS gate reasons about its cutover).
+        import json
+
+        route = respx_mock.post(f"{BASE}/applications/public").mock(
+            return_value=httpx.Response(201, json={"uuid": "a2"})
         )
         await create_resource(
             api,
-            snapshot,
-            _placement(),
+            _git_build_snapshot(),
+            _placement_wc(),
             {
                 "git_repository": "https://github.com/x/y",
                 "git_branch": "main",
                 "build_pack": "nixpacks",
                 "fqdn": "https://shop.example.com",
-                "domains": "https://shop.example.com",
             },
         )
-        body = route.calls[0].request.read().decode()
-        assert "shop.example.com" not in body
+        body = json.loads(route.calls[0].request.read())
+        assert body["domains"] == "https://shop.example.com"
+
+    async def test_without_wildcards_a_server_bound_url_is_left_intact(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # No wildcard configured on either side => nothing to rewrite onto; the
+        # host is carried unchanged rather than dropped or corrupted.
+        import json
+
+        route = respx_mock.post(f"{BASE}/applications/public").mock(
+            return_value=httpx.Response(201, json={"uuid": "a2"})
+        )
+        await create_resource(
+            api,
+            _git_build_snapshot(),
+            _placement(),  # no wildcards
+            {
+                "git_repository": "https://github.com/x/y",
+                "git_branch": "main",
+                "build_pack": "nixpacks",
+                "fqdn": "https://shop.example.com",
+            },
+        )
+        body = json.loads(route.calls[0].request.read())
+        assert body["domains"] == "https://shop.example.com"
 
     async def test_missing_git_fields_raise_before_the_round_trip(
         self, api: CoolifyClient
@@ -405,6 +471,61 @@ class TestPublicGitUrl:
             "git@github.com:o/r.git",
         ):
             assert _public_git_url(url) == url
+
+
+class TestRemapDomains:
+    SRC = "app.0046-20.cloud.bauer-group.com"
+    TGT = "app.0047-20.cloud.bauer-group.com"
+
+    def _remap(self, fqdn: str | None) -> str:
+        from bg_coolify_migrate.api.resources import _remap_domains
+
+        return _remap_domains(fqdn, source_wildcard=self.SRC, target_wildcard=self.TGT)
+
+    def test_server_bound_url_is_rewritten(self) -> None:
+        assert (
+            self._remap("https://pdf-tool.app.0046-20.cloud.bauer-group.com")
+            == "https://pdf-tool.app.0047-20.cloud.bauer-group.com"
+        )
+
+    def test_custom_domain_is_kept_verbatim(self) -> None:
+        assert self._remap("https://shop.example.com") == "https://shop.example.com"
+
+    def test_mixed_list_rewrites_only_the_server_bound_one(self) -> None:
+        out = self._remap(
+            "https://pdf-tool.app.0046-20.cloud.bauer-group.com,https://shop.example.com"
+        )
+        assert out == (
+            "https://pdf-tool.app.0047-20.cloud.bauer-group.com,https://shop.example.com"
+        )
+
+    def test_empty_is_empty(self) -> None:
+        assert self._remap(None) == ""
+        assert self._remap("") == ""
+
+    def test_duplicate_hosts_collapse(self) -> None:
+        out = self._remap("https://shop.example.com,https://shop.example.com")
+        assert out == "https://shop.example.com"
+
+    def test_server_bound_url_is_dropped_when_target_has_no_wildcard(self) -> None:
+        from bg_coolify_migrate.api.resources import _remap_domains
+
+        # Carrying the source-bound host would point the target at the SOURCE;
+        # dropping it lets Coolify auto-generate a working URL instead.
+        out = _remap_domains(
+            "https://pdf-tool.app.0046-20.cloud.bauer-group.com",
+            source_wildcard=self.SRC,
+            target_wildcard=None,
+        )
+        assert out == ""
+
+    def test_custom_domain_survives_even_without_a_target_wildcard(self) -> None:
+        from bg_coolify_migrate.api.resources import _remap_domains
+
+        out = _remap_domains(
+            "https://shop.example.com", source_wildcard=self.SRC, target_wildcard=None
+        )
+        assert out == "https://shop.example.com"
 
 
 class TestCopyEnvs:

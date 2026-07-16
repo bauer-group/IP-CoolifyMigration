@@ -23,18 +23,25 @@ has to be enabled once.
 ## The DNS gate blocked me (exit 3)
 
 Working as designed. It is a resumable stop, not a failure — the target is created
-and its data is verified.
+and its data is verified. It only ever fires for a **custom domain**
+(`shop.example.com`) that still points at the source. Server-bound URLs under a
+server's wildcard (`pdf-tool.app.0046-20…`) are rewritten onto the target's
+wildcard automatically and never gate — see *Domains & DNS* in the CLI reference.
 
 ```bash
 # Apply the printed cutover checklist to your DNS, wait out the TTL, then:
 coolify-migrate resume <id>
 ```
 
-There is no `--force`, because starting early is *actively harmful*: Traefik on
-the new host requests an ACME certificate, the HTTP-01 challenge is routed by DNS
-to the **old** host, the challenge fails, and Let's Encrypt rate-limits 5 failed
-validations per hostname per hour. A retry loop burns that budget, so even a
-correct cutover an hour later cannot get a certificate.
+Blocking by default is deliberate, because starting early is *actively harmful*:
+Traefik on the new host requests an ACME certificate, the HTTP-01 challenge is
+routed by DNS to the **old** host, the challenge fails, and Let's Encrypt
+rate-limits 5 failed validations per hostname per hour. A retry loop burns that
+budget, so even a correct cutover an hour later cannot get a certificate.
+
+If you accept that risk — you want to finalize now and repoint DNS in parallel,
+knowing propagation lags by the record's TTL — confirm interactively or pass
+`--accept-dns` (on `run` or `resume`). The gate then warns instead of blocking.
 
 ### "resolves to neither source nor target"
 

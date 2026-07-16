@@ -84,7 +84,9 @@ COPY           parallel rsync -aHAXS --numeric-ids     undo: drop target volumes
    |
 VERIFY         content + metadata manifests both sides
    |
-DNS_GATE       any live FQDN -> source?  STOP, exit 3, resumable
+DNS_GATE       custom domain -> source?  STOP, exit 3, resumable
+               (server-bound wildcard URLs rewritten, never gate;
+                --accept-dns downgrades the stop to a warning)
    |
 START_TARGET   deploy                                  undo: stop target
    |

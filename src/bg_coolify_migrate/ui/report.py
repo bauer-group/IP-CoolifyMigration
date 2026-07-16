@@ -33,6 +33,7 @@ _VERDICT_STYLE = {
     Verdict.ELSEWHERE: "warn",
     Verdict.UNRESOLVED: "warn",
     Verdict.GENERATED: "muted",
+    Verdict.SERVER_BOUND: "ok",
 }
 
 

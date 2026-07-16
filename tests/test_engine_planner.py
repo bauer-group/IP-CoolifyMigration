@@ -139,3 +139,22 @@ class TestServerRef:
         from bg_coolify_migrate.engine.planner import server_ref
 
         assert server_ref({"uuid": "u", "ip": "10.0.0.1", "port": 0}).port == 22
+
+    def test_reads_the_wildcard_from_the_settings_relation(self) -> None:
+        from bg_coolify_migrate.engine.planner import server_ref
+
+        ref = server_ref(
+            {
+                "uuid": "u",
+                "ip": "10.0.0.1",
+                "settings": {"wildcard_domain": "app.0046-20.cloud.bauer-group.com"},
+            }
+        )
+        assert ref.wildcard_domain == "app.0046-20.cloud.bauer-group.com"
+
+    def test_missing_settings_yields_an_empty_wildcard(self) -> None:
+        from bg_coolify_migrate.engine.planner import server_ref
+
+        # The LIST endpoint does not eager-load settings; a missing relation must
+        # not crash, it just means "no wildcard known here".
+        assert server_ref({"uuid": "u", "ip": "10.0.0.1"}).wildcard_domain == ""
