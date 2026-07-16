@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.1.3 (2026-07-16)
+
+### Bug Fixes
+
+- **ssh**: Restore accept-any when trusting without a known_hosts file
+  ([`2ac49c8`](https://github.com/bauer-group/IP-CoolifyMigration/commit/2ac49c83a9579f06e55fdf1c85a2046c8a2e4a63))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`0fbb124`](https://github.com/bauer-group/IP-CoolifyMigration/commit/0fbb124de8a10120cc0039daa584c9b4989d8150))
+
+
 ## v2.1.2 (2026-07-16)
 
 ### Bug Fixes
