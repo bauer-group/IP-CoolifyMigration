@@ -104,18 +104,14 @@ class SshTarget:
 HostKeyPrompt = Callable[[SshTarget, str], Awaitable[bool]]
 
 
-def _initial_known_hosts(known_hosts: Path | None, trust_new_host_key: bool) -> str | None | tuple[()]:
+def _initial_known_hosts(known_hosts: Path | None) -> str | tuple[()]:
     """The asyncssh ``known_hosts`` value for the first connect attempt.
 
-    * a managed file that exists -> validate against it;
-    * no managed file, but trusting -> ``None`` (accept any): there is nowhere to
-      record, so this is the tests / system-default escape hatch, matching the old
-      behaviour. With a managed file we NEVER pass None — an unknown key raises and
-      is then scanned, recorded and re-validated;
-    * otherwise -> ``()`` (empty): an unknown key is unverifiable and we say so.
+    Never ``None`` — that would disable host-key checking (accept any). A managed
+    file that exists is validated against; otherwise ``()`` (empty), so an unknown
+    key is unverifiable and we scan, record and re-validate it rather than trust it
+    blindly. Trusting therefore REQUIRES a ``known_hosts`` path to persist into.
     """
-    if trust_new_host_key and known_hosts is None:
-        return None
     return str(known_hosts) if known_hosts and known_hosts.exists() else ()
 
 
@@ -181,11 +177,17 @@ class RemoteHost:
             HostKeyUnknown: The key is unknown and was neither trusted nor accepted.
             SshError: Anything else.
         """
+        if known_hosts is None and (trust_new_host_key or host_key_prompt is not None):
+            # Accepting a key with nowhere to persist it would mean trusting a new
+            # key on EVERY connect (MITM-able). Require a path instead of silently
+            # disabling verification.
+            raise ValueError("trusting a host key requires a known_hosts path to persist it")
+
         options: dict[str, Any] = {
             "username": target.user,
             "port": target.port,
             "connect_timeout": connect_timeout,
-            "known_hosts": _initial_known_hosts(known_hosts, trust_new_host_key),
+            "known_hosts": _initial_known_hosts(known_hosts),
         }
         if target.private_key:
             options["client_keys"] = [

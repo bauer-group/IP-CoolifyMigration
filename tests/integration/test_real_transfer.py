@@ -61,15 +61,21 @@ def _require_rig() -> None:
 
 
 @pytest.fixture
-async def source() -> AsyncIterator[RemoteHost]:
-    async with RemoteHost.connect(_target(SOURCE_PORT), trust_new_host_key=True) as host:
+async def source(tmp_path: Path) -> AsyncIterator[RemoteHost]:
+    known_hosts = tmp_path / "known_hosts"
+    async with RemoteHost.connect(
+        _target(SOURCE_PORT), known_hosts=known_hosts, trust_new_host_key=True
+    ) as host:
         await host.run(f"rm -rf {DATA}/* {DATA}/.[!.]* 2>/dev/null")
         yield host
 
 
 @pytest.fixture
-async def target() -> AsyncIterator[RemoteHost]:
-    async with RemoteHost.connect(_target(TARGET_PORT), trust_new_host_key=True) as host:
+async def target(tmp_path: Path) -> AsyncIterator[RemoteHost]:
+    known_hosts = tmp_path / "known_hosts"
+    async with RemoteHost.connect(
+        _target(TARGET_PORT), known_hosts=known_hosts, trust_new_host_key=True
+    ) as host:
         await host.run(f"rm -rf {DATA}/* {DATA}/.[!.]* 2>/dev/null")
         yield host
 

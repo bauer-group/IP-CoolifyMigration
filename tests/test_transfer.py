@@ -342,21 +342,25 @@ class TestHostKeyRecording:
 
         return asyncssh.generate_private_key("ssh-ed25519").convert_to_public()
 
-    def test_initial_known_hosts_selection(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    def test_initial_known_hosts_never_disables_verification(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         from bg_coolify_migrate.transfer.ssh import _initial_known_hosts
 
-        # No managed file + trusting -> accept any (the tests / system-default hatch).
-        # This is the case the integration suite uses and the rewrite regressed.
-        assert _initial_known_hosts(None, True) is None
-        # No file, no trust -> empty, so an unknown key is unverifiable and refused.
-        assert _initial_known_hosts(None, False) == ()
-        # A managed file that does not exist yet -> empty (record on first contact).
-        assert _initial_known_hosts(tmp_path / "nope", True) == ()
-        # An existing managed file -> always validate against it, never accept-any.
+        # Never None (which would disable host-key checking). No file -> empty, so an
+        # unknown key is unverifiable and gets scanned+recorded rather than trusted.
+        assert _initial_known_hosts(None) == ()
+        assert _initial_known_hosts(tmp_path / "nope") == ()
         existing = tmp_path / "known_hosts"
         existing.write_text("x\n", encoding="utf-8")
-        assert _initial_known_hosts(existing, True) == str(existing)
-        assert _initial_known_hosts(existing, False) == str(existing)
+        assert _initial_known_hosts(existing) == str(existing)
+
+    async def test_trusting_without_a_known_hosts_path_is_rejected(self) -> None:
+        # Accepting a key with nowhere to persist it would trust a new key on every
+        # connect. Requiring a path is the fix flagged by the security review.
+        from bg_coolify_migrate.transfer.ssh import RemoteHost, SshTarget
+
+        with pytest.raises(ValueError, match="requires a known_hosts path"):
+            async with RemoteHost.connect(SshTarget(host="h"), trust_new_host_key=True):
+                pass
 
     def test_recorded_key_matches_a_port_22_connection(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         import asyncssh
