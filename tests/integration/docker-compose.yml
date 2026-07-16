@@ -16,6 +16,11 @@ services:
   source:
     image: alpine:3.20
     container_name: bgcm_it_source
+    # host.docker.internal is native on Docker Desktop but not on Linux;
+    # host-gateway makes it resolve to the host there too, so the source can
+    # rsync to the target's published port on either platform.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "2222:22"
     volumes:
@@ -40,6 +45,11 @@ services:
   target:
     image: alpine:3.20
     container_name: bgcm_it_target
+    # host.docker.internal is native on Docker Desktop but not on Linux;
+    # host-gateway makes it resolve to the host there too, so the source can
+    # rsync to the target's published port on either platform.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "2223:22"
     volumes:
