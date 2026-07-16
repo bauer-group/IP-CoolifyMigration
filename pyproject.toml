@@ -117,6 +117,15 @@ branch = "main"
 build_command = "python -m build"
 commit_parser = "conventional"
 major_on_zero = false
+
+# PSR 10 moved the changelog path under [changelog.default_templates]; a bare
+# top-level `changelog_file` is silently ignored, which is why the file stayed
+# empty across 1.0.0/1.0.1. mode = "init" rebuilds the whole file from tags each
+# run, so it needs no insertion marker (our old custom banner was never matched).
+[tool.semantic_release.changelog]
+mode = "init"
+
+[tool.semantic_release.changelog.default_templates]
 changelog_file = "CHANGELOG.md"
 
 [tool.semantic_release.commit_parser_options]
