@@ -1,6 +1,24 @@
 # CHANGELOG
 
 
+## v2.1.1 (2026-07-16)
+
+### Bug Fixes
+
+- **cli**: Bare resource uuid and swallowed errors
+  ([`71d5a1b`](https://github.com/bauer-group/IP-CoolifyMigration/commit/71d5a1b0270c596f68ff2bce62bc71579eb242f3))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`79539fe`](https://github.com/bauer-group/IP-CoolifyMigration/commit/79539fea9690192e20ff4790fb5152534046e7b9))
+
+### Testing
+
+- **cli**: Covered uuid-based selection
+  ([`aa28700`](https://github.com/bauer-group/IP-CoolifyMigration/commit/aa28700f8a29e084342cd1e9fe27663086677b72))
+
+
 ## v2.1.0 (2026-07-16)
 
 ### Documentation
