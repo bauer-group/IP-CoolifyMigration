@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.5.1 (2026-07-16)
+
+### Bug Fixes
+
+- **engine**: Waited for target compose volumes before pairing
+  ([`903291f`](https://github.com/bauer-group/IP-CoolifyMigration/commit/903291fa7fd170c481195f86e92d25d54e0aeb67))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`3fe65a1`](https://github.com/bauer-group/IP-CoolifyMigration/commit/3fe65a159b8fd773d74f5662b2f3dcfeaaab3750))
+
+
 ## v2.5.0 (2026-07-16)
 
 ### Bug Fixes
