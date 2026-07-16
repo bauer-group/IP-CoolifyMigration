@@ -382,3 +382,153 @@ class TestRunValidation:
         # No credentials, so it stops at preflight - but not at the parser.
         result = runner.invoke(app, ["run", "shop", "--to", "x", "--finalize", policy, "--yes"])
         assert "keep|rename|delete" not in result.stderr
+
+
+@pytest.fixture
+async def api():  # type: ignore[no-untyped-def]
+    from bg_coolify_migrate.api.client import CoolifyClient
+
+    client = CoolifyClient(HOST, "tok", max_retries=0)
+    yield client
+    await client.aclose()
+
+
+def _plan(project: str = "shop", environment: str = "production", blocked: bool = False):  # type: ignore[no-untyped-def]
+    from bg_coolify_migrate.domain.kinds import ResourceKind
+    from bg_coolify_migrate.domain.plan import (
+        MigrationPlan,
+        ResourcePlan,
+        ResourceSnapshot,
+        ServerRef,
+        Strategy,
+    )
+
+    snapshot = ResourceSnapshot(
+        uuid="a1",
+        name="web",
+        collection="databases",
+        kind=ResourceKind.DATABASE,
+        has_previews=blocked,  # a hard blocking reason -> is_blocked is True
+    )
+    return MigrationPlan(
+        project=project,
+        environment=environment,
+        source_server=ServerRef(uuid="s1", name="old", ip="1.1.1.1"),
+        target_server=ServerRef(uuid="s2", name="new", ip="2.2.2.2"),
+        resources=(ResourcePlan(snapshot=snapshot, strategy=Strategy.RECREATE_ONLY),),
+    )
+
+
+class TestSelectionResolution:
+    async def test_no_selector_non_interactive_demands_one(
+        self, api: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from bg_coolify_migrate.cli import _resolve_selection
+
+        monkeypatch.setattr("bg_coolify_migrate.cli.is_interactive", lambda: False)
+        with pytest.raises(MigrationError, match="provide a selector"):
+            await _resolve_selection(api, None, None, None)
+
+    async def test_selector_without_target_non_interactive_demands_to(
+        self, api: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from bg_coolify_migrate.cli import _resolve_selection
+
+        monkeypatch.setattr("bg_coolify_migrate.cli.is_interactive", lambda: False)
+        with pytest.raises(MigrationError, match="--to is required"):
+            await _resolve_selection(api, "shop", None, None)
+
+    async def test_selector_with_target_parses_without_touching_the_api(self, api: object) -> None:
+        from bg_coolify_migrate.cli import _resolve_selection
+
+        selection, target = await _resolve_selection(api, "shop/production/web", "srv", None)
+        assert selection == Selection("shop", "production", "web")
+        assert target == "srv"
+
+
+class TestPicker:
+    @respx.mock
+    async def test_walks_project_environment_resource_target(
+        self, api: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from bg_coolify_migrate.cli import _pick
+        from bg_coolify_migrate.ui import wizard
+
+        respx.get(f"{BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx.get(f"{BASE}/projects/p1").mock(
+            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+        )
+        respx.get(f"{BASE}/projects/p1/production").mock(
+            return_value=httpx.Response(200, json={"applications": [{"uuid": "a1", "name": "web"}]})
+        )
+        respx.get(f"{BASE}/servers").mock(
+            return_value=httpx.Response(
+                200, json=[{"uuid": "s2", "name": "target", "ip": "1.1.1.1"}]
+            )
+        )
+        monkeypatch.setattr(wizard, "choose_project", lambda projects: "shop")
+        monkeypatch.setattr(wizard, "choose_scope_environment", lambda envs: "production")
+        monkeypatch.setattr(wizard, "choose_scope_resource", lambda resources: "web")
+        monkeypatch.setattr(wizard, "choose_server", lambda servers, message: "s2")
+
+        selection, target = await _pick(api, None)
+        assert selection == Selection("shop", "production", "web")
+        assert target == "s2"
+
+    @respx.mock
+    async def test_whole_project_skips_resource_and_keeps_given_target(
+        self, api: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from bg_coolify_migrate.cli import _pick
+        from bg_coolify_migrate.ui import wizard
+
+        respx.get(f"{BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx.get(f"{BASE}/projects/p1").mock(
+            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+        )
+        monkeypatch.setattr(wizard, "choose_project", lambda projects: "shop")
+        monkeypatch.setattr(wizard, "choose_scope_environment", lambda envs: None)  # whole project
+
+        selection, target = await _pick(api, "given-target")
+        assert selection == Selection("shop", None, None)
+        assert target == "given-target"
+
+
+class TestConfirmPlans:
+    def test_single_scope_delegates_to_the_plan_wizard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from bg_coolify_migrate.cli import _confirm_plans
+        from bg_coolify_migrate.ui import wizard
+
+        monkeypatch.setattr(wizard, "confirm_plan", lambda plan: True)
+        monkeypatch.setattr(wizard, "confirm_destructive", lambda plan: True)
+        assert _confirm_plans([_plan()]) is True
+
+    def test_single_scope_declined(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from bg_coolify_migrate.cli import _confirm_plans
+        from bg_coolify_migrate.ui import wizard
+
+        monkeypatch.setattr(wizard, "confirm_plan", lambda plan: False)
+        assert _confirm_plans([_plan()]) is False
+
+    def test_whole_project_confirmed_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import questionary
+
+        from bg_coolify_migrate.cli import _confirm_plans
+        from bg_coolify_migrate.ui import wizard
+
+        class _Answer:
+            def ask(self) -> bool:
+                return True
+
+        monkeypatch.setattr(questionary, "confirm", lambda *a, **k: _Answer())
+        monkeypatch.setattr(wizard, "confirm_destructive", lambda plan: True)
+        assert _confirm_plans([_plan("a"), _plan("b")]) is True
+
+    def test_whole_project_refuses_when_an_environment_is_blocked(self) -> None:
+        from bg_coolify_migrate.cli import _confirm_plans
+
+        assert _confirm_plans([_plan("a"), _plan("b", blocked=True)]) is False
