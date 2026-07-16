@@ -9,7 +9,7 @@ coolify-migrate --help
 | Command | What it does |
 | --- | --- |
 | `doctor` | Check token scope, API reachability, server inventory. **Run this first.** |
-| `list [project]` | List every project and its server, or one project's resources. Reads only. |
+| `list [project]` | Recursively list every resource: server → project → environment → resource, with uuids. Reads only. |
 | `plan <selector>` | Produce a migration plan for a scope. Reads only. |
 | `run <selector> --to <server>` | Execute a migration for a scope. |
 | `resume <id>` | Continue a blocked or interrupted migration. |
@@ -47,29 +47,34 @@ the selector is required instead — a prompt there is a hang.
 
 ## Finding a project or resource
 
-`plan`/`run` take a **project** name/uuid, not a `team/app` path. To see what you
-can migrate and where it lives:
+`list` shows **everything** in one recursive pass — server → project → environment
+→ resource — so there is nothing to piece together:
 
 ```bash
-coolify-migrate list                 # projects, grouped by server
-coolify-migrate list bauer-group     # that project's resources, with uuids
+coolify-migrate list                 # the whole inventory
+coolify-migrate list bauer-group     # limited to one project
+coolify-migrate list --server 0047-20  # limited to one host
 ```
 
 ```text
 0047-20  (5.6.7.8)
-  whistleblower-app / production   3 resources   [prj-9f2a…]
+  bauer-group  [prj-9f2a]
+    production
+      whistleblower-app  application  [rsc-1a]
+      redis              database     [rsc-2b]
+    staging
+      whistleblower-app  application  [rsc-3c]
 
 hel-01   (1.2.3.4)
-  shop / production                5 resources   [prj-1c7b…]
-  shop / staging                   2 resources   [prj-1c7b…]
+  shop  [prj-1c7b]
+    production
+      web  application  [rsc-4d]
 ```
 
-The bold server heads a group; the indented name is the project and the trailing
-`[…]` is its **uuid**. `list <project>` drills in and prints each resource's
-**name, uuid, kind, environment and server**. Every level is selectable by uuid,
-which is the unambiguous handle when a name carries spaces or slashes — e.g.
-`plan prj-1c7b/production/<resource-uuid>`. Narrow the overview to one host with
-`--server 0047-20`, or get JSON (uuids included) with `--json`.
+Every level carries its **uuid**, the unambiguous handle when a name has spaces or
+slashes — pass them straight to `plan`/`run`, e.g.
+`plan prj-9f2a/production/rsc-1a`. `--json` emits one fully-qualified record per
+resource (server, project, environment, name, all uuids) for scripting.
 
 ## Exit codes
 

@@ -16,8 +16,8 @@ export COOLIFY_URL="https://coolify.example.com"
 export COOLIFY_TOKEN="..."        # MUST have root or read:sensitive
 
 coolify-migrate doctor            # verify token scope + reachability
-coolify-migrate list              # projects + the server each runs on
-coolify-migrate list my-project   # that project's resources, with uuids
+coolify-migrate list              # everything: server -> project -> env -> resource
+coolify-migrate list my-project   # limited to one project
 
 # Selector depth = scope: project / project/environment / project/environment/resource
 coolify-migrate plan my-project --to target-server              # whole project (dry run)

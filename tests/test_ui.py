@@ -288,38 +288,24 @@ class TestMarkupSafety:
         assert "api [v2]" in out
         assert "shop [staging]" in out
 
-    def test_resource_listing_tolerates_brackets(self) -> None:
+    def test_resource_tree_tolerates_brackets_and_shows_uuids(self) -> None:
         from bg_coolify_migrate.domain.plan import ResourceRow
-        from bg_coolify_migrate.ui.report import resource_rows_table
+        from bg_coolify_migrate.ui.report import resource_tree
 
         rows = [
             ResourceRow(
+                project="shop [x]",
+                project_uuid="p1",
                 environment="prod [1]",
                 name="api [v2]",
-                uuid="u1",
+                uuid="rsc-9",
                 kind="application",
                 server="srv [x]",
                 server_uuid="s1",
             )
         ]
-        assert "api [v2]" in self._render(resource_rows_table("proj [x]", rows))
-
-    def test_grouped_listing_tolerates_brackets_and_shows_uuid(self) -> None:
-        from bg_coolify_migrate.domain.plan import ProjectListing, ProjectPlacement
-        from bg_coolify_migrate.ui.report import listing_group
-
-        listing = ProjectListing(
-            servers=(ServerRef(uuid="s1", name="srv [x]", ip="1.1.1.1"),),
-            placements=(
-                ProjectPlacement(
-                    project="shop [x]",
-                    project_uuid="p1",
-                    environment="prod [1]",
-                    server_uuid="s1",
-                    resources=1,
-                ),
-            ),
-        )
-        out = self._render(listing_group(listing))
+        out = self._render(resource_tree(rows, (ServerRef(uuid="s1", name="srv [x]", ip="1.1.1.1"),)))
+        assert "api [v2]" in out  # resource name rendered literally, not as markup
         assert "shop [x]" in out
-        assert "p1" in out  # the uuid, so you can select the project by uuid
+        assert "p1" in out  # project uuid, for uuid-based selection
+        assert "rsc-9" in out  # resource uuid

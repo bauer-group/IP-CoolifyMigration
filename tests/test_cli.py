@@ -6,6 +6,7 @@ asserted explicitly rather than just "did it fail".
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -178,8 +179,8 @@ class TestStatus:
 
 
 class TestList:
-    """`list` answers "what can I migrate, and from where" — the discovery step
-    that `doctor` (servers only) and `status` (migrations only) never covered."""
+    """`list` answers "what can I migrate, and from where" in one recursive pass:
+    server -> project -> environment -> resource, everything, with uuids."""
 
     def _mock_instance(self) -> None:
         respx.get(f"{BASE}/servers").mock(
@@ -199,7 +200,7 @@ class TestList:
         )
         respx.get(f"{BASE}/projects/p1/production").mock(
             return_value=httpx.Response(
-                200, json={"applications": [{"uuid": "a1", "server_uuid": "s1"}]}
+                200, json={"applications": [{"uuid": "a1", "name": "web", "server_uuid": "s1"}]}
             )
         )
 
@@ -209,17 +210,15 @@ class TestList:
         assert "COOLIFY_URL" in result.stderr
 
     @respx.mock
-    def test_lists_projects_with_their_server(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_lists_everything_recursively(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("COOLIFY_URL", HOST)
         monkeypatch.setenv("COOLIFY_TOKEN", "tok")
         self._mock_instance()
         result = runner.invoke(app, ["list"])
         assert result.exit_code == 0
-        assert "shop" in result.stdout
-        assert "production" in result.stdout
-        assert "prod-1" in result.stdout
-        # An empty server is still shown — it is a candidate migration target.
-        assert "spare" in result.stdout
+        # server -> project -> environment -> resource, all in one pass, with uuids.
+        for token in ("prod-1", "shop", "p1", "production", "web", "a1", "application"):
+            assert token in result.stdout
 
     @respx.mock
     def test_json_is_machine_readable(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -233,11 +232,12 @@ class TestList:
             {
                 "server": "prod-1",
                 "server_uuid": "s1",
-                "server_ip": "10.0.0.1",
                 "project": "shop",
                 "project_uuid": "p1",
                 "environment": "production",
-                "resources": 1,
+                "name": "web",
+                "uuid": "a1",
+                "kind": "application",
             }
         ]
 
@@ -318,6 +318,41 @@ class TestListResources:
         assert "web" in result.stdout
         assert "a1" in result.stdout  # the uuid, for selection
         assert "prod-1" in result.stdout
+
+    @respx.mock
+    def test_project_scope_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COOLIFY_URL", HOST)
+        monkeypatch.setenv("COOLIFY_TOKEN", "tok")
+        respx.get(f"{BASE}/servers").mock(
+            return_value=httpx.Response(
+                200, json=[{"uuid": "s1", "name": "prod-1", "ip": "10.0.0.1", "id": 1}]
+            )
+        )
+        respx.get(f"{BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx.get(f"{BASE}/projects/p1").mock(
+            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+        )
+        respx.get(f"{BASE}/projects/p1/production").mock(
+            return_value=httpx.Response(
+                200, json={"applications": [{"uuid": "a1", "name": "web", "server_uuid": "s1"}]}
+            )
+        )
+        result = runner.invoke(app, ["list", "shop", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == [
+            {
+                "server": "prod-1",
+                "server_uuid": "s1",
+                "project": "shop",
+                "project_uuid": "p1",
+                "environment": "production",
+                "name": "web",
+                "uuid": "a1",
+                "kind": "application",
+            }
+        ]
 
 
 class TestCommandsRequireCredentials:
@@ -492,6 +527,42 @@ class TestPicker:
         )
         monkeypatch.setattr(wizard, "choose_project", lambda projects: "shop")
         monkeypatch.setattr(wizard, "choose_scope_environment", lambda envs: None)  # whole project
+
+        selection, target = await _pick(api, "given-target")
+        assert selection == Selection("shop", None, None)
+        assert target == "given-target"
+
+    @respx.mock
+    async def test_prompt_that_nests_asyncio_run_does_not_crash(
+        self, api: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression: questionary's .ask() calls asyncio.run() internally, and _pick
+        # runs inside our own asyncio.run(), which used to raise "asyncio.run() cannot
+        # be called from a running event loop". Off-loading to a worker thread (which
+        # has no running loop) fixes it.
+        from bg_coolify_migrate.cli import _pick
+        from bg_coolify_migrate.ui import wizard
+
+        respx.get(f"{BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx.get(f"{BASE}/projects/p1").mock(
+            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+        )
+
+        async def _noop() -> None:
+            return None
+
+        def _nested_project(_projects: object) -> str:
+            asyncio.run(_noop())  # what questionary does under the hood
+            return "shop"
+
+        def _nested_environment(_envs: object) -> None:
+            asyncio.run(_noop())
+            return None
+
+        monkeypatch.setattr(wizard, "choose_project", _nested_project)
+        monkeypatch.setattr(wizard, "choose_scope_environment", _nested_environment)
 
         selection, target = await _pick(api, "given-target")
         assert selection == Selection("shop", None, None)

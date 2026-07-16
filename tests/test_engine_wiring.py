@@ -27,7 +27,7 @@ from bg_coolify_migrate.engine.planner import (
     _engine_of,
     decode_compose,
     find_project,
-    list_placements,
+    list_all_resources,
     list_project_resources,
     observed_labels,
     project_environments,
@@ -286,13 +286,12 @@ class TestEphemeralKeys:
         await keys.revoke(source=None, target=None, migration_id="m1")
 
 
-class TestListPlacements:
-    """`list` is discovery: it must map every project to the server it lives on,
-    surface empty servers as migration targets, and never silently drop a project
-    whose server it could not resolve."""
+class TestListAllResources:
+    """`list` is discovery: every resource across every project/environment, fully
+    qualified (server, project, uuids), never silently dropping one it can't place."""
 
     @respx.mock
-    async def test_groups_projects_and_keeps_empty_servers(self, api: CoolifyClient) -> None:
+    async def test_lists_every_resource_fully_qualified(self, api: CoolifyClient) -> None:
         respx.get(f"{_BASE}/servers").mock(
             return_value=httpx.Response(
                 200,
@@ -310,18 +309,18 @@ class TestListPlacements:
         )
         # No "id" on the env detail, so environment_resources does not scan /databases.
         respx.get(f"{_BASE}/projects/p1/production").mock(
-            return_value=httpx.Response(200, json={"applications": [{"uuid": "a1", "server_uuid": "s1"}]})
+            return_value=httpx.Response(
+                200, json={"applications": [{"uuid": "a1", "name": "web", "server_uuid": "s1"}]}
+            )
         )
 
-        listing = await list_placements(api)
+        rows, servers = await list_all_resources(api)
 
-        assert {s.name for s in listing.servers} == {"prod-1", "spare"}
-        assert len(listing.placements) == 1
-        placement = listing.placements[0]
-        assert placement.project == "shop"
-        assert placement.environment == "production"
-        assert placement.server_uuid == "s1"
-        assert placement.resources == 1
+        assert {s.name for s in servers} == {"prod-1", "spare"}
+        assert len(rows) == 1
+        row = rows[0]
+        assert (row.project, row.project_uuid, row.environment) == ("shop", "p1", "production")
+        assert (row.name, row.uuid, row.kind, row.server) == ("web", "a1", "application", "prod-1")
 
     @respx.mock
     async def test_falls_back_to_get_resource_for_the_server(self, api: CoolifyClient) -> None:
@@ -345,12 +344,13 @@ class TestListPlacements:
             return_value=httpx.Response(200, json={"uuid": "a1", "destination": {"server_id": 7}})
         )
 
-        listing = await list_placements(api)
+        rows, _servers = await list_all_resources(api)
 
-        assert listing.placements[0].server_uuid == "s1"
+        assert rows[0].server_uuid == "s1"
+        assert rows[0].server == "prod-1"
 
     @respx.mock
-    async def test_environment_with_no_resources_is_skipped(self, api: CoolifyClient) -> None:
+    async def test_environment_with_no_resources_yields_no_rows(self, api: CoolifyClient) -> None:
         respx.get(f"{_BASE}/servers").mock(
             return_value=httpx.Response(
                 200, json=[{"uuid": "s1", "name": "prod-1", "ip": "10.0.0.1", "id": 1}]
@@ -366,10 +366,10 @@ class TestListPlacements:
             return_value=httpx.Response(200, json={"applications": [], "services": []})
         )
 
-        listing = await list_placements(api)
+        rows, servers = await list_all_resources(api)
 
-        assert listing.placements == ()
-        assert {s.name for s in listing.servers} == {"prod-1"}
+        assert rows == ()
+        assert {s.name for s in servers} == {"prod-1"}
 
 
 class TestFindProjectHint:
@@ -455,8 +455,9 @@ class TestListProjectResources:
                 200, json={"applications": [{"uuid": "a1", "name": "web", "server_uuid": "s1"}]}
             )
         )
-        name, rows = await list_project_resources(api, "shop")
+        name, rows, servers = await list_project_resources(api, "shop")
         assert name == "shop"
+        assert {s.name for s in servers} == {"prod-1"}
         assert len(rows) == 1
         row = rows[0]
         assert (row.name, row.uuid, row.kind, row.environment, row.server) == (

@@ -50,8 +50,6 @@ from bg_coolify_migrate.domain.manifest import (
 from bg_coolify_migrate.domain.naming import slugify
 from bg_coolify_migrate.domain.plan import (
     MigrationPlan,
-    ProjectListing,
-    ProjectPlacement,
     ResourcePlan,
     ResourceRow,
     ResourceSnapshot,
@@ -282,88 +280,30 @@ def _server_uuid_from_record(record: dict[str, Any], uuid_by_id: dict[Any, str])
     return None
 
 
-async def list_placements(api: CoolifyClient) -> ProjectListing:
-    """Enumerate every project/environment and the server it runs on. Reads only.
-
-    This is discovery for ``plan``/``run``: an operator cannot name a project they
-    cannot see. ``doctor`` proves the token and lists servers; this answers the
-    other half — *what* can I migrate, and *from where*.
-
-    Reuses :func:`environment_resources`, so the count is the authoritative one
-    (it catches the three database engines Coolify's environment endpoint forgets).
-    Deliberately does NOT require ``read:sensitive``: names and servers are not
-    secret, and forcing the scope here would make simple discovery fail closed.
-    """
-    raw_servers = await api.list_servers()
-    servers = tuple(server_ref(s) for s in raw_servers)
-    uuid_by_id = {
-        s["id"]: str(s["uuid"]) for s in raw_servers if s.get("id") is not None and s.get("uuid")
-    }
-
-    placements: list[ProjectPlacement] = []
-    for project in await api.list_projects():
-        project_uuid = str(project.get("uuid", ""))
-        if not project_uuid:
-            continue
-        project_name = str(project.get("name", project_uuid))
-
-        detail = await api.get_project(project_uuid)
-        env_names = [
-            str(env["name"])
-            for env in detail.get("environments") or []
-            if isinstance(env, dict) and env.get("name")
-        ] or ["production"]
-
-        for environment in env_names:
-            try:
-                resources = await environment_resources(api, project_uuid, environment)
-            except MigrationError:
-                # A missing environment or a transient read is not fatal to the
-                # whole listing — skip this one, keep enumerating the rest.
-                continue
-            if not resources:
-                continue
-
-            collection, first = resources[0]
-            server_uuid = _server_uuid_from_record(first, uuid_by_id)
-            if server_uuid is None:
-                # The environment-list record can omit the destination relation;
-                # the per-resource GET carries it. One extra call, only on miss.
-                full = await api.get_resource(collection, str(first.get("uuid", "")))
-                server_uuid = _server_uuid_from_record(full, uuid_by_id)
-
-            placements.append(
-                ProjectPlacement(
-                    project=project_name,
-                    project_uuid=project_uuid,
-                    environment=environment,
-                    server_uuid=server_uuid or "",
-                    resources=len(resources),
-                )
-            )
-
-    return ProjectListing(placements=tuple(placements), servers=servers)
-
-
-async def list_project_resources(
-    api: CoolifyClient, name_or_uuid: str
-) -> tuple[str, list[ResourceRow]]:
-    """Every resource of one project, across environments. Reads only.
-
-    The drill-down behind ``list <project>``: it surfaces resource names AND uuids
-    so an operator can name one for ``plan``/``run`` — by uuid when two resources in
-    different environments share a name. ``kind`` is the coarse collection, which
-    needs no per-resource fetch; the server is resolved like :func:`list_placements`.
-    """
-    raw_servers = await api.list_servers()
+def _server_maps(raw_servers: list[dict[str, Any]]) -> tuple[dict[str, str], dict[Any, str]]:
+    """``(uuid -> name, id -> uuid)`` for resolving a resource's server in one pass."""
     name_by_uuid = {str(s.get("uuid")): str(s.get("name", "?")) for s in raw_servers}
     uuid_by_id = {
         s["id"]: str(s["uuid"]) for s in raw_servers if s.get("id") is not None and s.get("uuid")
     }
+    return name_by_uuid, uuid_by_id
 
-    project_data = await find_project(api, name_or_uuid)
-    project_name = str(project_data.get("name", name_or_uuid))
-    project_uuid = str(project_data["uuid"])
+
+async def _rows_for_project(
+    api: CoolifyClient,
+    project: dict[str, Any],
+    name_by_uuid: dict[str, str],
+    uuid_by_id: dict[Any, str],
+) -> list[ResourceRow]:
+    """Every resource of one project as fully-qualified :class:`ResourceRow`.
+
+    Reuses :func:`environment_resources`, so the set is the authoritative one (it
+    catches the three database engines Coolify's environment endpoint forgets). The
+    server is resolved from the environment record, falling back to a per-resource
+    GET only when that record omits the destination relation.
+    """
+    project_uuid = str(project.get("uuid", ""))
+    project_name = str(project.get("name", project_uuid))
 
     detail = await api.get_project(project_uuid)
     env_names = [
@@ -377,6 +317,8 @@ async def list_project_resources(
         try:
             resources = await environment_resources(api, project_uuid, environment)
         except MigrationError:
+            # A missing environment or a transient read is not fatal to the whole
+            # listing — skip this one, keep enumerating the rest.
             continue
         for collection, record in resources:
             server_uuid = _server_uuid_from_record(record, uuid_by_id)
@@ -385,6 +327,8 @@ async def list_project_resources(
                 server_uuid = _server_uuid_from_record(full, uuid_by_id)
             rows.append(
                 ResourceRow(
+                    project=project_name,
+                    project_uuid=project_uuid,
                     environment=environment,
                     name=str(record.get("name") or record.get("uuid") or "?"),
                     uuid=str(record.get("uuid", "")),
@@ -394,7 +338,46 @@ async def list_project_resources(
                     server_uuid=server_uuid or "",
                 )
             )
-    return project_name, rows
+    return rows
+
+
+async def list_all_resources(
+    api: CoolifyClient,
+) -> tuple[tuple[ResourceRow, ...], tuple[ServerRef, ...]]:
+    """Every resource across every project and environment. Reads only.
+
+    The whole discovery answer in one call: what can I migrate, and from where.
+    ``doctor`` proves the token and lists servers; this lists everything else so an
+    operator never has to piece it together. Deliberately does NOT require
+    ``read:sensitive`` — names, uuids and servers are not secret.
+    """
+    raw_servers = await api.list_servers()
+    servers = tuple(server_ref(s) for s in raw_servers)
+    name_by_uuid, uuid_by_id = _server_maps(raw_servers)
+
+    rows: list[ResourceRow] = []
+    for project in await api.list_projects():
+        if not project.get("uuid"):
+            continue
+        rows.extend(await _rows_for_project(api, project, name_by_uuid, uuid_by_id))
+    return tuple(rows), servers
+
+
+async def list_project_resources(
+    api: CoolifyClient, name_or_uuid: str
+) -> tuple[str, tuple[ResourceRow, ...], tuple[ServerRef, ...]]:
+    """One project's resources (across its environments). Reads only.
+
+    ``list <project>`` — the same tree as :func:`list_all_resources`, scoped to one
+    project so it fetches only that project's environments.
+    """
+    raw_servers = await api.list_servers()
+    servers = tuple(server_ref(s) for s in raw_servers)
+    name_by_uuid, uuid_by_id = _server_maps(raw_servers)
+
+    project = await find_project(api, name_or_uuid)
+    rows = await _rows_for_project(api, project, name_by_uuid, uuid_by_id)
+    return str(project.get("name", name_or_uuid)), tuple(rows), servers
 
 
 def _engine_of(collection: str, resource: dict[str, Any]) -> DatabaseEngine | None:

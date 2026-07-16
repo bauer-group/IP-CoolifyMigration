@@ -76,49 +76,20 @@ class ServerRef(BaseModel):
     port: int = 22
 
 
-class ProjectPlacement(BaseModel):
-    """Where one project/environment currently runs. For the `list` command.
+class ResourceRow(BaseModel):
+    """One migratable resource, fully qualified. The unit of ``list``.
 
-    Discovery only — no volume, drift or manifest data. Its whole job is to let an
-    operator see project *names* and the server they live on before naming one in
-    `plan`/`run`.
+    Carries its whole path — server, project, environment — so ``list`` can render
+    the complete server -> project -> environment -> resource tree in one pass, and
+    each level's uuid is present so ``plan``/``run`` can be driven entirely by uuid
+    (the only unambiguous handle when a name carries spaces, slashes or other
+    specials).
     """
 
     model_config = ConfigDict(frozen=True)
 
     project: str
     project_uuid: str
-    """Shown in every view so a project can be named to `plan`/`run` by uuid — the
-    only unambiguous handle when a name carries spaces, slashes or other specials."""
-    environment: str
-    server_uuid: str
-    """The server the resources run on. Empty when it could not be resolved from
-    the API — surfaced as "unknown", never silently attributed to a host."""
-    resources: int
-
-
-class ProjectListing(BaseModel):
-    """Every placement, plus the full server set.
-
-    Servers are carried so the view can show a host that has *no* projects — a
-    candidate migration target is exactly what an operator wants to see.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    placements: tuple[ProjectPlacement, ...] = ()
-    servers: tuple[ServerRef, ...] = ()
-
-
-class ResourceRow(BaseModel):
-    """One migratable resource, for `list <project>`.
-
-    The uuid is the point: it is what `plan`/`run` accept for an unambiguous
-    ``project/environment/<uuid>`` selection when two resources share a name.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
     environment: str
     name: str
     uuid: str

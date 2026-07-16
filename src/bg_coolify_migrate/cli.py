@@ -23,11 +23,13 @@ Exit codes are a contract (see docs/cli.md). They are stable and scriptable:
 """
 
 import asyncio
+import contextlib
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from rich.markup import escape
@@ -180,102 +182,72 @@ async def _doctor(settings: Settings) -> None:
 def list_projects(
     project: Annotated[
         str | None,
-        typer.Argument(help="Drill into one project: list its resources with uuids."),
+        typer.Argument(help="Limit the tree to one project (name or uuid)."),
     ] = None,
     server: Annotated[
         str | None,
-        typer.Option("--server", "-s", help="Only show projects on this server (name or uuid)."),
+        typer.Option("--server", "-s", help="Only show resources on this server (name or uuid)."),
     ] = None,
     as_json: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
     log_level: Annotated[str, typer.Option(help="DEBUG|INFO|WARNING|ERROR")] = "INFO",
     log_format: Annotated[str, typer.Option(help="console|json")] = "console",
 ) -> None:
-    """List projects and their server, or one project's resources.
+    """List everything: server -> project -> environment -> resource, recursively.
 
-    Discovery for `plan` and `run`. With no argument: every project, its
-    environment(s) and where they live, grouped by server. With a project: each
-    resource's name, uuid, kind, environment and server - the uuid is what you pass
-    for an unambiguous `project/environment/<uuid>` selection. Reads only; needs no
+    Discovery for `plan` and `run` in one pass - no drilling, nothing to piece
+    together. Every level shows its uuid, so you can drive `plan`/`run` entirely by
+    uuid (`plan <project-uuid>/<environment>/<resource-uuid>`). Narrow with a project
+    argument or `--server`, or get JSON with `--json`. Reads only; needs no
     `read:sensitive` scope.
     """
     settings = _settings(log_level, log_format)
     try:
-        if project is not None:
-            asyncio.run(_list_resources(settings, project, as_json))
-        else:
-            asyncio.run(_list(settings, server, as_json))
+        asyncio.run(_list(settings, project, server, as_json))
     except MigrationError as exc:
         _fail(exc)
 
 
-async def _list_resources(settings: Settings, project: str, as_json: bool) -> None:
+async def _list(
+    settings: Settings, project: str | None, server_filter: str | None, as_json: bool
+) -> None:
     from bg_coolify_migrate.api.client import CoolifyClient
-    from bg_coolify_migrate.engine.planner import list_project_resources
+    from bg_coolify_migrate.engine.planner import list_all_resources, list_project_resources
     from bg_coolify_migrate.ui import report as report_mod
 
     console = get_console()
     url, token = settings.require_coolify()
+    scanning = Text(f"Scanning {project}..." if project else "Scanning everything...")
 
     async with CoolifyClient(url, token, verify=settings.coolify_verify_tls) as api:
-        if is_interactive() and not as_json:
-            with console.status(Text(f"Scanning {project}...")):
-                project_name, rows = await list_project_resources(api, project)
-        else:
-            project_name, rows = await list_project_resources(api, project)
-
-    if as_json:
-        console.print_json(json.dumps(report_mod.resource_row_dicts(rows)))
-        return
-    if not rows:
-        console.print(Text(f"no resources in {project_name}", style="muted"))
-        return
-    if is_interactive():
-        console.print(report_mod.resource_rows_table(project_name, rows))
-    else:
-        console.print(report_mod.plain_resource_rows(rows))
-
-
-async def _list(settings: Settings, server_filter: str | None, as_json: bool) -> None:
-    from bg_coolify_migrate.api.client import CoolifyClient
-    from bg_coolify_migrate.domain.plan import ProjectListing
-    from bg_coolify_migrate.engine.planner import list_placements
-    from bg_coolify_migrate.ui import report as report_mod
-
-    console = get_console()
-    url, token = settings.require_coolify()
-
-    async with CoolifyClient(url, token, verify=settings.coolify_verify_tls) as api:
-        if is_interactive() and not as_json:
-            with console.status("Scanning projects..."):
-                listing = await list_placements(api)
-        else:
-            listing = await list_placements(api)
+        show_status = is_interactive() and not as_json
+        with console.status(scanning) if show_status else contextlib.nullcontext():
+            if project is not None:
+                _name, rows, servers = await list_project_resources(api, project)
+            else:
+                rows, servers = await list_all_resources(api)
 
     if server_filter is not None:
-        matches = [s for s in listing.servers if server_filter in (s.name, s.uuid)]
+        matches = [s for s in servers if server_filter in (s.name, s.uuid)]
         if not matches:
             raise PreflightError(
                 f"no server named {server_filter!r}",
                 hint="Run `coolify-migrate list` without --server to see every server.",
             )
         keep = {s.uuid for s in matches}
-        listing = ProjectListing(
-            placements=tuple(p for p in listing.placements if p.server_uuid in keep),
-            servers=tuple(matches),
-        )
+        rows = tuple(r for r in rows if r.server_uuid in keep)
+        servers = tuple(matches)
 
     if as_json:
-        console.print_json(json.dumps(report_mod.listing_dicts(listing)))
+        console.print_json(json.dumps(report_mod.resource_row_dicts(rows)))
         return
-
-    if not listing.servers and not listing.placements:
-        console.print("no servers or projects visible", style="muted")
+    if not rows:
+        where = f" in {project}" if project else ""
+        console.print(Text(f"no resources visible{where}", style="muted"))
         return
-
     if is_interactive():
-        console.print(report_mod.listing_group(listing))
+        console.print(report_mod.resource_tree(rows, servers))
     else:
-        console.print(report_mod.plain_listing(listing))
+        console.print(report_mod.plain_resource_tree(rows))
 
 
 # ── selection: project[/environment[/resource]] ──────────────────────────────
@@ -337,7 +309,8 @@ async def _resolve_selection(
                     "--to is required",
                     hint="Name the target server, or run in a terminal to pick one.",
                 )
-            target = wizard.choose_server(await api.list_servers(), message="Target server?")  # type: ignore[attr-defined]
+            servers = await api.list_servers()  # type: ignore[attr-defined]
+            target = await _off_loop(wizard.choose_server, servers, message="Target server?")
         return selection, target
 
     if not is_interactive():
@@ -351,13 +324,26 @@ async def _resolve_selection(
     return await _pick(api, target)
 
 
+async def _off_loop(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Run a blocking questionary prompt off the running event loop.
+
+    questionary's ``.ask()`` calls ``asyncio.run()`` internally (via prompt_toolkit),
+    which raises ``RuntimeError: asyncio.run() cannot be called from a running event
+    loop`` when invoked inside our own ``asyncio.run(...)``. A worker thread has no
+    running loop, so its ``asyncio.run`` works and prompt_toolkit skips the
+    main-thread-only signal handlers. This is why every interactive prompt goes
+    through here.
+    """
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+
 async def _pick(api: object, target: str | None) -> tuple[Selection, str]:
     """The interactive picker: project -> environment -> resource -> target server."""
     from bg_coolify_migrate.engine.planner import environment_resources
     from bg_coolify_migrate.ui import wizard
 
     projects = await api.list_projects()  # type: ignore[attr-defined]
-    project_name = wizard.choose_project(projects)
+    project_name = await _off_loop(wizard.choose_project, projects)
     project = next((p for p in projects if str(p.get("name")) == project_name), None)
     if project is None:  # pragma: no cover - defensive; the name came from this list
         raise PreflightError(f"project {project_name!r} is no longer visible")
@@ -369,15 +355,16 @@ async def _pick(api: object, target: str | None) -> tuple[Selection, str]:
         for env in detail.get("environments") or []
         if isinstance(env, dict) and env.get("name")
     ]
-    environment = wizard.choose_scope_environment(environments)
+    environment = await _off_loop(wizard.choose_scope_environment, environments)
 
     resource: str | None = None
     if environment is not None:
         resources = await environment_resources(api, project_uuid, environment)  # type: ignore[arg-type]
-        resource = wizard.choose_scope_resource(resources)
+        resource = await _off_loop(wizard.choose_scope_resource, resources)
 
     if target is None:
-        target = wizard.choose_server(await api.list_servers(), message="Target server?")  # type: ignore[attr-defined]
+        servers = await api.list_servers()  # type: ignore[attr-defined]
+        target = await _off_loop(wizard.choose_server, servers, message="Target server?")
 
     return Selection(project=project_name, environment=environment, resource=resource), target
 
@@ -717,7 +704,7 @@ async def _run(
             # carry accept_drift through; otherwise preflight would ask again into
             # the void.
             try:
-                if not _confirm_plans(plans):
+                if not await _off_loop(_confirm_plans, plans):
                     return 0
             except wizard.Cancelled:
                 console.print("aborted", style="muted")
@@ -904,7 +891,7 @@ async def _rollback(settings: Settings, migration_id: str, assume_yes: bool) -> 
             f"resources created on [host]{escape(migration_plan.target_server.name)}[/host] "
             f"and restart [host]{escape(migration_plan.source_server.name)}[/host]."
         )
-        if not questionary.confirm("Proceed?", default=False).ask():
+        if not await _off_loop(questionary.confirm("Proceed?", default=False).ask):
             return 0
 
     async with CoolifyClient(url, token, verify=settings.coolify_verify_tls) as api:
@@ -1050,7 +1037,7 @@ async def _server_run(
             "\n[warn]This stops EVERYTHING on the source[/warn] - Coolify and every "
             "container it manages - for the duration of the transfer."
         )
-        if not questionary.confirm("Proceed?", default=False).ask():
+        if not await _off_loop(questionary.confirm("Proceed?", default=False).ask):
             return 0
 
     result, migration_id = await run_server_migration(
