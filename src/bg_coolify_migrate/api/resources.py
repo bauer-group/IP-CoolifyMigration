@@ -290,6 +290,26 @@ def _remap_domains(
     return ",".join(dict.fromkeys(urls))
 
 
+def _unrewritable_server_bound(
+    fqdn: str | None, *, source_wildcard: str | None, target_wildcard: str | None
+) -> list[str]:
+    """Server-bound hosts that could NOT be rewritten, because the target has no
+    wildcard to place them on. PURE.
+
+    These get dropped by :func:`_remap_domains` and Coolify then auto-generates a
+    sslip.io URL instead of the expected ``…{target-wildcard}`` one — a degraded
+    but functional outcome the operator should see, not discover later.
+    """
+    if not fqdn or not source_wildcard or target_wildcard:
+        return []
+    out: list[str] = []
+    for part in str(fqdn).split(","):
+        host = normalise_host(part.strip())
+        if host and dns_wildcard.under_wildcard(host, source_wildcard):
+            out.append(host)
+    return out
+
+
 async def create_application(
     api: CoolifyClient, snapshot: ResourceSnapshot, placement: Placement, source: dict[str, Any]
 ) -> str:
@@ -314,11 +334,27 @@ async def create_application(
     # Read from the SOURCE, not the filtered body: Coolify stores the URL in the
     # `fqdn` column, which is not a create input (``domains`` is) and so is
     # filtered out of `body`.
+    raw_fqdn = source.get("fqdn") or source.get("domains")
     target_domains = _remap_domains(
-        source.get("fqdn") or source.get("domains"),
+        raw_fqdn,
         source_wildcard=placement.source_wildcard,
         target_wildcard=placement.target_wildcard,
     )
+    dropped = _unrewritable_server_bound(
+        raw_fqdn,
+        source_wildcard=placement.source_wildcard,
+        target_wildcard=placement.target_wildcard,
+    )
+    if dropped:
+        log.warning(
+            "api.application.wildcard_unresolved",
+            name=snapshot.name,
+            hosts=dropped,
+            hint=(
+                "target server has no wildcard_domain — the URL falls back to sslip.io. "
+                "Configure it on the server, or pass --target-wildcard."
+            ),
+        )
     body.pop("fqdn", None)
     if target_domains:
         body["domains"] = target_domains

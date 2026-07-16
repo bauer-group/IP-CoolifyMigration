@@ -534,6 +534,16 @@ _SELECTOR_HELP = (
     "name or uuid. Omit in a terminal to pick interactively."
 )
 
+_SOURCE_WILDCARD_HELP = (
+    "Override the source server's wildcard base (e.g. app.0046-20.cloud.bauer-group.com). "
+    "Normally read from the server's settings; supply it only when that is empty or wrong."
+)
+_TARGET_WILDCARD_HELP = (
+    "Override the target server's wildcard base (e.g. app.0047-20.cloud.bauer-group.com). "
+    "Supply it when the target has no wildcard configured, so a server-bound URL can still "
+    "be rewritten onto it instead of falling back to a sslip.io name."
+)
+
 
 @app.command()
 def plan(
@@ -550,6 +560,12 @@ def plan(
     trust_host_key: Annotated[
         bool, typer.Option("--trust-host-key", help=_TRUST_HOST_KEY_HELP)
     ] = False,
+    source_wildcard: Annotated[
+        str | None, typer.Option("--source-wildcard", help=_SOURCE_WILDCARD_HELP)
+    ] = None,
+    target_wildcard: Annotated[
+        str | None, typer.Option("--target-wildcard", help=_TARGET_WILDCARD_HELP)
+    ] = None,
     output: Annotated[
         Path | None, typer.Option(help="Write the plan JSON here (single-scope only).")
     ] = None,
@@ -565,7 +581,12 @@ def plan(
     """
     settings = _settings(log_level, log_format)
     try:
-        asyncio.run(_plan(settings, selector, to, environment, output, trust_host_key))
+        asyncio.run(
+            _plan(
+                settings, selector, to, environment, output, trust_host_key,
+                source_wildcard, target_wildcard,
+            )
+        )
     except MigrationError as exc:
         _fail(exc)
 
@@ -577,6 +598,8 @@ async def _plan(
     environment_override: str | None,
     output: Path | None,
     trust_host_key: bool = False,
+    source_wildcard: str | None = None,
+    target_wildcard: str | None = None,
 ) -> None:
     from bg_coolify_migrate.api.client import CoolifyClient
     from bg_coolify_migrate.ui import wizard
@@ -601,7 +624,7 @@ async def _plan(
                 plans.append(
                     await _build(
                         api, settings, job_project, job_environment, resolved_target,
-                        job_resource, trust_host_key,
+                        job_resource, trust_host_key, source_wildcard, target_wildcard,
                     )
                 )
             except EmptyEnvironment:
@@ -678,6 +701,8 @@ async def _build(
     target: str,
     only_resource: str | None = None,
     trust_host_key: bool = False,
+    source_wildcard: str | None = None,
+    target_wildcard: str | None = None,
 ) -> MigrationPlan:
     """Open SSH to the source and build the plan for one environment.
 
@@ -735,6 +760,8 @@ async def _build(
             target_server=target,
             only_resource=only_resource,
             transfer_mode=TransferMode(settings.transfer_mode),
+            source_wildcard=source_wildcard,
+            target_wildcard=target_wildcard,
         )
 
 
@@ -784,6 +811,12 @@ def run(
     trust_host_key: Annotated[
         bool, typer.Option("--trust-host-key", help=_TRUST_HOST_KEY_HELP)
     ] = False,
+    source_wildcard: Annotated[
+        str | None, typer.Option("--source-wildcard", help=_SOURCE_WILDCARD_HELP)
+    ] = None,
+    target_wildcard: Annotated[
+        str | None, typer.Option("--target-wildcard", help=_TARGET_WILDCARD_HELP)
+    ] = None,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
     log_level: Annotated[str, typer.Option(help="DEBUG|INFO|WARNING|ERROR")] = "INFO",
     log_format: Annotated[str, typer.Option(help="console|json")] = "console",
@@ -814,6 +847,8 @@ def run(
                 accept_dns=accept_dns,
                 delete_previews=delete_previews,
                 trust_host_key=trust_host_key,
+                source_wildcard=source_wildcard,
+                target_wildcard=target_wildcard,
                 assume_yes=yes,
             )
         )
@@ -834,6 +869,8 @@ async def _run(
     accept_dns: bool = False,
     delete_previews: bool,
     trust_host_key: bool = False,
+    source_wildcard: str | None = None,
+    target_wildcard: str | None = None,
     assume_yes: bool,
 ) -> int:
     from bg_coolify_migrate.api.client import CoolifyClient
@@ -860,7 +897,7 @@ async def _run(
             try:
                 plan = await _build(
                     api, settings, job_project, job_environment, resolved_target,
-                    job_resource, trust_host_key,
+                    job_resource, trust_host_key, source_wildcard, target_wildcard,
                 )
                 plans.append(plan.model_copy(update={"finalize_policy": policy}))
             except EmptyEnvironment:

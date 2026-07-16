@@ -148,6 +148,13 @@ onto the target server's wildcard automatically —
 DNS change is needed and the gate never stops for these; they show as
 `server_bound` in the DNS table.
 
+The wildcard is read from each server's Coolify settings. If the **target** has
+none configured, the URL can't be rewritten onto it and Coolify falls back to a
+`sslip.io` name (a loud warning is logged). Supply it explicitly to keep the
+proper URL — `--target-wildcard app.0047-20.cloud.bauer-group.com` (and
+`--source-wildcard` to override a missing/wrong source wildcard). Both accept the
+bare host or the `https://…` form.
+
 **Custom domains** — `shop.example.com` and the like. These are
 server-independent: they move *with* the app, by repointing their DNS record at
 the target. Because the target's proxy requests an ACME certificate the moment it

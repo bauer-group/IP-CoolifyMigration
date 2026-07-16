@@ -528,6 +528,30 @@ class TestRemapDomains:
         assert out == "https://shop.example.com"
 
 
+class TestUnrewritableServerBound:
+    SRC = "app.0046-20.cloud.bauer-group.com"
+    TGT = "app.0047-20.cloud.bauer-group.com"
+
+    def _detect(self, fqdn: str | None, *, tgt: str | None):
+        from bg_coolify_migrate.api.resources import _unrewritable_server_bound
+
+        return _unrewritable_server_bound(fqdn, source_wildcard=self.SRC, target_wildcard=tgt)
+
+    def test_flags_server_bound_url_when_target_has_no_wildcard(self) -> None:
+        assert self._detect(
+            "https://pdf-tool.app.0046-20.cloud.bauer-group.com", tgt=None
+        ) == ["pdf-tool.app.0046-20.cloud.bauer-group.com"]
+
+    def test_nothing_flagged_when_the_target_has_a_wildcard(self) -> None:
+        # It CAN be rewritten, so it is not "unrewritable".
+        assert self._detect(
+            "https://pdf-tool.app.0046-20.cloud.bauer-group.com", tgt=self.TGT
+        ) == []
+
+    def test_custom_domain_is_never_flagged(self) -> None:
+        assert self._detect("https://shop.example.com", tgt=None) == []
+
+
 class TestCopyEnvs:
     async def test_bulk_upsert_overwrites_generated_secrets(
         self, api: CoolifyClient, respx_mock: respx.Router

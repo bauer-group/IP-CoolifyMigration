@@ -661,6 +661,8 @@ async def build_plan(
     only_resource: str | None = None,
     finalize_policy: FinalizePolicy = FinalizePolicy.RENAME,
     transfer_mode: TransferMode = TransferMode.AUTO,
+    source_wildcard: str | None = None,
+    target_wildcard: str | None = None,
     measure: bool = True,
 ) -> MigrationPlan:
     """Produce the complete plan. Reads only.
@@ -759,11 +761,20 @@ async def build_plan(
             hint="The API did not report a server for these resources.",
         )
 
+    # A server's wildcard is normally read from its settings, but the target may
+    # not have one configured — let the caller supply it (or override a wrong one).
+    source_ref = server_ref(source_server)
+    target_ref = server_ref(target)
+    if source_wildcard:
+        source_ref = source_ref.model_copy(update={"wildcard_domain": source_wildcard})
+    if target_wildcard:
+        target_ref = target_ref.model_copy(update={"wildcard_domain": target_wildcard})
+
     return MigrationPlan(
         project=str(project_data.get("name", project)),
         environment=environment,
-        source_server=server_ref(source_server),
-        target_server=server_ref(target),
+        source_server=source_ref,
+        target_server=target_ref,
         resources=tuple(plans),
         finalize_policy=finalize_policy,
         transfer_mode=transfer_mode,
