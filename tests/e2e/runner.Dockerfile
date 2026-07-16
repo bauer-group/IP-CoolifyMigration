@@ -37,7 +37,7 @@ RUN pip install --no-cache-dir \
       "httpx>=0.28.1,<1.0.0" \
       "pydantic>=2.10.0,<3.0.0" \
       "pydantic-settings>=2.14.1,<3.0.0" \
-      "structlog>=24.4.0,<26.0.0" \
+      "structlog>=24.4.0,<27.0.0" \
       "asyncssh>=2.18.0,<3.0.0" \
       "dnspython>=2.7.0,<3.0.0" \
       "pyyaml>=6.0.0,<7.0.0" \
