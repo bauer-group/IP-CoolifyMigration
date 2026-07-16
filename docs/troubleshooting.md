@@ -10,6 +10,16 @@ This is not a nicety. Coolify's `ApiSensitiveData` middleware omits `value`,
 no error, no redaction marker, the keys are simply absent**. A migration would
 recreate every environment variable empty and every service without its compose.
 
+## `403 API is disabled.` on every call
+
+Coolify ships with its REST API **off instance-wide**, separately from your
+token. Turn it on under **Settings > API**, or `GET /api/v1/enable` with a write
+token.
+
+This reads exactly like a token or permission problem and is neither — your token
+is fine, the instance switch just has not been flipped. It is off by default and
+has to be enabled once.
+
 ## The DNS gate blocked me (exit 3)
 
 Working as designed. It is a resumable stop, not a failure — the target is created

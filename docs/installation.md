@@ -18,6 +18,11 @@
 
 **In Coolify**:
 
+- **The REST API switched on.** It is off instance-wide by default — enable it
+  under **Settings > API**. Without it every call returns `403 "API is
+  disabled."`, even with a perfectly valid token, which makes it look like a
+  token problem when it is not. This is separate from the token and only has to
+  be done once per instance.
 - An API token with **`root`** or **`read:sensitive`**
   (Keys & Tokens > API tokens).
 

@@ -1,4 +1,4 @@
-<!-- AUTO-GENERATED FILE. DO NOT EDIT. Edit docs/README.template.MD instead. Generated 2026-07-15. -->
+<!-- AUTO-GENERATED FILE. DO NOT EDIT. Edit docs/README.template.MD instead. Generated 2026-07-16. -->
 # BAUER GROUP - Coolify Migration Toolkit
 
 [![PyPI](https://img.shields.io/pypi/v/bg-coolify-migrate.svg)](https://pypi.org/project/bg-coolify-migrate/)
@@ -62,10 +62,12 @@ external orchestrator has none of those constraints. That is what this is.
 | `dns/` | FQDN extraction, authoritative resolution, cutover gate |
 | `ui/` | Rich dashboard, wizard, and a plain non-TTY fallback |
 
-> **Requires a Coolify API token with `root` or `read:sensitive`.** Without it,
-> Coolify's `ApiSensitiveData` middleware silently omits `value`, `real_value`
-> and `docker_compose_raw` from responses — no error, no redaction marker. The
-> tool probes for this at startup and fails closed.
+> **Requires the instance API switched on (Settings > API — off by default) and a
+> token with `root` or `read:sensitive`.** Without the switch every call is
+> `403 "API is disabled."`, which looks like a token problem but is not. Without
+> the scope, Coolify's `ApiSensitiveData` middleware silently omits `value`,
+> `real_value` and `docker_compose_raw` from responses — no error, no redaction
+> marker. The tool checks both at startup and fails closed.
 
 ## Quick start
 

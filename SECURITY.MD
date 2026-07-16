@@ -1,4 +1,4 @@
-<!-- AUTO-GENERATED FILE. DO NOT EDIT. Edit docs/SECURITY.template.MD instead. Generated 2026-07-15. -->
+<!-- AUTO-GENERATED FILE. DO NOT EDIT. Edit docs/SECURITY.template.MD instead. Generated 2026-07-16. -->
 # Security Policy
 
 > **BAUER GROUP** | bauer-group/IP-CoolifyMigration
@@ -67,4 +67,4 @@ Secret scanning (gitleaks + GitGuardian) runs on every push via the
 
 ---
 
-_Last updated: 2026-07-15_
+_Last updated: 2026-07-16_
