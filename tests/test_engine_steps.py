@@ -119,6 +119,46 @@ async def ctx(tmp_path: Path):  # type: ignore[no-untyped-def]
     await api.aclose()
 
 
+class TestCaptureMounts:
+    """The 'no containers' guard protects stateful resources from silently copying
+    nothing - but a stateless / no-volume resource must migrate, not abort."""
+
+    async def test_refuses_when_there_are_volumes_but_no_containers(
+        self, ctx: MigrationContext
+    ) -> None:
+        # Default ctx: a COPY_DATA resource with a volume, source `docker ps` empty.
+        from bg_coolify_migrate.engine.steps import _capture_mounts
+
+        with pytest.raises(PreflightError, match="has volumes to migrate"):
+            await _capture_mounts(ctx)
+
+    async def test_proceeds_when_a_no_volume_resource_has_no_containers(
+        self, ctx: MigrationContext
+    ) -> None:
+        # A rebuild app with no volumes and no running containers must NOT abort -
+        # there is nothing to capture; it is recreated (rebuilt) on the target.
+        from bg_coolify_migrate.engine.steps import _capture_mounts
+
+        ctx.plan = _plan(
+            resources=(
+                ResourcePlan(
+                    snapshot=_snapshot(
+                        name="alam00000/bentopdf",
+                        collection="applications",
+                        kind=ResourceKind.APP_GIT_BUILD,
+                        engine=None,
+                        image=None,
+                        builds=True,
+                    ),
+                    strategy=Strategy.REBUILD,
+                    manifest=VolumeManifest(),  # no volumes to migrate
+                ),
+            )
+        )
+        await _capture_mounts(ctx)  # no raise
+        assert ctx.pre_stop_mounts == {}  # nothing captured, nothing lost
+
+
 class TestPreflight:
     async def test_passes_a_healthy_setup(
         self, ctx: MigrationContext, respx_mock: respx.Router

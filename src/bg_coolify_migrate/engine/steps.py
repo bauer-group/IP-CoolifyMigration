@@ -289,17 +289,25 @@ async def _capture_mounts(ctx: MigrationContext) -> None:
             name=snapshot.name,
         )
         if not containers:
-            raise PreflightError(
-                f"{snapshot.name}: no containers found on {ctx.plan.source_server.name} "
-                "before stopping it",
-                hint=(
-                    "The stack must be running for its volumes to be discoverable — "
-                    "Coolify removes containers when it stops them, so this is the only "
-                    "chance to see what they mounted.\n"
-                    "Either the resource is already stopped (start it, then migrate), or "
-                    "its containers do not carry the labels we filter on."
-                ),
-            )
+            # No containers is only a problem when there is data to copy. The plan's
+            # manifest is the signal: if it found volumes, a running stack is the ONLY
+            # chance to capture them, so refuse (silently copying nothing for a
+            # stateful resource is the failure we exist to prevent). If it found none
+            # — a stateless/rebuilt resource, or one that is simply stopped — there is
+            # nothing to capture, so carry on and let it be recreated on the target.
+            if resource.manifest.to_migrate:
+                raise PreflightError(
+                    f"{snapshot.name}: has volumes to migrate but no running containers "
+                    f"on {ctx.plan.source_server.name}",
+                    hint=(
+                        "Coolify removes containers when it stops them, so a running "
+                        "stack is the only chance to see what its volumes mounted. Start "
+                        "the resource, then migrate. If it IS running, its containers may "
+                        "not carry the labels we filter on."
+                    ),
+                )
+            log.info("quiesce.no_containers_no_volumes", resource=snapshot.name)
+            continue
         mounts = await inspect_all_mounts(ctx.source_host, containers)
         ctx.pre_stop_mounts[snapshot.uuid] = mounts
         log.info(
