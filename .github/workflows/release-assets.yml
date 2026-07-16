@@ -1,0 +1,87 @@
+# =============================================================================
+#  📦 Release Assets
+# -----------------------------------------------------------------------------
+#  WHAT         : Attaches the built wheel + sdist to the GitHub Release.
+#  WHY          : The org release pipeline runs `semantic-release version`
+#                 (creates the release + notes) but not `publish`, so no
+#                 distribution files are attached. This fills that gap so the
+#                 package is downloadable from GitHub, not only PyPI.
+#  WHEN         : After the release pipeline finishes. It deliberately does NOT
+#                 trigger on `release: published`: that release is created with
+#                 GITHUB_TOKEN, and GitHub suppresses downstream events from
+#                 GITHUB_TOKEN to avoid recursion. `workflow_run` is the
+#                 documented exception. `workflow_dispatch` allows backfilling.
+#  PRODUCES     : dist/*.whl and dist/*.tar.gz on the latest GitHub Release.
+#  PERMISSIONS  : contents: write (upload release assets).
+# =============================================================================
+name: 📦 Release Assets
+
+on:
+  workflow_run:
+    workflows: ["🐍 CI/CD Pipeline (Automatic Release)"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-assets
+  cancel-in-progress: false
+
+jobs:
+  attach:
+    name: 📎 Attach wheel + sdist
+    # Run on a successful release-pipeline finish on main, or a manual dispatch
+    # (which carries no workflow_run payload, so it is allowed through).
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 📥 Checkout (full history for tags + build)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: 🔎 Does the latest release still need its distributions?
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName // ""')
+          if [ -z "$TAG" ]; then
+            echo "No release found; nothing to attach."
+            echo "needs=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          WHEELS=$(gh release view "$TAG" --json assets \
+            --jq '[.assets[].name | select(endswith(".whl"))] | length')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ "$WHEELS" = "0" ]; then
+            echo "needs=true" >> "$GITHUB_OUTPUT"
+            echo "📦 $TAG has no wheel — will build and attach."
+          else
+            echo "needs=false" >> "$GITHUB_OUTPUT"
+            echo "✅ $TAG already carries its distributions."
+          fi
+
+      - name: 🏗️ Build the distributions at the release tag
+        if: steps.rel.outputs.needs == 'true'
+        run: |
+          git checkout --quiet "${{ steps.rel.outputs.tag }}"
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: 📎 Upload to the GitHub Release
+        if: steps.rel.outputs.needs == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ steps.rel.outputs.tag }}" dist/* --clobber
