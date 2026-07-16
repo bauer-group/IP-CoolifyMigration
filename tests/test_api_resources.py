@@ -835,7 +835,7 @@ class TestParkSourceDomains:
             ]
         }
 
-    async def test_nothing_to_park_makes_no_call(
+    async def test_only_server_bound_makes_no_patch_but_still_records_restore(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
         import json
@@ -849,7 +849,9 @@ class TestParkSourceDomains:
             kind=ResourceKind.APP_GIT_COMPOSE,
             git_auth=GitAuth.PUBLIC,
         )
-        # Only a server-bound domain: remapped on the target, never collides.
+        # Only a server-bound domain: remapped on the target, never collides, so
+        # nothing is parked — but the original is still recorded so a rollback can
+        # swing the URL back (finalize blanks it on success).
         source = {
             "docker_compose_domains": json.dumps(
                 {"web": {"domain": "https://x.app.0046-20.cloud.bauer-group.com"}}
@@ -858,7 +860,29 @@ class TestParkSourceDomains:
         restore = await park_source_domains(
             api, snapshot, source, source_wildcard=self.SRC, tag="t1"
         )
-        assert restore is None
+        assert restore == {
+            "docker_compose_domains": [
+                {"name": "web", "domain": "https://x.app.0046-20.cloud.bauer-group.com"}
+            ]
+        }
+        assert not respx_mock.calls  # no PATCH: nothing was parked
+
+    async def test_no_domains_at_all_returns_none(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        from bg_coolify_migrate.api.resources import park_source_domains
+
+        snapshot = ResourceSnapshot(
+            uuid="a1",
+            name="web",
+            collection="applications",
+            kind=ResourceKind.APP_GIT_BUILD,
+            git_auth=GitAuth.PUBLIC,
+        )
+        assert (
+            await park_source_domains(api, snapshot, {}, source_wildcard=self.SRC, tag="t1")
+            is None
+        )
         assert not respx_mock.calls
 
     async def test_regular_app_parks_its_fqdn_via_domains(
@@ -1007,3 +1031,70 @@ class TestReadVolumeEndpoints:
         )
         endpoints = await read_volume_endpoints(api, collection="databases", uuid="db2")
         assert endpoints[0].name == "postgres-data-db2"
+
+
+class TestMultiServiceDomains:
+    """A compose app whose services each carry a different URL — remap and park
+    must treat every service independently."""
+
+    SRC = "app.0046-20.cloud.bauer-group.com"
+    TGT = "app.0047-20.cloud.bauer-group.com"
+
+    def _raw(self) -> str:
+        import json
+
+        return json.dumps(
+            {
+                "globaleaks": {"domain": "https://speakup.bauer-group.com"},  # custom
+                "config": {"domain": "https://cfg.app.0046-20.cloud.bauer-group.com"},  # bound
+                "admin": {"domain": "https://admin.bauer-group.com"},  # custom
+            }
+        )
+
+    def test_remap_keeps_custom_and_rewrites_bound_per_service(self) -> None:
+        from bg_coolify_migrate.api.resources import _compose_domains_body
+
+        out = _compose_domains_body(self._raw(), source_wildcard=self.SRC, target_wildcard=self.TGT)
+        assert out == [
+            {"name": "globaleaks", "domain": "https://speakup.bauer-group.com"},
+            {"name": "config", "domain": "https://cfg.app.0047-20.cloud.bauer-group.com"},
+            {"name": "admin", "domain": "https://admin.bauer-group.com"},
+        ]
+
+    async def test_park_frees_every_custom_service_and_records_full_original(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        import json
+
+        from bg_coolify_migrate.api.resources import park_source_domains
+
+        route = respx_mock.patch(f"{BASE}/applications/a1").mock(
+            return_value=httpx.Response(200, json={"uuid": "a1"})
+        )
+        snapshot = ResourceSnapshot(
+            uuid="a1",
+            name="wb",
+            collection="applications",
+            kind=ResourceKind.APP_GIT_COMPOSE,
+            git_auth=GitAuth.PUBLIC,
+        )
+        restore = await park_source_domains(
+            api, snapshot, {"docker_compose_domains": self._raw()},
+            source_wildcard=self.SRC, tag="t1",
+        )
+        # Both custom services are parked; the bound one is left alone.
+        assert json.loads(route.calls[0].request.read()) == {
+            "docker_compose_domains": [
+                {"name": "globaleaks", "domain": "https://old-t1.speakup.bauer-group.com"},
+                {"name": "config", "domain": "https://cfg.app.0046-20.cloud.bauer-group.com"},
+                {"name": "admin", "domain": "https://old-t1.admin.bauer-group.com"},
+            ]
+        }
+        # The restore body carries every service's ORIGINAL domain.
+        assert restore == {
+            "docker_compose_domains": [
+                {"name": "globaleaks", "domain": "https://speakup.bauer-group.com"},
+                {"name": "config", "domain": "https://cfg.app.0046-20.cloud.bauer-group.com"},
+                {"name": "admin", "domain": "https://admin.bauer-group.com"},
+            ]
+        }

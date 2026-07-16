@@ -418,8 +418,12 @@ async def park_source_domains(
     another resource already holds. So before creating the target we rename the
     source's custom domains with an ``old-<tag>`` marker (in Coolify's DB only —
     the running source is not redeployed, so it keeps serving the real domain
-    until quiesce). Returns the body that restores the originals, for the rollback
-    compensation, or ``None`` when there was nothing custom to park.
+    until quiesce).
+
+    ALWAYS returns the body that restores the source's ORIGINAL domains, even when
+    nothing is parked: finalize blanks the source's domains on success, and the
+    rollback needs the originals to swing the URL back onto the old stack. Returns
+    ``None`` only when the source has no domains at all.
     """
     if snapshot.kind is ResourceKind.APP_GIT_COMPOSE:
         parsed = _parse_compose_domains(source.get("docker_compose_domains"))
@@ -430,20 +434,20 @@ async def park_source_domains(
             {"name": name, "domain": _park_hosts(domain, source_wildcard=source_wildcard, tag=tag)}
             for name, domain in parsed.items()
         ]
-        if parked == original:
-            return None
-        await api.update_resource(
-            snapshot.collection, snapshot.uuid, {"docker_compose_domains": parked}
-        )
-        log.info("api.source_domains.parked", uuid=snapshot.uuid, tag=tag)
+        if parked != original:
+            await api.update_resource(
+                snapshot.collection, snapshot.uuid, {"docker_compose_domains": parked}
+            )
+            log.info("api.source_domains.parked", uuid=snapshot.uuid, tag=tag)
         return {"docker_compose_domains": original}
 
     original_fqdn = str(source.get("fqdn") or "")
-    parked_fqdn = _park_hosts(original_fqdn, source_wildcard=source_wildcard, tag=tag)
-    if parked_fqdn == original_fqdn:
+    if not original_fqdn:
         return None
-    await api.update_resource(snapshot.collection, snapshot.uuid, {"domains": parked_fqdn})
-    log.info("api.source_domains.parked", uuid=snapshot.uuid, tag=tag)
+    parked_fqdn = _park_hosts(original_fqdn, source_wildcard=source_wildcard, tag=tag)
+    if parked_fqdn != original_fqdn:
+        await api.update_resource(snapshot.collection, snapshot.uuid, {"domains": parked_fqdn})
+        log.info("api.source_domains.parked", uuid=snapshot.uuid, tag=tag)
     return {"domains": original_fqdn}
 
 

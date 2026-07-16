@@ -888,3 +888,32 @@ class TestUndoParkedDomains:
 
         await undo_create_target(ctx, {"target_uuids": {}})
         assert not respx_mock.calls
+
+    async def test_target_is_deleted_before_the_source_domain_is_reclaimed(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        # Reclaiming a custom domain the target still holds would 409, so the
+        # target must be deleted FIRST, then the source domain restored.
+        from bg_coolify_migrate.engine.compensations import undo_create_target
+
+        order: list[str] = []
+
+        def rec_delete(request: httpx.Request) -> httpx.Response:
+            order.append("delete")
+            return httpx.Response(200, json={})
+
+        def rec_patch(request: httpx.Request) -> httpx.Response:
+            order.append("patch")
+            return httpx.Response(200, json={"uuid": "db1"})
+
+        respx_mock.delete(f"{BASE}/databases/dbT").mock(side_effect=rec_delete)
+        respx_mock.patch(f"{BASE}/databases/db1").mock(side_effect=rec_patch)
+
+        await undo_create_target(
+            ctx,
+            {
+                "target_uuids": {"db1": "dbT"},
+                "parked_domains": {"db1": {"domains": "https://speakup.bauer-group.com"}},
+            },
+        )
+        assert order == ["delete", "patch"]

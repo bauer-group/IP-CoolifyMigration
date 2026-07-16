@@ -24,15 +24,35 @@ log = structlog.get_logger(__name__)
 
 
 async def undo_create_target(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
-    """Delete the resources we created and restore any parked source domains.
+    """Delete the resources we created and restore the source's original domains.
 
     ``delete_volumes=True`` is correct here and only here: these are volumes WE
     created on the target minutes ago. The source's volumes are never touched by
     a rollback.
+
+    ORDER matters: the target is deleted FIRST so it releases any domain it holds,
+    and only THEN is the source's original domain restored — otherwise reclaiming
+    a custom domain the target still holds would 409. Both parts are best-effort so
+    a stuck target delete cannot also strand the source without its URL.
     """
-    # Un-park FIRST and best-effort: create_target renamed the source's custom
-    # domains to free them, and the source needs its real domain back regardless
-    # of whether the target deletes cleanly. A failure here must not stop that.
+    target_uuids: dict[str, str] = undo_info.get("target_uuids") or {}
+    delete_failures: list[str] = []
+    for source_uuid, target_uuid in target_uuids.items():
+        try:
+            collection = ctx.collection_of(source_uuid)
+        except KeyError:
+            log.warning("compensate.unknown_resource", source_uuid=source_uuid)
+            continue
+        try:
+            await ctx.api.delete_resource(collection, target_uuid, delete_volumes=True)
+            log.info("compensate.target_deleted", uuid=target_uuid)
+        except Exception as exc:
+            delete_failures.append(target_uuid)
+            log.error("compensate.target_delete_failed", uuid=target_uuid, error=str(exc)[:200])
+
+    # The target is gone (or noted as stuck) — now swing the source's domains back.
+    # create_target parked the custom ones and finalize blanked them on success;
+    # this puts the originals back so the old stack regains its URL.
     parked: dict[str, dict[str, Any]] = undo_info.get("parked_domains") or {}
     for source_uuid, restore_body in parked.items():
         try:
@@ -46,22 +66,9 @@ async def undo_create_target(ctx: MigrationContext, undo_info: dict[str, Any]) -
                 error=str(exc)[:200],
             )
 
-    target_uuids: dict[str, str] = undo_info.get("target_uuids") or {}
-    if not target_uuids:
-        return
-
-    for source_uuid, target_uuid in target_uuids.items():
-        try:
-            collection = ctx.collection_of(source_uuid)
-        except KeyError:
-            log.warning("compensate.unknown_resource", source_uuid=source_uuid)
-            continue
-        try:
-            await ctx.api.delete_resource(collection, target_uuid, delete_volumes=True)
-            log.info("compensate.target_deleted", uuid=target_uuid)
-        except Exception as exc:
-            log.error("compensate.target_delete_failed", uuid=target_uuid, error=str(exc)[:200])
-            raise
+    if delete_failures:
+        # Surfaced so the rollback reports honestly; the source restore still ran.
+        raise RuntimeError("could not delete target(s): " + ", ".join(delete_failures))
 
 
 async def undo_quiesce(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
@@ -157,27 +164,15 @@ async def undo_restore_source_name(ctx: MigrationContext, undo_info: dict[str, A
 
 
 async def undo_restore_source_fqdn(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
-    """Restore the source's FQDN after a released one.
+    """No-op: the source's domains are restored by ``undo_create_target``.
 
-    Best-effort: we cleared it, so we must put it back, but a failure here leaves
-    a stopped resource with no domain — recoverable by hand and far less harmful
-    than the alternative.
+    That compensation recorded the originals at create and runs LAST — after the
+    target it deletes has released the domain — so it can reclaim a custom domain
+    without a 409. Doing it here (a finalize compensation, which runs while the
+    target still exists) would conflict, so this stays a no-op and is kept only so
+    the state machine's compensation map remains complete.
     """
-    if undo_info.get("policy") != "rename":
-        return
-    for resource in ctx.plan.resources:
-        try:
-            full = await ctx.api.get_resource(
-                resource.snapshot.collection, resource.snapshot.uuid
-            )
-            if resource.snapshot.collection == "applications" and not full.get("fqdn"):
-                log.warning(
-                    "compensate.fqdn_not_restored",
-                    name=resource.snapshot.name,
-                    hint="the original FQDN was not recorded; set it in Coolify",
-                )
-        except Exception as exc:
-            log.debug("compensate.fqdn_check_failed", error=str(exc)[:120])
+    return
 
 
 def build_compensations() -> dict[Any, Any]:
