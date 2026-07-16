@@ -24,7 +24,7 @@ from bg_coolify_migrate.engine.steps import build_steps
 from bg_coolify_migrate.errors import MigrationError
 from bg_coolify_migrate.journal.store import Journal
 from bg_coolify_migrate.settings.base import Settings
-from bg_coolify_migrate.transfer.ssh import RemoteHost, SshTarget
+from bg_coolify_migrate.transfer.ssh import HostKeyPrompt, RemoteHost, SshTarget
 
 log = structlog.get_logger(__name__)
 
@@ -115,7 +115,13 @@ async def ssh_target_for(api: CoolifyClient, server: ServerRef) -> SshTarget:
 
 @asynccontextmanager
 async def open_hosts(
-    api: CoolifyClient, settings: Settings, source: ServerRef, target: ServerRef
+    api: CoolifyClient,
+    settings: Settings,
+    source: ServerRef,
+    target: ServerRef,
+    *,
+    trust_host_key: bool = False,
+    host_key_prompt: HostKeyPrompt | None = None,
 ) -> AsyncIterator[tuple[RemoteHost, RemoteHost]]:
     """Open both SSH connections, closing them whatever happens."""
     source_target = await ssh_target_for(api, source)
@@ -124,12 +130,14 @@ async def open_hosts(
     async with RemoteHost.connect(
         source_target,
         known_hosts=settings.resolved_known_hosts(),
-        trust_new_host_key=settings.trust_host_key,
+        trust_new_host_key=trust_host_key or settings.trust_host_key,
+        host_key_prompt=host_key_prompt,
         connect_timeout=settings.ssh_timeout,
     ) as source_host, RemoteHost.connect(
         target_target,
         known_hosts=settings.resolved_known_hosts(),
-        trust_new_host_key=settings.trust_host_key,
+        trust_new_host_key=trust_host_key or settings.trust_host_key,
+        host_key_prompt=host_key_prompt,
         connect_timeout=settings.ssh_timeout,
     ) as target_host:
         yield source_host, target_host
@@ -192,6 +200,8 @@ async def run_migration(
     migration_id: str | None = None,
     accept_drift: bool = False,
     delete_previews: bool = False,
+    trust_host_key: bool = False,
+    host_key_prompt: HostKeyPrompt | None = None,
     on_state: Callable[[State], Awaitable[None]] | None = None,
 ) -> RunResult:
     """Execute a migration end to end."""
@@ -201,7 +211,14 @@ async def run_migration(
     # Before anything else: resume and rollback are useless without it.
     save_plan(state_dir, mid, plan)
 
-    async with open_hosts(api, settings, plan.source_server, plan.target_server) as (
+    async with open_hosts(
+        api,
+        settings,
+        plan.source_server,
+        plan.target_server,
+        trust_host_key=trust_host_key,
+        host_key_prompt=host_key_prompt,
+    ) as (
         source_host,
         target_host,
     ):
@@ -228,6 +245,8 @@ async def resume_migration(
     migration_id: str,
     *,
     accept_drift: bool = False,
+    trust_host_key: bool = False,
+    host_key_prompt: HostKeyPrompt | None = None,
     on_state: Callable[[State], Awaitable[None]] | None = None,
 ) -> RunResult:
     """Continue a blocked or interrupted migration.
@@ -244,7 +263,14 @@ async def resume_migration(
             hint="Run `coolify-migrate status <id>` to see what happened.",
         )
 
-    async with open_hosts(api, settings, plan.source_server, plan.target_server) as (
+    async with open_hosts(
+        api,
+        settings,
+        plan.source_server,
+        plan.target_server,
+        trust_host_key=trust_host_key,
+        host_key_prompt=host_key_prompt,
+    ) as (
         source_host,
         target_host,
     ):
@@ -278,11 +304,21 @@ async def rollback_migration(
     settings: Settings,
     plan: MigrationPlan,
     migration_id: str,
+    *,
+    trust_host_key: bool = False,
+    host_key_prompt: HostKeyPrompt | None = None,
 ) -> RunResult:
     """Undo a migration, using only what the journal recorded."""
     journal = Journal.open(settings.resolved_state_dir(), migration_id)
 
-    async with open_hosts(api, settings, plan.source_server, plan.target_server) as (
+    async with open_hosts(
+        api,
+        settings,
+        plan.source_server,
+        plan.target_server,
+        trust_host_key=trust_host_key,
+        host_key_prompt=host_key_prompt,
+    ) as (
         source_host,
         target_host,
     ):

@@ -330,3 +330,104 @@ class TestVerifyCompare:
         b = Manifest()
         (diff,) = compare(a, b)
         assert "missing on target" in diff.describe()
+
+
+class TestHostKeyRecording:
+    """Regression for the broken TOFU: a recorded host key must actually match a
+    later connection, and unseen keys must be prompted/refused, not accepted blindly."""
+
+    @staticmethod
+    def _public_key():  # type: ignore[no-untyped-def]
+        import asyncssh
+
+        return asyncssh.generate_private_key("ssh-ed25519").convert_to_public()
+
+    def test_recorded_key_matches_a_port_22_connection(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        import asyncssh
+
+        from bg_coolify_migrate.transfer.ssh import SshTarget, _append_known_host
+
+        known_hosts = tmp_path / "known_hosts"
+        _append_known_host(known_hosts, SshTarget(host="host.example.com", port=22), self._public_key())
+
+        parsed = asyncssh.import_known_hosts(known_hosts.read_text(encoding="utf-8"))
+        server_keys = parsed.match("host.example.com", "1.2.3.4", 22)[0]
+        assert server_keys, "a recorded key must be matchable, or TOFU is a no-op"
+
+    async def test_trust_flag_records_without_prompting(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from bg_coolify_migrate.transfer.ssh import RemoteHost, SshTarget
+
+        key = self._public_key()
+
+        async def _scan(target: object) -> object:
+            return key
+
+        monkeypatch.setattr(RemoteHost, "_scan_host_key", _scan)
+        known_hosts = tmp_path / "known_hosts"
+        await RemoteHost.ensure_host_key(
+            SshTarget(host="h", port=22), known_hosts=known_hosts, trust_new_host_key=True
+        )
+        assert known_hosts.exists() and "h" in known_hosts.read_text(encoding="utf-8")
+
+    async def test_prompt_yes_shows_fingerprint_and_records(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from bg_coolify_migrate.transfer.ssh import RemoteHost, SshTarget
+
+        key = self._public_key()
+
+        async def _scan(target: object) -> object:
+            return key
+
+        monkeypatch.setattr(RemoteHost, "_scan_host_key", _scan)
+        seen: dict[str, object] = {}
+
+        async def _prompt(target: object, fingerprint: str) -> bool:
+            seen["fingerprint"] = fingerprint
+            return True
+
+        known_hosts = tmp_path / "known_hosts"
+        await RemoteHost.ensure_host_key(
+            SshTarget(host="h"), known_hosts=known_hosts, host_key_prompt=_prompt
+        )
+        assert seen["fingerprint"]
+        assert known_hosts.exists()
+
+    async def test_prompt_no_refuses_and_records_nothing(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from bg_coolify_migrate.transfer.ssh import HostKeyUnknown, RemoteHost, SshTarget
+
+        key = self._public_key()
+
+        async def _scan(target: object) -> object:
+            return key
+
+        monkeypatch.setattr(RemoteHost, "_scan_host_key", _scan)
+
+        async def _prompt(target: object, fingerprint: str) -> bool:
+            return False
+
+        known_hosts = tmp_path / "known_hosts"
+        with pytest.raises(HostKeyUnknown):
+            await RemoteHost.ensure_host_key(
+                SshTarget(host="h"), known_hosts=known_hosts, host_key_prompt=_prompt
+            )
+        assert not known_hosts.exists()
+
+    async def test_already_known_key_never_prompts(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from bg_coolify_migrate.transfer.ssh import RemoteHost, SshTarget, _append_known_host
+
+        key = self._public_key()
+        target = SshTarget(host="h", port=22)
+        known_hosts = tmp_path / "known_hosts"
+        _append_known_host(known_hosts, target, key)
+
+        async def _scan(t: object) -> object:
+            return key
+
+        monkeypatch.setattr(RemoteHost, "_scan_host_key", _scan)
+        prompted = {"count": 0}
+
+        async def _prompt(t: object, fingerprint: str) -> bool:
+            prompted["count"] += 1
+            return True
+
+        await RemoteHost.ensure_host_key(target, known_hosts=known_hosts, host_key_prompt=_prompt)
+        assert prompted["count"] == 0

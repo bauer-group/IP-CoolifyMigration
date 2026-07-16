@@ -42,10 +42,14 @@ Migrating one resource stops only that resource on the source; the rest of the
 environment stays up. A whole-project run migrates each environment in turn and
 stops at the first failure, leaving later environments untouched.
 
-The first time `plan`/`run` reach a server, its SSH host key is unknown and the run
-stops with a clear message rather than trusting blindly. Verify the fingerprint,
-then pass **`--trust-host-key`** to record it (trust on first use). Host-key
-checking is never disabled.
+### Host keys
+
+The first time a command reaches a server, its SSH host key is unknown. In a
+terminal you get the OpenSSH prompt — the fingerprint and a y/N — and an accepted
+key is recorded, so you are asked only once (trust on first use). Unattended (a
+pipe or CI), pass **`--trust-host-key`** after verifying the fingerprint out of
+band. Either way host-key checking is never disabled — an unknown key that you
+don't accept stops the run.
 
 ### Interactive picker
 

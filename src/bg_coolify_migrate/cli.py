@@ -337,6 +337,44 @@ async def _off_loop(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
+async def _host_key_prompt(target: object, fingerprint: str) -> bool:
+    """OpenSSH-style: show the fingerprint and ask whether to trust an unseen host."""
+    import questionary
+
+    console = get_console()
+    console.print(
+        Text(
+            f"\nThe authenticity of host '{target.host}' (port {target.port}) "  # type: ignore[attr-defined]
+            "can't be established.",
+            style="warn",
+        )
+    )
+    console.print(Text(f"Key fingerprint is {fingerprint}"))
+    prompt = questionary.confirm("Are you sure you want to continue connecting?", default=False)
+    return bool(await _off_loop(prompt.ask))
+
+
+def _host_key_decision() -> object:
+    """The interactive host-key prompt on a TTY; None in a pipe/CI (use the flag)."""
+    return _host_key_prompt if is_interactive() else None
+
+
+async def _accept_host_key(
+    api: object, settings: Settings, server: object, trust_host_key: bool
+) -> None:
+    """Preflight one server's SSH host key (prompt/record) before any live display."""
+    from bg_coolify_migrate.engine.runner import ssh_target_for
+    from bg_coolify_migrate.transfer.ssh import RemoteHost
+
+    ssh = await ssh_target_for(api, server)  # type: ignore[arg-type]
+    await RemoteHost.ensure_host_key(
+        ssh,
+        known_hosts=settings.resolved_known_hosts(),
+        trust_new_host_key=trust_host_key or settings.trust_host_key,
+        host_key_prompt=_host_key_decision(),  # type: ignore[arg-type]
+    )
+
+
 async def _pick(api: object, target: str | None) -> tuple[Selection, str]:
     """The interactive picker: project -> environment -> resource -> target server."""
     from bg_coolify_migrate.engine.planner import environment_resources
@@ -621,6 +659,7 @@ async def _build(
         ssh,
         known_hosts=settings.resolved_known_hosts(),
         trust_new_host_key=trust_host_key or settings.trust_host_key,
+        host_key_prompt=_host_key_decision(),  # type: ignore[arg-type]
         connect_timeout=settings.ssh_timeout,
     ) as source_host:
         return await build_plan(
@@ -781,6 +820,10 @@ async def _run(
                     console.print(report_mod.plain_plan(migration_plan))
                 return 2
 
+        # Accept the target host key HERE - before the live dashboard, where a
+        # prompt cannot be shown. The source key was recorded while building the plan.
+        await _accept_host_key(api, settings, plans[0].target_server, trust_host_key)
+
         worst = 0
         for migration_plan in plans:
             migration_id = make_migration_id(migration_plan.project, migration_plan.environment)
@@ -796,6 +839,8 @@ async def _run(
                     migration_id=migration_id,
                     accept_drift=accept_drift,
                     delete_previews=delete_previews,
+                    trust_host_key=trust_host_key,
+                    host_key_prompt=None,  # keys pre-accepted; never prompt under Live
                     on_state=reporter.on_state,
                 )
             elapsed = time.monotonic() - started
@@ -865,6 +910,9 @@ def resume(
     accept_drift: Annotated[
         bool, typer.Option(help="Proceed past the drift gate without asking (for unattended runs).")
     ] = False,
+    trust_host_key: Annotated[
+        bool, typer.Option("--trust-host-key", help=_TRUST_HOST_KEY_HELP)
+    ] = False,
     log_level: Annotated[str, typer.Option(help="DEBUG|INFO|WARNING|ERROR")] = "INFO",
     log_format: Annotated[str, typer.Option(help="console|json")] = "console",
 ) -> None:
@@ -875,14 +923,16 @@ def resume(
     """
     settings = _settings(log_level, log_format)
     try:
-        code = asyncio.run(_resume(settings, migration_id, accept_drift))
+        code = asyncio.run(_resume(settings, migration_id, accept_drift, trust_host_key))
     except MigrationError as exc:
         _fail(exc)
         return
     raise typer.Exit(code)
 
 
-async def _resume(settings: Settings, migration_id: str, accept_drift: bool) -> int:
+async def _resume(
+    settings: Settings, migration_id: str, accept_drift: bool, trust_host_key: bool = False
+) -> int:
     from bg_coolify_migrate.api.client import CoolifyClient
     from bg_coolify_migrate.engine.runner import load_plan, resume_migration
     from bg_coolify_migrate.ui import dashboard, run_report
@@ -893,6 +943,10 @@ async def _resume(settings: Settings, migration_id: str, accept_drift: bool) -> 
 
     async with CoolifyClient(url, token, verify=settings.coolify_verify_tls) as api:
         await api.assert_can_read_sensitive()
+        # Accept both host keys before the live dashboard - resume has no plan phase
+        # to have recorded the source key.
+        await _accept_host_key(api, settings, migration_plan.source_server, trust_host_key)
+        await _accept_host_key(api, settings, migration_plan.target_server, trust_host_key)
         started = time.monotonic()
         reporter = dashboard.build(title=f"resume {migration_id}")
         with reporter:
@@ -902,6 +956,8 @@ async def _resume(settings: Settings, migration_id: str, accept_drift: bool) -> 
                 migration_plan,
                 migration_id,
                 accept_drift=accept_drift,
+                trust_host_key=trust_host_key,
+                host_key_prompt=None,
                 on_state=reporter.on_state,
             )
         elapsed = time.monotonic() - started
@@ -918,6 +974,9 @@ async def _resume(settings: Settings, migration_id: str, accept_drift: bool) -> 
 def rollback(
     migration_id: Annotated[str, typer.Argument(help="From `coolify-migrate status`.")],
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
+    trust_host_key: Annotated[
+        bool, typer.Option("--trust-host-key", help=_TRUST_HOST_KEY_HELP)
+    ] = False,
     log_level: Annotated[str, typer.Option(help="DEBUG|INFO|WARNING|ERROR")] = "INFO",
     log_format: Annotated[str, typer.Option(help="console|json")] = "console",
 ) -> None:
@@ -928,14 +987,16 @@ def rollback(
     """
     settings = _settings(log_level, log_format)
     try:
-        code = asyncio.run(_rollback(settings, migration_id, yes))
+        code = asyncio.run(_rollback(settings, migration_id, yes, trust_host_key))
     except MigrationError as exc:
         _fail(exc)
         return
     raise typer.Exit(code)
 
 
-async def _rollback(settings: Settings, migration_id: str, assume_yes: bool) -> int:
+async def _rollback(
+    settings: Settings, migration_id: str, assume_yes: bool, trust_host_key: bool = False
+) -> int:
     import questionary
 
     from bg_coolify_migrate.api.client import CoolifyClient
@@ -959,7 +1020,15 @@ async def _rollback(settings: Settings, migration_id: str, assume_yes: bool) -> 
             return 0
 
     async with CoolifyClient(url, token, verify=settings.coolify_verify_tls) as api:
-        result = await rollback_migration(api, settings, migration_plan, migration_id)
+        # rollback has no live dashboard, so prompting during connect is fine.
+        result = await rollback_migration(
+            api,
+            settings,
+            migration_plan,
+            migration_id,
+            trust_host_key=trust_host_key,
+            host_key_prompt=_host_key_decision(),  # type: ignore[arg-type]
+        )
         if is_interactive():
             console.print(run_report.outcome_panel(result, migration_id=migration_id))
         else:

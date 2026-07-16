@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import shlex
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -99,6 +99,22 @@ class SshTarget:
         return f"{self.user}@{self.host}:{self.port}"
 
 
+#: Interactive host-key decision: given the target and its fingerprint, return
+#: whether to trust it. Supplied by the CLI on a TTY; None means non-interactive.
+HostKeyPrompt = Callable[[SshTarget, str], Awaitable[bool]]
+
+
+def _append_known_host(known_hosts: Path, target: SshTarget, key: Any) -> None:
+    """Append a host key to our managed known_hosts (OpenSSH format, deduped)."""
+    entry = f"[{target.host}]:{target.port} {key.export_public_key().decode().strip()}"
+    known_hosts.parent.mkdir(parents=True, exist_ok=True)
+    existing = known_hosts.read_text(encoding="utf-8") if known_hosts.exists() else ""
+    if entry.strip() in existing:
+        return
+    with known_hosts.open("a", encoding="utf-8", newline="\n") as fh:
+        fh.write(entry.rstrip("\n") + "\n")
+
+
 class RemoteHost:
     """One SSH connection to a Linux server.
 
@@ -120,20 +136,34 @@ class RemoteHost:
         *,
         known_hosts: Path | None = None,
         trust_new_host_key: bool = False,
+        host_key_prompt: HostKeyPrompt | None = None,
         connect_timeout: float = 15.0,
     ) -> AsyncIterator[RemoteHost]:
-        """Open a connection, verifying the host key.
+        """Open a connection, always verifying the host key.
+
+        On an unknown key we never connect blindly. In order of preference:
+
+        * ``trust_new_host_key`` (the ``--trust-host-key`` flag / env, for
+          unattended use) — record it and proceed.
+        * ``host_key_prompt`` (interactive) — show the fingerprint and ask; on
+          yes, record it and proceed.
+        * otherwise — refuse with :class:`HostKeyUnknown`, carrying the fingerprint.
+
+        The key is scanned out of band and WRITTEN to ``known_hosts`` before we
+        authenticate, so the next run recognises it without asking again — real
+        trust-on-first-use, not ``known_hosts=None`` (which accepts silently and
+        records nothing).
 
         Args:
             target: Where to connect.
-            known_hosts: Our managed known_hosts file. ``None`` means the
-                system default, which is only appropriate for tests.
-            trust_new_host_key: Record an unseen key instead of refusing. This is
-                the ``--trust-host-key`` escape hatch; it is never the default.
+            known_hosts: Our managed known_hosts file. ``None`` means the system
+                default, and disables recording — only appropriate for tests.
+            trust_new_host_key: Accept and record an unseen key without asking.
+            host_key_prompt: Interactive decision for an unseen key (TTY only).
             connect_timeout: Seconds.
 
         Raises:
-            HostKeyUnknown: The key is unknown and ``trust_new_host_key`` is off.
+            HostKeyUnknown: The key is unknown and was neither trusted nor accepted.
             SshError: Anything else.
         """
         options: dict[str, Any] = {
@@ -143,8 +173,6 @@ class RemoteHost:
             # Never disable host key checking. If a key is unknown we say so.
             "known_hosts": str(known_hosts) if known_hosts and known_hosts.exists() else (),
         }
-        if trust_new_host_key:
-            options["known_hosts"] = None  # asyncssh: accept any (TOFU, opted in)
         if target.private_key:
             options["client_keys"] = [
                 asyncssh.import_private_key(target.private_key, passphrase=target.passphrase)
@@ -155,15 +183,9 @@ class RemoteHost:
         try:
             conn = await asyncssh.connect(target.host, **options)
         except asyncssh.HostKeyNotVerifiable as exc:
-            raise HostKeyUnknown(
-                f"host key for {target} is not known and was not accepted",
-                hint=(
-                    "Re-run with --trust-host-key to record it after verifying the fingerprint "
-                    "out of band. We never disable host key checking: both tools this one "
-                    "replaces use StrictHostKeyChecking=no, which makes every transfer "
-                    "MITM-able."
-                ),
-            ) from exc
+            conn = await cls._accept_or_refuse(
+                target, options, known_hosts, trust_new_host_key, host_key_prompt, exc
+            )
         except (TimeoutError, OSError, asyncssh.Error) as exc:
             raise SshError(
                 f"cannot connect to {target}: {exc}",
@@ -172,8 +194,6 @@ class RemoteHost:
 
         host = cls(conn, target)
         try:
-            if trust_new_host_key and known_hosts is not None:
-                await host._record_host_key(known_hosts)
             yield host
         finally:
             conn.close()
@@ -183,18 +203,102 @@ class RemoteHost:
             except Exception:
                 log.debug("ssh.close.failed", target=str(target))
 
-    async def _record_host_key(self, known_hosts: Path) -> None:
-        key = self._conn.get_server_host_key()
-        if key is None:  # pragma: no cover - only with an unusual transport
+    @classmethod
+    async def _accept_or_refuse(
+        cls,
+        target: SshTarget,
+        options: dict[str, Any],
+        known_hosts: Path | None,
+        trust_new_host_key: bool,
+        host_key_prompt: HostKeyPrompt | None,
+        original: BaseException,
+    ) -> Any:
+        """Handle an unknown host key: scan it, decide, record + retry, or refuse."""
+        if known_hosts is None:
+            # No managed file to record into (tests / system default).
+            raise HostKeyUnknown(
+                f"host key for {target} is not known and was not accepted"
+            ) from original
+
+        key = await cls._scan_host_key(target)
+        fingerprint = key.get_fingerprint()
+
+        accept = trust_new_host_key
+        if not accept and host_key_prompt is not None:
+            accept = await host_key_prompt(target, fingerprint)
+
+        if not accept:
+            raise HostKeyUnknown(
+                f"host key for {target} is not known and was not accepted",
+                hint=(
+                    f"Fingerprint: {fingerprint}. Run in a terminal to accept it interactively, "
+                    "or pass --trust-host-key once you have verified it out of band. Host key "
+                    "checking is never disabled."
+                ),
+            ) from original
+
+        _append_known_host(known_hosts, target, key)
+        log.info("ssh.hostkey.recorded", target=str(target), fingerprint=fingerprint)
+        try:
+            return await asyncssh.connect(
+                target.host, **{**options, "known_hosts": str(known_hosts)}
+            )
+        except (TimeoutError, OSError, asyncssh.Error) as exc:
+            raise SshError(
+                f"cannot connect to {target} after recording its host key: {exc}"
+            ) from exc
+
+    @classmethod
+    async def _scan_host_key(cls, target: SshTarget) -> Any:
+        """Fetch the server's host key without authenticating, to show and record."""
+        kwargs: dict[str, Any] = {}
+        if target.proxy_command:
+            kwargs["proxy_command"] = target.proxy_command
+        try:
+            key = await asyncssh.get_server_host_key(target.host, target.port, **kwargs)
+        except (TimeoutError, OSError, asyncssh.Error) as exc:
+            raise SshError(f"cannot read the host key for {target}: {exc}") from exc
+        if key is None:
+            raise SshError(f"{target} presented no host key to record")
+        return key
+
+    @classmethod
+    async def ensure_host_key(
+        cls,
+        target: SshTarget,
+        *,
+        known_hosts: Path | None,
+        trust_new_host_key: bool = False,
+        host_key_prompt: HostKeyPrompt | None = None,
+    ) -> None:
+        """Record ``target``'s host key if unseen, prompting or refusing as needed.
+
+        A preflight run BEFORE the real connection, so a connection made under a
+        live display (where a prompt cannot be shown) never has to ask. No-op when
+        the key is already trusted or ``known_hosts`` is None.
+        """
+        if known_hosts is None:
             return
-        entry = f"[{self.target.host}]:{self.target.port} {key.export_public_key().decode()}"
-        known_hosts.parent.mkdir(parents=True, exist_ok=True)
+        key = await cls._scan_host_key(target)
+        entry = f"[{target.host}]:{target.port} {key.export_public_key().decode().strip()}"
         existing = known_hosts.read_text(encoding="utf-8") if known_hosts.exists() else ""
         if entry.strip() in existing:
-            return
-        with known_hosts.open("a", encoding="utf-8", newline="\n") as fh:
-            fh.write(entry.rstrip("\n") + "\n")
-        log.info("ssh.hostkey.recorded", target=str(self.target), fingerprint=key.get_fingerprint())
+            return  # already trusted
+
+        fingerprint = key.get_fingerprint()
+        accept = trust_new_host_key
+        if not accept and host_key_prompt is not None:
+            accept = await host_key_prompt(target, fingerprint)
+        if not accept:
+            raise HostKeyUnknown(
+                f"host key for {target} is not known and was not accepted",
+                hint=(
+                    f"Fingerprint: {fingerprint}. Run in a terminal to accept it interactively, "
+                    "or pass --trust-host-key once you have verified it out of band."
+                ),
+            )
+        _append_known_host(known_hosts, target, key)
+        log.info("ssh.hostkey.recorded", target=str(target), fingerprint=fingerprint)
 
     async def __aenter__(self) -> Self:
         return self
