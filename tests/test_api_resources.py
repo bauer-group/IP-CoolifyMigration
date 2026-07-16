@@ -355,6 +355,57 @@ class TestCreateApplication:
         with pytest.raises(UnsupportedResource, match="missing required field"):
             await create_resource(api, snapshot, _placement(), {})
 
+    async def test_public_short_repo_is_rebuilt_into_a_github_url(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # Coolify stores a public app's repo as owner/repo, but the public create
+        # route validates git_repository as a URL (422 otherwise). Reconstruct it.
+        import json
+
+        route = respx_mock.post(f"{BASE}/applications/public").mock(
+            return_value=httpx.Response(201, json={"uuid": "a2"})
+        )
+        snapshot = ResourceSnapshot(
+            uuid="a1",
+            name="bentopdf",
+            collection="applications",
+            kind=ResourceKind.APP_GIT_BUILD,
+            git_repository="alam00000/bentopdf",
+            git_branch="main",
+            git_auth=GitAuth.PUBLIC,
+        )
+        await create_resource(
+            api,
+            snapshot,
+            _placement(),
+            {
+                "git_repository": "alam00000/bentopdf",
+                "git_branch": "main",
+                "build_pack": "nixpacks",
+            },
+        )
+        body = json.loads(route.calls[0].request.read())
+        assert body["git_repository"] == "https://github.com/alam00000/bentopdf"
+
+
+class TestPublicGitUrl:
+    def test_short_form_becomes_a_github_url(self) -> None:
+        from bg_coolify_migrate.api.resources import _public_git_url
+
+        assert _public_git_url("alam00000/bentopdf") == "https://github.com/alam00000/bentopdf"
+        assert _public_git_url("/owner/repo/") == "https://github.com/owner/repo"
+
+    def test_a_real_url_is_left_untouched(self) -> None:
+        from bg_coolify_migrate.api.resources import _public_git_url
+
+        for url in (
+            "https://github.com/o/r",
+            "http://example.com/o/r",
+            "git://example.com/o/r",
+            "git@github.com:o/r.git",
+        ):
+            assert _public_git_url(url) == url
+
 
 class TestCopyEnvs:
     async def test_bulk_upsert_overwrites_generated_secrets(

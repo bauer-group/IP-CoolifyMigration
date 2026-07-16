@@ -223,6 +223,27 @@ async def create_service(
     return str(uuid)
 
 
+_GIT_URL_PREFIXES = ("https://", "http://", "git://", "git@")
+
+
+def _public_git_url(git_repository: str) -> str:
+    """A full git URL for the ``/applications/public`` route.
+
+    Coolify stores a PUBLIC app's repo as the short ``owner/repo`` form: on create
+    it parses the URL and keeps only the path (``ApplicationsController`` does
+    ``git_repository = segment(1)/segment(2)`` and sets the default GitHub source).
+    But the same endpoint validates ``git_repository`` with ``ValidGitRepositoryUrl``
+    — it must be a full URL. So a public app that GETs back as ``owner/repo`` is
+    rejected on re-create with "must start with https://…". We rebuild the
+    github.com URL (Coolify's default public source); anything already a URL is left
+    untouched. The private-github-app / deploy-key routes accept the short form, so
+    this is only for ``public``.
+    """
+    if git_repository.startswith(_GIT_URL_PREFIXES):
+        return git_repository
+    return f"https://github.com/{git_repository.strip('/')}"
+
+
 async def create_application(
     api: CoolifyClient, snapshot: ResourceSnapshot, placement: Placement, source: dict[str, Any]
 ) -> str:
@@ -233,6 +254,10 @@ async def create_application(
     body = filter_body({**source, **placement.as_body()}, APPLICATION_CREATE)
     body["name"] = snapshot.name
     body["instant_deploy"] = False
+
+    # Public git apps come back short (owner/repo) but the public route needs a URL.
+    if segment == "public" and body.get("git_repository"):
+        body["git_repository"] = _public_git_url(str(body["git_repository"]))
 
     # The FQDN is decided by the DNS gate and the finalize policy, not carried
     # over. coolify-mover copies it verbatim, producing two resources that claim
