@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.2.3 (2026-07-16)
+
+### Bug Fixes
+
+- **engine**: Finish the no-volume migration path
+  ([`0c1a4b8`](https://github.com/bauer-group/IP-CoolifyMigration/commit/0c1a4b8684f6f872d01d72c1d0236e1be04ea63a))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`764b31e`](https://github.com/bauer-group/IP-CoolifyMigration/commit/764b31e4b7d1dd73076634154bf97f5f5524131a))
+
+
 ## v2.2.2 (2026-07-16)
 
 ### Bug Fixes
