@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.1.5 (2026-07-16)
+
+### Bug Fixes
+
+- **ssh**: Record port-22 host keys under the bare hostname
+  ([`e108e3a`](https://github.com/bauer-group/IP-CoolifyMigration/commit/e108e3a7de94295a9a0710214172204513915877))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`80ee94d`](https://github.com/bauer-group/IP-CoolifyMigration/commit/80ee94d0a8f66bb41b7fe387aab4f1d3e6651908))
+
+
 ## v2.1.4 (2026-07-16)
 
 ### Bug Fixes
