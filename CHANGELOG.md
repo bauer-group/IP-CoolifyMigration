@@ -1,6 +1,27 @@
 # CHANGELOG
 
 
+## v2.5.6 (2026-07-20)
+
+### Bug Fixes
+
+- **api**: Carried resource tags across the migration
+  ([`88a9961`](https://github.com/bauer-group/IP-CoolifyMigration/commit/88a9961ac89b879197423f0c9b24081f83690e63))
+
+### Continuous Integration
+
+- **security**: Granted scopes the scan module requires
+  ([`aa963e3`](https://github.com/bauer-group/IP-CoolifyMigration/commit/aa963e33c5e154a435ce360934558f6c7b56dd5d))
+
+- **workflows**: Granted scopes the called modules require
+  ([`a63ca77`](https://github.com/bauer-group/IP-CoolifyMigration/commit/a63ca772d90e7705a0f30f49f669c549db06d68c))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`88700c3`](https://github.com/bauer-group/IP-CoolifyMigration/commit/88700c387802ffc60a36acb21f584c782a667fde))
+
+
 ## v2.5.5 (2026-07-16)
 
 ### Bug Fixes
