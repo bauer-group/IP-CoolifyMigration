@@ -279,7 +279,14 @@ APPLICATION_CREATE: frozenset[str] = frozenset(
         "post_deployment_command_container",
         "pre_deployment_command",
         "pre_deployment_command_container",
-        # Settings — write-only over the API (GET does not eager-load `settings`).
+        # Settings. These were write-only when this list was written; upstream has
+        # since added `->with('settings')` to application_by_uuid, so they DO come
+        # back on the GET now — but nested under a `settings` object, whereas the
+        # create body takes them flat. filter_body reads the flat dict, so the
+        # values still never arrive and the target comes up on defaults. Sending
+        # them stays correct; reading them needs a flattening step that does not
+        # exist yet. See KNOWN_APPLICATION_GAP in tests/test_api_fields.py for the
+        # 13 sibling settings fields this list does not even name.
         "is_static",
         "is_spa",
         "is_auto_deploy_enabled",

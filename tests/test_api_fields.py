@@ -332,11 +332,26 @@ async def test_whitelists_match_upstream_openapi() -> None:
 
 
 #: POST /applications/* documents 17 fields APPLICATION_CREATE does not carry.
-#: This predates tag support and is NOT upstream drift: they are settings-table
-#: fields, and some are handled deliberately elsewhere (autogenerate_domain is
-#: force-set False in create_application). They are listed, not excluded, so the
-#: gap stays visible; each needs adjudicating against ApplicationsController's
-#: $allowedFields the way `tags` was before it can be whitelisted.
+#:
+#: ADJUDICATED against ApplicationsController — all 17 are genuinely accepted on
+#: create, none is a documentation artifact: 13 arrive via the
+#: ``...self::APPLICATION_SETTING_FIELDS`` spread at the end of the create
+#: $allowedFields (:1123, constant at :38), and autogenerate_domain,
+#: force_domain_override, use_build_secrets and is_preview_deployments_enabled are
+#: listed explicitly in that same array.
+#:
+#: They are NOT whitelisted anyway, because accepting them on write is only half
+#: the problem. ``application_by_uuid`` eager-loads ``->with('settings')``, so the
+#: 13 settings fields DO come back on the GET — but nested under a ``settings``
+#: object, while the create body takes them flat. filter_body works on the flat
+#: dict, so it never sees them. Whitelisting without flattening would change
+#: nothing; flattening is a real change with per-field judgement attached, and at
+#: least one field must NOT be copied blindly (create_application deliberately
+#: forces autogenerate_domain=False when the source has no domains).
+#:
+#: Consequence, recorded rather than hidden: an application's build settings
+#: currently come up on target defaults. Same class of silent loss as tags, one
+#: layer deeper. Tracked here so the canary stays useful in the meantime.
 KNOWN_APPLICATION_GAP: frozenset[str] = frozenset(
     {
         "autogenerate_domain",
