@@ -7,7 +7,10 @@
 #  WHY IT MATTERS HERE : this repo's users hold a Coolify root token, SSH private
 #                 keys and APP_KEY. A credential committed here is a fleet-wide
 #                 incident, not a repo-scoped one.
-#  PERMISSIONS  : Delegated to the reusable workflow.
+#  PERMISSIONS  : Must be granted here. A called workflow's `permissions:` block
+#                 is a request ceiling, not a grant -- the token is minted from
+#                 the caller's scopes. These three mirror what
+#                 modules-security-scan.yml declares; dropping any fails at parse.
 # =============================================================================
 name: 🔒 Security Management
 
@@ -19,6 +22,11 @@ on:
   schedule:
     - cron: '0 3 * * 1'
   workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
 
 jobs:
   security:
