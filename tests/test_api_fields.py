@@ -349,9 +349,13 @@ async def test_whitelists_match_upstream_openapi() -> None:
 #: least one field must NOT be copied blindly (create_application deliberately
 #: forces autogenerate_domain=False when the source has no domains).
 #:
-#: Consequence, recorded rather than hidden: an application's build settings
-#: currently come up on target defaults. Same class of silent loss as tags, one
-#: layer deeper. Tracked here so the canary stays useful in the meantime.
+#: DECIDED: not migrated, and that is fine. Coolify's defaults already enable the
+#: ones that would hurt if they were off — submodules, LFS, shallow clone, force
+#: https, gzip, strip prefixes all default ON — so an application lands on the
+#: target configured the way the overwhelming majority of sources already are.
+#: The only exposure is a source that deliberately turned one OFF coming back up
+#: with it ON; that is a narrow edge case, not the silent loss `tags` was.
+#: Revisit only if someone hits it.
 KNOWN_APPLICATION_GAP: frozenset[str] = frozenset(
     {
         "autogenerate_domain",

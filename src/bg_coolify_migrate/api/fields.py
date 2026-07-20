@@ -283,10 +283,10 @@ APPLICATION_CREATE: frozenset[str] = frozenset(
         # since added `->with('settings')` to application_by_uuid, so they DO come
         # back on the GET now — but nested under a `settings` object, whereas the
         # create body takes them flat. filter_body reads the flat dict, so the
-        # values still never arrive and the target comes up on defaults. Sending
-        # them stays correct; reading them needs a flattening step that does not
-        # exist yet. See KNOWN_APPLICATION_GAP in tests/test_api_fields.py for the
-        # 13 sibling settings fields this list does not even name.
+        # values never arrive and the target comes up on defaults. That is an
+        # accepted outcome, not a gap to close: Coolify's defaults already enable
+        # the settings worth having. See KNOWN_APPLICATION_GAP in
+        # tests/test_api_fields.py for the reasoning and the 13 sibling fields.
         "is_static",
         "is_spa",
         "is_auto_deploy_enabled",
