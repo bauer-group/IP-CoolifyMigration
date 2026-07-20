@@ -7,6 +7,7 @@ impossible to notice afterwards: copy `value`, not `real_value`.
 from __future__ import annotations
 
 import base64
+import json
 
 import httpx
 import pytest
@@ -289,6 +290,29 @@ class TestCreateService:
             b"services:\n  minio:\n    image: minio/minio"
         ).decode()
         assert expected in body
+
+    async def test_tags_ride_along_with_the_create(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # Tags are settable ONLY on create — the PATCH $allowedFields omits them —
+        # so a tag that misses this body cannot be set through the API afterwards.
+        route = respx_mock.post(f"{BASE}/services").mock(
+            return_value=httpx.Response(201, json={"uuid": "s2"})
+        )
+        await create_resource(api, self._snapshot(), _placement(), {"tags": ["prod", "billing"]})
+        body = json.loads(route.calls[0].request.read().decode())
+        assert body["tags"] == ["prod", "billing"]
+
+    async def test_untagged_source_omits_the_key(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # steps.py sends None rather than [] for an untagged source; filter_body
+        # drops it, so no opinion is expressed. Guards against a regression to [].
+        route = respx_mock.post(f"{BASE}/services").mock(
+            return_value=httpx.Response(201, json={"uuid": "s2"})
+        )
+        await create_resource(api, self._snapshot(), _placement(), {"tags": None})
+        assert "tags" not in json.loads(route.calls[0].request.read().decode())
 
     async def test_custom_compose_omits_type(
         self, api: CoolifyClient, respx_mock: respx.Router

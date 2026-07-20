@@ -136,6 +136,12 @@ class TestDatabaseFields:
     def test_each_engine_exposes_its_credential(self, engine: str, credential: str) -> None:
         assert credential in database_allowed(engine)
 
+    def test_tags_accepted_on_every_engine(self) -> None:
+        # Lives in DATABASE_COMMON, not the per-engine sets: all eight create
+        # routes carry it. Databases drifted together when upstream added it.
+        for engine in DATABASE_ENGINE_FIELDS:
+            assert "tags" in database_allowed(engine)
+
 
 class TestServiceFields:
     def test_type_and_compose_both_accepted_but_are_mutually_exclusive(self) -> None:
@@ -169,6 +175,18 @@ class TestServiceFields:
         assert "server_uuid" not in SERVICE_UPDATE
         assert "project_uuid" not in SERVICE_UPDATE
 
+    def test_tags_are_settable_on_create_only(self) -> None:
+        """The exact inverse of connect_to_docker_network above.
+
+        `tags` IS in the first $allowedFields (ServicesController:358) — the list
+        the extra-field rejection at :396 tests against — so create accepts it and
+        :561 attaches it. The PATCH list (:1173) omits it, so a service's tags must
+        ride along with the create or they cannot be set through the API at all.
+        """
+        assert "tags" in SERVICE_CREATE
+        assert "tags" in SERVICE_CREATE_CUSTOM_COMPOSE
+        assert "tags" not in SERVICE_UPDATE
+
 
 class TestApplicationFields:
     def test_compose_raw_is_accepted_on_create(self) -> None:
@@ -185,6 +203,11 @@ class TestApplicationFields:
     def test_update_cannot_relocate(self) -> None:
         for field in ("server_uuid", "project_uuid", "destination_uuid", "environment_name"):
             assert field not in APPLICATION_UPDATE
+
+    def test_tags_accepted_on_create(self) -> None:
+        # All five create routes share one $allowedFields, so one assert covers
+        # public / private-github-app / private-deploy-key / dockerfile / dockerimage.
+        assert "tags" in APPLICATION_CREATE
 
     def test_git_routes_require_repository_and_branch(self) -> None:
         # This is the wall that makes a raw-YAML compose stack impossible to
@@ -273,6 +296,8 @@ async def test_whitelists_match_upstream_openapi() -> None:
         )
         return set(schema.get("properties", {}))
 
+    drift: dict[str, list[str]] = {}
+
     documented = body_props("/services", "post")
     if documented:
         # openapi documents connect_to_docker_network for POST /services, but the
@@ -282,10 +307,97 @@ async def test_whitelists_match_upstream_openapi() -> None:
         # against the running instance by the e2e compose-service migration.
         openapi_only = {"connect_to_docker_network"}
         missing = documented - SERVICE_CREATE_CUSTOM_COMPOSE - openapi_only
-        assert not missing, (
-            f"openapi.json documents fields we do not whitelist for POST /services: "
-            f"{sorted(missing)}. Upstream may have added fields; review api/fields.py."
+        if missing:
+            drift["POST /services"] = sorted(missing)
+
+    # Databases carry one create route per engine and they drifted together when
+    # upstream added `tags` — checking only /services would have caught one of
+    # nine routes. The engine-specific credential fields differ per route, so each
+    # is diffed against its own database_allowed().
+    for engine in sorted(DATABASE_ENGINE_FIELDS):
+        path = f"/databases/{engine}"
+        documented = body_props(path, "post")
+        if not documented:
+            continue
+        missing = documented - database_allowed(engine)
+        if missing:
+            drift[f"POST {path}"] = sorted(missing)
+
+    assert not drift, (
+        f"openapi.json documents fields we do not whitelist: {drift}. "
+        f"Upstream may have added fields; review api/fields.py. Adjudicate each "
+        f"against the controller's $allowedFields before whitelisting — the schema "
+        f"documents fields the controller rejects (see connect_to_docker_network)."
+    )
+
+
+#: POST /applications/* documents 17 fields APPLICATION_CREATE does not carry.
+#: This predates tag support and is NOT upstream drift: they are settings-table
+#: fields, and some are handled deliberately elsewhere (autogenerate_domain is
+#: force-set False in create_application). They are listed, not excluded, so the
+#: gap stays visible; each needs adjudicating against ApplicationsController's
+#: $allowedFields the way `tags` was before it can be whitelisted.
+KNOWN_APPLICATION_GAP: frozenset[str] = frozenset(
+    {
+        "autogenerate_domain",
+        "disable_build_cache",
+        "docker_images_to_keep",
+        "force_domain_override",
+        "include_source_commit_in_build",
+        "inject_build_args_to_dockerfile",
+        "is_env_sorting_enabled",
+        "is_git_lfs_enabled",
+        "is_git_shallow_clone_enabled",
+        "is_git_submodules_enabled",
+        "is_gzip_enabled",
+        "is_pr_deployments_public_enabled",
+        "is_preview_deployments_enabled",
+        "is_raw_compose_deployment_enabled",
+        "is_stripprefix_enabled",
+        "stop_grace_period",
+        "use_build_secrets",
+    }
+)
+
+
+@pytest.mark.integration
+async def test_application_gap_does_not_grow() -> None:
+    """The application whitelist gap is known; this fails if it WIDENS.
+
+    Pinning the gap instead of excluding the whole route keeps the canary useful:
+    a newly documented application field still breaks CI, but the 17 already
+    triaged do not cry every week.
+    """
+    import httpx
+
+    url = "https://raw.githubusercontent.com/coollabsio/coolify/main/openapi.json"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        spec = response.json()
+
+    routes = ("public", "private-github-app", "private-deploy-key", "dockerfile", "dockerimage")
+    new: dict[str, list[str]] = {}
+    for route in routes:
+        op = spec.get("paths", {}).get(f"/applications/{route}", {}).get("post", {})
+        documented = set(
+            op.get("requestBody", {})
+            .get("content", {})
+            .get("application/json", {})
+            .get("schema", {})
+            .get("properties", {})
         )
+        if not documented:
+            continue
+        missing = documented - APPLICATION_CREATE - KNOWN_APPLICATION_GAP
+        if missing:
+            new[route] = sorted(missing)
+
+    assert not new, (
+        f"NEW fields documented for POST /applications/*: {new}. Adjudicate against "
+        f"ApplicationsController's $allowedFields, then either whitelist in "
+        f"APPLICATION_CREATE or add to KNOWN_APPLICATION_GAP with a reason."
+    )
 
 
 class TestDatabaseHealthCheckWarnings:

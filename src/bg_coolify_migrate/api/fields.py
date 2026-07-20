@@ -57,6 +57,10 @@ DATABASE_COMMON: frozenset[str] = frozenset(
         "limits_cpus",
         "limits_cpuset",
         "limits_cpu_shares",
+        # Settable on create for all eight engine routes, attached by name via
+        # attachTagsToResource. NOT readable from the resource GET — see
+        # CoolifyClient.get_tag_names for why this arrives by a separate call.
+        "tags",
         # NOT health_check_*. They come back in every GET, and the obvious move is
         # to send them on. Coolify lists them in no $allowedFields — not on create,
         # not on update — so any request carrying one is rejected wholesale with
@@ -163,6 +167,14 @@ SERVICE_CREATE: frozenset[str] = frozenset(
         "urls",
         "force_domain_override",
         "is_container_label_escape_enabled",
+        # The mirror image of connect_to_docker_network below: that one is
+        # documented in openapi but validated OUT of create, this one IS in the
+        # first $allowedFields (ServicesController:358) — the list the extra-field
+        # rejection at :396 tests against — with rules `array|nullable` /
+        # `tags.* string|min:2`, and :561 actually attaches it. Settable on create,
+        # NOT on update: the PATCH $allowedFields (:1173) omits it, so it must ride
+        # along with the create or not at all.
+        "tags",
     }
 )
 
@@ -236,6 +248,10 @@ APPLICATION_CREATE: frozenset[str] = frozenset(
         "custom_docker_run_options",
         "custom_nginx_configuration",
         "watch_paths",
+        # Shared by all five create routes, like every other field here. Arrives
+        # from a separate GET, not from the resource payload — see
+        # CoolifyClient.get_tag_names.
+        "tags",
         "health_check_enabled",
         "health_check_path",
         "health_check_port",

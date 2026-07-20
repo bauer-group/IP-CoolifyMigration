@@ -304,6 +304,7 @@ class TestCreateTarget:
             return_value=httpx.Response(201, json={"uuid": "db2"})
         )
         respx_mock.get(f"{BASE}/databases/db1/envs").mock(return_value=httpx.Response(200, json=[]))
+        respx_mock.get(f"{BASE}/databases/db1/tags").mock(return_value=httpx.Response(200, json=[]))
 
         result = await steps.step_create_target(ctx)
         assert result["target_uuids"] == {"db1": "db2"}
@@ -312,6 +313,41 @@ class TestCreateTarget:
         assert any(
             r.detail.get("target_uuids") == {"db1": "db2"} for r in ctx.journal.read()
         )
+
+    async def test_source_tags_reach_the_create_body(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """Tags are read separately and merged into the create.
+
+        GET /{collection}/{uuid} never carries them, and PATCH cannot set them —
+        so if they miss this body they are lost for good. Before tag support, a
+        tagged source migrated to an untagged target with nothing reported.
+        """
+        respx_mock.get(f"{BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx_mock.get(f"{BASE}/projects/p1").mock(
+            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+        )
+        respx_mock.get(f"{BASE}/servers/s2").mock(
+            return_value=httpx.Response(200, json={"uuid": "s2", "destinations": [{"uuid": "d1"}]})
+        )
+        respx_mock.get(f"{BASE}/databases/db1").mock(
+            return_value=httpx.Response(200, json={"uuid": "db1", "postgres_password": "s3cret"})
+        )
+        respx_mock.get(f"{BASE}/databases/db1/tags").mock(
+            return_value=httpx.Response(
+                200, json=[{"uuid": "t1", "name": "prod"}, {"uuid": "t2", "name": "billing"}]
+            )
+        )
+        respx_mock.get(f"{BASE}/databases/db1/envs").mock(return_value=httpx.Response(200, json=[]))
+        route = respx_mock.post(f"{BASE}/databases/postgresql").mock(
+            return_value=httpx.Response(201, json={"uuid": "db2"})
+        )
+
+        await steps.step_create_target(ctx)
+        body = json.loads(route.calls[0].request.read().decode())
+        assert body["tags"] == ["prod", "billing"]
 
 
 class TestDnsGate:

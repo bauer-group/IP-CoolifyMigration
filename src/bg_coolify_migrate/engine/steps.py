@@ -156,6 +156,21 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
         snapshot = resource.snapshot
         source_full = await ctx.api.get_resource(snapshot.collection, snapshot.uuid)
 
+        # SYNTHETIC KEY: "tags" is NOT part of the GET above — service_by_uuid
+        # eager-loads only ['applications', 'databases'] — so it is read separately
+        # and merged in here. Everything downstream builds the create body as
+        # filter_body({**source, ...}), and "tags" is whitelisted for all three
+        # families, so this one assignment is the whole wiring. Tags are settable
+        # ONLY on create (the PATCH $allowedFields omits them), which is why this
+        # has to happen before create_resource rather than as a follow-up call.
+        #
+        # None, not [], when the source has no tags: filter_body drops None but
+        # would forward an empty list, and "we have no opinion" is expressed by
+        # omission — same reasoning as the connect_to_docker_network PATCH below,
+        # where a redundant write is just risk.
+        tag_names = await ctx.api.get_tag_names(snapshot.collection, snapshot.uuid)
+        source_full["tags"] = tag_names or None
+
         # Free the source's custom domains so the target can claim them — Coolify
         # 409s on a duplicate. Journal the restore body BEFORE creating, so a
         # failed create still un-parks them on rollback. Server-bound domains are

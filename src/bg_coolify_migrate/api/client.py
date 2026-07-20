@@ -326,6 +326,22 @@ class CoolifyClient:
         """
         return _as_list(await self.get(f"/{collection}/{uuid}/envs"))
 
+    async def get_tag_names(self, collection: str, uuid: str) -> list[str]:
+        """Tag names attached to a resource, in upstream order.
+
+        Needs its own round trip: ``GET /{collection}/{uuid}`` does NOT carry
+        tags. ``service_by_uuid`` loads only ``['applications', 'databases']``
+        (+ ``destination.server.settings``), so tags are invisible to the
+        snapshot and must be read from ``/tags``.
+
+        Upstream returns full Tag objects (``uuid``, ``name``, timestamps); only
+        ``name`` is portable, because the target instance mints its own tag rows
+        per team. Entries without a name are dropped rather than sent as null —
+        the create would 422 on the whole resource.
+        """
+        raw = _as_list(await self.get(f"/{collection}/{uuid}/tags"))
+        return [str(t["name"]) for t in raw if isinstance(t, dict) and t.get("name")]
+
     # ── writes ───────────────────────────────────────────────────────────────
 
     async def set_envs_bulk(self, collection: str, uuid: str, entries: list[dict[str, Any]]) -> Any:
