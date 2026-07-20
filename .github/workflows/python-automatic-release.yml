@@ -7,7 +7,11 @@
 #  WHEN         : Push to main; manual dispatch.
 #  PRODUCES     : A GitHub release, a git tag vX.Y.Z, and a PyPI publish.
 #  REQUIREMENTS : Org secrets, inherited.
-#  PERMISSIONS  : Delegated to the reusable workflow.
+#  PERMISSIONS  : Must be granted here -- a called workflow's `permissions:` block
+#                 is a request ceiling, not a grant. Mirrors what
+#                 python-semantic-release.yml declares. id-token is for PyPI
+#                 trusted publishing; contents/issues/pull-requests for the tag,
+#                 release notes and changelog commit.
 # =============================================================================
 name: 🐍 CI/CD Pipeline (Automatic Release)
 
@@ -21,6 +25,15 @@ on:
         description: 'Build and tag but do not publish to PyPI'
         type: boolean
         default: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+  checks: write
+  security-events: write
+  actions: read
 
 jobs:
   release:
