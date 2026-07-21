@@ -1,12 +1,23 @@
 # CHANGELOG
 
 
+## v2.6.1 (2026-07-21)
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`122bde9`](https://github.com/bauer-group/IP-CoolifyMigration/commit/122bde9722aa4ffecd0ba2fd52f4e3c76a2071d9))
+
+
 ## v2.6.0 (2026-07-21)
 
 ### Bug Fixes
 
 - **api**: Reverted the main-only tag transfer
   ([`8420d63`](https://github.com/bauer-group/IP-CoolifyMigration/commit/8420d635a6301908851432e539b0f4c6f8c3d87e))
+
+- **transfer**: Dialled the tunnel by address, not by name
+  ([`40e0815`](https://github.com/bauer-group/IP-CoolifyMigration/commit/40e0815cd1060d983a2181fd2a118cd0610c1a2c))
 
 ### Continuous Integration
 
