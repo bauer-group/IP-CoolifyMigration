@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.7.2 (2026-07-21)
+
+### Bug Fixes
+
+- **discover**: Paired a volume shared by two containers
+  ([`305f5eb`](https://github.com/bauer-group/IP-CoolifyMigration/commit/305f5eb88f185a2218437696b4360da2c0af447e))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`b9a5955`](https://github.com/bauer-group/IP-CoolifyMigration/commit/b9a5955c5e38ce387799ae4b3afe4128bd703d3f))
+
+
 ## v2.7.1 (2026-07-21)
 
 ### Bug Fixes
