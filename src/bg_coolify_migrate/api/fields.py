@@ -57,7 +57,7 @@ DATABASE_COMMON: frozenset[str] = frozenset(
         "limits_cpus",
         "limits_cpuset",
         "limits_cpu_shares",
-        # NOT tags — unreleased. See the note on SERVICE_CREATE.
+        # NOT tags — released in 4.2.0, but our fleet runs 4.1.2. See SERVICE_CREATE.
         # NOT health_check_*. They come back in every GET, and the obvious move is
         # to send them on. Coolify lists them in no $allowedFields — not on create,
         # not on update — so any request carrying one is rejected wholesale with
@@ -165,22 +165,27 @@ SERVICE_CREATE: frozenset[str] = frozenset(
         "force_domain_override",
         "is_container_label_escape_enabled",
         # NOT tags. Shipped once (2.5.6) and reverted in 2.5.7 — it broke every
-        # migration against every Coolify that exists.
+        # migration against every Coolify that existed at the time.
         #
-        # `tags` IS in ServicesController's create $allowedFields, and
-        # GET/POST /{collection}/{uuid}/tags ARE in openapi.json — but only on
-        # `main`. Tag management merged upstream 2026-07-07; the newest release,
-        # v4.1.2, is from 2026-06-04. On a real instance the read 404s and, had it
-        # not, the create would 422 on an unknown field.
+        # It is no longer unreleased: v4.2.0 (2026-07-21) carries it in the create
+        # $allowedFields at ServicesController:358, ApplicationsController:1123 and
+        # DatabasesController:1762 plus all eight engine routes — verified at that
+        # tag, not on `main`. Create-only; the update lists do not have it.
         #
-        # THE LESSON, not the fact: `main` is not a release. This whitelist is
-        # transcribed from upstream source, and reading that source on the default
-        # branch reports fields no operator can use yet. The drift canary now
-        # diffs against the latest release tag for exactly this reason.
+        # It stays out regardless, because the constraint moved rather than
+        # disappeared. In 2.5.6 the SOURCE was wrong: a field read off `main` that
+        # no release carried. Now the source is right and the TARGET is too old —
+        # the fleet's control plane runs 4.1.2, where an unlisted create field is a
+        # 422 on the whole resource. Same outage, opposite cause.
         #
-        # Re-add only when a RELEASE carries it, and then as a post-create
+        # THE LESSON, generalised: the whitelist must match the version that RUNS,
+        # not the newest that exists. Reading the released tag was half of it; the
+        # canary pins the release, and this comment pins the fleet.
+        #
+        # Re-add when the fleet is on >=4.2.0, and then as a post-create
         # POST /{collection}/{uuid}/tags — a separate, non-fatal call. Cosmetic
         # metadata must never sit on the critical path of a cutover.
+        # Adjudication recorded in tests/test_api_fields.py::KNOWN_TAGS_GAP.
     }
 )
 
@@ -254,7 +259,7 @@ APPLICATION_CREATE: frozenset[str] = frozenset(
         "custom_docker_run_options",
         "custom_nginx_configuration",
         "watch_paths",
-        # NOT tags — unreleased. See the note on SERVICE_CREATE.
+        # NOT tags — released in 4.2.0, but our fleet runs 4.1.2. See SERVICE_CREATE.
         "health_check_enabled",
         "health_check_path",
         "health_check_port",

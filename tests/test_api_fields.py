@@ -322,6 +322,31 @@ async def released_openapi() -> tuple[str, dict[str, Any]]:
     return _RELEASED_SPEC["tag"], _RELEASED_SPEC["spec"]
 
 
+#: ADJUDICATED against v4.2.0 (released 2026-07-21T16:08Z), controllers read AT
+#: THAT TAG: `tags` is genuinely in the create $allowedFields — ServicesController
+#: :358, ApplicationsController:1123 (all five routes share it), DatabasesController
+#: :1762 plus each of the eight engine routes. It is NOT a schema artefact like
+#: connect_to_docker_network; the enforcement arrays themselves carry it. It is
+#: create-only — absent from the update lists at ServicesController:1173 and
+#: ApplicationsController:2695.
+#:
+#: NOT whitelisted anyway, and the reason is the inverse of the 2.5.6 regression.
+#: That outage came from transcribing a field off `main` that no release carried.
+#: This time the source is right and the TARGET is too old: our fleet's control
+#: plane runs 4.1.2 (preflight.coolify version=4.1.2), where an unlisted create
+#: field is a 422 on the whole resource. Whitelisting now would break every
+#: migration on every instance we actually operate.
+#:
+#: THE LESSON, generalised: the whitelist must match the version that RUNS, not
+#: the newest version that exists. Reading the released tag was only ever half of
+#: it.
+#:
+#: Revisit when the fleet is on >=4.2.0, and then as a post-create
+#: POST /{collection}/{uuid}/tags — a separate, non-fatal call. Cosmetic metadata
+#: must never sit on the critical path of a cutover.
+KNOWN_TAGS_GAP: frozenset[str] = frozenset({"tags"})
+
+
 @pytest.mark.integration
 async def test_whitelists_match_upstream_openapi() -> None:
     """Report drift between our whitelists and Coolify's RELEASED openapi.json.
@@ -356,7 +381,7 @@ async def test_whitelists_match_upstream_openapi() -> None:
         # disagree the arrays win, and this is the recorded exception — verified
         # against the running instance by the e2e compose-service migration.
         openapi_only = {"connect_to_docker_network"}
-        missing = documented - SERVICE_CREATE_CUSTOM_COMPOSE - openapi_only
+        missing = documented - SERVICE_CREATE_CUSTOM_COMPOSE - openapi_only - KNOWN_TAGS_GAP
         if missing:
             drift["POST /services"] = sorted(missing)
 
@@ -369,7 +394,7 @@ async def test_whitelists_match_upstream_openapi() -> None:
         documented = body_props(path, "post")
         if not documented:
             continue
-        missing = documented - database_allowed(engine)
+        missing = documented - database_allowed(engine) - KNOWN_TAGS_GAP
         if missing:
             drift[f"POST {path}"] = sorted(missing)
 
@@ -454,7 +479,7 @@ async def test_application_gap_does_not_grow() -> None:
         )
         if not documented:
             continue
-        missing = documented - APPLICATION_CREATE - KNOWN_APPLICATION_GAP
+        missing = documented - APPLICATION_CREATE - KNOWN_APPLICATION_GAP - KNOWN_TAGS_GAP
         if missing:
             new[route] = sorted(missing)
 
