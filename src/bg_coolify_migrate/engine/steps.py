@@ -25,7 +25,6 @@ from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.dns import wildcard as dns_wildcard
 from bg_coolify_migrate.dns.gate import Resolution, build_report, explain_why_blocking_matters
 from bg_coolify_migrate.domain.naming import VolumeEndpoint, pair_by_mount_path
-from bg_coolify_migrate.domain.plan import TransferMode
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.engine import keys
 from bg_coolify_migrate.engine.context import MigrationContext, serialise_mounts
@@ -43,7 +42,7 @@ from bg_coolify_migrate.errors import (
     TransferError,
     VerificationError,
 )
-from bg_coolify_migrate.transfer import rsync, verify
+from bg_coolify_migrate.transfer import rsync, ssh, verify
 from bg_coolify_migrate.transfer.partition import PathEntry, plan_transfer, suggest_parallelism
 from bg_coolify_migrate.transfer.ssh import LOOPBACK
 
@@ -86,6 +85,47 @@ async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
         await rsync.ensure_installed(host, label=label)
         if not await host.which("docker"):
             raise PreflightError(f"docker is not installed on the {label} server")
+
+    # Can the source actually REACH the endpoint rsync will dial? step_copy
+    # resolves the same tuple, but it runs after quiesce — so a dead endpoint used
+    # to cost a stopped source and a rollback instead of an error. It did exactly
+    # that on 2026-07-21, which is the reason this check exists at all.
+    #
+    # Probed only when something will actually be transferred: a stateless
+    # migration never opens the socket, and blocking one on an unreachable
+    # endpoint would refuse a run that cannot fail this way.
+    #
+    # An UNDETERMINED probe does NOT block. A missing bash is not evidence of an
+    # unreachable target, and a preflight that fails closed on its own blind spot
+    # is worse than no preflight — it refuses migrations that would have worked.
+    if any(r.manifest.to_migrate for r in ctx.plan.resources):
+        endpoint_host, endpoint_port, _ = _transfer_endpoint(ctx)
+        reachable = await ssh.can_reach(ctx.source_host, endpoint_host, endpoint_port)
+        log.info(
+            "preflight.transfer_endpoint",
+            host=endpoint_host,
+            port=endpoint_port,
+            mode="tunnel" if ctx.tunnel_port is not None else "direct",
+            reachable=reachable,
+        )
+        if reachable is False:
+            via = (
+                "the ssh tunnel through this workstation"
+                if ctx.tunnel_port is not None
+                else "a direct connection"
+            )
+            raise PreflightError(
+                f"the source cannot reach {endpoint_host}:{endpoint_port}, "
+                f"which is where rsync would send {ctx.plan.total_bytes / 1024**2:.1f} MB "
+                f"over {via}",
+                hint=(
+                    "Nothing has been changed and the source is untouched.\n"
+                    "For a tunnel this usually means the source's sshd forbids port "
+                    "forwarding (AllowTcpForwarding), or the tunnel was closed.\n"
+                    "For a direct transfer, check routing and firewalling between the "
+                    "two servers on that port."
+                ),
+            )
 
     # Previews are not stopped by Coolify's stop endpoint, so they would keep
     # writing during the copy. Refuse now rather than corrupt later.
@@ -568,33 +608,35 @@ async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
     return {"volume_pairs": pairs_recorded}
 
 
-async def _transfer_endpoint(ctx: MigrationContext) -> tuple[str, int, str | None]:
-    """Decide direct vs tunnel. Returns ``(host, port, identity_file)``.
+def _transfer_endpoint(ctx: MigrationContext) -> tuple[str, int, str | None]:
+    """The address rsync dials. Returns ``(host, port, identity_file)``. PURE.
 
-    The tunnel solves reachability, not authentication — the ephemeral key is
-    needed either way.
+    Reads the decision the RUNNER already made rather than making its own.
+    ``maybe_tunnel`` probes reachability once, opens the forward, and publishes
+    the result as ``ctx.tunnel_port``. An open forward IS the decision: a port
+    means tunnel, no port means direct.
+
+    This used to re-probe here and pick independently, which was a second opinion
+    that could disagree with the first. When it did — a blip between the two
+    probes was enough — the tunnel branch fell back to
+    ``ctx.tunnel_port or target_port`` and returned ``127.0.0.1:22``: the SOURCE's
+    own sshd. rsync would have mirrored the volume onto the source under the
+    target's path. Verification catches it after the fact; not writing to the
+    wrong machine in the first place is better.
+
+    The host is a LITERAL whenever we choose it (see :data:`LOOPBACK`), so the
+    source never has to resolve a name we already know the address for. In direct
+    mode it is whatever Coolify records as the server's address, which may be a
+    hostname — but that path is only reachable BECAUSE the runner's probe already
+    resolved and connected to it.
     """
     key = ctx.ephemeral_key
     identity = key.remote_path if key else None
-    target_ip = ctx.plan.target_server.ip
-    target_port = ctx.plan.target_server.port
 
-    if ctx.plan.transfer_mode is TransferMode.TUNNEL:
-        return LOOPBACK, ctx.tunnel_port or target_port, identity
+    if ctx.tunnel_port is not None:
+        return LOOPBACK, ctx.tunnel_port, identity
 
-    if ctx.plan.transfer_mode is TransferMode.DIRECT:
-        return target_ip, target_port, identity
-
-    # AUTO: probe whether the source can reach the target at all.
-    probe = await ctx.source_host.run(
-        f"timeout 5 sh -c 'exec 3<>/dev/tcp/{shlex.quote(target_ip)}/{target_port}' 2>/dev/null"
-    )
-    if probe.ok:
-        log.info("transfer.mode", mode="direct", reason="source can reach target")
-        return target_ip, target_port, identity
-
-    log.info("transfer.mode", mode="tunnel", reason="source cannot reach target directly")
-    return LOOPBACK, ctx.tunnel_port or target_port, identity
+    return ctx.plan.target_server.ip, ctx.plan.target_server.port, identity
 
 
 async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
@@ -637,7 +679,7 @@ async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
 
 
 async def _copy_one(ctx: MigrationContext, source_path: str, target_path: str) -> None:
-    host, port, identity = await _transfer_endpoint(ctx)
+    host, port, identity = _transfer_endpoint(ctx)
 
     entries: list[PathEntry] = []
     listing = await ctx.source_host.run(

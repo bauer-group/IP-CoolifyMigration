@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 from pathlib import Path
 
 import httpx
@@ -26,7 +27,6 @@ from bg_coolify_migrate.domain.plan import (
     ResourceSnapshot,
     ServerRef,
     Strategy,
-    TransferMode,
 )
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.engine import compensations, steps
@@ -40,6 +40,7 @@ from bg_coolify_migrate.errors import (
 )
 from bg_coolify_migrate.journal.store import Journal
 from bg_coolify_migrate.settings.base import Settings
+from bg_coolify_migrate.transfer import ssh
 from tests.conftest import FakeHost
 
 HOST = "https://coolify.example.com"
@@ -87,11 +88,19 @@ def _plan(**kw: object) -> MigrationPlan:
     return MigrationPlan(**{**base, **kw})  # type: ignore[arg-type]
 
 
-def _source_host() -> FakeHost:
+def _source_host(*, probe: str = "REACH") -> FakeHost:
+    """A healthy source. ``probe`` is what ssh.can_reach will conclude.
+
+    A PARAMETER, not a stub to override afterwards: FakeHost matches routes in
+    insertion order, so a later `.on()` for the same pattern is dead code that
+    silently keeps the default. A test asking for NOPE and quietly getting REACH
+    asserts nothing — which is how this helper first got written.
+    """
     host = FakeHost()
     host.on(r"command -v rsync", exit_status=0)
     host.on(r"command -v docker", exit_status=0)
     host.on(r"docker ps", stdout="")
+    host.on(r"command -v bash", stdout=probe)
     return host
 
 
@@ -195,6 +204,71 @@ class TestPreflight:
         )
         result = await steps.step_preflight(ctx)
         assert result["free_bytes"] > result["required_bytes"]
+
+    async def test_unreachable_transfer_endpoint_blocks_before_quiesce(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """The check that would have saved the 2026-07-21 run.
+
+        rsync could not reach its endpoint, but nothing found out until COPY —
+        which runs AFTER quiesce. So the source was stopped, the copy failed, and
+        the whole thing rolled back. Here it is an error with the source
+        untouched.
+        """
+        respx_mock.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"private_key": "x"}])
+        )
+        source = _source_host(probe="NOPE")
+        ctx.source_host = source  # type: ignore[assignment]
+        ctx.tunnel_port = 44087
+
+        with pytest.raises(PreflightError, match=re.escape("cannot reach 127.0.0.1:44087")):
+            await steps.step_preflight(ctx)
+
+    async def test_undeterminable_endpoint_does_not_block(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """A blind spot must not become a veto.
+
+        A host with neither bash nor nc tells us nothing about reachability.
+        Treating that as "unreachable" would refuse migrations that work — the
+        preflight would start causing the outages it exists to prevent.
+        """
+        respx_mock.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"private_key": "x"}])
+        )
+        source = _source_host(probe="UNKNOWN")
+        ctx.source_host = source  # type: ignore[assignment]
+
+        await steps.step_preflight(ctx)  # must not raise
+
+    async def test_no_volumes_means_no_endpoint_probe(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """A stateless migration never opens the socket, so it is not gated on one.
+
+        The source host below stubs NO probe at all: FakeHost errors on an
+        unstubbed command, so this passes only if the probe was never sent.
+        """
+        respx_mock.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"private_key": "x"}])
+        )
+        source = FakeHost()
+        source.on(r"command -v rsync", exit_status=0)
+        source.on(r"command -v docker", exit_status=0)
+        source.on(r"docker ps", stdout="")
+        ctx.source_host = source  # type: ignore[assignment]
+        ctx.plan = _plan(
+            resources=(
+                ResourcePlan(
+                    snapshot=_snapshot(),
+                    strategy=Strategy.REBUILD,
+                    manifest=VolumeManifest(items=()),
+                ),
+            )
+        )
+
+        await steps.step_preflight(ctx)  # must not raise
 
     async def test_records_the_coolify_version(
         self, ctx: MigrationContext, respx_mock: respx.Router
@@ -387,12 +461,11 @@ class TestTransferEndpoint:
     quiesce — so it cost downtime rather than a preflight error.
     """
 
-    async def test_tunnel_dials_an_address_never_a_name(
+    def test_an_open_tunnel_is_dialled_by_address_never_by_name(
         self, ctx: MigrationContext
     ) -> None:
-        ctx.plan = _plan(transfer_mode=TransferMode.TUNNEL)
         ctx.tunnel_port = 44087
-        host, port, _ = await steps._transfer_endpoint(ctx)
+        host, port, _ = steps._transfer_endpoint(ctx)
 
         # Asserted as a PROPERTY, not just a value: anything that needs resolving
         # on the source is the bug, and `localhost` is only the instance of it we
@@ -401,46 +474,36 @@ class TestTransferEndpoint:
         assert host == "127.0.0.1"
         assert port == 44087
 
-    async def test_dialled_address_is_the_one_forward_to_binds(self) -> None:
+    def test_dialled_address_is_the_one_forward_to_binds(self) -> None:
         """The two ends cannot drift, because there is only one constant.
 
-        This is the regression in structural form. Before 2.6.1 ssh.py bound the
-        literal "127.0.0.1" while steps.py dialled the name "localhost" — two
-        literals in two files, agreeing by luck until a host disagreed.
+        The regression in structural form: ssh.py bound the literal "127.0.0.1"
+        while steps.py dialled the name "localhost" — two literals in two files,
+        agreeing by luck until a host disagreed.
         """
-        from bg_coolify_migrate.transfer import ssh
-
         assert steps.LOOPBACK is ssh.LOOPBACK
 
-    async def test_direct_dials_the_target_itself(self, ctx: MigrationContext) -> None:
-        ctx.plan = _plan(transfer_mode=TransferMode.DIRECT)
-        host, port, _ = await steps._transfer_endpoint(ctx)
+    def test_no_tunnel_means_the_target_itself(self, ctx: MigrationContext) -> None:
+        ctx.tunnel_port = None
+        host, port, _ = steps._transfer_endpoint(ctx)
         assert host == "10.0.0.2"
         assert port == 22
 
-    async def test_auto_falls_back_to_the_tunnel_when_unreachable(
+    def test_never_dials_loopback_without_an_open_tunnel(
         self, ctx: MigrationContext
     ) -> None:
-        # The probe is a /dev/tcp open against the target; a non-zero exit means
-        # no route, which is the case the tunnel exists for.
-        source = _source_host()
-        source.on(r"/dev/tcp/", exit_status=1)
-        ctx.source_host = source  # type: ignore[assignment]
-        ctx.tunnel_port = 44087
+        """The reason this reads ctx.tunnel_port instead of probing again.
 
-        host, port, _ = await steps._transfer_endpoint(ctx)
-        assert host == "127.0.0.1"
-        assert port == 44087
-
-    async def test_auto_prefers_direct_when_reachable(self, ctx: MigrationContext) -> None:
-        source = _source_host()
-        source.on(r"/dev/tcp/", exit_status=0)
-        ctx.source_host = source  # type: ignore[assignment]
-        ctx.tunnel_port = 44087
-
-        host, port, _ = await steps._transfer_endpoint(ctx)
-        assert host == "10.0.0.2"
-        assert port == 22
+        The old code probed a SECOND time and, when its answer disagreed with the
+        runner's, returned `ctx.tunnel_port or target_port` — loopback with the
+        TARGET's port. rsync would have dialled 127.0.0.1:22 on the source: its
+        own sshd, mirroring the volume onto the wrong machine under the target's
+        path. No tunnel, no loopback. Ever.
+        """
+        ctx.tunnel_port = None
+        host, port, _ = steps._transfer_endpoint(ctx)
+        assert host != steps.LOOPBACK
+        assert (host, port) == ("10.0.0.2", 22)
 
 
 class TestDnsGate:
@@ -1046,3 +1109,55 @@ class TestUndoParkedDomains:
             },
         )
         assert order == ["delete", "patch"]
+
+
+class TestMaybeTunnel:
+    """Whether the reverse forward is opened at all.
+
+    This branch decides where every byte of the migration travels, and it had no
+    unit coverage until 2.6.2 -- the same blind spot that let a hostname and a
+    dash-only probe reach production.
+    """
+
+    async def _run(self, ctx: MigrationContext) -> None:
+        from bg_coolify_migrate.engine.runner import maybe_tunnel
+
+        async with maybe_tunnel(ctx):
+            pass
+
+    async def test_opens_the_tunnel_when_the_target_is_unreachable(
+        self, ctx: MigrationContext
+    ) -> None:
+        source = _source_host(probe="NOPE")
+        ctx.source_host = source  # type: ignore[assignment]
+
+        await self._run(ctx)
+        assert source.forwards == [("10.0.0.2", 22)]
+        assert ctx.tunnel_port == 44087
+
+    async def test_skips_the_tunnel_when_the_target_is_reachable(
+        self, ctx: MigrationContext
+    ) -> None:
+        source = _source_host()  # stubs bash -> REACH
+        ctx.source_host = source  # type: ignore[assignment]
+
+        await self._run(ctx)
+        assert source.forwards == []
+        assert ctx.tunnel_port is None
+
+    async def test_an_undeterminable_probe_takes_the_tunnel(
+        self, ctx: MigrationContext
+    ) -> None:
+        """`reachable is not True`, not `not reachable`.
+
+        A host with no bash and no nc tells us nothing. The tunnel works whether
+        or not a direct route exists, so an unknown must fall THAT way -- reading
+        it as "reachable" would dial a route that may not be there, after the
+        source is already stopped.
+        """
+        source = _source_host(probe="UNKNOWN")
+        ctx.source_host = source  # type: ignore[assignment]
+
+        await self._run(ctx)
+        assert source.forwards == [("10.0.0.2", 22)]
+        assert ctx.tunnel_port == 44087
