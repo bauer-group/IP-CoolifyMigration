@@ -68,6 +68,19 @@ async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
     """
     await ctx.api.assert_can_read_sensitive()
 
+    # ONE Coolify control plane manages both servers, so there is ONE API version
+    # here — not one per side. Read and recorded, never gated: the whitelists in
+    # api/fields.py are transcribed from upstream source and only ever match a
+    # RANGE of releases, and turning that into a hard version wall would be
+    # guesswork about which field landed in which tag.
+    #
+    # It earns its round trip as diagnostics. "Which Coolify was this?" is the
+    # first question asked of any failed migration, and answering it for the 2.5.6
+    # tags 404 took a bisect of upstream release dates against a merge commit. In
+    # the journal it is one line, available before anything has been touched.
+    coolify_version = await ctx.api.version()
+    log.info("preflight.coolify", version=coolify_version)
+
     for host, label in ((ctx.source_host, "source"), (ctx.target_host, "target")):
         await rsync.ensure_installed(host, label=label)
         if not await host.which("docker"):
@@ -118,7 +131,11 @@ async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
     if hard:
         raise PreflightError("the plan is blocked:\n" + "\n".join(hard))
 
-    return {"free_bytes": free, "required_bytes": required}
+    return {
+        "free_bytes": free,
+        "required_bytes": required,
+        "coolify_version": coolify_version,
+    }
 
 
 async def step_plan(ctx: MigrationContext) -> dict[str, Any]:

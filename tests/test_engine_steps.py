@@ -174,6 +174,17 @@ class TestCaptureMounts:
 
 
 class TestPreflight:
+    @pytest.fixture(autouse=True)
+    def _coolify_version(self, respx_mock: respx.Router) -> None:
+        """Preflight records the instance version; most tests here ignore it.
+
+        Autouse because it is infrastructure, not subject. Note `text=`, not
+        `json=`: /version answers a BARE STRING (see CoolifyClient.version, found
+        by the e2e rig after a unit test mocked it as JSON). Six hand-written
+        copies would be six chances to re-encode that mistake.
+        """
+        respx_mock.get(f"{BASE}/version").mock(return_value=httpx.Response(200, text="4.1.2"))
+
     async def test_passes_a_healthy_setup(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
@@ -182,6 +193,22 @@ class TestPreflight:
         )
         result = await steps.step_preflight(ctx)
         assert result["free_bytes"] > result["required_bytes"]
+
+    async def test_records_the_coolify_version(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """One control plane manages both servers, so there is one version.
+
+        Journalled, never gated — but journalled BEFORE anything is touched, so a
+        failed run answers "which Coolify was this?" without a bisect of upstream
+        release dates. That question cost an investigation after the 2.5.6 tags
+        404, which is why this round trip exists at all.
+        """
+        respx_mock.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"private_key": "x"}])
+        )
+        result = await steps.step_preflight(ctx)
+        assert result["coolify_version"] == "4.1.2"
 
     async def test_missing_rsync_fails_before_anything_stops(
         self, ctx: MigrationContext, respx_mock: respx.Router
