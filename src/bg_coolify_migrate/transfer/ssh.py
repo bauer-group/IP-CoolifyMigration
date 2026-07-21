@@ -5,7 +5,7 @@ three concrete reasons:
 
 1. **The tunnel fallback needs a reverse port-forward.** When the source cannot
    reach the target directly we call :meth:`RemoteHost.forward_to`, and the
-   source then runs ``rsync -e "ssh -p <lport>" root@localhost:...``. The bytes
+   source then runs ``rsync -e "ssh -p <lport>" root@127.0.0.1:...``. The bytes
    flow source -> a socket on the workstation -> target, and **never touch the
    Windows filesystem**. Managing that with a child ``ssh -R`` process means
    guessing at its lifecycle.
@@ -39,6 +39,22 @@ import structlog
 from bg_coolify_migrate.errors import MigrationError, PreflightError
 
 log = structlog.get_logger(__name__)
+
+#: Both ends of the tunnel — the address :meth:`RemoteHost.forward_to` BINDS and
+#: the address rsync DIALS. One constant, imported by both, because they were
+#: once two literals and drifted.
+#:
+#: A LITERAL, never the name ``localhost``. Dialling a name asks the source to
+#: resolve its way back to an address we already know, and that resolution is not
+#: guaranteed: a BAUER source host had no working ``localhost`` entry, so rsync
+#: died with "Could not resolve hostname localhost" — after the source was
+#: already stopped, which turned a config detail into downtime.
+#:
+#: The literal also closes a quieter failure. Where ``localhost`` resolves to
+#: ``::1`` first, common on dual-stack hosts, rsync dials IPv6 while the forward
+#: listens on IPv4 and gets "Connection refused" — which reads like a broken
+#: tunnel rather than a name mismatch, and sends you debugging the wrong thing.
+LOOPBACK = "127.0.0.1"
 
 
 class SshError(MigrationError):
@@ -411,14 +427,18 @@ class RemoteHost:
 
         Returns the port on *this* host's loopback that now tunnels to
         ``remote_host:remote_port`` via our workstation. The source can then run
-        ``rsync -e 'ssh -p <port>' root@localhost:...`` and reach a target it has
+        ``rsync -e 'ssh -p <port>' root@127.0.0.1:...`` and reach a target it has
         no route to.
+
+        Binds :data:`LOOPBACK`, which callers must also dial — importing the same
+        constant rather than repeating the literal is what keeps the two ends
+        from drifting apart.
 
         The workstation only relays TCP; it never stores a byte, so ownership,
         symlinks and xattrs are untouched — unlike coolify-mover's three-hop
         rsync through the operator's ``/tmp``.
         """
-        listener = await self._conn.forward_remote_port("127.0.0.1", 0, remote_host, remote_port)
+        listener = await self._conn.forward_remote_port(LOOPBACK, 0, remote_host, remote_port)
         port = listener.get_port()
         log.info(
             "ssh.tunnel.open",

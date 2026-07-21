@@ -45,6 +45,7 @@ from bg_coolify_migrate.errors import (
 )
 from bg_coolify_migrate.transfer import rsync, verify
 from bg_coolify_migrate.transfer.partition import PathEntry, plan_transfer, suggest_parallelism
+from bg_coolify_migrate.transfer.ssh import LOOPBACK
 
 log = structlog.get_logger(__name__)
 
@@ -579,7 +580,7 @@ async def _transfer_endpoint(ctx: MigrationContext) -> tuple[str, int, str | Non
     target_port = ctx.plan.target_server.port
 
     if ctx.plan.transfer_mode is TransferMode.TUNNEL:
-        return "localhost", ctx.tunnel_port or target_port, identity
+        return LOOPBACK, ctx.tunnel_port or target_port, identity
 
     if ctx.plan.transfer_mode is TransferMode.DIRECT:
         return target_ip, target_port, identity
@@ -593,7 +594,7 @@ async def _transfer_endpoint(ctx: MigrationContext) -> tuple[str, int, str | Non
         return target_ip, target_port, identity
 
     log.info("transfer.mode", mode="tunnel", reason="source cannot reach target directly")
-    return "localhost", ctx.tunnel_port or target_port, identity
+    return LOOPBACK, ctx.tunnel_port or target_port, identity
 
 
 async def step_copy(ctx: MigrationContext) -> dict[str, Any]:

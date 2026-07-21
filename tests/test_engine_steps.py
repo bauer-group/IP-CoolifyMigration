@@ -6,6 +6,7 @@ docs/safety.md.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from bg_coolify_migrate.domain.plan import (
     ResourceSnapshot,
     ServerRef,
     Strategy,
+    TransferMode,
 )
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.engine import compensations, steps
@@ -374,6 +376,71 @@ class TestCreateTarget:
         await steps.step_create_target(ctx)
         assert not tags_route.called, "create_target read the main-only /tags endpoint"
         assert "tags" not in json.loads(route.calls[0].request.read().decode())
+
+
+class TestTransferEndpoint:
+    """The address rsync dials.
+
+    Had NO unit test until 2.6.1, which is precisely how a hostname reached
+    production where an address was bound: the only coverage was e2e, on hosts
+    that happened to resolve `localhost`. The failure surfaced at COPY — after
+    quiesce — so it cost downtime rather than a preflight error.
+    """
+
+    async def test_tunnel_dials_an_address_never_a_name(
+        self, ctx: MigrationContext
+    ) -> None:
+        ctx.plan = _plan(transfer_mode=TransferMode.TUNNEL)
+        ctx.tunnel_port = 44087
+        host, port, _ = await steps._transfer_endpoint(ctx)
+
+        # Asserted as a PROPERTY, not just a value: anything that needs resolving
+        # on the source is the bug, and `localhost` is only the instance of it we
+        # happened to ship. ip_address() raises on any hostname.
+        ipaddress.ip_address(host)
+        assert host == "127.0.0.1"
+        assert port == 44087
+
+    async def test_dialled_address_is_the_one_forward_to_binds(self) -> None:
+        """The two ends cannot drift, because there is only one constant.
+
+        This is the regression in structural form. Before 2.6.1 ssh.py bound the
+        literal "127.0.0.1" while steps.py dialled the name "localhost" — two
+        literals in two files, agreeing by luck until a host disagreed.
+        """
+        from bg_coolify_migrate.transfer import ssh
+
+        assert steps.LOOPBACK is ssh.LOOPBACK
+
+    async def test_direct_dials_the_target_itself(self, ctx: MigrationContext) -> None:
+        ctx.plan = _plan(transfer_mode=TransferMode.DIRECT)
+        host, port, _ = await steps._transfer_endpoint(ctx)
+        assert host == "10.0.0.2"
+        assert port == 22
+
+    async def test_auto_falls_back_to_the_tunnel_when_unreachable(
+        self, ctx: MigrationContext
+    ) -> None:
+        # The probe is a /dev/tcp open against the target; a non-zero exit means
+        # no route, which is the case the tunnel exists for.
+        source = _source_host()
+        source.on(r"/dev/tcp/", exit_status=1)
+        ctx.source_host = source  # type: ignore[assignment]
+        ctx.tunnel_port = 44087
+
+        host, port, _ = await steps._transfer_endpoint(ctx)
+        assert host == "127.0.0.1"
+        assert port == 44087
+
+    async def test_auto_prefers_direct_when_reachable(self, ctx: MigrationContext) -> None:
+        source = _source_host()
+        source.on(r"/dev/tcp/", exit_status=0)
+        ctx.source_host = source  # type: ignore[assignment]
+        ctx.tunnel_port = 44087
+
+        host, port, _ = await steps._transfer_endpoint(ctx)
+        assert host == "10.0.0.2"
+        assert port == 22
 
 
 class TestDnsGate:
