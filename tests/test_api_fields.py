@@ -8,6 +8,8 @@ that upstream drift breaks OUR ci rather than someone's production migration.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from bg_coolify_migrate.api.fields import (
@@ -268,9 +270,61 @@ class TestEnvFields:
         assert "is_buildtime" in ENV_FIELDS
 
 
+#: Resolved once per session — two tests share it, and the GitHub API is rate
+#: limited. Keyed nowhere: there is only ever one answer per run.
+_RELEASED_SPEC: dict[str, Any] = {}
+
+
+async def released_openapi() -> tuple[str, dict[str, Any]]:
+    """Coolify's openapi.json AT THE NEWEST PUBLISHED RELEASE, and that tag.
+
+    NOT `main`. This is the whole lesson of the 2.5.6 tags regression: these
+    whitelists are transcribed from upstream source, which makes the REF that
+    source is read from part of the contract. Tag management sat on `main` from
+    2026-07-07 while the newest release, v4.1.2, was from 2026-06-04 — so a
+    canary reading `main` reported `tags` as a field we were missing, it was
+    whitelisted in good faith, and every migration then died on an endpoint no
+    operator could install. `main` is not a release.
+
+    The tag is resolved dynamically rather than pinned to a constant, so the
+    canary tracks what is installable without anyone remembering to bump it.
+    ``/releases/latest`` excludes prereleases, which is what we want — Coolify
+    publishes long beta chains and those are not what operators run.
+    """
+    if not _RELEASED_SPEC:
+        import os
+
+        import httpx
+
+        headers = {"Accept": "application/vnd.github+json"}
+        # Unauthenticated api.github.com allows 60 requests/hour per IP. A shared
+        # CI runner can exhaust that, and a rate-limited canary fails looking
+        # exactly like real drift — the one thing it must never do.
+        token = os.environ.get("GITHUB_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            latest = await client.get(
+                "https://api.github.com/repos/coollabsio/coolify/releases/latest",
+                headers=headers,
+            )
+            latest.raise_for_status()
+            tag = str(latest.json()["tag_name"])
+
+            spec = await client.get(
+                f"https://raw.githubusercontent.com/coollabsio/coolify/{tag}/openapi.json"
+            )
+            spec.raise_for_status()
+            _RELEASED_SPEC["tag"] = tag
+            _RELEASED_SPEC["spec"] = spec.json()
+
+    return _RELEASED_SPEC["tag"], _RELEASED_SPEC["spec"]
+
+
 @pytest.mark.integration
 async def test_whitelists_match_upstream_openapi() -> None:
-    """Report drift between our whitelists and Coolify's published openapi.json.
+    """Report drift between our whitelists and Coolify's RELEASED openapi.json.
 
     Marked `integration` because it needs network. A scheduled CI job runs it so
     that an upstream API change breaks our CI rather than a user's migration.
@@ -280,13 +334,7 @@ async def test_whitelists_match_upstream_openapi() -> None:
     reports EXTRA fields we might be missing; it does not fail on fields we
     deliberately exclude (documented in api/fields.py).
     """
-    import httpx
-
-    url = "https://raw.githubusercontent.com/coollabsio/coolify/main/openapi.json"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-        spec = response.json()
+    tag, spec = await released_openapi()
 
     def body_props(path: str, method: str) -> set[str]:
         op = spec.get("paths", {}).get(path, {}).get(method, {})
@@ -326,10 +374,12 @@ async def test_whitelists_match_upstream_openapi() -> None:
             drift[f"POST {path}"] = sorted(missing)
 
     assert not drift, (
-        f"openapi.json documents fields we do not whitelist: {drift}. "
+        f"Coolify {tag} documents fields we do not whitelist: {drift}. "
         f"Upstream may have added fields; review api/fields.py. Adjudicate each "
-        f"against the controller's $allowedFields before whitelisting — the schema "
-        f"documents fields the controller rejects (see connect_to_docker_network)."
+        f"against the controller's $allowedFields AT THIS TAG before whitelisting — "
+        f"the schema documents fields the controller rejects (see "
+        f"connect_to_docker_network), and reading the controller on `main` instead "
+        f"of {tag} is what shipped the 2.5.6 tags regression."
     )
 
 
@@ -389,13 +439,7 @@ async def test_application_gap_does_not_grow() -> None:
     a newly documented application field still breaks CI, but the 17 already
     triaged do not cry every week.
     """
-    import httpx
-
-    url = "https://raw.githubusercontent.com/coollabsio/coolify/main/openapi.json"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-        spec = response.json()
+    tag, spec = await released_openapi()
 
     routes = ("public", "private-github-app", "private-deploy-key", "dockerfile", "dockerimage")
     new: dict[str, list[str]] = {}
@@ -415,9 +459,10 @@ async def test_application_gap_does_not_grow() -> None:
             new[route] = sorted(missing)
 
     assert not new, (
-        f"NEW fields documented for POST /applications/*: {new}. Adjudicate against "
-        f"ApplicationsController's $allowedFields, then either whitelist in "
-        f"APPLICATION_CREATE or add to KNOWN_APPLICATION_GAP with a reason."
+        f"NEW fields documented for POST /applications/* in Coolify {tag}: {new}. "
+        f"Adjudicate against ApplicationsController's $allowedFields at that tag, "
+        f"then either whitelist in APPLICATION_CREATE or add to "
+        f"KNOWN_APPLICATION_GAP with a reason."
     )
 
 
