@@ -24,6 +24,7 @@ from bg_coolify_migrate.engine.steps import build_steps
 from bg_coolify_migrate.errors import MigrationError
 from bg_coolify_migrate.journal.store import Journal
 from bg_coolify_migrate.settings.base import Settings
+from bg_coolify_migrate.transfer import ssh
 from bg_coolify_migrate.transfer.ssh import HostKeyPrompt, RemoteHost, SshTarget
 
 log = structlog.get_logger(__name__)
@@ -158,11 +159,22 @@ async def maybe_tunnel(
 
     needs_tunnel = ctx.plan.transfer_mode is TransferMode.TUNNEL
     if not needs_tunnel:
-        probe = await ctx.source_host.run(
-            f"timeout 5 sh -c 'exec 3<>/dev/tcp/{ctx.plan.target_server.ip}/"
-            f"{ctx.plan.target_server.port}' 2>/dev/null"
+        # `is not True` on purpose: can_reach returns None when the source has no
+        # way to answer, and an unknown must fall to the tunnel — it works either
+        # way, where a wrong "direct" does not.
+        reachable = await ssh.can_reach(
+            ctx.source_host, ctx.plan.target_server.ip, ctx.plan.target_server.port
         )
-        needs_tunnel = not probe.ok
+        needs_tunnel = reachable is not True
+        log.info(
+            "transfer.mode",
+            mode="tunnel" if needs_tunnel else "direct",
+            reason={
+                True: "source can reach target",
+                False: "source cannot reach target directly",
+                None: "source could not be probed (no bash, no nc)",
+            }[reachable],
+        )
 
     if not needs_tunnel:
         yield

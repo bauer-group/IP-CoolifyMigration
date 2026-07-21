@@ -10,7 +10,8 @@ excuse both predecessor tools used for not testing theirs.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -30,6 +31,7 @@ class FakeHost:
         self.target = target or SshTarget(host="10.0.0.1")
         self._routes: list[tuple[re.Pattern[str], Callable[[str], CommandResult]]] = []
         self.commands: list[str] = []
+        self.forwards: list[tuple[str, int]] = []
 
     def on(
         self,
@@ -98,6 +100,17 @@ class FakeHost:
     async def free_bytes(self, path: str) -> int:
         result = await self.run_checked(f"df -Pk {path}")
         return int(result.stdout.strip()) * 1024
+
+    @asynccontextmanager
+    async def forward_to(self, remote_host: str, remote_port: int) -> AsyncIterator[int]:
+        """Record that a reverse forward was opened, and hand back a fixed port.
+
+        Exists so ``maybe_tunnel``'s decision is testable at all. Whether the
+        tunnel is opened is what routes the migration's bytes, and it was decided
+        by an untested branch until 2.6.2.
+        """
+        self.forwards.append((remote_host, remote_port))
+        yield 44087
 
 
 @pytest.fixture

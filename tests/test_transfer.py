@@ -6,8 +6,11 @@ every one of them is a bug in coolify-mover, which uses `-avz --progress`.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
+from bg_coolify_migrate.transfer import ssh
 from bg_coolify_migrate.transfer.partition import (
     Chunk,
     PathEntry,
@@ -23,6 +26,7 @@ from bg_coolify_migrate.transfer.rsync import (
     parse_progress,
 )
 from bg_coolify_migrate.transfer.verify import DiffKind, Manifest, compare
+from tests.conftest import FakeHost
 
 
 def _spec(**kw: object) -> RsyncSpec:
@@ -470,8 +474,6 @@ class TestRsyncEnsureInstalled:
 
     async def test_noop_when_already_present(self) -> None:
         from bg_coolify_migrate.transfer import rsync
-        from tests.conftest import FakeHost
-
         host = FakeHost()
         host.on(r"command -v rsync", exit_status=0)
         await rsync.ensure_installed(host, label="source")  # no raise
@@ -479,8 +481,6 @@ class TestRsyncEnsureInstalled:
 
     async def test_installs_with_apt_when_missing(self) -> None:
         from bg_coolify_migrate.transfer import rsync
-        from tests.conftest import FakeHost
-
         host = FakeHost()
         # Missing on the first check, present after the install.
         host.on_sequence(r"command -v rsync", [{"exit_status": 1}, {"exit_status": 0}])
@@ -492,10 +492,67 @@ class TestRsyncEnsureInstalled:
     async def test_raises_when_no_package_manager(self) -> None:
         from bg_coolify_migrate.errors import TransferError
         from bg_coolify_migrate.transfer import rsync
-        from tests.conftest import FakeHost
-
         host = FakeHost()
         host.on(r"command -v rsync", exit_status=1)  # always missing
         host.on(r"command -v \S+", exit_status=1)  # no package manager present
         with pytest.raises(TransferError, match="could not be installed"):
             await rsync.ensure_installed(host, label="source")
+
+
+class TestCanReach:
+    """The TCP reachability probe.
+
+    Replaces `sh -c 'exec 3<>/dev/tcp/…'`, which could not work on the hosts it
+    was written for: /dev/tcp is a BASH builtin and Debian's /bin/sh is dash. It
+    always failed, so AUTO always chose the tunnel and the direct path was dead
+    code on every Debian fleet -- including BAUER's, where "we always use the
+    tunnel" turned out to be a symptom rather than a setting.
+    """
+
+    async def test_reachable_when_bash_opens_the_socket(self) -> None:
+        host = FakeHost()
+        host.on(r"command -v bash", stdout="REACH")
+        assert await ssh.can_reach(host, "10.0.0.2", 22) is True  # type: ignore[arg-type]
+
+    async def test_unreachable_is_false_not_none(self) -> None:
+        # Distinct from "could not tell": this one is real evidence of no route.
+        host = FakeHost()
+        host.on(r"command -v bash", stdout="NOPE")
+        assert await ssh.can_reach(host, "10.0.0.2", 22) is False  # type: ignore[arg-type]
+
+    async def test_no_probe_tool_is_unknown_never_false(self) -> None:
+        """The distinction the exit-status version could not express.
+
+        A host with neither bash nor nc tells us nothing about the target. Read
+        as False it would strand a working migration; callers must see None and
+        decide for themselves -- the runner takes the tunnel, preflight declines
+        to block.
+        """
+        host = FakeHost()
+        host.on(r"command -v bash", stdout="UNKNOWN")
+        assert await ssh.can_reach(host, "10.0.0.2", 22) is None  # type: ignore[arg-type]
+
+    async def test_invokes_bash_explicitly_and_never_plain_sh(self) -> None:
+        """The regression, stated as the thing that broke.
+
+        `sh -c` with /dev/tcp is the bug; asserting the command shape is the only
+        way a unit test can catch it, because a FakeHost cannot tell us that dash
+        would have choked.
+        """
+        host = FakeHost()
+        host.on(r"command -v bash", stdout="REACH")
+        await ssh.can_reach(host, "10.0.0.2", 22)  # type: ignore[arg-type]
+
+        sent = host.commands[0]
+        assert "bash -c" in sent
+        # NOT `"sh -c" not in sent`: "bash -c" contains "sh -c", so the naive form
+        # passes on the broken command too. The lookbehind is the whole assertion.
+        assert re.search(r"(?<!ba)sh -c", sent) is None
+        assert "nc -z" in sent  # the Alpine fallback, where bash is usually absent
+
+    async def test_quotes_a_hostile_target(self) -> None:
+        # The address comes from Coolify's server record, i.e. from outside.
+        host = FakeHost()
+        host.on(r"command -v bash", stdout="NOPE")
+        await ssh.can_reach(host, "evil; rm -rf /", 22)  # type: ignore[arg-type]
+        assert "; rm -rf /" not in host.commands[0].replace("'evil; rm -rf /'", "")

@@ -453,6 +453,46 @@ class RemoteHost:
             log.debug("ssh.tunnel.closed", via=str(self.target), local_port=port)
 
 
+async def can_reach(host: RemoteHost, target: str, port: int) -> bool | None:
+    """Whether ``host`` can open a TCP connection to ``target:port``.
+
+    ``True`` reachable, ``False`` refused/unresolvable, ``None`` **we could not
+    tell** — the host has no tool to ask with. Three states on purpose: callers
+    must not read "we did not find out" as "no".
+
+    NEVER ``sh -c 'exec 3<>/dev/tcp/…'``, which is what this replaces. ``/dev/tcp``
+    is a BASH builtin, not POSIX, and Debian's ``/bin/sh`` is dash — so that probe
+    could not succeed on a stock Debian host no matter how reachable the target
+    was. It failed closed into "unreachable", which is why every BAUER migration
+    silently took the tunnel and the direct path was effectively dead code.
+
+    So: invoke ``bash`` explicitly rather than ``sh``, fall back to ``nc`` for
+    Alpine (busybox, where bash is usually absent), and report ``None`` rather
+    than guess when neither exists. Answers come back as words on stdout, not as
+    exit codes, because "the probe said no" and "the probe could not run" are
+    different facts and an exit status conflates them.
+    """
+    t = shlex.quote(target)
+    p = shlex.quote(str(port))
+    script = (
+        f"if command -v bash >/dev/null 2>&1; then "
+        f"timeout 5 bash -c 'exec 3<>/dev/tcp/{t}/{p}' >/dev/null 2>&1 "
+        f"&& echo REACH || echo NOPE; "
+        f"elif command -v nc >/dev/null 2>&1; then "
+        f"timeout 5 nc -z {t} {p} >/dev/null 2>&1 && echo REACH || echo NOPE; "
+        f"else echo UNKNOWN; fi"
+    )
+    result = await host.run(script)
+    answer = result.stdout.strip().split()[-1] if result.stdout.strip() else ""
+
+    if answer == "REACH":
+        return True
+    if answer == "NOPE":
+        return False
+    log.info("ssh.reach.undetermined", target=f"{target}:{port}", via=str(host.target))
+    return None
+
+
 def _text(value: Any) -> str:
     if value is None:
         return ""
