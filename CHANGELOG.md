@@ -1,6 +1,24 @@
 # CHANGELOG
 
 
+## v2.7.1 (2026-07-21)
+
+### Bug Fixes
+
+- **quiesce**: Tolerated a container removed mid-stop
+  ([`1787b6c`](https://github.com/bauer-group/IP-CoolifyMigration/commit/1787b6caa6bd4a9eeb199eb86c46f7684696ae62))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`4d9a130`](https://github.com/bauer-group/IP-CoolifyMigration/commit/4d9a13049e6f3974f0a5a2bb8ce8656d0b951d32))
+
+### Testing
+
+- **api**: Adjudicated the v4.2.0 tags drift
+  ([`b9e4bf7`](https://github.com/bauer-group/IP-CoolifyMigration/commit/b9e4bf7d2e2ba3f68b10ea6dab8ae4d6f889ce44))
+
+
 ## v2.7.0 (2026-07-21)
 
 ### Bug Fixes
