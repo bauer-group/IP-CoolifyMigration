@@ -304,7 +304,6 @@ class TestCreateTarget:
             return_value=httpx.Response(201, json={"uuid": "db2"})
         )
         respx_mock.get(f"{BASE}/databases/db1/envs").mock(return_value=httpx.Response(200, json=[]))
-        respx_mock.get(f"{BASE}/databases/db1/tags").mock(return_value=httpx.Response(200, json=[]))
 
         result = await steps.step_create_target(ctx)
         assert result["target_uuids"] == {"db1": "db2"}
@@ -314,15 +313,20 @@ class TestCreateTarget:
             r.detail.get("target_uuids") == {"db1": "db2"} for r in ctx.journal.read()
         )
 
-    async def test_source_tags_reach_the_create_body(
+    async def test_never_reads_the_main_only_tags_endpoint(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
-        """Tags are read separately and merged into the create.
+        """REGRESSION (2.5.6): create_target must not touch /tags.
 
-        GET /{collection}/{uuid} never carries them, and PATCH cannot set them —
-        so if they miss this body they are lost for good. Before tag support, a
-        tagged source migrated to an untagged target with nothing reported.
+        2.5.6 read it on the critical path, so every migration against a real
+        Coolify died at create_target with a 404 — the endpoint exists only on
+        unreleased `main`. The mock below is registered precisely so it can be
+        asserted UNUSED; an unmocked call would also fail, but silently as a
+        connection error rather than as this named regression.
         """
+        tags_route = respx_mock.get(f"{BASE}/databases/db1/tags").mock(
+            return_value=httpx.Response(404, json={"message": "Not found."})
+        )
         respx_mock.get(f"{BASE}/projects").mock(
             return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
         )
@@ -335,19 +339,14 @@ class TestCreateTarget:
         respx_mock.get(f"{BASE}/databases/db1").mock(
             return_value=httpx.Response(200, json={"uuid": "db1", "postgres_password": "s3cret"})
         )
-        respx_mock.get(f"{BASE}/databases/db1/tags").mock(
-            return_value=httpx.Response(
-                200, json=[{"uuid": "t1", "name": "prod"}, {"uuid": "t2", "name": "billing"}]
-            )
-        )
         respx_mock.get(f"{BASE}/databases/db1/envs").mock(return_value=httpx.Response(200, json=[]))
         route = respx_mock.post(f"{BASE}/databases/postgresql").mock(
             return_value=httpx.Response(201, json={"uuid": "db2"})
         )
 
         await steps.step_create_target(ctx)
-        body = json.loads(route.calls[0].request.read().decode())
-        assert body["tags"] == ["prod", "billing"]
+        assert not tags_route.called, "create_target read the main-only /tags endpoint"
+        assert "tags" not in json.loads(route.calls[0].request.read().decode())
 
 
 class TestDnsGate:

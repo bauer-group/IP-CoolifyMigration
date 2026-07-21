@@ -227,42 +227,6 @@ class TestEndpoints:
         result = await api.get_storages("applications", "u1")
         assert set(result) == {"persistent_storages", "file_storages"}
 
-    async def test_tag_names_projects_to_names(
-        self, api: CoolifyClient, respx_mock: respx.Router
-    ) -> None:
-        # Upstream returns full Tag objects; only `name` survives a move, because
-        # the target instance mints its own tag rows per team.
-        respx_mock.get(f"{BASE}/services/u1/tags").mock(
-            return_value=httpx.Response(
-                200,
-                json=[
-                    {"uuid": "t1", "name": "prod", "created_at": "x", "updated_at": "y"},
-                    {"uuid": "t2", "name": "billing", "created_at": "x", "updated_at": "y"},
-                ],
-            )
-        )
-        assert await api.get_tag_names("services", "u1") == ["prod", "billing"]
-
-    async def test_tag_names_drops_nameless_entries(
-        self, api: CoolifyClient, respx_mock: respx.Router
-    ) -> None:
-        # A null name forwarded into a create body 422s the WHOLE resource, not
-        # just the tag — upstream validates `tags.*` as string|min:2.
-        respx_mock.get(f"{BASE}/services/u1/tags").mock(
-            return_value=httpx.Response(
-                200, json=[{"uuid": "t1", "name": None}, {"uuid": "t2", "name": "keep"}, {}]
-            )
-        )
-        assert await api.get_tag_names("services", "u1") == ["keep"]
-
-    async def test_no_tags_is_an_empty_list_not_an_error(
-        self, api: CoolifyClient, respx_mock: respx.Router
-    ) -> None:
-        respx_mock.get(f"{BASE}/databases/u1/tags").mock(
-            return_value=httpx.Response(200, json=[])
-        )
-        assert await api.get_tag_names("databases", "u1") == []
-
     async def test_delete_passes_delete_volumes_flag(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:

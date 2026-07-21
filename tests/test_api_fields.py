@@ -136,11 +136,10 @@ class TestDatabaseFields:
     def test_each_engine_exposes_its_credential(self, engine: str, credential: str) -> None:
         assert credential in database_allowed(engine)
 
-    def test_tags_accepted_on_every_engine(self) -> None:
-        # Lives in DATABASE_COMMON, not the per-engine sets: all eight create
-        # routes carry it. Databases drifted together when upstream added it.
+    def test_tags_are_not_whitelisted_on_any_engine(self) -> None:
+        # REGRESSION (2.5.6). See TestServiceFields.test_tags_are_not_whitelisted.
         for engine in DATABASE_ENGINE_FIELDS:
-            assert "tags" in database_allowed(engine)
+            assert "tags" not in database_allowed(engine)
 
 
 class TestServiceFields:
@@ -175,16 +174,20 @@ class TestServiceFields:
         assert "server_uuid" not in SERVICE_UPDATE
         assert "project_uuid" not in SERVICE_UPDATE
 
-    def test_tags_are_settable_on_create_only(self) -> None:
-        """The exact inverse of connect_to_docker_network above.
+    def test_tags_are_not_whitelisted(self) -> None:
+        """REGRESSION (2.5.6): `tags` is real upstream, but only on `main`.
 
-        `tags` IS in the first $allowedFields (ServicesController:358) — the list
-        the extra-field rejection at :396 tests against — so create accepts it and
-        :561 attaches it. The PATCH list (:1173) omits it, so a service's tags must
-        ride along with the create or they cannot be set through the API at all.
+        It IS in ServicesController's create $allowedFields — read on the default
+        branch. Tag management merged 2026-07-07; the newest release, v4.1.2, is
+        from 2026-06-04. So on every Coolify an operator can actually install, a
+        create body carrying `tags` is a 422 on the whole resource.
+
+        Whitelists are transcribed from upstream source, which makes the branch
+        that source is read from part of the contract. Re-add only when a RELEASE
+        carries it — the drift canary now pins the latest release tag.
         """
-        assert "tags" in SERVICE_CREATE
-        assert "tags" in SERVICE_CREATE_CUSTOM_COMPOSE
+        assert "tags" not in SERVICE_CREATE
+        assert "tags" not in SERVICE_CREATE_CUSTOM_COMPOSE
         assert "tags" not in SERVICE_UPDATE
 
 
@@ -204,10 +207,9 @@ class TestApplicationFields:
         for field in ("server_uuid", "project_uuid", "destination_uuid", "environment_name"):
             assert field not in APPLICATION_UPDATE
 
-    def test_tags_accepted_on_create(self) -> None:
-        # All five create routes share one $allowedFields, so one assert covers
-        # public / private-github-app / private-deploy-key / dockerfile / dockerimage.
-        assert "tags" in APPLICATION_CREATE
+    def test_tags_are_not_whitelisted(self) -> None:
+        # REGRESSION (2.5.6). See TestServiceFields.test_tags_are_not_whitelisted.
+        assert "tags" not in APPLICATION_CREATE
 
     def test_git_routes_require_repository_and_branch(self) -> None:
         # This is the wall that makes a raw-YAML compose stack impossible to
