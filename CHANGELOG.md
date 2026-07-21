@@ -1,6 +1,40 @@
 # CHANGELOG
 
 
+## v2.6.0 (2026-07-21)
+
+### Bug Fixes
+
+- **api**: Reverted the main-only tag transfer
+  ([`8420d63`](https://github.com/bauer-group/IP-CoolifyMigration/commit/8420d635a6301908851432e539b0f4c6f8c3d87e))
+
+### Continuous Integration
+
+- **labeler**: Added the config actions/labeler requires
+  ([`e3a3339`](https://github.com/bauer-group/IP-CoolifyMigration/commit/e3a3339fe8e6744be3c46f3c5bc9cd2a6df75c88))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`5367c68`](https://github.com/bauer-group/IP-CoolifyMigration/commit/5367c68de3c02cac6d795da95026b81ba7895c27))
+
+- **api**: Recorded the adjudicated application settings gap
+  ([`ea32d97`](https://github.com/bauer-group/IP-CoolifyMigration/commit/ea32d97916fb3f47042be524ed49515f860c2bdd))
+
+- **api**: Recorded the settings gap as an accepted outcome
+  ([`6924df5`](https://github.com/bauer-group/IP-CoolifyMigration/commit/6924df5ff4f9c347c5a471c2e91584d9d2470929))
+
+### Features
+
+- **engine**: Recorded the Coolify version in preflight
+  ([`90de042`](https://github.com/bauer-group/IP-CoolifyMigration/commit/90de042f34f6f0a9dcd2ab48e49cd69070c942fe))
+
+### Testing
+
+- **api**: Pinned the drift canary to the newest release
+  ([`92e50ca`](https://github.com/bauer-group/IP-CoolifyMigration/commit/92e50caf4bbe870088a15439566350202d2337b9))
+
+
 ## v2.5.6 (2026-07-20)
 
 ### Bug Fixes
