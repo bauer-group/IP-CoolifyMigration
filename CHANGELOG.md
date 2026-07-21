@@ -1,6 +1,29 @@
 # CHANGELOG
 
 
+## v2.7.0 (2026-07-21)
+
+### Bug Fixes
+
+- **transfer**: Probed reachability with bash, not dash
+  ([`14a5252`](https://github.com/bauer-group/IP-CoolifyMigration/commit/14a52522867bc51377333d14fbd9f572212d2a83))
+
+### Chores
+
+- **ci**: Removed redundant teams notification
+  ([`43b8cf4`](https://github.com/bauer-group/IP-CoolifyMigration/commit/43b8cf46db4090f79c7f071b37c6302ec0b465a8))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`01ced27`](https://github.com/bauer-group/IP-CoolifyMigration/commit/01ced27e2945eb6d3821f46028bd265b276a11b3))
+
+### Features
+
+- **engine**: Checked the transfer endpoint before quiesce
+  ([`6f69b77`](https://github.com/bauer-group/IP-CoolifyMigration/commit/6f69b77b415938c94173553fa4cf0ca958d03e7e))
+
+
 ## v2.6.1 (2026-07-21)
 
 ### Documentation
