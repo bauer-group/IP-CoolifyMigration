@@ -214,6 +214,20 @@ class TestPairByMountPath:
         with pytest.raises(VolumePairingError, match="ambiguous source"):
             pair_by_mount_path(source, target)
 
+    def test_same_volume_shared_by_two_containers_is_not_ambiguous(self) -> None:
+        # A WordPress stack mounts one uploads volume into both nginx and php-fpm
+        # at the same path; docker inspect reports it once per container. That is a
+        # duplicate of one volume, not two volumes fighting over a path — it must
+        # collapse to a single pair, not raise.
+        source = [
+            VolumeEndpoint("uploads", "/var/www/html/wp-content/uploads"),
+            VolumeEndpoint("uploads", "/var/www/html/wp-content/uploads"),
+        ]
+        target = [VolumeEndpoint("new-uploads", "/var/www/html/wp-content/uploads")]
+        (pair,) = pair_by_mount_path(source, target)
+        assert pair.source.name == "uploads"
+        assert pair.target.name == "new-uploads"
+
     def test_ambiguous_target_refused(self) -> None:
         source = [VolumeEndpoint("a", "/data")]
         target = [VolumeEndpoint("x", "/data"), VolumeEndpoint("y", "/data")]

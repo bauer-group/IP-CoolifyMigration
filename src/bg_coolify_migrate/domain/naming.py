@@ -278,7 +278,11 @@ def pair_by_mount_path(
     src_index: dict[tuple[str, ...], VolumeEndpoint] = {}
     for ep in source:
         k = _key(ep, with_container=with_container)
-        if k in src_index:
+        # The SAME volume mounted into two containers at one path (e.g. nginx and
+        # php-fpm sharing a WordPress web root) reports once per container. That is
+        # a duplicate, not a conflict: it collapses to one copy job. Only a second
+        # *differently named* volume at the key is the ambiguity we must refuse.
+        if k in src_index and src_index[k].name != ep.name:
             raise VolumePairingError(
                 f"ambiguous source volumes: {src_index[k].name!r} and {ep.name!r} "
                 f"both mount at {ep.mount_path!r}"
@@ -290,7 +294,7 @@ def pair_by_mount_path(
     tgt_index: dict[tuple[str, ...], VolumeEndpoint] = {}
     for ep in target:
         k = _key(ep, with_container=with_container)
-        if k in tgt_index:
+        if k in tgt_index and tgt_index[k].name != ep.name:
             raise VolumePairingError(
                 f"ambiguous target volumes: {tgt_index[k].name!r} and {ep.name!r} "
                 f"both mount at {ep.mount_path!r}. Cannot pair safely."
