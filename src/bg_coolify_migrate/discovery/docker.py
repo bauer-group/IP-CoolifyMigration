@@ -44,6 +44,11 @@ LABEL_ENVIRONMENT = "coolify.environmentName"
 LABEL_RESOURCE = "coolify.resourceName"
 LABEL_PR_ID = "coolify.pullRequestId"
 
+#: Synthetic state for a container that `docker ps -a` listed but that was
+#: removed before we could inspect it. Not a docker state — docker's answer is
+#: "no such object". See :func:`inspect_state`.
+STATE_GONE = "gone"
+
 
 @dataclass(frozen=True, slots=True)
 class Container:
@@ -58,7 +63,15 @@ class Container:
 
     @property
     def is_stopped(self) -> bool:
-        return self.state in ("exited", "created", "dead")
+        """Not writing anything.
+
+        ``gone`` counts: a container that has been removed stopped first —
+        ``docker rm -f`` kills before it deletes — and a record that no longer
+        exists is not mounting a volume. Whether that stop was clean is a
+        separate question, and one only the event log can answer
+        (:func:`~bg_coolify_migrate.discovery.quiesce.killed_since`).
+        """
+        return self.state in ("exited", "created", "dead", STATE_GONE)
 
     @property
     def pull_request_id(self) -> int:
@@ -156,10 +169,25 @@ async def inspect_state(host: RemoteHost, container: str) -> tuple[str, int | No
 
     ``docker ps`` does not report the exit code, and we need it to distinguish a
     clean stop from a SIGKILL at the stop timeout.
+
+    Returns ``(STATE_GONE, None)`` if the container no longer exists. This is the
+    normal outcome, not an edge case: callers reach us from a ``docker ps -a``
+    listing, and Coolify's stop is ``docker stop`` followed by ``docker rm -f``
+    in a single invocation — so a container listed as ``exited`` one round-trip
+    ago is routinely deleted by the time we ask about it. Raising here aborted
+    migrations at the quiesce gate for the sole reason that the stop we asked for
+    had worked.
+
+    Any other failure still raises: a container that vanished and a daemon that
+    is not answering must not look alike.
     """
-    result = await host.run_checked(
+    result = await host.run(
         f"docker inspect --format '{{{{json .State}}}}' {shlex.quote(container)}"
     )
+    if not result.ok:
+        if "no such object" in (result.stderr + result.stdout).lower():
+            return STATE_GONE, None
+        result.check()
     try:
         state = json.loads(result.stdout.strip() or "{}")
     except json.JSONDecodeError:

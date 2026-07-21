@@ -13,6 +13,7 @@ import json
 import pytest
 
 from bg_coolify_migrate.discovery.docker import (
+    STATE_GONE,
     Container,
     _parse_labels,
     container_labels,
@@ -32,6 +33,7 @@ from bg_coolify_migrate.discovery.quiesce import (
     wait_until_stopped,
 )
 from bg_coolify_migrate.errors import QuiesceError
+from bg_coolify_migrate.transfer.ssh import SshError
 from tests.conftest import FakeHost
 
 
@@ -92,8 +94,10 @@ class TestListContainers:
 
 
 class TestContainerProperties:
-    @pytest.mark.parametrize("state", ["exited", "created", "dead"])
+    @pytest.mark.parametrize("state", ["exited", "created", "dead", STATE_GONE])
     def test_stopped_states(self, state: str) -> None:
+        # `gone` included: docker rm -f kills before it deletes, so a container
+        # that no longer exists stopped first — and is certainly not writing.
         assert Container(id="i", name="n", state=state, labels={}).is_stopped
 
     @pytest.mark.parametrize("state", ["running", "restarting", "paused"])
@@ -102,7 +106,9 @@ class TestContainerProperties:
 
     def test_preview_detection(self) -> None:
         base = Container(id="i", name="n", state="running", labels={"coolify.pullRequestId": "0"})
-        preview = Container(id="i", name="n", state="running", labels={"coolify.pullRequestId": "7"})
+        preview = Container(
+            id="i", name="n", state="running", labels={"coolify.pullRequestId": "7"}
+        )
         assert base.is_preview is False
         assert preview.is_preview is True
 
@@ -124,12 +130,39 @@ class TestContainerProperties:
 
 class TestInspect:
     async def test_state_and_exit_code(self, fake_host: FakeHost) -> None:
-        fake_host.on(r"docker inspect .*State", stdout=json.dumps({"Status": "exited", "ExitCode": 0}))
+        fake_host.on(
+            r"docker inspect .*State", stdout=json.dumps({"Status": "exited", "ExitCode": 0})
+        )
         assert await inspect_state(fake_host, "c1") == ("exited", 0)  # type: ignore[arg-type]
 
     async def test_state_unparseable(self, fake_host: FakeHost) -> None:
         fake_host.on(r"docker inspect .*State", stdout="nonsense")
         assert await inspect_state(fake_host, "c1") == ("unknown", None)  # type: ignore[arg-type]
+
+    async def test_removed_container_reports_gone(self, fake_host: FakeHost) -> None:
+        """A container deleted between `docker ps -a` and the inspect.
+
+        The normal case, not an edge case: Coolify's stop is `docker stop` then
+        `docker rm -f` in one invocation, so a container listed as exited one
+        round-trip ago is routinely already deleted. Raising here aborted the
+        migration at the quiesce gate because the stop we asked for had worked.
+        """
+        fake_host.on(
+            r"docker inspect .*State",
+            stderr="Error: No such object: 92a6dca14b5f",
+            exit_status=1,
+        )
+        assert await inspect_state(fake_host, "92a6dca14b5f") == (STATE_GONE, None)  # type: ignore[arg-type]
+
+    async def test_daemon_failure_still_raises(self, fake_host: FakeHost) -> None:
+        """A vanished container and an unreachable daemon must not look alike."""
+        fake_host.on(
+            r"docker inspect .*State",
+            stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+            exit_status=1,
+        )
+        with pytest.raises(SshError):
+            await inspect_state(fake_host, "c1")  # type: ignore[arg-type]
 
     async def test_mounts(self, fake_host: FakeHost) -> None:
         fake_host.on(
@@ -235,12 +268,16 @@ class TestPreviewGate:
     async def test_previews_block(self, fake_host: FakeHost) -> None:
         # Verified: POST /applications/{uuid}/stop does NOT stop previews
         # (StopApplication filters pullRequestId=0), so they keep writing.
-        fake_host.on(r"docker ps", stdout=_ps_line("web-pr-7", "running", "coolify.pullRequestId=7"))
+        fake_host.on(
+            r"docker ps", stdout=_ps_line("web-pr-7", "running", "coolify.pullRequestId=7")
+        )
         with pytest.raises(QuiesceError, match="preview deployment"):
             await assert_previews_absent(fake_host, label_filters=LABELS)  # type: ignore[arg-type]
 
     async def test_error_explains_why_and_how_to_fix(self, fake_host: FakeHost) -> None:
-        fake_host.on(r"docker ps", stdout=_ps_line("web-pr-7", "running", "coolify.pullRequestId=7"))
+        fake_host.on(
+            r"docker ps", stdout=_ps_line("web-pr-7", "running", "coolify.pullRequestId=7")
+        )
         with pytest.raises(QuiesceError) as exc:
             await assert_previews_absent(fake_host, label_filters=LABELS)  # type: ignore[arg-type]
         assert "pullRequestId=0" in str(exc.value)
@@ -289,6 +326,24 @@ class TestWaitUntilStopped:
         report = await wait_until_stopped(fake_host, label_filters=LABELS, timeout=1)  # type: ignore[arg-type]
         assert report.is_quiesced
 
+    async def test_container_removed_mid_snapshot_is_quiesced(self, fake_host: FakeHost) -> None:
+        """The failure that rolled back a real migration.
+
+        `docker ps -a` lists the stack, and Coolify's `docker rm -f` lands before
+        the per-container inspect. The gate must read that as "the stop worked",
+        not abort — the exit codes it costs us are recovered from the event log
+        by killed_since().
+        """
+        fake_host.on(r"docker ps", stdout=_ps_line("db", "exited"))
+        fake_host.on(
+            r"docker inspect",
+            stderr="Error: No such object: id-db",
+            exit_status=1,
+        )
+        report = await wait_until_stopped(fake_host, label_filters=LABELS, timeout=1)  # type: ignore[arg-type]
+        assert report.is_quiesced
+        assert not report.killed
+
 
 class TestAssertStillStopped:
     async def test_restart_during_copy_is_detected(self, fake_host: FakeHost) -> None:
@@ -303,7 +358,7 @@ class TestAssertStillStopped:
         with pytest.raises(QuiesceError, match="restarted during the copy"):
             await assert_still_stopped(fake_host, label_filters=LABELS, since=since)  # type: ignore[arg-type]
 
-    async def test_changed_container_set_is_detected(self, fake_host: FakeHost) -> None:
+    async def test_new_container_is_detected(self, fake_host: FakeHost) -> None:
         before = FakeHost()
         before.on(r"docker ps", stdout=_ps_line("db", "exited"))
         before.on(r"docker inspect", stdout=json.dumps({"Status": "exited", "ExitCode": 0}))
@@ -311,8 +366,25 @@ class TestAssertStillStopped:
 
         fake_host.on(r"docker ps", stdout=_ps_line("something-else", "exited"))
         fake_host.on(r"docker inspect", stdout=json.dumps({"Status": "exited", "ExitCode": 0}))
-        with pytest.raises(QuiesceError, match="set of containers changed"):
+        with pytest.raises(QuiesceError, match="appeared during the copy"):
             await assert_still_stopped(fake_host, label_filters=LABELS, since=since)  # type: ignore[arg-type]
+
+    async def test_disappearance_is_tolerated(self, fake_host: FakeHost) -> None:
+        """The copy's `before` snapshot can land inside Coolify's rm -f sweep.
+
+        Demanding set equality failed finished 2.5 GB transfers because containers
+        that were already dead finished being deleted. A container that is gone
+        cannot have written to a volume we were mirroring.
+        """
+        before = FakeHost()
+        before.on(
+            r"docker ps", stdout="\n".join([_ps_line("db", "exited"), _ps_line("app", "exited")])
+        )
+        before.on(r"docker inspect", stdout=json.dumps({"Status": "exited", "ExitCode": 0}))
+        since = await snapshot(before, label_filters=LABELS)  # type: ignore[arg-type]
+
+        fake_host.on(r"docker ps", stdout="")
+        await assert_still_stopped(fake_host, label_filters=LABELS, since=since)  # type: ignore[arg-type]
 
     async def test_unchanged_passes(self, fake_host: FakeHost) -> None:
         before = FakeHost()

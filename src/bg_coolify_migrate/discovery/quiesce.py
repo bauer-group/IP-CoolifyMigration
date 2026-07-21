@@ -87,6 +87,13 @@ async def snapshot(host: RemoteHost, *, label_filters: dict[str, str]) -> Quiesc
     ``docker ps`` does not report exit codes, so each stopped container is
     inspected individually — we must distinguish a clean shutdown from a SIGKILL
     at the stop timeout.
+
+    Listing and inspecting are two round-trips, and Coolify deletes containers as
+    it stops them, so a container can vanish in between. That is reported as
+    ``gone`` — stopped, exit code unknown — rather than raised, because it is the
+    signature of the stop having succeeded. The exit codes lost this way are
+    recovered from the event log by :func:`killed_since`, which exists for
+    exactly this reason.
     """
     containers = await list_containers(host, label_filters=label_filters)
     resolved: list[Container] = []
@@ -94,9 +101,7 @@ async def snapshot(host: RemoteHost, *, label_filters: dict[str, str]) -> Quiesc
         if c.is_stopped:
             state, exit_code = await inspect_state(host, c.id or c.name)
             resolved.append(
-                Container(
-                    id=c.id, name=c.name, state=state, labels=c.labels, exit_code=exit_code
-                )
+                Container(id=c.id, name=c.name, state=state, labels=c.labels, exit_code=exit_code)
             )
         else:
             resolved.append(c)
@@ -234,16 +239,32 @@ async def assert_still_stopped(
             ),
         )
 
+    # Only *new* containers are fatal, and the asymmetry is the point. `before`
+    # is taken at the start of the copy, which can still fall inside the tail of
+    # Coolify's `docker rm -f` sweep, so containers disappear between the two
+    # snapshots with nothing whatsoever wrong — demanding set equality threw away
+    # finished transfers over containers that were already dead. A container that
+    # is gone cannot have written to a volume we were mirroring; a container that
+    # was not there before and is there now may well have.
     before = {c.name for c in since.containers}
     after = {c.name for c in now.containers}
-    if before != after:
+
+    appeared = after - before
+    if appeared:
         raise QuiesceError(
-            "the set of containers changed during the copy",
+            f"container(s) appeared during the copy: {', '.join(sorted(appeared))}",
             hint=(
-                f"before: {sorted(before)}\nafter:  {sorted(after)}\n"
-                "The stack was modified mid-transfer; the copy cannot be trusted."
+                "Something started a container on this stack mid-transfer — a `restart:` "
+                "policy, or a deploy triggered from the dashboard. It may have written to "
+                "a volume we were mirroring, so the copy is a torn snapshot and must not "
+                "be trusted. The target's volumes will be dropped and the source restarted."
             ),
         )
+
+    disappeared = before - after
+    if disappeared:
+        log.info("quiesce.containers_removed", names=sorted(disappeared))
+
 
 #: Docker's SIGKILL exit code: 128 + SIGKILL(9).
 SIGKILL_EXIT = 137
