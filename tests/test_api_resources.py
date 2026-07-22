@@ -656,13 +656,13 @@ class TestCreateApplication:
 
 class TestPublicGitUrl:
     def test_short_form_becomes_a_github_url(self) -> None:
-        from bg_coolify_migrate.api.resources import _public_git_url
+        from bg_coolify_migrate.api.resources import public_git_url
 
-        assert _public_git_url("alam00000/bentopdf") == "https://github.com/alam00000/bentopdf"
-        assert _public_git_url("/owner/repo/") == "https://github.com/owner/repo"
+        assert public_git_url("alam00000/bentopdf") == "https://github.com/alam00000/bentopdf"
+        assert public_git_url("/owner/repo/") == "https://github.com/owner/repo"
 
     def test_a_real_url_is_left_untouched(self) -> None:
-        from bg_coolify_migrate.api.resources import _public_git_url
+        from bg_coolify_migrate.api.resources import public_git_url
 
         for url in (
             "https://github.com/o/r",
@@ -670,7 +670,7 @@ class TestPublicGitUrl:
             "git://example.com/o/r",
             "git@github.com:o/r.git",
         ):
-            assert _public_git_url(url) == url
+            assert public_git_url(url) == url
 
 
 class TestRemapDomains:

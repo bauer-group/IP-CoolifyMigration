@@ -262,7 +262,7 @@ async def create_service(
 _GIT_URL_PREFIXES = ("https://", "http://", "git://", "git@")
 
 
-def _public_git_url(git_repository: str) -> str:
+def public_git_url(git_repository: str) -> str:
     """A full git URL for the ``/applications/public`` route.
 
     Coolify stores a PUBLIC app's repo as the short ``owner/repo`` form: on create
@@ -484,7 +484,7 @@ async def create_application(
 
     # Public git apps come back short (owner/repo) but the public route needs a URL.
     if segment == "public" and body.get("git_repository"):
-        body["git_repository"] = _public_git_url(str(body["git_repository"]))
+        body["git_repository"] = public_git_url(str(body["git_repository"]))
 
     # Rewrite the URLs onto the TARGET rather than dropping or copying them.
     # Server-bound URLs (under the source server's wildcard) move to the target's

@@ -235,12 +235,28 @@ def reconcile(
 
     items: list[VolumeItem] = []
     warnings: list[str] = []
-    seen_paths: set[tuple[str, str]] = set()
     migrating_names: set[str] = set()
+    seen_volume_names: set[str] = set()
+    seen_bind_sources: set[str] = set()
 
     # 1. Docker inspect — the truth.
     for m in docker_mounts:
         mount_class, decision, reason = _classify_docker_mount(m)
+        # One item per payload, not per sighting. The same named volume mounted
+        # into a second container (nginx and php-fpm sharing a WordPress web
+        # root) — or at a second path — is the same bytes seen again, not a
+        # second copy job. Duplicates here cascade: N rows in the plan, an
+        # N-fold inflated total that the disk-headroom preflight then demands, and N
+        # pairing endpoints for one volume. First sighting wins; its mount_path
+        # is a live one, so pairing still works.
+        if m.type == "volume" and m.name:
+            if m.name in seen_volume_names:
+                continue
+            seen_volume_names.add(m.name)
+        elif m.type == "bind" and decision is Decision.MIGRATE:
+            if m.source in seen_bind_sources:
+                continue
+            seen_bind_sources.add(m.source)
         source_path = volume_data_path(m.name) if m.type == "volume" and m.name else m.source
         items.append(
             VolumeItem(
@@ -254,7 +270,6 @@ def reconcile(
                 discovered_from=frozenset({DiscoverySource.DOCKER_INSPECT}),
             )
         )
-        seen_paths.add((m.container, m.destination))
         if decision is Decision.MIGRATE and m.name:
             migrating_names.add(m.name)
 
@@ -269,6 +284,20 @@ def reconcile(
             )
         if s.mount_path in docker_paths:
             continue  # a live mount already covers it (step 1 is the truth)
+
+        # The volume is already migrating from a live mount, just at a DIFFERENT
+        # path than the API declares. That is a stale row — an older compose
+        # revision's mount point that Coolify never re-parsed — not extra data.
+        # A second item would copy the same volume twice and, worse, demand a
+        # target mount path the target's compose will never declare, which makes
+        # the pairing step refuse the whole migration.
+        if s.name and s.name in migrating_names:
+            warnings.append(
+                f"Coolify declares persistent storage {s.name!r} at {s.mount_path!r}, but "
+                "containers mount that volume elsewhere; the declared path looks stale and "
+                "the volume is migrated once, from its live mount"
+            )
+            continue
 
         # No container mounts it. But if Coolify DECLARES a persistent storage and
         # its docker volume actually EXISTS, that is data, not noise — migrate it.

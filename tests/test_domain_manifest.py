@@ -43,6 +43,68 @@ class TestNamedVolumes:
         assert len(manifest.to_migrate) == 2
 
 
+class TestSharedMounts:
+    """One item per payload, not per sighting.
+
+    The covalida WordPress stack: nginx and php-fpm both mount the web-root and
+    uploads volumes, and Coolify additionally declared uploads at a stale path.
+    Per-sighting items printed 7 plan rows for 4 payloads, inflated the total
+    (and with it the disk-headroom demand) by ~30%, and produced duplicate and
+    unsatisfiable pairing endpoints.
+    """
+
+    def test_same_volume_via_two_containers_is_one_item(self) -> None:
+        manifest = reconcile(
+            docker_mounts=[
+                _m(name="u1_app", destination="/var/www/html", container="nginx"),
+                _m(name="u1_app", destination="/var/www/html", container="php-fpm"),
+            ]
+        )
+        (item,) = manifest.to_migrate
+        assert item.source_name == "u1_app"
+
+    def test_same_volume_at_a_second_path_is_still_one_item(self) -> None:
+        # Same bytes seen through a different window — a second copy job would
+        # mirror the volume twice and demand a second target mount path.
+        manifest = reconcile(
+            docker_mounts=[
+                _m(name="u1_app", destination="/var/www/html", container="web"),
+                _m(name="u1_app", destination="/backup/source", container="backup"),
+            ]
+        )
+        (item,) = manifest.to_migrate
+        assert item.mount_path == "/var/www/html"  # first sighting wins
+
+    def test_distinct_volumes_are_not_collapsed(self) -> None:
+        manifest = reconcile(
+            docker_mounts=[
+                _m(name="u1_app", destination="/var/www/html"),
+                _m(name="u1_db", destination="/var/lib/mysql"),
+            ]
+        )
+        assert len(manifest.to_migrate) == 2
+
+    def test_bind_mount_shared_by_two_containers_is_one_item(self) -> None:
+        manifest = reconcile(
+            docker_mounts=[
+                _m(
+                    type="bind", source="/srv/shared", destination="/data", name=None, container="a"
+                ),
+                _m(
+                    type="bind", source="/srv/shared", destination="/data", name=None, container="b"
+                ),
+            ]
+        )
+        (item,) = manifest.to_migrate
+        assert item.source_path == "/srv/shared"
+
+    def test_shared_anonymous_volume_still_refuses_once(self) -> None:
+        # Dedup must not weaken the anonymous-volume refusal, only unclutter it.
+        manifest = reconcile(docker_mounts=[_m(name="a" * 64), _m(name="a" * 64, container="c2")])
+        assert manifest.is_blocked
+        assert len(manifest.refused) == 1
+
+
 class TestBindMounts:
     def test_bind_mount_is_migrated(self) -> None:
         # coolify-mover copies the DB row for a bind mount but never the data:
@@ -177,6 +239,24 @@ class TestApiCrossCheck:
         assert item.source_path == "/var/lib/docker/volumes/u1_data/_data"
         # and it is NOT also reported as an orphan
         assert manifest.warnings == ()
+
+    def test_declared_storage_for_an_already_migrating_volume_is_not_duplicated(self) -> None:
+        # covalida: Coolify declared `uploads` at /srv/uploads (an older compose
+        # revision) while the running containers mount the SAME volume at
+        # /var/www/html/wp-content/uploads. The stale row is not extra data — a
+        # second item would copy the volume twice and demand a target mount path
+        # the target's compose will never declare, refusing the whole migration.
+        manifest = reconcile(
+            docker_mounts=[_m(name="u1_uploads", destination="/var/www/html/wp-content/uploads")],
+            api_storages=[
+                ApiStorage(kind="persistent", name="u1_uploads", mount_path="/srv/uploads")
+            ],
+            docker_volumes=[DockerVolume(name="u1_uploads")],
+            uuid_prefixes=frozenset({"u1"}),
+        )
+        (item,) = manifest.to_migrate
+        assert item.mount_path == "/var/www/html/wp-content/uploads"
+        assert any("stale" in w for w in manifest.warnings)
 
     def test_declared_persistent_storage_without_a_volume_still_warns(self) -> None:
         # No volume on disk means nothing to migrate — keep the surfacing warning.

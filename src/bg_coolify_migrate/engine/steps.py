@@ -18,13 +18,14 @@ from typing import Any
 import structlog
 
 from bg_coolify_migrate.api import resources as api_resources
-from bg_coolify_migrate.api.resources import Placement
+from bg_coolify_migrate.api.resources import Placement, public_git_url
 from bg_coolify_migrate.discovery import docker, quiesce
 from bg_coolify_migrate.dns import extract as dns_extract
 from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.dns import wildcard as dns_wildcard
 from bg_coolify_migrate.dns.gate import Resolution, build_report, explain_why_blocking_matters
-from bg_coolify_migrate.domain.naming import VolumeEndpoint, pair_by_mount_path
+from bg_coolify_migrate.domain.kinds import GitAuth, ResourceKind
+from bg_coolify_migrate.domain.naming import VolumeEndpoint, VolumePairingError, pair_by_mount_path
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.engine import keys
 from bg_coolify_migrate.engine.context import MigrationContext, serialise_mounts
@@ -85,6 +86,8 @@ async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
         await rsync.ensure_installed(host, label=label)
         if not await host.which("docker"):
             raise PreflightError(f"docker is not installed on the {label} server")
+
+    await _assert_target_can_read_git(ctx)
 
     # Can the source actually REACH the endpoint rsync will dial? step_copy
     # resolves the same tuple, but it runs after quiesce — so a dead endpoint used
@@ -264,6 +267,61 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
     return {"target_uuids": created}
 
 
+async def _assert_target_can_read_git(ctx: MigrationContext) -> None:
+    """Prove the target's own shell can reach every public compose repo.
+
+    A dockercompose application's target gets its compose — and therefore its
+    volumes — from Coolify's LoadComposeFile job, which runs ``git ls-remote``
+    and a sparse clone ON the target server's shell (`Application::loadComposeFile`,
+    ``exec_in_docker: false``). Deploys clone inside the helper container, so a
+    server can deploy git apps for years while being unable to LOAD a compose:
+    no git binary, or no egress to the git host. That failure otherwise surfaces
+    only in DISCOVER, after the source is stopped — an outage plus a rollback for
+    something knowable before anything was touched.
+
+    Probes with the same command Coolify will run. Private repos are skipped —
+    the deploy key lives on the control plane and is not ours to borrow — and a
+    probe that cannot run (no ``timeout`` binary) does not block: a broken probe
+    is not evidence of a broken target.
+    """
+    for resource in ctx.plan.resources:
+        snapshot = resource.snapshot
+        if snapshot.kind is not ResourceKind.APP_GIT_COMPOSE:
+            continue
+        if snapshot.git_auth is not GitAuth.PUBLIC or not snapshot.git_repository:
+            log.debug("preflight.git_probe_skipped", resource=snapshot.name, reason="private auth")
+            continue
+
+        url = public_git_url(snapshot.git_repository)
+        probe = f"timeout 20 git ls-remote {shlex.quote(url)}"
+        result = await ctx.target_host.run(probe)
+        if result.ok:
+            log.info("preflight.git_reachable", resource=snapshot.name, url=url)
+            continue
+
+        stderr = result.stderr.strip().splitlines()
+        detail = stderr[-1][:200] if stderr else f"exit code {result.exit_status}"
+        if "timeout" in detail and "not found" in detail:
+            log.warning(
+                "preflight.git_probe_undetermined", resource=snapshot.name, detail=detail
+            )
+            continue
+
+        raise PreflightError(
+            f"{snapshot.name}: the target server cannot read {url}",
+            hint=(
+                "Coolify loads a dockercompose app's compose file by running git ON the "
+                "target server's own shell (LoadComposeFile) — unlike deploys, which clone "
+                "inside a helper container. Until that works, a target created there never "
+                "gets its volumes, and the migration would stop the source only to fail "
+                "in DISCOVER.\n"
+                f"{ctx.plan.target_server.name} said: {detail}\n"
+                "Install git on the target / allow egress to the git host, then re-run. "
+                "Nothing has been changed."
+            ),
+        )
+
+
 async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
     """Stop the whole stack and prove it, by asking the daemon.
 
@@ -288,7 +346,7 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
     # Capture the mounts while the containers still exist. Coolify's stop is
     # `docker stop` then `docker rm -f`, so this is the last moment anyone can
     # ask a container what it had mounted.
-    await _capture_mounts(ctx)
+    captured = await _capture_mounts(ctx)
 
     # The source's clock, not ours: it is the window for the event-log check
     # below, and a skewed workstation would silently shrink it.
@@ -322,9 +380,13 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
             ),
         )
 
+    # Counts come from the PRE-stop capture. The report cannot know them: a
+    # Coolify stop removes containers as it stops them, so the final snapshot is
+    # empty precisely when everything worked — it counted 0 for a 4-container
+    # stack and journalled that as what the migration stopped.
     return {
-        "containers_stopped": len(report.containers),
-        "container_names": sorted(c.name for c in report.containers),
+        "containers_stopped": sum(len(names) for names in captured.values()),
+        "container_names": sorted(n for names in captured.values() for n in names),
         "elapsed": round(report.elapsed, 1),
     }
 
@@ -354,8 +416,13 @@ async def _storages_or_none(
         return None
 
 
-async def _capture_mounts(ctx: MigrationContext) -> None:
+async def _capture_mounts(ctx: MigrationContext) -> dict[str, list[str]]:
     """Record every container mount before the stop erases the containers.
+
+    Returns the container names seen per resource uuid. They matter beyond
+    debugging: the post-stop report can only ever say how many containers are
+    LEFT (none, if the stop worked — Coolify removes them), so this capture is
+    the one honest answer to "what did we stop?".
 
     Coolify does not merely stop a stack, it removes it — `docker rm -f` in
     StopDatabase, StopApplication and StopService alike. So the post-stop
@@ -367,6 +434,7 @@ async def _capture_mounts(ctx: MigrationContext) -> None:
     label filter" look identical from here, and the difference is a migration
     that copies nothing and says it worked.
     """
+    captured: dict[str, list[str]] = {}
     for resource in ctx.plan.resources:
         snapshot = resource.snapshot
         containers = await resource_containers(
@@ -397,10 +465,12 @@ async def _capture_mounts(ctx: MigrationContext) -> None:
             # missing key (None) as a lost capture and aborts, but an empty list
             # correctly means "this resource had no mounts".
             ctx.pre_stop_mounts[snapshot.uuid] = []
+            captured[snapshot.uuid] = []
             log.info("quiesce.no_containers_no_volumes", resource=snapshot.name)
             continue
         mounts = await inspect_all_mounts(ctx.source_host, containers)
         ctx.pre_stop_mounts[snapshot.uuid] = mounts
+        captured[snapshot.uuid] = sorted(c.name for c in containers)
         log.info(
             "quiesce.mounts_captured",
             resource=snapshot.name,
@@ -416,6 +486,7 @@ async def _capture_mounts(ctx: MigrationContext) -> None:
         state="quiesce",
         detail={"pre_stop_mounts": serialise_mounts(ctx.pre_stop_mounts)},
     )
+    return captured
 
 
 async def _request_stop(ctx: MigrationContext) -> None:
@@ -474,6 +545,7 @@ async def _await_target_volumes(
     collection: str,
     target_uuid: str,
     expected: set[str],
+    compose_from_git: bool = False,
 ) -> list[VolumeEndpoint]:
     """Poll the target's declared volumes until they cover ``expected`` mount paths.
 
@@ -482,6 +554,14 @@ async def _await_target_volumes(
     can miss them. Returns as soon as every expected mount path is present, or the
     latest reading at timeout — the caller's unpaired-volume check then produces
     the precise, actionable error rather than a silent miss.
+
+    With ``compose_from_git`` (an APP_GIT_COMPOSE target), a timeout is
+    disambiguated before returning: the storages come from Coolify cloning the
+    repo ON the target server and parsing the compose, and when that job dies the
+    app's ``docker_compose_raw`` stays empty forever. That is not a race to wait
+    out but an infrastructure failure to name — so it raises here, with the
+    failing machinery in the message, instead of surfacing later as a pairing
+    refusal that reads like a compose mismatch.
     """
     deadline = ctx.settings.target_storage_timeout
     interval = 3.0
@@ -502,6 +582,23 @@ async def _await_target_volumes(
             expected=sorted(expected),
             seen=sorted(e.mount_path for e in endpoints),
         )
+        if compose_from_git:
+            target = await ctx.api.get_resource(collection, target_uuid)
+            if not target.get("docker_compose_raw"):
+                raise TransferError(
+                    f"the target application never loaded its compose from git "
+                    f"({round(waited)}s): its volumes cannot exist yet",
+                    hint=(
+                        "Coolify's LoadComposeFile job runs `git ls-remote` and a sparse "
+                        "clone ON THE TARGET SERVER'S own shell (not in a container) and "
+                        "creates the persistent storages from the parsed compose. An empty "
+                        "compose after this long means that job failed or never ran.\n"
+                        f"On {ctx.plan.target_server.name}, try: git ls-remote <repo url> — "
+                        "a missing git binary or blocked egress to the git host reproduces "
+                        "this exactly. Coolify's failed-jobs list has the original error.\n"
+                        "The source will be restarted and the target deleted."
+                    ),
+                )
     else:
         log.info("discover.target_volumes_ready", waited=round(waited, 1))
     return endpoints
@@ -567,28 +664,35 @@ async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
                 collection=snapshot.collection,
                 target_uuid=target_uuid,
                 expected={e.mount_path for e in source_eps},
+                compose_from_git=snapshot.kind is ResourceKind.APP_GIT_COMPOSE,
             )
         else:
             target_eps = await api_resources.read_volume_endpoints(
                 ctx.api, collection=snapshot.collection, uuid=target_uuid
             )
 
-        pairs = pair_by_mount_path(source_eps, target_eps) if source_eps else []
-        ctx.volume_pairs[snapshot.uuid] = pairs
-
-        # An unpaired source volume is data we were asked to move and did not.
-        # Silence here is what "migrated successfully, moved nothing" is made of.
-        unpaired = {e.name for e in source_eps} - {p.source.name for p in pairs}
-        if unpaired:
+        # pair_by_mount_path refuses ambiguity and unpaired volumes on either
+        # side — data left behind, or a target volume starting silently empty.
+        # Those refusals are diagnoses, not crashes: name both sides so the
+        # operator can see WHICH compose disagrees, instead of a raw traceback
+        # wrapped as "unexpected error in discover" (which is what this was).
+        try:
+            pairs = pair_by_mount_path(source_eps, target_eps) if source_eps else []
+        except VolumePairingError as exc:
             raise TransferError(
-                f"{snapshot.name}: no target volume matches {sorted(unpaired)}",
+                f"{snapshot.name}: {exc}",
                 hint=(
                     "Volumes are paired by mount_path, read back from what Coolify "
-                    "actually created on the target. A source volume with no partner "
-                    "would be left behind silently, so this stops instead.\n"
-                    f"Target volumes seen: {sorted(e.mount_path for e in target_eps)}"
+                    "actually created on the target — never predicted.\n"
+                    f"Source mounts: {sorted(e.mount_path for e in source_eps)}\n"
+                    f"Target declares: {sorted(e.mount_path for e in target_eps) or 'nothing'}\n"
+                    "A mismatch usually means the compose at the branch HEAD no longer "
+                    "matches what the source is running. The source will be restarted "
+                    "and the target deleted."
                 ),
-            )
+            ) from exc
+        ctx.volume_pairs[snapshot.uuid] = pairs
+
         pairs_recorded[snapshot.uuid] = [
             {"source": p.source.name, "target": p.target.name, "mount_path": p.source.mount_path}
             for p in pairs

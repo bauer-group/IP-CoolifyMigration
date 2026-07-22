@@ -185,9 +185,12 @@ async def wait_until_stopped(
             )
 
         if not report.running:
+            # `remaining`, not a stop count: a Coolify stop removes containers,
+            # so the daemon usually lists none by the time the gate opens. What
+            # was actually stopped is known only to the pre-stop capture.
             log.info(
                 "quiesce.ok",
-                containers=len(report.containers),
+                remaining=len(report.containers),
                 elapsed=round(elapsed, 1),
             )
             return report

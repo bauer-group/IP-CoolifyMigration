@@ -18,7 +18,7 @@ import respx
 from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.domain.compose import MountClass
 from bg_coolify_migrate.domain.drift import DriftAxis, DriftFinding, RebuildDriftReport, Severity
-from bg_coolify_migrate.domain.kinds import DatabaseEngine, ResourceKind
+from bg_coolify_migrate.domain.kinds import DatabaseEngine, GitAuth, ResourceKind
 from bg_coolify_migrate.domain.manifest import Decision, VolumeItem, VolumeManifest
 from bg_coolify_migrate.domain.naming import VolumeEndpoint, VolumePair
 from bg_coolify_migrate.domain.plan import (
@@ -36,6 +36,7 @@ from bg_coolify_migrate.errors import (
     DnsGateBlocked,
     PreflightError,
     RebuildDriftBlocked,
+    TransferError,
     VerificationError,
 )
 from bg_coolify_migrate.journal.store import Journal
@@ -86,6 +87,29 @@ def _plan(**kw: object) -> MigrationPlan:
         ),
     }
     return MigrationPlan(**{**base, **kw})  # type: ignore[arg-type]
+
+
+def _compose_plan(*, git_auth: GitAuth = GitAuth.PUBLIC) -> MigrationPlan:
+    """A public git-compose app — the covalida shape."""
+    return _plan(
+        resources=(
+            ResourcePlan(
+                snapshot=_snapshot(
+                    uuid="app1",
+                    name="wp",
+                    collection="applications",
+                    kind=ResourceKind.APP_GIT_COMPOSE,
+                    engine=None,
+                    image=None,
+                    git_repository="bauer-group/CS-WordPressStack",
+                    git_branch="main",
+                    git_auth=git_auth,
+                ),
+                strategy=Strategy.COPY_DATA,
+                manifest=_manifest(),
+            ),
+        )
+    )
 
 
 def _source_host(*, probe: str = "REACH") -> FakeHost:
@@ -166,10 +190,28 @@ class TestCaptureMounts:
                 ),
             )
         )
-        await _capture_mounts(ctx)  # no raise
+        captured = await _capture_mounts(ctx)  # no raise
         # An EXPLICIT empty capture (not a missing key), so DISCOVER does not treat
         # it as a lost capture and abort at the next step.
         assert ctx.pre_stop_mounts == {"db1": []}
+        assert captured == {"db1": []}
+
+    async def test_returns_the_container_names_it_captured(self, ctx: MigrationContext) -> None:
+        # QUIESCE's undo_info counted the FINAL snapshot's containers — always 0,
+        # because Coolify removes containers as it stops them. The pre-stop capture
+        # is the only honest answer to "what did we stop?", so it reports the names.
+        from bg_coolify_migrate.engine.steps import _capture_mounts
+
+        host = FakeHost()
+        host.on(
+            r"docker ps -a",
+            stdout='{"ID": "abc123", "Names": "db-abc123", "State": "running", "Labels": ""}',
+        )
+        host.on(r"docker inspect", stdout="[]")
+        ctx.source_host = host  # type: ignore[assignment]
+
+        captured = await _capture_mounts(ctx)
+        assert captured == {"db1": ["db-abc123"]}
 
     async def test_copy_is_a_noop_and_installs_no_key_without_volumes(
         self, ctx: MigrationContext
@@ -269,6 +311,83 @@ class TestPreflight:
         )
 
         await steps.step_preflight(ctx)  # must not raise
+
+    async def test_git_compose_target_that_cannot_read_the_repo_blocks(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """The check that would have saved the 2026-07-22 covalida run.
+
+        Coolify loads a dockercompose app's compose by running git ON the target
+        server's shell; when that fails, the target never gets its volumes and
+        DISCOVER fails 3 minutes after the source was stopped. Probing the same
+        command here turns an outage-plus-rollback into an error with the source
+        untouched.
+        """
+        respx_mock.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"private_key": "x"}])
+        )
+        ctx.plan = _compose_plan()
+        target = _target_host()
+        target.on(
+            r"timeout 20 git ls-remote",
+            exit_status=128,
+            stderr="fatal: unable to access 'https://github.com/...': Could not resolve host",
+        )
+        ctx.target_host = target  # type: ignore[assignment]
+
+        with pytest.raises(
+            PreflightError, match=re.escape("cannot read https://github.com/bauer-group")
+        ):
+            await steps.step_preflight(ctx)
+
+    async def test_a_target_without_git_blocks_with_the_shell_story(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        # Deploys clone inside the helper container, so a server can deploy git
+        # apps for years while LoadComposeFile — plain git on the host — fails.
+        respx_mock.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"private_key": "x"}])
+        )
+        ctx.plan = _compose_plan()
+        target = _target_host()
+        target.on(r"timeout 20 git ls-remote", exit_status=127, stderr="sh: 1: git: not found")
+        ctx.target_host = target  # type: ignore[assignment]
+
+        with pytest.raises(PreflightError, match="cannot read"):
+            await steps.step_preflight(ctx)
+
+    async def test_an_unrunnable_probe_does_not_block(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        # No `timeout` binary on the target: the probe cannot run, which is not
+        # evidence about the target's git. Same doctrine as the endpoint probe —
+        # a preflight that fails closed on its own blind spot causes the outages
+        # it exists to prevent.
+        respx_mock.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"private_key": "x"}])
+        )
+        ctx.plan = _compose_plan()
+        target = _target_host()
+        target.on(
+            r"timeout 20 git ls-remote", exit_status=127, stderr="sh: 1: timeout: not found"
+        )
+        ctx.target_host = target  # type: ignore[assignment]
+
+        await steps.step_preflight(ctx)  # must not raise
+
+    async def test_private_repos_are_not_probed(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        # The deploy key lives on the control plane and is not ours to borrow.
+        # FakeHost errors on an unstubbed command, so this passes only if no
+        # ls-remote was ever sent.
+        respx_mock.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"private_key": "x"}])
+        )
+        ctx.plan = _compose_plan(git_auth=GitAuth.DEPLOY_KEY)
+
+        await steps.step_preflight(ctx)  # must not raise
+        assert not any("ls-remote" in c for c in ctx.target_host.commands)  # type: ignore[attr-defined]
 
     async def test_records_the_coolify_version(
         self, ctx: MigrationContext, respx_mock: respx.Router
@@ -1049,6 +1168,103 @@ class TestAwaitTargetVolumes:
             ctx, collection="applications", target_uuid="t", expected={"/var/globaleaks"}
         )
         assert eps == []
+
+    async def test_timeout_with_an_unloaded_compose_names_the_real_failure(
+        self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The covalida 2026-07-22 run: seen=[] after 180s, then a raw traceback.
+
+        An APP_GIT_COMPOSE target whose docker_compose_raw is STILL empty at
+        timeout never ran LoadComposeFile — an infrastructure failure on the
+        target server, not a compose mismatch. Name it, instead of letting the
+        pairing step refuse with a story about differing composes.
+        """
+        object.__setattr__(ctx.settings, "target_storage_timeout", 0.0)
+
+        async def fake_read(api, *, collection, uuid):  # type: ignore[no-untyped-def]
+            return []
+
+        monkeypatch.setattr("bg_coolify_migrate.api.resources.read_volume_endpoints", fake_read)
+        respx_mock.get(f"{BASE}/applications/t").mock(
+            return_value=httpx.Response(200, json={"uuid": "t", "docker_compose_raw": None})
+        )
+
+        with pytest.raises(TransferError, match="never loaded its compose from git"):
+            await steps._await_target_volumes(
+                ctx,
+                collection="applications",
+                target_uuid="t",
+                expected={"/var/www/html"},
+                compose_from_git=True,
+            )
+
+    async def test_timeout_with_a_loaded_compose_defers_to_the_pairing_error(
+        self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The compose DID load but declares different volumes: genuine drift
+        # between what the source runs and the branch HEAD. That diagnosis
+        # belongs to the pairing step, which sees both sides — so return.
+        object.__setattr__(ctx.settings, "target_storage_timeout", 0.0)
+
+        async def fake_read(api, *, collection, uuid):  # type: ignore[no-untyped-def]
+            return []
+
+        monkeypatch.setattr("bg_coolify_migrate.api.resources.read_volume_endpoints", fake_read)
+        respx_mock.get(f"{BASE}/applications/t").mock(
+            return_value=httpx.Response(
+                200, json={"uuid": "t", "docker_compose_raw": "services: {}"}
+            )
+        )
+
+        eps = await steps._await_target_volumes(
+            ctx,
+            collection="applications",
+            target_uuid="t",
+            expected={"/var/www/html"},
+            compose_from_git=True,
+        )
+        assert eps == []
+
+
+class TestDiscoverPairing:
+    """A pairing refusal is a diagnosis, not a crash.
+
+    VolumePairingError is a ValueError; unwrapped it crashed the saga as
+    "unexpected error in discover" with a full traceback — which is exactly how
+    the covalida run reported a knowable condition.
+    """
+
+    async def test_unpairable_volumes_raise_a_transfer_error_with_both_sides(
+        self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from bg_coolify_migrate.domain.manifest import DockerMount
+
+        ctx.target_uuids = {"db1": "tgt1"}
+        ctx.pre_stop_mounts = {
+            "db1": [
+                DockerMount(
+                    container="c1",
+                    type="volume",
+                    name="postgres-data-db1",
+                    destination="/var/lib/postgresql/data",
+                )
+            ]
+        }
+        object.__setattr__(ctx.settings, "target_storage_timeout", 0.0)
+
+        async def fake_manifest(host, *, mounts, api_storages, uuid, measure):  # type: ignore[no-untyped-def]
+            return _manifest()
+
+        async def fake_read(api, *, collection, uuid):  # type: ignore[no-untyped-def]
+            return []  # the target declares nothing
+
+        monkeypatch.setattr(steps, "build_manifest", fake_manifest)
+        monkeypatch.setattr("bg_coolify_migrate.api.resources.read_volume_endpoints", fake_read)
+
+        with pytest.raises(TransferError, match="no counterpart on the target") as exc_info:
+            await steps.step_discover(ctx)
+        # The operator gets both sides, not a traceback.
+        assert "/var/lib/postgresql/data" in (exc_info.value.hint or "")
 
 
 class TestUndoParkedDomains:
