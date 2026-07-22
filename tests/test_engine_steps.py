@@ -89,7 +89,9 @@ def _plan(**kw: object) -> MigrationPlan:
     return MigrationPlan(**{**base, **kw})  # type: ignore[arg-type]
 
 
-def _compose_plan(*, git_auth: GitAuth = GitAuth.PUBLIC) -> MigrationPlan:
+def _compose_plan(
+    *, git_auth: GitAuth = GitAuth.PUBLIC, manifest: VolumeManifest | None = None
+) -> MigrationPlan:
     """A public git-compose app — the covalida shape."""
     return _plan(
         resources=(
@@ -106,9 +108,55 @@ def _compose_plan(*, git_auth: GitAuth = GitAuth.PUBLIC) -> MigrationPlan:
                     git_auth=git_auth,
                 ),
                 strategy=Strategy.COPY_DATA,
-                manifest=_manifest(),
+                manifest=manifest if manifest is not None else _manifest(),
             ),
         )
+    )
+
+
+def _compose_manifest() -> VolumeManifest:
+    return VolumeManifest(
+        items=(
+            VolumeItem(
+                mount_class=MountClass.NAMED,
+                decision=Decision.MIGRATE,
+                reason="named volume",
+                source_name="app1_app",
+                source_path="/var/lib/docker/volumes/app1_app/_data",
+                mount_path="/var/www/html",
+                bytes=1024,
+            ),
+        )
+    )
+
+
+def _mock_compose_create_routes(respx_mock: respx.Router) -> None:
+    """Everything CREATE needs up to (not including) the compose-adoption gate."""
+    respx_mock.get(f"{BASE}/projects").mock(
+        return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+    )
+    respx_mock.get(f"{BASE}/projects/p1").mock(
+        return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+    )
+    respx_mock.get(f"{BASE}/servers/s2").mock(
+        return_value=httpx.Response(200, json={"uuid": "s2", "destinations": [{"uuid": "d1"}]})
+    )
+    respx_mock.get(f"{BASE}/applications/app1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "uuid": "app1",
+                "git_repository": "bauer-group/CS-WordPressStack",
+                "git_branch": "main",
+                "build_pack": "dockercompose",
+            },
+        )
+    )
+    respx_mock.post(f"{BASE}/applications/public").mock(
+        return_value=httpx.Response(201, json={"uuid": "tgt1"})
+    )
+    respx_mock.get(f"{BASE}/applications/app1/envs").mock(
+        return_value=httpx.Response(200, json=[])
     )
 
 
@@ -534,6 +582,75 @@ class TestCreateTarget:
         assert any(
             r.detail.get("target_uuids") == {"db1": "db2"} for r in ctx.journal.read()
         )
+
+    async def test_compose_target_waits_for_its_compose_before_quiesce(
+        self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Git access is verified through Coolify's OWN machinery, every auth mode.
+
+        LoadComposeFile clones on the target with Coolify's credentials; CREATE
+        waits for its outcome (raw saved, storages parsed) while the source is
+        still serving. This is what replaces borrowing keys for private repos.
+        """
+        ctx.plan = _compose_plan(manifest=_compose_manifest())
+        _mock_compose_create_routes(respx_mock)
+        respx_mock.get(f"{BASE}/applications/tgt1").mock(
+            side_effect=[
+                httpx.Response(200, json={"uuid": "tgt1", "docker_compose_raw": None}),
+                httpx.Response(200, json={"uuid": "tgt1", "docker_compose_raw": "services: {}"}),
+            ]
+        )
+        respx_mock.get(f"{BASE}/applications/tgt1/storages").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "persistent_storages": [{"name": "tgt1_app", "mount_path": "/var/www/html"}]
+                },
+            )
+        )
+
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(steps.asyncio, "sleep", no_sleep)
+
+        result = await steps.step_create_target(ctx)
+        assert result["target_uuids"] == {"app1": "tgt1"}
+
+    async def test_compose_target_that_never_loads_fails_with_zero_downtime(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        # The covalida failure, moved to where it belongs: BEFORE the stop.
+        object.__setattr__(ctx.settings, "target_storage_timeout", 0.0)
+        ctx.plan = _compose_plan(manifest=_compose_manifest())
+        _mock_compose_create_routes(respx_mock)
+        respx_mock.get(f"{BASE}/applications/tgt1").mock(
+            return_value=httpx.Response(200, json={"uuid": "tgt1", "docker_compose_raw": None})
+        )
+
+        with pytest.raises(TransferError, match="never loaded its compose") as exc_info:
+            await steps.step_create_target(ctx)
+        assert "never stopped" in (exc_info.value.hint or "")
+
+    async def test_compose_drift_in_volumes_fails_before_the_stop(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        # The compose loaded, but HEAD no longer mounts a volume where the
+        # running source does. DISCOVER caught this only after the outage began.
+        object.__setattr__(ctx.settings, "target_storage_timeout", 0.0)
+        ctx.plan = _compose_plan(manifest=_compose_manifest())
+        _mock_compose_create_routes(respx_mock)
+        respx_mock.get(f"{BASE}/applications/tgt1").mock(
+            return_value=httpx.Response(
+                200, json={"uuid": "tgt1", "docker_compose_raw": "services: {}"}
+            )
+        )
+        respx_mock.get(f"{BASE}/applications/tgt1/storages").mock(
+            return_value=httpx.Response(200, json={"persistent_storages": []})
+        )
+
+        with pytest.raises(TransferError, match="declares no volume at"):
+            await steps.step_create_target(ctx)
 
     async def test_never_reads_the_main_only_tags_endpoint(
         self, ctx: MigrationContext, respx_mock: respx.Router

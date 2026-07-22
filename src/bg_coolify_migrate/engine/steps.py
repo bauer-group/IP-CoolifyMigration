@@ -26,6 +26,7 @@ from bg_coolify_migrate.dns import wildcard as dns_wildcard
 from bg_coolify_migrate.dns.gate import Resolution, build_report, explain_why_blocking_matters
 from bg_coolify_migrate.domain.kinds import GitAuth, ResourceKind
 from bg_coolify_migrate.domain.naming import VolumeEndpoint, VolumePairingError, pair_by_mount_path
+from bg_coolify_migrate.domain.plan import ResourcePlan
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.engine import keys
 from bg_coolify_migrate.engine.context import MigrationContext, serialise_mounts
@@ -264,7 +265,85 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
             kind=snapshot.kind,
         )
 
+        # STILL inside CREATE, deliberately: the next step stops the source.
+        if snapshot.kind is ResourceKind.APP_GIT_COMPOSE:
+            await _assert_compose_target_ready(ctx, resource, target_uuid=target_uuid)
+
     return {"target_uuids": created}
+
+
+async def _assert_compose_target_ready(
+    ctx: MigrationContext, resource: ResourcePlan, *, target_uuid: str
+) -> None:
+    """Gate CREATE on the target having actually adopted its compose.
+
+    This is how git access is verified for EVERY auth mode, private repos
+    included: not by borrowing credentials — the deploy key lives on the control
+    plane and is not ours — but by waiting for Coolify's own LoadComposeFile,
+    which clones on the target server with Coolify's own key/GitHub App. Not a
+    probe of the machinery; the machinery itself, observed.
+
+    Runs BEFORE quiesce, deliberately. Waiting until DISCOVER meant the same
+    refusal cost a production stop plus a rollback (covalida, 2026-07-22); here
+    the source is still serving, and a failure deletes the target and un-parks
+    the domains with zero downtime.
+
+    Two gates, in order:
+
+    1. ``docker_compose_raw`` is non-empty — the job cloned and saved it.
+    2. The declared storages cover every mount path the plan migrates — the
+       parse ran, and the compose at HEAD still declares the volumes the source
+       is running (drift surfaces HERE, not after the stop). DISCOVER re-checks
+       against the post-stop capture, which stays authoritative.
+    """
+    snapshot = resource.snapshot
+    deadline = ctx.settings.target_storage_timeout
+    interval = 3.0
+    waited = 0.0
+    while True:
+        target = await ctx.api.get_resource(snapshot.collection, target_uuid)
+        if target.get("docker_compose_raw"):
+            break
+        if waited >= deadline:
+            raise TransferError(
+                f"{snapshot.name}: the target never loaded its compose from git "
+                f"({round(waited)}s)",
+                hint=(
+                    "Coolify's LoadComposeFile job runs `git ls-remote` and a sparse "
+                    "clone ON THE TARGET SERVER'S own shell, with Coolify's own "
+                    "credentials. An empty compose after this long means that job "
+                    "failed or never ran — a missing git binary or blocked egress to "
+                    "the git host reproduces this exactly.\n"
+                    f"Try on {ctx.plan.target_server.name}: git ls-remote <repo url>. "
+                    "Coolify's failed-jobs list has the original error.\n"
+                    "The source was never stopped and keeps serving; the created "
+                    "target will be deleted."
+                ),
+            )
+        await asyncio.sleep(interval)
+        waited += interval
+    log.info("create.compose_loaded", resource=snapshot.name, waited=round(waited, 1))
+
+    expected = {i.mount_path for i in resource.manifest.to_migrate if i.source_name}
+    if not expected:
+        return
+    endpoints = await _await_target_volumes(
+        ctx, collection=snapshot.collection, target_uuid=target_uuid, expected=expected
+    )
+    missing = expected - {e.mount_path for e in endpoints}
+    if missing:
+        raise TransferError(
+            f"{snapshot.name}: the target's compose declares no volume at "
+            f"{sorted(missing)}",
+            hint=(
+                "The compose Coolify just loaded from the branch HEAD does not mount "
+                "volumes where the running source does — it has drifted since the "
+                "source was deployed. Migrating would leave that data behind, so this "
+                "stops while the source is still running.\n"
+                f"Target declares: {sorted(e.mount_path for e in endpoints) or 'nothing'}\n"
+                "The source was never stopped; the created target will be deleted."
+            ),
+        )
 
 
 async def _assert_target_can_read_git(ctx: MigrationContext) -> None:
