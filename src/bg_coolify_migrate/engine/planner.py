@@ -448,7 +448,7 @@ async def _resolve_git_auth(
     a create-request field. This tool used to read the create field off the GET,
     found nothing, and classified every GitHub-App-backed application as PUBLIC —
     so the target was created credential-less and its LoadComposeFile died asking
-    for a Username (covalida, 2026-07-22, twice). The ids are mapped to the uuids
+    for a Username (2026-07-22, twice). The ids are mapped to the uuids
     the create routes want via /github-apps and /security/keys; an unmappable id
     is an ERROR, never a fall-back to public, because silently-public is exactly
     the failure being prevented.

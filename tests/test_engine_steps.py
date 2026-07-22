@@ -92,7 +92,7 @@ def _plan(**kw: object) -> MigrationPlan:
 def _compose_plan(
     *, git_auth: GitAuth = GitAuth.PUBLIC, manifest: VolumeManifest | None = None
 ) -> MigrationPlan:
-    """A public git-compose app — the covalida shape."""
+    """A public git-compose app — the shape behind the 2026-07-22 failures."""
     return _plan(
         resources=(
             ResourcePlan(
@@ -103,7 +103,7 @@ def _compose_plan(
                     kind=ResourceKind.APP_GIT_COMPOSE,
                     engine=None,
                     image=None,
-                    git_repository="bauer-group/CS-WordPressStack",
+                    git_repository="acme/wordpress-stack",
                     git_branch="main",
                     git_auth=git_auth,
                 ),
@@ -146,7 +146,7 @@ def _mock_compose_create_routes(respx_mock: respx.Router) -> None:
             200,
             json={
                 "uuid": "app1",
-                "git_repository": "bauer-group/CS-WordPressStack",
+                "git_repository": "acme/wordpress-stack",
                 "git_branch": "main",
                 "build_pack": "dockercompose",
             },
@@ -363,7 +363,7 @@ class TestPreflight:
     async def test_git_compose_target_that_cannot_read_the_repo_blocks(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
-        """The check that would have saved the 2026-07-22 covalida run.
+        """The check that would have saved the 2026-07-22 run.
 
         Coolify loads a dockercompose app's compose by running git ON the target
         server's shell; when that fails, the target never gets its volumes and
@@ -384,7 +384,7 @@ class TestPreflight:
         ctx.target_host = target  # type: ignore[assignment]
 
         with pytest.raises(
-            PreflightError, match=re.escape("cannot read https://github.com/bauer-group")
+            PreflightError, match=re.escape("cannot read https://github.com/acme")
         ):
             await steps.step_preflight(ctx)
 
@@ -407,7 +407,7 @@ class TestPreflight:
     async def test_a_private_repo_behind_a_public_source_names_the_right_knob(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
-        """covalida, second run: git and egress were fine — the repo had gone
+        """Second run, 2026-07-22: git and egress were fine — the repo had gone
         private while the app's source stayed public. The install-git hint sent
         the operator to the wrong knob; an auth refusal must name the real one."""
         respx_mock.get(f"{BASE}/security/keys").mock(
@@ -645,7 +645,7 @@ class TestCreateTarget:
     async def test_compose_target_that_never_loads_fails_with_zero_downtime(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
-        # The covalida failure, moved to where it belongs: BEFORE the stop.
+        # The 2026-07-22 failure, moved to where it belongs: BEFORE the stop.
         object.__setattr__(ctx.settings, "target_storage_timeout", 0.0)
         ctx.plan = _compose_plan(manifest=_compose_manifest())
         _mock_compose_create_routes(respx_mock)
@@ -1314,7 +1314,7 @@ class TestAwaitTargetVolumes:
     async def test_timeout_with_an_unloaded_compose_names_the_real_failure(
         self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The covalida 2026-07-22 run: seen=[] after 180s, then a raw traceback.
+        """The 2026-07-22 run: seen=[] after 180s, then a raw traceback.
 
         An APP_GIT_COMPOSE target whose docker_compose_raw is STILL empty at
         timeout never ran LoadComposeFile — an infrastructure failure on the
@@ -1373,7 +1373,7 @@ class TestDiscoverPairing:
 
     VolumePairingError is a ValueError; unwrapped it crashed the saga as
     "unexpected error in discover" with a full traceback — which is exactly how
-    the covalida run reported a knowable condition.
+    the 2026-07-22 run reported a knowable condition.
     """
 
     async def test_unpairable_volumes_raise_a_transfer_error_with_both_sides(

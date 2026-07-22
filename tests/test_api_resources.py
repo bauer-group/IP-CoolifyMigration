@@ -349,7 +349,7 @@ class TestCreateApplication:
     async def test_github_app_snapshot_creates_via_the_private_route(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
-        """covalida regression: a GitHub-App-backed app must NOT become public.
+        """Regression: a GitHub-App-backed app must NOT become public.
 
         The planner resolves source_id -> github_app_uuid; create must send it
         on the private-github-app route, or the target is created without
@@ -365,7 +365,7 @@ class TestCreateApplication:
             name="wp",
             collection="applications",
             kind=ResourceKind.APP_GIT_COMPOSE,
-            git_repository="bauer-group/CS-WordPressStack",
+            git_repository="acme/wordpress-stack",
             git_branch="main",
             git_auth=GitAuth.GITHUB_APP,
             github_app_uuid="gh-uuid",
@@ -375,7 +375,7 @@ class TestCreateApplication:
             snapshot,
             _placement(),
             {
-                "git_repository": "bauer-group/CS-WordPressStack",
+                "git_repository": "acme/wordpress-stack",
                 "git_branch": "main",
                 "build_pack": "dockercompose",
             },
@@ -384,7 +384,7 @@ class TestCreateApplication:
         assert body["github_app_uuid"] == "gh-uuid"
         # The short owner/repo form is what the private route accepts — no URL
         # expansion, which is public-route-only behaviour.
-        assert body["git_repository"] == "bauer-group/CS-WordPressStack"
+        assert body["git_repository"] == "acme/wordpress-stack"
 
     async def test_deploy_key_snapshot_sends_the_resolved_key_uuid(
         self, api: CoolifyClient, respx_mock: respx.Router

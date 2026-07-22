@@ -284,7 +284,7 @@ async def _assert_compose_target_ready(
     probe of the machinery; the machinery itself, observed.
 
     Runs BEFORE quiesce, deliberately. Waiting until DISCOVER meant the same
-    refusal cost a production stop plus a rollback (covalida, 2026-07-22); here
+    refusal cost a production stop plus a rollback (2026-07-22); here
     the source is still serving, and a failure deletes the target and un-parks
     the domains with zero downtime.
 
@@ -390,7 +390,7 @@ async def _assert_target_can_read_git(ctx: MigrationContext) -> None:
         # for a Username means the host and the network are FINE — the repo is
         # private while the app is treated as public. That app survives on its
         # cached compose; a fresh target has no cache and can never load one.
-        # (covalida, 2026-07-22: this stderr surfaced the real bug — the planner
+        # (2026-07-22: this stderr surfaced the real bug — the planner
         # misread the GET's absent `github_app_uuid` as 'public' for a
         # GitHub-App-backed app. The classifier is fixed; this branch remains
         # for apps whose source genuinely is public while the repo is not.)

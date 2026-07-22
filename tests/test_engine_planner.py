@@ -228,7 +228,7 @@ class TestBuildPlanProjectName:
 # and NEVER github_app_uuid, which is a create-request field. Reading the
 # create field off the GET classified every GitHub-App-backed application as
 # PUBLIC, so its target was created credential-less and LoadComposeFile died
-# asking for a Username (covalida, 2026-07-22, both runs).
+# asking for a Username (2026-07-22, both runs).
 
 
 class _Api:
@@ -259,7 +259,7 @@ class TestResolveGitAuth:
             api,  # type: ignore[arg-type]
             {
                 "name": "wp",
-                "git_repository": "bauer-group/CS-WordPressStack",
+                "git_repository": "acme/wordpress-stack",
                 "source_type": r"App\Models\GithubApp",
                 "source_id": 5,
                 "private_key_id": None,

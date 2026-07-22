@@ -46,7 +46,7 @@ class TestNamedVolumes:
 class TestSharedMounts:
     """One item per payload, not per sighting.
 
-    The covalida WordPress stack: nginx and php-fpm both mount the web-root and
+    A WordPress stack: nginx and php-fpm both mount the web-root and
     uploads volumes, and Coolify additionally declared uploads at a stale path.
     Per-sighting items printed 7 plan rows for 4 payloads, inflated the total
     (and with it the disk-headroom demand) by ~30%, and produced duplicate and
@@ -241,7 +241,7 @@ class TestApiCrossCheck:
         assert manifest.warnings == ()
 
     def test_declared_storage_for_an_already_migrating_volume_is_not_duplicated(self) -> None:
-        # covalida: Coolify declared `uploads` at /srv/uploads (an older compose
+        # Seen in the wild: Coolify declared `uploads` at /srv/uploads (an older compose
         # revision) while the running containers mount the SAME volume at
         # /var/www/html/wp-content/uploads. The stale row is not extra data — a
         # second item would copy the volume twice and demand a target mount path
