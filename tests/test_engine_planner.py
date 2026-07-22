@@ -6,7 +6,7 @@ which is why they are worth table-driven tests rather than a passing glance.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -221,3 +221,140 @@ class TestBuildPlanProjectName:
         # The label filter must slugify the NAME, never the uuid.
         assert captured["project"] == "01. BAUER GROUP - Prod"
         assert captured["environment"] == "production"
+
+
+# ── _resolve_git_auth ────────────────────────────────────────────────────────
+# The GET serialises the raw columns — source_type/source_id/private_key_id —
+# and NEVER github_app_uuid, which is a create-request field. Reading the
+# create field off the GET classified every GitHub-App-backed application as
+# PUBLIC, so its target was created credential-less and LoadComposeFile died
+# asking for a Username (covalida, 2026-07-22, both runs).
+
+
+class _Api:
+    """Answers canned GETs; any other path is an assertion failure."""
+
+    _PATHS: ClassVar[dict[str, str]] = {
+        "github_apps": "/github-apps",
+        "security_keys": "/security/keys",
+    }
+
+    def __init__(self, **routes: Any) -> None:
+        self.routes = {self._PATHS[k]: v for k, v in routes.items()}
+        self.calls: list[str] = []
+
+    async def get(self, path: str) -> Any:
+        self.calls.append(path)
+        if path not in self.routes:
+            raise AssertionError(f"unexpected GET {path}")
+        return self.routes[path]
+
+
+class TestResolveGitAuth:
+    async def test_github_app_source_resolves_to_its_uuid(self) -> None:
+        from bg_coolify_migrate.engine.planner import _resolve_git_auth
+
+        api = _Api(github_apps=[{"id": 5, "uuid": "gh-uuid", "is_public": False}])
+        gh, pk = await _resolve_git_auth(
+            api,  # type: ignore[arg-type]
+            {
+                "name": "wp",
+                "git_repository": "bauer-group/CS-WordPressStack",
+                "source_type": r"App\Models\GithubApp",
+                "source_id": 5,
+                "private_key_id": None,
+            },
+        )
+        assert (gh, pk) == ("gh-uuid", None)
+
+    async def test_the_seeded_public_source_stays_public(self) -> None:
+        # Coolify's "Public GitHub" source is itself a GithubApp row; passing its
+        # uuid to the private route would be pointless indirection.
+        from bg_coolify_migrate.engine.planner import _resolve_git_auth
+
+        api = _Api(github_apps=[{"id": 0, "uuid": "pub", "is_public": True}])
+        gh, pk = await _resolve_git_auth(
+            api,  # type: ignore[arg-type]
+            {
+                "git_repository": "x/y",
+                "source_type": r"App\Models\GithubApp",
+                "source_id": 0,
+            },
+        )
+        assert (gh, pk) == (None, None)
+
+    async def test_a_real_deploy_key_beats_the_source(self) -> None:
+        # Transcribed from Application::deploymentType(): private_key_id > 0 wins.
+        from bg_coolify_migrate.engine.planner import _resolve_git_auth
+
+        api = _Api(security_keys=[{"id": 3, "uuid": "key-uuid"}])
+        gh, pk = await _resolve_git_auth(
+            api,  # type: ignore[arg-type]
+            {
+                "git_repository": "x/y",
+                "source_type": r"App\Models\GithubApp",
+                "source_id": 5,
+                "private_key_id": 3,
+            },
+        )
+        assert (gh, pk) == (None, "key-uuid")
+        assert api.calls == ["/security/keys"]  # /github-apps never consulted
+
+    async def test_an_invisible_github_app_refuses_rather_than_public(self) -> None:
+        from bg_coolify_migrate.engine.planner import _resolve_git_auth
+        from bg_coolify_migrate.errors import UnsupportedResource
+
+        api = _Api(github_apps=[{"id": 9, "uuid": "other", "is_public": False}])
+        with pytest.raises(UnsupportedResource, match="not visible"):
+            await _resolve_git_auth(
+                api,  # type: ignore[arg-type]
+                {
+                    "name": "wp",
+                    "git_repository": "x/y",
+                    "source_type": r"App\Models\GithubApp",
+                    "source_id": 5,
+                },
+            )
+
+    async def test_a_gitlab_source_refuses_rather_than_public(self) -> None:
+        from bg_coolify_migrate.engine.planner import _resolve_git_auth
+        from bg_coolify_migrate.errors import UnsupportedResource
+
+        api = _Api()
+        with pytest.raises(UnsupportedResource, match="cannot be recreated"):
+            await _resolve_git_auth(
+                api,  # type: ignore[arg-type]
+                {
+                    "git_repository": "x/y",
+                    "source_type": r"App\Models\GitlabApp",
+                    "source_id": 2,
+                },
+            )
+
+    async def test_a_plain_public_app_needs_no_lookup(self) -> None:
+        from bg_coolify_migrate.engine.planner import _resolve_git_auth
+
+        api = _Api()
+        gh, pk = await _resolve_git_auth(
+            api,  # type: ignore[arg-type]
+            {"git_repository": "x/y", "source_type": None, "source_id": None},
+        )
+        assert (gh, pk) == (None, None)
+        assert api.calls == []
+
+    async def test_non_git_resources_are_untouched(self) -> None:
+        from bg_coolify_migrate.engine.planner import _resolve_git_auth
+
+        api = _Api()
+        assert await _resolve_git_auth(api, {"name": "db"}) == (None, None)  # type: ignore[arg-type]
+        assert api.calls == []
+
+    async def test_the_localhost_key_counts_only_without_a_source(self) -> None:
+        from bg_coolify_migrate.engine.planner import _resolve_git_auth
+
+        api = _Api(security_keys=[{"id": 0, "uuid": "localhost-key"}])
+        gh, pk = await _resolve_git_auth(
+            api,  # type: ignore[arg-type]
+            {"git_repository": "x/y", "private_key_id": 0},
+        )
+        assert (gh, pk) == (None, "localhost-key")

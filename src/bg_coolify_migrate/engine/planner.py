@@ -58,7 +58,12 @@ from bg_coolify_migrate.domain.plan import (
     select_strategy,
 )
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
-from bg_coolify_migrate.errors import EmptyEnvironment, MigrationError, PreflightError
+from bg_coolify_migrate.errors import (
+    EmptyEnvironment,
+    MigrationError,
+    PreflightError,
+    UnsupportedResource,
+)
 from bg_coolify_migrate.transfer.ssh import RemoteHost
 
 log = structlog.get_logger(__name__)
@@ -426,6 +431,93 @@ def resource_labels(*, project: str, environment: str, name: str) -> dict[str, s
     }
 
 
+async def _resolve_git_auth(
+    api: CoolifyClient, full: dict[str, Any]
+) -> tuple[str | None, str | None]:
+    """Resolve the credentials a git app's create route will need.
+
+    Returns ``(github_app_uuid, private_key_uuid)`` — at most one set.
+
+    Transcribed from ``Application::deploymentType()`` (v4.1.2): a real deploy
+    key (``private_key_id > 0``) takes precedence over the source; the localhost
+    key (``id == 0``) counts only when no source is configured; otherwise the
+    ``source`` morph decides.
+
+    Why this exists: the GET serialises the raw columns — ``source_type``,
+    ``source_id``, ``private_key_id`` — and NEVER a ``github_app_uuid``, which is
+    a create-request field. This tool used to read the create field off the GET,
+    found nothing, and classified every GitHub-App-backed application as PUBLIC —
+    so the target was created credential-less and its LoadComposeFile died asking
+    for a Username (covalida, 2026-07-22, twice). The ids are mapped to the uuids
+    the create routes want via /github-apps and /security/keys; an unmappable id
+    is an ERROR, never a fall-back to public, because silently-public is exactly
+    the failure being prevented.
+
+    Raises:
+        UnsupportedResource: For a GitLab-App source — v4.1.2 has no create
+            route that can reproduce it — or a source id the token cannot see.
+    """
+    if not full.get("git_repository"):
+        return None, None
+
+    name = str(full.get("name") or full.get("uuid") or "?")
+    private_key_id = full.get("private_key_id")
+    source_type = str(full.get("source_type") or "")
+    source_id = full.get("source_id")
+
+    if isinstance(private_key_id, int) and private_key_id > 0:
+        return None, await _private_key_uuid(api, private_key_id, resource=name)
+
+    if source_type and source_id is not None:
+        if not source_type.endswith("GithubApp"):
+            raise UnsupportedResource(
+                f"{name}: git source {source_type!r} cannot be recreated",
+                hint=(
+                    "The v4.1.2 API offers create routes for public, GitHub-App and "
+                    "deploy-key sources only. Recreate the application with one of "
+                    "those sources, then migrate."
+                ),
+            )
+        apps = await api.get("/github-apps")
+        match = next((a for a in apps if isinstance(a, dict) and a.get("id") == source_id), None)
+        if match is None:
+            raise UnsupportedResource(
+                f"{name}: its GitHub App (source_id={source_id}) is not visible to this API token",
+                hint=(
+                    "GET /github-apps lists the token team's apps plus system-wide "
+                    "ones; this app's source is neither. Without its uuid the target "
+                    "cannot be created with credentials — and creating it public "
+                    "would strand it unable to clone. Make the GitHub App "
+                    "system-wide, or use a token of the owning team."
+                ),
+            )
+        if match.get("is_public"):
+            # The seeded "Public GitHub" source: same clone behaviour as the
+            # public route, so classify it as such rather than passing a uuid.
+            return None, None
+        return str(match.get("uuid")), None
+
+    if private_key_id == 0:
+        return None, await _private_key_uuid(api, 0, resource=name)
+
+    return None, None
+
+
+async def _private_key_uuid(api: CoolifyClient, key_id: int, *, resource: str) -> str:
+    keys = await api.get("/security/keys")
+    match = next((k for k in keys if isinstance(k, dict) and k.get("id") == key_id), None)
+    if match is None or not match.get("uuid"):
+        raise UnsupportedResource(
+            f"{resource}: its deploy key (private_key_id={key_id}) is not visible "
+            "to this API token",
+            hint=(
+                "GET /security/keys lists the token team's keys; this app's key is "
+                "not among them, so the target cannot be created with credentials."
+            ),
+        )
+    return str(match["uuid"])
+
+
 async def snapshot_resource(
     api: CoolifyClient,
     source_host: RemoteHost,
@@ -468,6 +560,8 @@ async def snapshot_resource(
     base = [c for c in containers if not c.is_preview]
     running_image = await docker.image_of(source_host, base[0].id or base[0].name) if base else None
 
+    github_app_uuid, private_key_uuid = await _resolve_git_auth(api, full)
+
     snapshot = ResourceSnapshot(
         uuid=uuid,
         name=str(full.get("name", uuid)),
@@ -481,9 +575,11 @@ async def snapshot_resource(
         git_branch=full.get("git_branch"),
         git_auth=git_auth(
             git_repository=full.get("git_repository"),
-            github_app_uuid=full.get("github_app_uuid"),
-            private_key_uuid=full.get("private_key_uuid"),
+            github_app_uuid=github_app_uuid,
+            private_key_uuid=private_key_uuid,
         ),
+        github_app_uuid=github_app_uuid,
+        private_key_uuid=private_key_uuid,
         docker_compose_raw=compose_raw,
         running_image=running_image,
         builds=builds,

@@ -195,10 +195,21 @@ class TestPlanPersistence:
 
     def test_saved_plan_contains_no_secrets(self, tmp_path: Path) -> None:
         # A plan carries uuids, names, paths and sizes - never credentials.
+        # `private_key_uuid` / `github_app_uuid` ARE such uuids (they name which
+        # credential Coolify should use, and carry none of it), so an identifier
+        # suffix is exempt; the bare field — the one that holds key material on
+        # /security/keys — still trips the scan.
+        import re
+
         path = save_plan(tmp_path, "mig-001", self._plan())
         text = path.read_text(encoding="utf-8").lower()
         for forbidden in ("password", "app_key", "private_key", "token"):
-            assert forbidden not in text
+            leaks = [
+                m.start()
+                for m in re.finditer(forbidden, text)
+                if not text[m.end() :].startswith(("_uuid", "_id"))
+            ]
+            assert not leaks, f"{forbidden!r} appears outside an identifier field"
 
 
 class TestEphemeralKeys:

@@ -132,6 +132,15 @@ class ResourceSnapshot(BaseModel):
     git_branch: str | None = None
     git_auth: GitAuth = GitAuth.NONE
 
+    github_app_uuid: str | None = None
+    """Resolved by the planner from the source's ``source_id`` via /github-apps.
+    The GET serialises only the raw ``source_type``/``source_id`` columns —
+    ``github_app_uuid`` is a CREATE-request field that never appears in reads,
+    and treating its absence as 'public' created credential-less targets."""
+
+    private_key_uuid: str | None = None
+    """Resolved from ``private_key_id`` via /security/keys, same reasoning."""
+
     docker_compose_raw: str | None = None
     """Decoded, not base64. Coolify re-dumps this through Yaml::dump(Yaml::parse())
     on the service path, which destroys comments and formatting — warn the user."""

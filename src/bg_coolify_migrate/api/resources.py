@@ -482,6 +482,15 @@ async def create_application(
     body["name"] = snapshot.name
     body["instant_deploy"] = False
 
+    # The GET never carries these — it serialises source_type/source_id and
+    # private_key_id, which the PLANNER resolved into the uuids the private
+    # create routes require. Without them the filtered body cannot satisfy
+    # APPLICATION_ROUTE_REQUIRED and _check below refuses, loudly.
+    if snapshot.github_app_uuid:
+        body["github_app_uuid"] = snapshot.github_app_uuid
+    if snapshot.private_key_uuid:
+        body["private_key_uuid"] = snapshot.private_key_uuid
+
     # Public git apps come back short (owner/repo) but the public route needs a URL.
     if segment == "public" and body.get("git_repository"):
         body["git_repository"] = public_git_url(str(body["git_repository"]))

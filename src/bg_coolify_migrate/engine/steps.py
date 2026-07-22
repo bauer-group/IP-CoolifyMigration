@@ -388,10 +388,12 @@ async def _assert_target_can_read_git(ctx: MigrationContext) -> None:
 
         # An auth refusal is a different disease than a broken host. git asking
         # for a Username means the host and the network are FINE — the repo is
-        # private while the app's source says public. That app survives on its
+        # private while the app is treated as public. That app survives on its
         # cached compose; a fresh target has no cache and can never load one.
-        # (covalida, 2026-07-22: the repo had gone private after the app was
-        # created, and the install-git hint sent the operator to the wrong knob.)
+        # (covalida, 2026-07-22: this stderr surfaced the real bug — the planner
+        # misread the GET's absent `github_app_uuid` as 'public' for a
+        # GitHub-App-backed app. The classifier is fixed; this branch remains
+        # for apps whose source genuinely is public while the repo is not.)
         auth_markers = (
             "could not read Username",
             "could not read Password",
