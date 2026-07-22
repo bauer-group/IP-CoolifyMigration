@@ -155,9 +155,7 @@ def _mock_compose_create_routes(respx_mock: respx.Router) -> None:
     respx_mock.post(f"{BASE}/applications/public").mock(
         return_value=httpx.Response(201, json={"uuid": "tgt1"})
     )
-    respx_mock.get(f"{BASE}/applications/app1/envs").mock(
-        return_value=httpx.Response(200, json=[])
-    )
+    respx_mock.get(f"{BASE}/applications/app1/envs").mock(return_value=httpx.Response(200, json=[]))
 
 
 def _source_host(*, probe: str = "REACH") -> FakeHost:
@@ -383,9 +381,7 @@ class TestPreflight:
         )
         ctx.target_host = target  # type: ignore[assignment]
 
-        with pytest.raises(
-            PreflightError, match=re.escape("cannot read https://github.com/acme")
-        ):
+        with pytest.raises(PreflightError, match=re.escape("cannot read https://github.com/acme")):
             await steps.step_preflight(ctx)
 
     async def test_a_target_without_git_blocks_with_the_shell_story(
@@ -441,9 +437,7 @@ class TestPreflight:
         )
         ctx.plan = _compose_plan()
         target = _target_host()
-        target.on(
-            r"timeout 20 git ls-remote", exit_status=127, stderr="sh: 1: timeout: not found"
-        )
+        target.on(r"timeout 20 git ls-remote", exit_status=127, stderr="sh: 1: timeout: not found")
         ctx.target_host = target  # type: ignore[assignment]
 
         await steps.step_preflight(ctx)  # must not raise
@@ -528,9 +522,7 @@ class TestPreflight:
             ),
         )
         ctx.plan = _plan(
-            resources=(
-                ResourcePlan(snapshot=_snapshot(), strategy=Strategy.REBUILD, drift=drift),
-            )
+            resources=(ResourcePlan(snapshot=_snapshot(), strategy=Strategy.REBUILD, drift=drift),)
         )
         with pytest.raises(RebuildDriftBlocked, match="HEAD moved"):
             await steps.step_preflight(ctx)
@@ -552,7 +544,10 @@ class TestPreflight:
         ctx.plan = _plan(
             resources=(
                 ResourcePlan(
-                    snapshot=_snapshot(), strategy=Strategy.REBUILD, drift=drift, manifest=_manifest()
+                    snapshot=_snapshot(),
+                    strategy=Strategy.REBUILD,
+                    drift=drift,
+                    manifest=_manifest(),
                 ),
             )
         )
@@ -568,7 +563,12 @@ class TestPreflight:
         host.on(
             r"docker ps",
             stdout=json.dumps(
-                {"ID": "c1", "Names": "web-pr-7", "State": "running", "Labels": "coolify.pullRequestId=7"}
+                {
+                    "ID": "c1",
+                    "Names": "web-pr-7",
+                    "State": "running",
+                    "Labels": "coolify.pullRequestId=7",
+                }
             ),
         )
         ctx.source_host = host  # type: ignore[assignment]
@@ -604,9 +604,7 @@ class TestCreateTarget:
         assert result["target_uuids"] == {"db1": "db2"}
         assert ctx.target_uuids["db1"] == "db2"
         # Journalled before the envs were copied, not after.
-        assert any(
-            r.detail.get("target_uuids") == {"db1": "db2"} for r in ctx.journal.read()
-        )
+        assert any(r.detail.get("target_uuids") == {"db1": "db2"} for r in ctx.journal.read())
 
     async def test_compose_target_waits_for_its_compose_before_quiesce(
         self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
@@ -628,9 +626,7 @@ class TestCreateTarget:
         respx_mock.get(f"{BASE}/applications/tgt1/storages").mock(
             return_value=httpx.Response(
                 200,
-                json={
-                    "persistent_storages": [{"name": "tgt1_app", "mount_path": "/var/www/html"}]
-                },
+                json={"persistent_storages": [{"name": "tgt1_app", "mount_path": "/var/www/html"}]},
             )
         )
 
@@ -660,8 +656,8 @@ class TestCreateTarget:
     async def test_compose_drift_in_volumes_fails_before_the_stop(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
-        # The compose loaded, but HEAD no longer mounts a volume where the
-        # running source does. DISCOVER caught this only after the outage began.
+        # The compose loaded, but HEAD no longer declares the volume KEY the
+        # running source uses. DISCOVER caught this only after the outage began.
         object.__setattr__(ctx.settings, "target_storage_timeout", 0.0)
         ctx.plan = _compose_plan(manifest=_compose_manifest())
         _mock_compose_create_routes(respx_mock)
@@ -674,8 +670,42 @@ class TestCreateTarget:
             return_value=httpx.Response(200, json={"persistent_storages": []})
         )
 
-        with pytest.raises(TransferError, match="declares no volume at"):
+        with pytest.raises(TransferError, match="declares no volume for key"):
             await steps.step_create_target(ctx)
+
+    async def test_compose_gate_matches_volume_keys_not_mount_paths(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """REGRESSION (covalida, 2026-07-22): one volume, several mount paths.
+
+        The running source mounts app1_app at /var/www/html while the freshly
+        parsed target declares the same compose key at a different path — the
+        sighting of a profile-gated service that never runs. The gate must
+        accept the KEY instead of waiting 180s for a mount path that can never
+        appear, and extra target-only keys (sftp-keys) must not block.
+        """
+        object.__setattr__(ctx.settings, "target_storage_timeout", 0.0)
+        ctx.plan = _compose_plan(manifest=_compose_manifest())
+        _mock_compose_create_routes(respx_mock)
+        respx_mock.get(f"{BASE}/applications/tgt1").mock(
+            return_value=httpx.Response(
+                200, json={"uuid": "tgt1", "docker_compose_raw": "services: {}"}
+            )
+        )
+        respx_mock.get(f"{BASE}/applications/tgt1/storages").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "persistent_storages": [
+                        {"name": "tgt1_app", "mount_path": "/srv/app"},
+                        {"name": "tgt1_sftp-keys", "mount_path": "/etc/ssh/keys"},
+                    ]
+                },
+            )
+        )
+
+        result = await steps.step_create_target(ctx)
+        assert result["target_uuids"] == {"app1": "tgt1"}
 
     async def test_never_reads_the_main_only_tags_endpoint(
         self, ctx: MigrationContext, respx_mock: respx.Router
@@ -750,9 +780,7 @@ class TestTransferEndpoint:
         assert host == "10.0.0.2"
         assert port == 22
 
-    def test_never_dials_loopback_without_an_open_tunnel(
-        self, ctx: MigrationContext
-    ) -> None:
+    def test_never_dials_loopback_without_an_open_tunnel(self, ctx: MigrationContext) -> None:
         """The reason this reads ctx.tunnel_port instead of probing again.
 
         The old code probed a SECOND time and, when its answer disagreed with the
@@ -774,7 +802,9 @@ class TestDnsGate:
         # The gate reads the TARGET's domains; point it at the mocked resource.
         ctx.target_uuids["db1"] = "db1"
         respx_mock.get(f"{BASE}/databases/db1").mock(
-            return_value=httpx.Response(200, json={"uuid": "db1", "fqdn": "https://shop.example.com"})
+            return_value=httpx.Response(
+                200, json={"uuid": "db1", "fqdn": "https://shop.example.com"}
+            )
         )
         respx_mock.get(f"{BASE}/databases/db1/envs").mock(return_value=httpx.Response(200, json=[]))
 
@@ -803,7 +833,9 @@ class TestDnsGate:
     ) -> None:
         ctx.target_uuids["db1"] = "db1"
         respx_mock.get(f"{BASE}/databases/db1").mock(
-            return_value=httpx.Response(200, json={"uuid": "db1", "fqdn": "https://shop.example.com"})
+            return_value=httpx.Response(
+                200, json={"uuid": "db1", "fqdn": "https://shop.example.com"}
+            )
         )
         respx_mock.get(f"{BASE}/databases/db1/envs").mock(return_value=httpx.Response(200, json=[]))
 
@@ -839,11 +871,15 @@ class TestDnsGate:
         # and must never block.
         ctx.plan = _plan(
             source_server=ServerRef(
-                uuid="s1", name="old", ip="10.0.0.1",
+                uuid="s1",
+                name="old",
+                ip="10.0.0.1",
                 wildcard_domain="app.0046-20.cloud.bauer-group.com",
             ),
             target_server=ServerRef(
-                uuid="s2", name="new", ip="10.0.0.2",
+                uuid="s2",
+                name="new",
+                ip="10.0.0.2",
                 wildcard_domain="app.0047-20.cloud.bauer-group.com",
             ),
         )
@@ -874,7 +910,9 @@ class TestDnsGate:
         ctx.accept_dns = True
         ctx.target_uuids["db1"] = "db1"
         respx_mock.get(f"{BASE}/databases/db1").mock(
-            return_value=httpx.Response(200, json={"uuid": "db1", "fqdn": "https://shop.example.com"})
+            return_value=httpx.Response(
+                200, json={"uuid": "db1", "fqdn": "https://shop.example.com"}
+            )
         )
         respx_mock.get(f"{BASE}/databases/db1/envs").mock(return_value=httpx.Response(200, json=[]))
 
@@ -884,7 +922,9 @@ class TestDnsGate:
         async def fake_resolve(hostnames, config=None):  # type: ignore[no-untyped-def]
             return [
                 Resolution(
-                    Hostname("shop.example.com", HostnameOrigin.FQDN, False), ("10.0.0.1",), ttl=3600
+                    Hostname("shop.example.com", HostnameOrigin.FQDN, False),
+                    ("10.0.0.1",),
+                    ttl=3600,
                 )
             ]
 
@@ -945,9 +985,7 @@ class TestVerify:
         self, ctx: MigrationContext
     ) -> None:
         ctx.volume_pairs["db1"] = [
-            VolumePair(
-                source=VolumeEndpoint("old", "/data"), target=VolumeEndpoint("new", "/data")
-            )
+            VolumePair(source=VolumeEndpoint("old", "/data"), target=VolumeEndpoint("new", "/data"))
         ]
         source = FakeHost()
         source.on(r"sha256sum", stdout="aaa  ./f\n")
@@ -967,9 +1005,7 @@ class TestVerify:
 
     async def test_identical_volumes_pass(self, ctx: MigrationContext) -> None:
         ctx.volume_pairs["db1"] = [
-            VolumePair(
-                source=VolumeEndpoint("old", "/data"), target=VolumeEndpoint("new", "/data")
-            )
+            VolumePair(source=VolumeEndpoint("old", "/data"), target=VolumeEndpoint("new", "/data"))
         ]
 
         def host() -> FakeHost:
@@ -1277,9 +1313,7 @@ class TestAwaitTargetVolumes:
         async def no_sleep(_seconds: float) -> None:
             return None
 
-        monkeypatch.setattr(
-            "bg_coolify_migrate.api.resources.read_volume_endpoints", fake_read
-        )
+        monkeypatch.setattr("bg_coolify_migrate.api.resources.read_volume_endpoints", fake_read)
         monkeypatch.setattr(steps.asyncio, "sleep", no_sleep)
 
         eps = await steps._await_target_volumes(
@@ -1301,9 +1335,7 @@ class TestAwaitTargetVolumes:
         async def no_sleep(_seconds: float) -> None:
             return None
 
-        monkeypatch.setattr(
-            "bg_coolify_migrate.api.resources.read_volume_endpoints", fake_read
-        )
+        monkeypatch.setattr("bg_coolify_migrate.api.resources.read_volume_endpoints", fake_read)
         monkeypatch.setattr(steps.asyncio, "sleep", no_sleep)
 
         eps = await steps._await_target_volumes(
@@ -1408,6 +1440,84 @@ class TestDiscoverPairing:
         # The operator gets both sides, not a traceback.
         assert "/var/lib/postgresql/data" in (exc_info.value.hint or "")
 
+    async def test_compose_volumes_pair_by_key_across_differing_mount_paths(
+        self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """REGRESSION (covalida, 2026-07-22): mount paths identify nothing.
+
+        The live containers mount uploads at /var/www/html/wp-content/uploads;
+        both sides DECLARE it at /srv/uploads (a dormant sftp service's mount).
+        The target also declares /data twice (redis-data + backup-data) — fatal
+        for mount-path pairing, irrelevant for key pairing — plus volumes of
+        profile-gated services that legitimately start empty.
+        """
+        from bg_coolify_migrate.domain.manifest import DockerMount
+
+        ctx.plan = _compose_plan(
+            manifest=VolumeManifest(
+                items=(
+                    VolumeItem(
+                        mount_class=MountClass.NAMED,
+                        decision=Decision.MIGRATE,
+                        reason="named volume",
+                        source_name="app1_uploads",
+                        source_path="/var/lib/docker/volumes/app1_uploads/_data",
+                        mount_path="/var/www/html/wp-content/uploads",
+                        bytes=1024,
+                    ),
+                    VolumeItem(
+                        mount_class=MountClass.NAMED,
+                        decision=Decision.MIGRATE,
+                        reason="named volume",
+                        source_name="app1_redis-data",
+                        source_path="/var/lib/docker/volumes/app1_redis-data/_data",
+                        mount_path="/data",
+                        bytes=1024,
+                    ),
+                )
+            )
+        )
+        ctx.target_uuids = {"app1": "tgt1"}
+        ctx.pre_stop_mounts = {
+            "app1": [
+                DockerMount(
+                    container="wordpress",
+                    type="volume",
+                    name="app1_uploads",
+                    destination="/var/www/html/wp-content/uploads",
+                )
+            ]
+        }
+        object.__setattr__(ctx.settings, "target_storage_timeout", 0.0)
+
+        async def fake_manifest(host, *, mounts, api_storages, uuid, measure):  # type: ignore[no-untyped-def]
+            return ctx.plan.resources[0].manifest
+
+        async def fake_read(api, *, collection, uuid):  # type: ignore[no-untyped-def]
+            return [
+                VolumeEndpoint("tgt1_uploads", "/srv/uploads"),
+                VolumeEndpoint("tgt1_redis-data", "/data"),
+                VolumeEndpoint("tgt1_backup-data", "/data"),
+                VolumeEndpoint("tgt1_sftp-keys", "/etc/ssh/keys"),
+            ]
+
+        monkeypatch.setattr(steps, "build_manifest", fake_manifest)
+        monkeypatch.setattr("bg_coolify_migrate.api.resources.read_volume_endpoints", fake_read)
+
+        result = await steps.step_discover(ctx)
+        assert result["volume_pairs"]["app1"] == [
+            {
+                "source": "app1_redis-data",
+                "target": "tgt1_redis-data",
+                "mount_path": "/data",
+            },
+            {
+                "source": "app1_uploads",
+                "target": "tgt1_uploads",
+                "mount_path": "/var/www/html/wp-content/uploads",
+            },
+        ]
+
 
 class TestUndoParkedDomains:
     """Rollback must un-park the source domains create_target freed."""
@@ -1503,9 +1613,7 @@ class TestMaybeTunnel:
         assert source.forwards == []
         assert ctx.tunnel_port is None
 
-    async def test_an_undeterminable_probe_takes_the_tunnel(
-        self, ctx: MigrationContext
-    ) -> None:
+    async def test_an_undeterminable_probe_takes_the_tunnel(self, ctx: MigrationContext) -> None:
         """`reachable is not True`, not `not reachable`.
 
         A host with no bash and no nc tells us nothing. The tunnel works whether

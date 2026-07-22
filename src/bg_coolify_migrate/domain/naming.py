@@ -20,8 +20,16 @@ Volume names **cannot be preserved** across a migration, by construction:
 
 So the target names are whatever Coolify decides. The only correct algorithm is:
 create the target, let Coolify materialise its own volumes, read them back, and
-**pair source to target by ``mount_path``** — the one key that is stable across
-the migration because it is a property of the container, not of Coolify.
+pair what was read — never what was predicted. The pairing KEY depends on the
+kind:
+
+* ``mount_path`` (:func:`pair_by_mount_path`) — stable for databases and
+  API-storage-backed apps because it is a property of the container.
+* the uuid-stripped name suffix (:func:`pair_by_name_suffix`) — for
+  compose-backed resources, where one volume can be mounted at several paths
+  by several services (some behind never-running ``profiles:``) and mount_path
+  therefore identifies nothing. The compose volume key does: both sides parse
+  the same ``volumes:`` section.
 """
 
 from __future__ import annotations
@@ -246,6 +254,95 @@ class VolumePair:
     @property
     def target_path(self) -> str:
         return volume_data_path(self.target.name)
+
+
+def compose_volume_suffix(name: str, resource_uuid: str) -> str | None:
+    """The compose volume KEY hiding inside a Coolify volume name. PURE.
+
+    Coolify rewrites every compose volume to ``{resource_uuid}{sep}{key}`` when
+    it parses the file — the key (``uploads``, ``db-data``) comes from the
+    compose's ``volumes:`` section and is therefore identical on both sides of a
+    migration, while the uuid prefix changes by construction. Both separators are
+    accepted because they differ by kind (see :func:`compose_volume_separator`).
+
+    Returns None when the name does not start with the uuid prefix (e.g. an
+    external volume with a pinned name); suffix pairing must not be used then.
+    """
+    for sep in ("_", "-"):
+        prefix = f"{resource_uuid}{sep}"
+        if name.startswith(prefix) and len(name) > len(prefix):
+            return name[len(prefix) :]
+    return None
+
+
+def pair_by_name_suffix(
+    source: list[VolumeEndpoint],
+    target: list[VolumeEndpoint],
+    *,
+    source_uuid: str,
+    target_uuid: str,
+) -> list[VolumePair]:
+    """Pair compose volumes by their uuid-stripped name suffix.
+
+    For compose-backed resources the mount path is NOT a reliable key: one
+    volume can be mounted by several services at several different paths, some
+    of them behind ``profiles:`` that never run (a WordPress ``uploads`` volume
+    mounted at ``/var/www/html/wp-content/uploads`` by the live containers and
+    at ``/srv/uploads`` by a dormant sftp service — Coolify's storage row can
+    record either sighting). Two different volumes can even share one path
+    across services (``redis-data`` and ``backup-data`` both at ``/data``).
+    The compose volume KEY is the identity that actually survives: both sides
+    parse the same ``volumes:`` section.
+
+    This does not violate the module's headline rule. Nothing is predicted by
+    string-replacing a uuid: both endpoint lists are read back from what Coolify
+    actually created, and only the *matching key* is derived from the names.
+
+    Deliberately asymmetric, unlike :func:`pair_by_mount_path`:
+
+    * an unpaired SOURCE volume is still fatal — its data would be left behind;
+    * unpaired TARGET volumes are allowed — they belong to compose volumes whose
+      source counterpart never materialised (profile-gated services that never
+      ran) and will start empty on the target exactly as they would on the
+      source. The caller may log them.
+
+    Raises:
+        VolumePairingError: When any endpoint's name does not carry its side's
+            uuid prefix, on duplicate suffixes, or on a source volume with no
+            target counterpart.
+    """
+
+    def index(endpoints: list[VolumeEndpoint], uuid: str, side: str) -> dict[str, VolumeEndpoint]:
+        out: dict[str, VolumeEndpoint] = {}
+        for ep in endpoints:
+            suffix = compose_volume_suffix(ep.name, uuid)
+            if suffix is None:
+                raise VolumePairingError(
+                    f"{side} volume {ep.name!r} does not carry the resource uuid "
+                    f"prefix {uuid!r}; cannot pair by name suffix."
+                )
+            if suffix in out and out[suffix].name != ep.name:
+                raise VolumePairingError(
+                    f"ambiguous {side} volumes: {out[suffix].name!r} and {ep.name!r} "
+                    f"both reduce to suffix {suffix!r}. Cannot pair safely."
+                )
+            out[suffix] = ep
+        return out
+
+    src_index = index(source, source_uuid, "source")
+    tgt_index = index(target, target_uuid, "target")
+
+    missing_target = sorted(src_index.keys() - tgt_index.keys())
+    if missing_target:
+        names = ", ".join(repr(src_index[k].name) for k in missing_target)
+        raise VolumePairingError(
+            f"source volume(s) with no counterpart on the target: {names}. "
+            "Their data would be left behind. The compose at the branch HEAD no "
+            "longer declares these volume keys — it has drifted since the source "
+            "was deployed."
+        )
+
+    return [VolumePair(source=src_index[k], target=tgt_index[k]) for k in sorted(src_index)]
 
 
 def _key(ep: VolumeEndpoint, *, with_container: bool) -> tuple[str, ...]:

@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import shlex
+from collections.abc import Callable
 from typing import Any
 
 import structlog
@@ -25,7 +26,13 @@ from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.dns import wildcard as dns_wildcard
 from bg_coolify_migrate.dns.gate import Resolution, build_report, explain_why_blocking_matters
 from bg_coolify_migrate.domain.kinds import GitAuth, ResourceKind
-from bg_coolify_migrate.domain.naming import VolumeEndpoint, VolumePairingError, pair_by_mount_path
+from bg_coolify_migrate.domain.naming import (
+    VolumeEndpoint,
+    VolumePairingError,
+    compose_volume_suffix,
+    pair_by_mount_path,
+    pair_by_name_suffix,
+)
 from bg_coolify_migrate.domain.plan import ResourcePlan
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.engine import keys
@@ -134,7 +141,9 @@ async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
     # Previews are not stopped by Coolify's stop endpoint, so they would keep
     # writing during the copy. Refuse now rather than corrupt later.
     if not ctx.delete_previews:
-        await quiesce.assert_previews_absent(ctx.source_host, label_filters=observed_labels(ctx.plan))
+        await quiesce.assert_previews_absent(
+            ctx.source_host, label_filters=observed_labels(ctx.plan)
+        )
 
     # Proportional disk check against the ACTUAL payload.
     required = int(ctx.plan.total_bytes * ctx.settings.disk_headroom_factor)
@@ -306,8 +315,7 @@ async def _assert_compose_target_ready(
             break
         if waited >= deadline:
             raise TransferError(
-                f"{snapshot.name}: the target never loaded its compose from git "
-                f"({round(waited)}s)",
+                f"{snapshot.name}: the target never loaded its compose from git ({round(waited)}s)",
                 hint=(
                     "Coolify's LoadComposeFile job runs `git ls-remote` and a sparse "
                     "clone ON THE TARGET SERVER'S own shell, with Coolify's own "
@@ -324,17 +332,59 @@ async def _assert_compose_target_ready(
         waited += interval
     log.info("create.compose_loaded", resource=snapshot.name, waited=round(waited, 1))
 
-    expected = {i.mount_path for i in resource.manifest.to_migrate if i.source_name}
-    if not expected:
+    migrating = [i for i in resource.manifest.to_migrate if i.source_name]
+    if not migrating:
         return
+
+    # Compose volumes are matched by their uuid-stripped KEY, not by mount path:
+    # one volume can be mounted at several paths by several services — some
+    # behind never-running ``profiles:`` — and Coolify's storage row records only
+    # ONE of those sightings. covalida (2026-07-22): uploads lived at
+    # /var/www/html/wp-content/uploads in the running containers while BOTH
+    # sides' declarations said /srv/uploads (the dormant sftp service's mount);
+    # the path-based gate refused a perfectly migratable stack after 180s of
+    # waiting for a path that could never appear.
+    suffixes = {
+        i.source_name: compose_volume_suffix(i.source_name, snapshot.uuid)
+        for i in migrating
+        if i.source_name
+    }
+    if all(suffixes.values()):
+        expected = {s for s in suffixes.values() if s}
+        endpoints = await _await_target_volumes(
+            ctx,
+            collection=snapshot.collection,
+            target_uuid=target_uuid,
+            expected=expected,
+            key=lambda e: compose_volume_suffix(e.name, target_uuid),
+        )
+        seen = sorted(s for e in endpoints if (s := compose_volume_suffix(e.name, target_uuid)))
+        missing = expected - set(seen)
+        if missing:
+            raise TransferError(
+                f"{snapshot.name}: the target's compose declares no volume for "
+                f"key(s) {sorted(missing)}",
+                hint=(
+                    "The compose Coolify just loaded from the branch HEAD no longer "
+                    "declares these volume keys — they were removed or renamed since "
+                    "the source was deployed. Migrating would leave that data behind, "
+                    "so this stops while the source is still running.\n"
+                    f"Target declares: {seen or 'nothing'}\n"
+                    "The source was never stopped; the created target will be deleted."
+                ),
+            )
+        return
+
+    # A migrating volume without the uuid prefix (a pinned external name):
+    # suffix identity does not apply, fall back to the mount-path gate.
+    expected_paths = {i.mount_path for i in migrating}
     endpoints = await _await_target_volumes(
-        ctx, collection=snapshot.collection, target_uuid=target_uuid, expected=expected
+        ctx, collection=snapshot.collection, target_uuid=target_uuid, expected=expected_paths
     )
-    missing = expected - {e.mount_path for e in endpoints}
-    if missing:
+    missing_paths = expected_paths - {e.mount_path for e in endpoints}
+    if missing_paths:
         raise TransferError(
-            f"{snapshot.name}: the target's compose declares no volume at "
-            f"{sorted(missing)}",
+            f"{snapshot.name}: the target's compose declares no volume at {sorted(missing_paths)}",
             hint=(
                 "The compose Coolify just loaded from the branch HEAD does not mount "
                 "volumes where the running source does — it has drifted since the "
@@ -381,9 +431,7 @@ async def _assert_target_can_read_git(ctx: MigrationContext) -> None:
         stderr = result.stderr.strip().splitlines()
         detail = stderr[-1][:200] if stderr else f"exit code {result.exit_status}"
         if "timeout" in detail and "not found" in detail:
-            log.warning(
-                "preflight.git_probe_undetermined", resource=snapshot.name, detail=detail
-            )
+            log.warning("preflight.git_probe_undetermined", resource=snapshot.name, detail=detail)
             continue
 
         # An auth refusal is a different disease than a broken host. git asking
@@ -660,12 +708,18 @@ async def _await_target_volumes(
     target_uuid: str,
     expected: set[str],
     compose_from_git: bool = False,
+    key: Callable[[VolumeEndpoint], str | None] | None = None,
 ) -> list[VolumeEndpoint]:
-    """Poll the target's declared volumes until they cover ``expected`` mount paths.
+    """Poll the target's declared volumes until they cover ``expected`` keys.
+
+    ``key`` extracts the comparison key from an endpoint — ``mount_path`` by
+    default, or the uuid-stripped name suffix for compose apps (see
+    :func:`bg_coolify_migrate.domain.naming.pair_by_name_suffix` for why the
+    mount path identifies nothing there).
 
     The target of a dockercompose migration gets its persistent storages from an
     async LoadComposeFile job dispatched at create, so a read right after create
-    can miss them. Returns as soon as every expected mount path is present, or the
+    can miss them. Returns as soon as every expected key is present, or the
     latest reading at timeout — the caller's unpaired-volume check then produces
     the precise, actionable error rather than a silent miss.
 
@@ -677,24 +731,29 @@ async def _await_target_volumes(
     failing machinery in the message, instead of surfacing later as a pairing
     refusal that reads like a compose mismatch.
     """
+    keyfn = key or (lambda e: e.mount_path)
+
+    def seen_keys(endpoints: list[VolumeEndpoint]) -> set[str]:
+        return {k for e in endpoints if (k := keyfn(e)) is not None}
+
     deadline = ctx.settings.target_storage_timeout
     interval = 3.0
     waited = 0.0
     endpoints = await api_resources.read_volume_endpoints(
         ctx.api, collection=collection, uuid=target_uuid
     )
-    while not expected <= {e.mount_path for e in endpoints} and waited < deadline:
+    while not expected <= seen_keys(endpoints) and waited < deadline:
         await asyncio.sleep(interval)
         waited += interval
         endpoints = await api_resources.read_volume_endpoints(
             ctx.api, collection=collection, uuid=target_uuid
         )
-    if not expected <= {e.mount_path for e in endpoints}:
+    if not expected <= seen_keys(endpoints):
         log.warning(
             "discover.target_volumes_incomplete",
             waited=round(waited, 1),
             expected=sorted(expected),
-            seen=sorted(e.mount_path for e in endpoints),
+            seen=sorted(seen_keys(endpoints)),
         )
         if compose_from_git:
             target = await ctx.api.get_resource(collection, target_uuid)
@@ -768,38 +827,77 @@ async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
             for i in manifest.to_migrate
             if i.source_name
         ]
+        # Compose volumes pair by their uuid-stripped name suffix — the compose
+        # volume KEY — because one volume can be mounted at several different
+        # paths by several services (some behind never-running `profiles:`), so
+        # mount_path identifies nothing. Falls back to mount-path pairing when a
+        # source name does not carry the uuid prefix (a pinned external name).
+        by_suffix = snapshot.kind is ResourceKind.APP_GIT_COMPOSE and all(
+            compose_volume_suffix(e.name, snapshot.uuid) for e in source_eps
+        )
         # A dockercompose target loads its compose — and its persistent storages —
         # via an async job at create, so /storages is empty for the first seconds.
         # Wait for the volumes we need before pairing, or DISCOVER races the queue
         # and reports a real volume unpairable.
         if source_eps:
+
+            def suffix_key(e: VolumeEndpoint, uuid: str = target_uuid) -> str | None:
+                return compose_volume_suffix(e.name, uuid)
+
             target_eps = await _await_target_volumes(
                 ctx,
                 collection=snapshot.collection,
                 target_uuid=target_uuid,
-                expected={e.mount_path for e in source_eps},
+                expected=(
+                    {s for e in source_eps if (s := compose_volume_suffix(e.name, snapshot.uuid))}
+                    if by_suffix
+                    else {e.mount_path for e in source_eps}
+                ),
                 compose_from_git=snapshot.kind is ResourceKind.APP_GIT_COMPOSE,
+                key=suffix_key if by_suffix else None,
             )
         else:
             target_eps = await api_resources.read_volume_endpoints(
                 ctx.api, collection=snapshot.collection, uuid=target_uuid
             )
 
-        # pair_by_mount_path refuses ambiguity and unpaired volumes on either
-        # side — data left behind, or a target volume starting silently empty.
-        # Those refusals are diagnoses, not crashes: name both sides so the
-        # operator can see WHICH compose disagrees, instead of a raw traceback
-        # wrapped as "unexpected error in discover" (which is what this was).
+        # Both pairers refuse ambiguity and unpaired source volumes — data left
+        # behind if allowed through. Those refusals are diagnoses, not crashes:
+        # name both sides so the operator can see WHICH compose disagrees,
+        # instead of a raw traceback wrapped as "unexpected error in discover"
+        # (which is what this was).
         try:
-            pairs = pair_by_mount_path(source_eps, target_eps) if source_eps else []
+            if not source_eps:
+                pairs = []
+            elif by_suffix:
+                pairs = pair_by_name_suffix(
+                    source_eps, target_eps, source_uuid=snapshot.uuid, target_uuid=target_uuid
+                )
+                # Target volumes with no source counterpart are legitimate here:
+                # compose volumes of profile-gated services that never ran on the
+                # source. They start empty on the target exactly as they would on
+                # the source — say so, but do not refuse.
+                paired = {p.target.name for p in pairs}
+                unpaired = sorted(e.name for e in target_eps if e.name not in paired)
+                if unpaired:
+                    log.info(
+                        "discover.target_volumes_start_empty",
+                        resource=snapshot.name,
+                        volumes=unpaired,
+                    )
+            else:
+                pairs = pair_by_mount_path(source_eps, target_eps)
         except VolumePairingError as exc:
             raise TransferError(
                 f"{snapshot.name}: {exc}",
                 hint=(
-                    "Volumes are paired by mount_path, read back from what Coolify "
-                    "actually created on the target — never predicted.\n"
-                    f"Source mounts: {sorted(e.mount_path for e in source_eps)}\n"
-                    f"Target declares: {sorted(e.mount_path for e in target_eps) or 'nothing'}\n"
+                    "Volumes are paired by "
+                    + ("compose volume key" if by_suffix else "mount_path")
+                    + ", read back from what Coolify actually created on the target "
+                    "— never predicted.\n"
+                    f"Source volumes: {sorted(f'{e.name} @ {e.mount_path}' for e in source_eps)}\n"
+                    "Target declares: "
+                    f"{sorted(f'{e.name} @ {e.mount_path}' for e in target_eps) or 'nothing'}\n"
                     "A mismatch usually means the compose at the branch HEAD no longer "
                     "matches what the source is running. The source will be restarted "
                     "and the target deleted."
@@ -1002,9 +1100,7 @@ async def _server_addresses(host: str) -> frozenset[str]:
     except ValueError:
         pass
     resolution = await dns_resolve.resolve_one(
-        dns_extract.Hostname(
-            host=host, origin=dns_extract.HostnameOrigin.FQDN, is_generated=False
-        )
+        dns_extract.Hostname(host=host, origin=dns_extract.HostnameOrigin.FQDN, is_generated=False)
     )
     return frozenset(resolution.addresses) or frozenset({host})
 

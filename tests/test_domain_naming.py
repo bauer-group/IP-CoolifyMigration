@@ -15,8 +15,10 @@ from bg_coolify_migrate.domain.naming import (
     VolumePairingError,
     application_volume_name,
     compose_volume_separator,
+    compose_volume_suffix,
     database_volume_name,
     pair_by_mount_path,
+    pair_by_name_suffix,
     postgres_mount_path,
     resource_config_dir,
     service_volume_name,
@@ -257,3 +259,106 @@ class TestPairByMountPath:
         target = [VolumeEndpoint("new", "/data")]
         (pair,) = pair_by_mount_path(source, target)
         assert pair.target.name == "new"
+
+
+class TestComposeVolumeSuffix:
+    def test_underscore_separator(self) -> None:
+        assert compose_volume_suffix("app1_uploads", "app1") == "uploads"
+
+    def test_hyphen_separator(self) -> None:
+        assert compose_volume_suffix("app1-uploads", "app1") == "uploads"
+
+    def test_key_may_itself_contain_the_separator(self) -> None:
+        # `db-data` is a real compose key; only the FIRST prefix is stripped.
+        assert compose_volume_suffix("app1_db-data", "app1") == "db-data"
+
+    def test_foreign_prefix_yields_none(self) -> None:
+        assert compose_volume_suffix("wordpress-uploads", "app1") is None
+
+    def test_bare_prefix_yields_none(self) -> None:
+        assert compose_volume_suffix("app1_", "app1") is None
+
+
+class TestPairByNameSuffix:
+    """The covalida shape (2026-07-22): mount paths identify nothing.
+
+    One `uploads` volume mounted at three different paths by four services, two
+    of them behind never-running `profiles:`; Coolify's storage row recorded the
+    dormant sftp service's `/srv/uploads` while the live containers mounted
+    `/var/www/html/wp-content/uploads`. Pairing by mount path refused a
+    perfectly migratable stack; the compose volume KEY pairs it.
+    """
+
+    def test_pairs_across_differing_mount_paths(self) -> None:
+        # Source endpoint carries the LIVE mount, target row the DECLARED one.
+        source = [VolumeEndpoint("old_uploads", "/var/www/html/wp-content/uploads")]
+        target = [VolumeEndpoint("new_uploads", "/srv/uploads")]
+        (pair,) = pair_by_name_suffix(source, target, source_uuid="old", target_uuid="new")
+        assert pair.source.name == "old_uploads"
+        assert pair.target.name == "new_uploads"
+
+    def test_duplicate_target_mount_paths_are_no_ambiguity(self) -> None:
+        # redis-data and backup-data both declare /data — fatal for mount-path
+        # pairing, irrelevant for key pairing.
+        source = [VolumeEndpoint("old_redis-data", "/data")]
+        target = [
+            VolumeEndpoint("new_redis-data", "/data"),
+            VolumeEndpoint("new_backup-data", "/data"),
+        ]
+        (pair,) = pair_by_name_suffix(source, target, source_uuid="old", target_uuid="new")
+        assert pair.target.name == "new_redis-data"
+
+    def test_unpaired_target_volumes_start_empty_and_are_allowed(self) -> None:
+        # Profile-gated services (backup, sftp) declare volumes that never
+        # materialised on the source. They start empty on the target exactly as
+        # they would on the source — not a refusal, unlike pair_by_mount_path.
+        source = [VolumeEndpoint("old_app", "/var/www/html")]
+        target = [
+            VolumeEndpoint("new_app", "/var/www/html"),
+            VolumeEndpoint("new_sftp-keys", "/etc/ssh/keys"),
+        ]
+        (pair,) = pair_by_name_suffix(source, target, source_uuid="old", target_uuid="new")
+        assert pair.target.name == "new_app"
+
+    def test_unpaired_source_refused_because_data_would_be_left_behind(self) -> None:
+        source = [
+            VolumeEndpoint("old_app", "/var/www/html"),
+            VolumeEndpoint("old_uploads", "/srv/uploads"),
+        ]
+        target = [VolumeEndpoint("new_app", "/var/www/html")]
+        with pytest.raises(VolumePairingError, match="no counterpart on the target"):
+            pair_by_name_suffix(source, target, source_uuid="old", target_uuid="new")
+
+    def test_source_name_without_uuid_prefix_refused(self) -> None:
+        # A pinned external volume name carries no uuid; suffix identity does
+        # not apply and the caller must fall back to mount-path pairing.
+        source = [VolumeEndpoint("wordpress-uploads", "/srv/uploads")]
+        target = [VolumeEndpoint("new_uploads", "/srv/uploads")]
+        with pytest.raises(VolumePairingError, match="does not carry the resource uuid"):
+            pair_by_name_suffix(source, target, source_uuid="old", target_uuid="new")
+
+    def test_full_covalida_stack(self) -> None:
+        source = [
+            VolumeEndpoint("old_app", "/var/www/html"),
+            VolumeEndpoint("old_uploads", "/var/www/html/wp-content/uploads"),
+            VolumeEndpoint("old_db-data", "/var/lib/mysql"),
+            VolumeEndpoint("old_redis-data", "/data"),
+        ]
+        target = [
+            VolumeEndpoint("new_app", "/var/www/html"),
+            VolumeEndpoint("new_uploads", "/srv/uploads"),
+            VolumeEndpoint("new_db-data", "/var/lib/mysql"),
+            VolumeEndpoint("new_redis-data", "/data"),
+            VolumeEndpoint("new_backup-data", "/data"),
+            VolumeEndpoint("new_sftp-keys", "/etc/ssh/keys"),
+        ]
+        pairs = {
+            p.source.name: p.target.name
+            for p in pair_by_name_suffix(source, target, source_uuid="old", target_uuid="new")
+        }
+        assert pairs == {
+            "old_app": "new_app",
+            "old_uploads": "new_uploads",
+            "old_db-data": "new_db-data",
+            "old_redis-data": "new_redis-data",
+        }
