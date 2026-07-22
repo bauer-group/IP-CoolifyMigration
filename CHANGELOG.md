@@ -1,7 +1,25 @@
 # CHANGELOG
 
 
+## v2.7.6 (2026-07-22)
+
+### Bug Fixes
+
+- **engine**: Paired compose volumes by volume key
+  ([`aaa864a`](https://github.com/bauer-group/IP-CoolifyMigration/commit/aaa864adf9ea2caa32f3d233558ba571bde52f56))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`d8b7f12`](https://github.com/bauer-group/IP-CoolifyMigration/commit/d8b7f1271a83cb332900c611712733f195a6abb5))
+
+
 ## v2.7.5 (2026-07-22)
+
+### Chores
+
+- Scrubbed project names from comments and tests
+  ([`b31f9c4`](https://github.com/bauer-group/IP-CoolifyMigration/commit/b31f9c41d150dd992f44f921fe7753850e094de9))
 
 ### Documentation
 
