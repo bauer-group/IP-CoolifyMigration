@@ -1,9 +1,20 @@
 # CHANGELOG
 
 
+## v2.7.4 (2026-07-22)
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`733f24d`](https://github.com/bauer-group/IP-CoolifyMigration/commit/733f24d90fd9a5d5bb83e0050012da911aed6f25))
+
+
 ## v2.7.3 (2026-07-22)
 
 ### Bug Fixes
+
+- **create**: Gated compose targets before the stop
+  ([`db2a2eb`](https://github.com/bauer-group/IP-CoolifyMigration/commit/db2a2eb7906c34600d2b97a50c5e074d4677bdb1))
 
 - **discover**: Fixed git-compose migration failure
   ([`d546963`](https://github.com/bauer-group/IP-CoolifyMigration/commit/d546963e680445590db9fd09233e7aef621449ef))
