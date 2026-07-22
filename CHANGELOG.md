@@ -1,7 +1,23 @@
 # CHANGELOG
 
 
+## v2.7.5 (2026-07-22)
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`f10248a`](https://github.com/bauer-group/IP-CoolifyMigration/commit/f10248af6e824ae7062eef683f148545a2785d76))
+
+
 ## v2.7.4 (2026-07-22)
+
+### Bug Fixes
+
+- **plan**: Resolved git auth from source columns, not create fields
+  ([`d40912e`](https://github.com/bauer-group/IP-CoolifyMigration/commit/d40912eb13dd08815a4bf851bb1e066cf9ddbae1))
+
+- **preflight**: Diagnosed private repos behind public sources
+  ([`53c6eee`](https://github.com/bauer-group/IP-CoolifyMigration/commit/53c6eeed08ada2258fe39a690ecde5b45b6ce1cf))
 
 ### Documentation
 
