@@ -404,6 +404,31 @@ class TestPreflight:
         with pytest.raises(PreflightError, match="cannot read"):
             await steps.step_preflight(ctx)
 
+    async def test_a_private_repo_behind_a_public_source_names_the_right_knob(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """covalida, second run: git and egress were fine — the repo had gone
+        private while the app's source stayed public. The install-git hint sent
+        the operator to the wrong knob; an auth refusal must name the real one."""
+        respx_mock.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"private_key": "x"}])
+        )
+        ctx.plan = _compose_plan()
+        target = _target_host()
+        target.on(
+            r"timeout 20 git ls-remote",
+            exit_status=128,
+            stderr="fatal: could not read Username for 'https://github.com': "
+            "No such device or address",
+        )
+        ctx.target_host = target  # type: ignore[assignment]
+
+        with pytest.raises(PreflightError, match="requires authentication") as exc_info:
+            await steps.step_preflight(ctx)
+        hint = exc_info.value.hint or ""
+        assert "private git source" in hint
+        assert "Install git" not in hint
+
     async def test_an_unrunnable_probe_does_not_block(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:

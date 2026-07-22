@@ -386,6 +386,39 @@ async def _assert_target_can_read_git(ctx: MigrationContext) -> None:
             )
             continue
 
+        # An auth refusal is a different disease than a broken host. git asking
+        # for a Username means the host and the network are FINE — the repo is
+        # private while the app's source says public. That app survives on its
+        # cached compose; a fresh target has no cache and can never load one.
+        # (covalida, 2026-07-22: the repo had gone private after the app was
+        # created, and the install-git hint sent the operator to the wrong knob.)
+        auth_markers = (
+            "could not read Username",
+            "could not read Password",
+            "Authentication failed",
+            "Permission denied",
+            "Repository not found",
+            "terminal prompts disabled",
+        )
+        if any(marker in result.stderr for marker in auth_markers):
+            raise PreflightError(
+                f"{snapshot.name}: {url} requires authentication, but the app's git "
+                "source is PUBLIC",
+                hint=(
+                    "The repository refused an unauthenticated read — which is exactly "
+                    "what Coolify's LoadComposeFile will attempt for a public-source "
+                    "app, on this and every server. The source still runs because its "
+                    "compose was cached while access worked; a fresh target cannot.\n"
+                    f"{ctx.plan.target_server.name} said: {detail}\n"
+                    "Give the application a private git source in Coolify (GitHub App, "
+                    "or a deploy key on the repo), then re-run — the target is then "
+                    "created via the matching private route and Coolify clones with its "
+                    "own credentials. Note a public-source app also cannot DEPLOY from "
+                    "a private repo, so this needs fixing regardless of the migration.\n"
+                    "Nothing has been changed."
+                ),
+            )
+
         raise PreflightError(
             f"{snapshot.name}: the target server cannot read {url}",
             hint=(
