@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.7.3 (2026-07-22)
+
+### Bug Fixes
+
+- **discover**: Fixed git-compose migration failure
+  ([`d546963`](https://github.com/bauer-group/IP-CoolifyMigration/commit/d546963e680445590db9fd09233e7aef621449ef))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`a74ce7f`](https://github.com/bauer-group/IP-CoolifyMigration/commit/a74ce7fc8867edd7e841762fefbfffc0cff3e03c))
+
+
 ## v2.7.2 (2026-07-21)
 
 ### Bug Fixes
