@@ -19,6 +19,7 @@ from bg_coolify_migrate.api import resources as api_resources
 from bg_coolify_migrate.discovery import docker
 from bg_coolify_migrate.engine import keys
 from bg_coolify_migrate.engine.context import MigrationContext
+from bg_coolify_migrate.errors import CoolifyApiError
 
 log = structlog.get_logger(__name__)
 
@@ -57,7 +58,7 @@ async def undo_create_target(ctx: MigrationContext, undo_info: dict[str, Any]) -
     for source_uuid, restore_body in parked.items():
         try:
             collection = ctx.collection_of(source_uuid)
-            await ctx.api.update_resource(collection, source_uuid, restore_body)
+            await _restore_source_domains(ctx, collection, source_uuid, restore_body)
             log.info("compensate.source_domains_restored", uuid=source_uuid)
         except Exception as exc:
             log.error(
@@ -69,6 +70,33 @@ async def undo_create_target(ctx: MigrationContext, undo_info: dict[str, Any]) -
     if delete_failures:
         # Surfaced so the rollback reports honestly; the source restore still ran.
         raise RuntimeError("could not delete target(s): " + ", ".join(delete_failures))
+
+
+async def _restore_source_domains(
+    ctx: MigrationContext, collection: str, source_uuid: str, restore_body: dict[str, Any]
+) -> None:
+    """Give the source back its own domains, surviving the parking 409.
+
+    Coolify's domain-uniqueness check 409s ("Domain conflicts detected. Use
+    force_domain_override=true") when a resource asks for a domain another still
+    holds — and the target we just deleted can linger in that check for a beat
+    (the delete is async). The plain restore then failed and the source kept
+    serving under its parked ``old-<tag>`` name (covalida, 2026-07-23:
+    staging.covalida.com was left parked while the source was back up).
+
+    So on a 409 we retry ONCE with ``force_domain_override``. In a rollback that
+    is unconditionally correct: the domain is the source's own, and the only
+    thing that could still be holding it is the target being torn down.
+    """
+    try:
+        await ctx.api.update_resource(collection, source_uuid, restore_body)
+    except CoolifyApiError as exc:
+        if exc.status_code != 409:
+            raise
+        log.warning("compensate.source_domains_conflict_forcing", uuid=source_uuid)
+        await ctx.api.update_resource(
+            collection, source_uuid, {**restore_body, "force_domain_override": True}
+        )
 
 
 async def undo_quiesce(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
@@ -114,9 +142,7 @@ async def undo_revoke_key(ctx: MigrationContext, undo_info: dict[str, Any]) -> N
     keyed on our comment marker, which contains the migration id, so we can
     always find exactly our line and never anyone else's.
     """
-    await keys.revoke(
-        source=ctx.source_host, target=ctx.target_host, migration_id=ctx.migration_id
-    )
+    await keys.revoke(source=ctx.source_host, target=ctx.target_host, migration_id=ctx.migration_id)
 
 
 async def undo_start_target(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
@@ -127,9 +153,7 @@ async def undo_start_target(ctx: MigrationContext, undo_info: dict[str, Any]) ->
     """
     started: list[str] = undo_info.get("started") or []
     for target_uuid in started:
-        source_uuid = next(
-            (s for s, t in ctx.target_uuids.items() if t == target_uuid), None
-        )
+        source_uuid = next((s for s, t in ctx.target_uuids.items() if t == target_uuid), None)
         collection = ctx.collection_of(source_uuid) if source_uuid else "applications"
         try:
             await ctx.api.stop(collection, target_uuid)
@@ -157,9 +181,7 @@ async def undo_restore_source_name(ctx: MigrationContext, undo_info: dict[str, A
                 resource.snapshot.name,
             )
         except Exception as exc:
-            log.error(
-                "compensate.rename_failed", name=resource.snapshot.name, error=str(exc)[:200]
-            )
+            log.error("compensate.rename_failed", name=resource.snapshot.name, error=str(exc)[:200])
             raise
 
 

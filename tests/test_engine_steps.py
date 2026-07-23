@@ -1631,6 +1631,59 @@ class TestUndoParkedDomains:
         )
         assert order == ["delete", "patch"]
 
+    async def test_domain_restore_retries_with_force_on_409(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        # The parking 409 (covalida, 2026-07-23): the deleted target lingers in
+        # Coolify's domain-uniqueness check for a beat, the plain restore 409s,
+        # and the source is left serving under its parked name. The rollback must
+        # retry ONCE with force_domain_override so the source regains its URL.
+        import json
+
+        from bg_coolify_migrate.engine.compensations import undo_create_target
+
+        route = respx_mock.patch(f"{BASE}/databases/db1").mock(
+            side_effect=[
+                httpx.Response(409, json={"message": "Domain conflicts detected."}),
+                httpx.Response(200, json={"uuid": "db1"}),
+            ]
+        )
+        await undo_create_target(
+            ctx,
+            {
+                "target_uuids": {},
+                "parked_domains": {"db1": {"domains": "https://speakup.bauer-group.com"}},
+            },
+        )
+        assert route.call_count == 2
+        first = json.loads(route.calls[0].request.read())
+        second = json.loads(route.calls[1].request.read())
+        assert "force_domain_override" not in first
+        assert second == {
+            "domains": "https://speakup.bauer-group.com",
+            "force_domain_override": True,
+        }
+
+    async def test_domain_restore_does_not_force_on_other_errors(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        # A 422 is a real rejection, not the transient parking conflict: retrying
+        # with force would paper over a genuine problem. Restore attempts it once,
+        # the error is caught and logged (best-effort), and no force retry fires.
+        from bg_coolify_migrate.engine.compensations import undo_create_target
+
+        route = respx_mock.patch(f"{BASE}/databases/db1").mock(
+            return_value=httpx.Response(422, json={"message": "Unprocessable."})
+        )
+        await undo_create_target(
+            ctx,
+            {
+                "target_uuids": {},
+                "parked_domains": {"db1": {"domains": "https://speakup.bauer-group.com"}},
+            },
+        )
+        assert route.call_count == 1
+
 
 class TestMaybeTunnel:
     """Whether the reverse forward is opened at all.
