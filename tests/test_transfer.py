@@ -129,6 +129,39 @@ class TestRsyncCommand:
         assert "--files-from" not in build_command(_spec(paths=(".",)))
 
 
+class TestRootMetadataPass:
+    """The chunked-transfer root-ownership gap (covalida, 2026-07-23).
+
+    --files-from never names the volume root, so a split transfer leaves the
+    destination root at docker's 0:0 while the source root is the container
+    user's (999). verify caught `metadata_differs . 999:999 != 0:0`; the fix is
+    a non-recursive metadata pass.
+    """
+
+    def test_dirs_only_transfers_the_root_via_files_from(self) -> None:
+        cmd = build_command(_spec(dirs_only=True))
+        assert "--files-from=-" in cmd
+        assert "printf '%s\\n' ." in cmd
+
+    def test_dirs_only_does_not_recurse(self) -> None:
+        # With --files-from and NO -r, only the named directory NODE transfers;
+        # its contents are untouched. An -r here would re-copy the whole tree.
+        cmd = build_command(_spec(dirs_only=True))
+        assert " -r " not in f" {cmd} " and not cmd.endswith(" -r")
+
+    def test_dirs_only_drops_delete(self) -> None:
+        # --delete on a non-recursive single-entry pass does nothing useful and
+        # is a foot-gun; it must not appear.
+        assert "--delete" not in build_command(_spec(dirs_only=True))
+
+    def test_dirs_only_keeps_ownership_flags(self) -> None:
+        # The whole point is to carry owner/perms across, so -a and
+        # --numeric-ids must survive.
+        cmd = build_command(_spec(dirs_only=True))
+        assert " -a " in f" {cmd} "
+        assert "--numeric-ids" in cmd
+
+
 class TestSshOption:
     def test_never_disables_host_key_checking(self) -> None:
         # Both predecessor tools use StrictHostKeyChecking=no, which accepts
@@ -246,6 +279,15 @@ class TestPartition:
         plan = whole_tree(500, "because")
         assert plan.chunks == (Chunk(paths=(".",), bytes=500),)
         assert plan.reason == "because"
+
+    def test_whole_tree_is_not_split(self) -> None:
+        # The root's metadata rides along with `rsync -a src/ dst/`; no extra pass.
+        assert whole_tree(500, "because").is_split is False
+
+    def test_chunked_plan_is_split(self) -> None:
+        # --files-from never names the root, so a metadata pass is required.
+        entries = [PathEntry(f"d{i}", 100) for i in range(8)]
+        assert plan_transfer(entries, max_parallel=4).is_split is True
 
 
 class TestSuggestParallelism:
@@ -474,6 +516,7 @@ class TestRsyncEnsureInstalled:
 
     async def test_noop_when_already_present(self) -> None:
         from bg_coolify_migrate.transfer import rsync
+
         host = FakeHost()
         host.on(r"command -v rsync", exit_status=0)
         await rsync.ensure_installed(host, label="source")  # no raise
@@ -481,6 +524,7 @@ class TestRsyncEnsureInstalled:
 
     async def test_installs_with_apt_when_missing(self) -> None:
         from bg_coolify_migrate.transfer import rsync
+
         host = FakeHost()
         # Missing on the first check, present after the install.
         host.on_sequence(r"command -v rsync", [{"exit_status": 1}, {"exit_status": 0}])
@@ -492,6 +536,7 @@ class TestRsyncEnsureInstalled:
     async def test_raises_when_no_package_manager(self) -> None:
         from bg_coolify_migrate.errors import TransferError
         from bg_coolify_migrate.transfer import rsync
+
         host = FakeHost()
         host.on(r"command -v rsync", exit_status=1)  # always missing
         host.on(r"command -v \S+", exit_status=1)  # no package manager present

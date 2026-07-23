@@ -272,6 +272,59 @@ class TestCaptureMounts:
         assert ctx.ephemeral_key is None
 
 
+class TestCopyOneRootMetadata:
+    """A split transfer must carry the volume ROOT's own ownership across.
+
+    covalida (2026-07-23): db-data was the only volume large enough to be
+    chunked; --files-from never names the root, so the destination root stayed
+    docker's 0:0 while the source was mysql's 999:999. verify refused it with
+    `metadata_differs . 999:999 != 0:0`. The single-stream volumes passed
+    because `rsync -a src/ dst/` sets the destination root. The fix adds one
+    non-recursive metadata pass after a split — and none after a whole-tree copy.
+    """
+
+    def _source_for(self, entries: dict[str, int], *, total_kb: int) -> FakeHost:
+        host = FakeHost()
+        host.on(r"ls -A", stdout="\n".join(entries))
+        for name, kb in entries.items():
+            host.on(rf"du -sk [^|]*{name}\b", stdout=str(kb))
+        host.on(r"-links \+1", stdout="")  # no hardlinks
+        host.on(r"du -sk", stdout=str(total_kb))  # whole-tree total (last match wins)
+        host.on(r"wc -l", stdout="1")
+        host.on(r"rsync", stdout="")  # both chunk rsyncs and the metadata pass
+        return host
+
+    async def test_split_transfer_appends_a_root_metadata_pass(self, ctx: MigrationContext) -> None:
+        from bg_coolify_migrate.engine.steps import _copy_one
+
+        # Two large entries + no hardlinks -> the plan splits into files-from chunks.
+        source = self._source_for({"base": 600_000, "waldir": 600_000}, total_kb=1_200_000)
+        ctx.source_host = source  # type: ignore[assignment]
+
+        await _copy_one(
+            ctx, "/var/lib/docker/volumes/old/_data", "/var/lib/docker/volumes/new/_data"
+        )
+
+        rsyncs = [c for c in source.commands if "rsync" in c]
+        assert any("--files-from=-" in c and "-r" in c.split() for c in rsyncs), "no chunked copy"
+        meta = [c for c in rsyncs if c.startswith("printf '%s\\n' . |")]
+        assert len(meta) == 1, "expected exactly one root-metadata pass after the split"
+        assert "--numeric-ids" in meta[0] and "--delete" not in meta[0]
+
+    async def test_whole_tree_transfer_has_no_extra_pass(self, ctx: MigrationContext) -> None:
+        from bg_coolify_migrate.engine.steps import _copy_one
+
+        # One entry -> whole-tree copy; `rsync -a src/ dst/` already carries the root.
+        source = self._source_for({"only": 10}, total_kb=10)
+        ctx.source_host = source  # type: ignore[assignment]
+
+        await _copy_one(
+            ctx, "/var/lib/docker/volumes/old/_data", "/var/lib/docker/volumes/new/_data"
+        )
+
+        assert not any(c.startswith("printf '%s\\n' . |") for c in source.commands)
+
+
 class TestPreflight:
     @pytest.fixture(autouse=True)
     def _coolify_version(self, respx_mock: respx.Router) -> None:

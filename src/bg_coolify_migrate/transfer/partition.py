@@ -66,6 +66,17 @@ class TransferPlan:
         return len(self.chunks)
 
     @property
+    def is_split(self) -> bool:
+        """True when the tree is copied as ``--files-from`` chunks.
+
+        A split transfer never names the volume ROOT, so its metadata must be
+        synced in a separate non-recursive pass (see
+        :attr:`bg_coolify_migrate.transfer.rsync.RsyncSpec.dirs_only`). The
+        whole-tree plan carries the root already.
+        """
+        return not (len(self.chunks) == 1 and self.chunks[0].is_whole_tree)
+
+    @property
     def total_bytes(self) -> int:
         return sum(c.bytes for c in self.chunks)
 

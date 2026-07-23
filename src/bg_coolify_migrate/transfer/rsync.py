@@ -97,6 +97,14 @@ class RsyncSpec:
     """Path to a private key ON THE SOURCE."""
     paths: Sequence[str] = (".",)
     """Relative paths to include, from :mod:`.partition`. ``('.',)`` = whole tree."""
+    dirs_only: bool = False
+    """Transfer only the volume ROOT's own metadata, no contents. A chunked
+    (``--files-from``) transfer never names the root itself, so the destination
+    root keeps the ``0:0`` ownership ``docker volume create`` gave it while the
+    source root is owned by the container user (mysql/postgres = 999). That one
+    directory mismatch stops a database from starting; this pass fixes it. The
+    whole-tree transfer already carries the root (``rsync -a src/ dst/`` sets the
+    destination directory), so it is only needed after a split."""
     compress: bool = False
     dry_run: bool = False
     checksum: bool = False
@@ -156,6 +164,24 @@ def build_command(spec: RsyncSpec) -> str:
 
     source = spec.source_path.rstrip("/") + "/"
     target = spec.target_path.rstrip("/") + "/"
+
+    # Root-metadata-only pass after a split (see RsyncSpec.dirs_only).
+    #
+    # `--files-from` with `.` and NO `-r` transfers exactly the named directory
+    # NODE — the volume root — carrying its perms/owner/times without touching a
+    # single byte of content. `--delete` is dropped: there is nothing to delete
+    # in a non-recursive, single-entry transfer, and keeping it here would only
+    # be a foot-gun.
+    if spec.dirs_only:
+        meta_flags = [f for f in flags if f != "--delete"]
+        meta_parts = ["rsync", *meta_flags, "--files-from=-"]
+        return (
+            "printf '%s\\n' . | "
+            + " ".join(shlex.quote(p) if " " in p else p for p in meta_parts)
+            + f" -e {shlex.quote(build_ssh_option(spec))}"
+            + f" {shlex.quote(source)}"
+            + f" {shlex.quote(f'{spec.target_user}@{spec.target_host}:{target}')}"
+        )
 
     parts = ["rsync", *flags]
 

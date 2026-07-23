@@ -1043,6 +1043,28 @@ async def _copy_one(ctx: MigrationContext, source_path: str, target_path: str) -
 
     await asyncio.gather(*(run_chunk(chunk.paths) for chunk in plan.chunks))
 
+    # A split transfer copies the tree through --files-from, which never names
+    # the volume ROOT itself — so the destination root keeps the 0:0 ownership
+    # `docker volume create` gave it, while the source root is owned by the
+    # container user (mysql/postgres = 999). Invisible in the data, but it stops
+    # a database from starting, and verify rightly refuses it (covalida,
+    # 2026-07-23: db-data, the only volume large enough to be chunked, failed
+    # `metadata_differs . 999:999 != 0:0` while the single-stream volumes
+    # passed). One non-recursive pass carries the root's own metadata across.
+    if plan.is_split:
+        await rsync.run(
+            ctx.source_host,
+            rsync.RsyncSpec(
+                source_path=source_path,
+                target_path=target_path,
+                target_host=host,
+                target_user=ctx.plan.target_server.user,
+                target_port=port,
+                identity_file=identity,
+                dirs_only=True,
+            ),
+        )
+
 
 async def step_verify(ctx: MigrationContext) -> dict[str, Any]:
     """Content AND metadata, both sides. A content-only check cannot see a chown."""
