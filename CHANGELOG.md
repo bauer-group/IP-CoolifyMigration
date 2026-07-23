@@ -1,6 +1,22 @@
 # CHANGELOG
 
 
+## v2.7.7 (2026-07-23)
+
+### Bug Fixes
+
+- **rollback**: Forced the source domain restore past the parking 409
+  ([`a87cef1`](https://github.com/bauer-group/IP-CoolifyMigration/commit/a87cef1dd6a6b4b174a5ea9241bfe10985538902))
+
+- **transfer**: Carried the volume root's ownership across a split copy
+  ([`c0fbb30`](https://github.com/bauer-group/IP-CoolifyMigration/commit/c0fbb3024af3fc4a82e3914279ea8a6c46fdbd6b))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`f6b356e`](https://github.com/bauer-group/IP-CoolifyMigration/commit/f6b356e1d01a0077a490b9dcc1a9617204f6dc15))
+
+
 ## v2.7.6 (2026-07-22)
 
 ### Bug Fixes
