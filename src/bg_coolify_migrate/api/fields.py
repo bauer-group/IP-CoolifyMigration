@@ -25,6 +25,7 @@ Verified against coollabsio/coolify@main.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # ── Databases ────────────────────────────────────────────────────────────────
@@ -57,7 +58,7 @@ DATABASE_COMMON: frozenset[str] = frozenset(
         "limits_cpus",
         "limits_cpuset",
         "limits_cpu_shares",
-        # NOT tags — released in 4.2.0, but our fleet runs 4.1.2. See SERVICE_CREATE.
+        # NOT tags — carried post-create by resources.copy_tags. See SERVICE_CREATE.
         # NOT health_check_*. They come back in every GET, and the obvious move is
         # to send them on. Coolify lists them in no $allowedFields — not on create,
         # not on update — so any request carrying one is rejected wholesale with
@@ -164,27 +165,22 @@ SERVICE_CREATE: frozenset[str] = frozenset(
         "urls",
         "force_domain_override",
         "is_container_label_escape_enabled",
-        # NOT tags. Shipped once (2.5.6) and reverted in 2.5.7 — it broke every
-        # migration against every Coolify that existed at the time.
+        # NOT tags — and this is now a permanent decision, not a version wait.
         #
-        # It is no longer unreleased: v4.2.0 (2026-07-21) carries it in the create
-        # $allowedFields at ServicesController:358, ApplicationsController:1123 and
-        # DatabasesController:1762 plus all eight engine routes — verified at that
-        # tag, not on `main`. Create-only; the update lists do not have it.
+        # History: shipped once (2.5.6) from a field read off `main` that no
+        # release carried, which broke every migration against every Coolify that
+        # existed. Reverted in 2.5.7. It became real in v4.2.0 (ServicesController
+        # :358, ApplicationsController:1123, DatabasesController:1762 + all eight
+        # engine routes) and our fleet has since moved to 4.3.2, so the old
+        # "target is too old" objection has expired.
         #
-        # It stays out regardless, because the constraint moved rather than
-        # disappeared. In 2.5.6 the SOURCE was wrong: a field read off `main` that
-        # no release carried. Now the source is right and the TARGET is too old —
-        # the fleet's control plane runs 4.1.2, where an unlisted create field is a
-        # 422 on the whole resource. Same outage, opposite cause.
-        #
-        # THE LESSON, generalised: the whitelist must match the version that RUNS,
-        # not the newest that exists. Reading the released tag was half of it; the
-        # canary pins the release, and this comment pins the fleet.
-        #
-        # Re-add when the fleet is on >=4.2.0, and then as a post-create
-        # POST /{collection}/{uuid}/tags — a separate, non-fatal call. Cosmetic
-        # metadata must never sit on the critical path of a cutover.
+        # It stays out because tags are copied OFF the critical path instead, by
+        # resources.copy_tags as a post-create POST /{collection}/{uuid}/tags. That
+        # is better than a create field on both axes that matter here: it works
+        # against 4.1.2 and 4.3.x alike (the route simply 404s on the older one),
+        # and it is non-fatal. A create field can be neither — an unlisted field is
+        # a 422 that destroys the whole resource, so cosmetic metadata would sit on
+        # the critical path of a cutover forever.
         # Adjudication recorded in tests/test_api_fields.py::KNOWN_TAGS_GAP.
     }
 )
@@ -245,7 +241,17 @@ APPLICATION_CREATE: frozenset[str] = frozenset(
         "static_image",
         "dockerfile",
         "dockerfile_location",
-        "dockerfile_target_build",
+        # NOT dockerfile_target_build. It is in the UPDATE list and in every GET,
+        # so it looks like a create field and was transcribed as one — but it
+        # appears in NO create $allowedFields, neither at v4.1.2 (:914) nor at
+        # v4.3.3 (:1194). A source app with a multi-stage build target set would
+        # therefore 422 the whole create, and the resource is never made.
+        #
+        # Never triggered in our fleet (0 of 39 apps carry one, measured
+        # 2026-08-15 against paas.cloud), which is exactly why it survived: a
+        # latent whitelist error only fires for the one operator who uses the
+        # feature. APPLICATION_UPDATE re-adds it explicitly below — it is genuinely
+        # settable there, just not on create.
         "docker_registry_image_name",
         "docker_registry_image_tag",
         "docker_compose_location",
@@ -259,7 +265,7 @@ APPLICATION_CREATE: frozenset[str] = frozenset(
         "custom_docker_run_options",
         "custom_nginx_configuration",
         "watch_paths",
-        # NOT tags — released in 4.2.0, but our fleet runs 4.1.2. See SERVICE_CREATE.
+        # NOT tags — carried post-create by resources.copy_tags. See SERVICE_CREATE.
         "health_check_enabled",
         "health_check_path",
         "health_check_port",
@@ -381,6 +387,83 @@ ENV_FIELDS: frozenset[str] = frozenset(
         "comment",
     }
 )
+
+#: Coolify >=4.2 tightened what an environment variable KEY may look like.
+#:
+#: ``app/Support/ValidationPatterns.php::ENVIRONMENT_VARIABLE_KEY_PATTERN``::
+#:
+#:     4.1.2:  /\A[^=\x00]+\z/u               anything without '=' or NUL
+#:     4.3.x:  /\A[A-Za-z_][A-Za-z0-9_.]*\z/u letter/underscore, then word chars + '.'
+#:
+#: Why this matters far more than a normal validation tweak: the rule is enforced
+#: by ``create_bulk_envs`` — the exact endpoint :meth:`CoolifyClient.set_envs_bulk`
+#: uses — and upstream validates and SAVES inside the same ``foreach``, with no
+#: transaction. A rejected key at position N therefore leaves entries 1..N-1
+#: already written and returns 422. The target ends up with a PARTIAL environment,
+#: mid-cutover, which is far worse than a clean refusal.
+#:
+#: Keys created under the old rule survive in the database untouched, so an
+#: instance upgraded to 4.3.x can hold keys its own API would now reject. That is
+#: the migration-relevant case: source and target share one control plane, and the
+#: source's stored keys are replayed through the new validator.
+_ENV_KEY_PATTERN = re.compile(r"\A[A-Za-z_][A-Za-z0-9_.]*\Z")
+
+#: Upstream's rule list is ``['required', 'string', 'max:255', 'regex:...']`` and
+#: Laravel applies ALL of them, so length is a separate failure from shape.
+_ENV_KEY_MAX_LENGTH = 255
+
+
+def env_key_rejection(key: str) -> str | None:
+    """Why Coolify >=4.2 would reject this env var key, or ``None`` if it passes.
+
+    PURE. Returns a human-readable reason rather than a bool, because the operator
+    has to fix the key by hand on the source and "invalid" alone does not say how.
+
+    Length is checked BEFORE shape: a 260-character key matches the pattern and
+    would still be rejected by ``max:255``, so testing the regex first reports a
+    doomed key as clean.
+    """
+    if not key:
+        return "is empty"
+    if len(key) > _ENV_KEY_MAX_LENGTH:
+        return f"is {len(key)} characters (Coolify allows at most {_ENV_KEY_MAX_LENGTH})"
+    if _ENV_KEY_PATTERN.match(key):
+        return None
+    if not re.match(r"[A-Za-z_]", key[0]):
+        return f"starts with {key[0]!r} — must start with a letter or underscore"
+    bad = sorted({c for c in key[1:] if not re.match(r"[A-Za-z0-9_.]", c)})
+    return "contains " + ", ".join(repr(c) for c in bad) + " — only letters, digits, '_' and '.'"
+
+
+def env_key_warnings(envs: list[dict[str, Any]]) -> list[str]:
+    """Warn about source env keys the target's API would reject. PURE.
+
+    Empty for the overwhelmingly common case of ``SCREAMING_SNAKE_CASE`` keys — 0
+    of 2751 keys across our own fleet were affected (measured 2026-08-15) — so
+    this does not tax every migration with noise.
+
+    Deliberately a WARNING and not a hard block. The rule bites only instances
+    that predate 4.2 and hold legacy keys; refusing to plan on it would block
+    migrations that cannot fail this way. But it is surfaced at PLAN time, because
+    the alternative is discovering it as a half-written env set during cutover.
+    """
+    out: list[str] = []
+    for env in envs:
+        key = str(env.get("key") or "")
+        if not key:
+            # A keyless entry is never sent: build_env_entries drops it (`if
+            # entry.get("key")`). Warning about something that cannot reach the API
+            # would be a false alarm, and this warning has to stay trustworthy.
+            continue
+        reason = env_key_rejection(key)
+        if reason:
+            out.append(
+                f"environment variable {key!r} {reason}. Coolify >=4.2 rejects it on "
+                "the bulk endpoint, and because upstream saves inside the validation "
+                "loop the target would be left with a PARTIAL environment. Rename it "
+                "on the source before migrating."
+            )
+    return out
 
 
 def filter_body(body: dict[str, Any], allowed: frozenset[str]) -> dict[str, Any]:

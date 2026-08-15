@@ -230,21 +230,36 @@ class TestEndpoints:
     async def test_delete_passes_delete_volumes_flag(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
+        """The parameter is snake_case — upstream reads `delete_volumes`.
+
+        These two tests asserted camelCase `deleteVolumes` until 2026-08-16 and
+        passed the whole time, because a mock echoes back whatever name we invent.
+        Laravel ignored the real requests and fell through to its own default of
+        true, so `delete_volumes=False` silently destroyed volumes.
+
+        The name is asserted explicitly here, against the upstream source rather
+        than against ourselves: `$request->boolean('delete_volumes', true)`, at
+        v4.1.2 (:2159) and v4.3.3 (:2560) alike.
+        """
         route = respx_mock.delete(f"{BASE}/databases/u1").mock(
             return_value=httpx.Response(200, json={})
         )
         await api.delete_resource("databases", "u1", delete_volumes=True)
-        assert route.calls[0].request.url.params["deleteVolumes"] == "true"
+        params = route.calls[0].request.url.params
+        assert params["delete_volumes"] == "true"
+        assert "deleteVolumes" not in params
 
     async def test_delete_defaults_to_keeping_volumes(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
-        # Never destroy data as a side effect of a default.
+        # Never destroy data as a side effect of a default. Note this default
+        # deliberately CONTRADICTS upstream's (true): an orphaned volume is
+        # recoverable, a deleted one is not.
         route = respx_mock.delete(f"{BASE}/databases/u1").mock(
             return_value=httpx.Response(200, json={})
         )
         await api.delete_resource("databases", "u1")
-        assert route.calls[0].request.url.params["deleteVolumes"] == "false"
+        assert route.calls[0].request.url.params["delete_volumes"] == "false"
 
     async def test_empty_body_returns_none(
         self, api: CoolifyClient, respx_mock: respx.Router

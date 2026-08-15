@@ -138,9 +138,12 @@ def _mock_compose_create_routes(respx_mock: respx.Router) -> None:
     respx_mock.get(f"{BASE}/projects/p1").mock(
         return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
     )
-    respx_mock.get(f"{BASE}/servers/s2").mock(
-        return_value=httpx.Response(200, json={"uuid": "s2", "destinations": [{"uuid": "d1"}]})
+    respx_mock.get(f"{BASE}/servers/s2/destinations").mock(
+        return_value=httpx.Response(200, json=[{"uuid": "d1", "network": "coolify"}])
     )
+    # An untagged resource — the common case. copy_tags runs post-create for every
+    # resource, so every CREATE test needs this route to exist.
+    respx_mock.get(f"{BASE}/applications/app1/tags").mock(return_value=httpx.Response(200, json=[]))
     respx_mock.get(f"{BASE}/applications/app1").mock(
         return_value=httpx.Response(
             200,
@@ -642,9 +645,10 @@ class TestCreateTarget:
         respx_mock.get(f"{BASE}/projects/p1").mock(
             return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
         )
-        respx_mock.get(f"{BASE}/servers/s2").mock(
-            return_value=httpx.Response(200, json={"uuid": "s2", "destinations": [{"uuid": "d1"}]})
+        respx_mock.get(f"{BASE}/servers/s2/destinations").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "d1", "network": "coolify"}])
         )
+        respx_mock.get(f"{BASE}/databases/db1/tags").mock(return_value=httpx.Response(200, json=[]))
         respx_mock.get(f"{BASE}/databases/db1").mock(
             return_value=httpx.Response(200, json={"uuid": "db1", "postgres_password": "s3cret"})
         )
@@ -760,16 +764,20 @@ class TestCreateTarget:
         result = await steps.step_create_target(ctx)
         assert result["target_uuids"] == {"app1": "tgt1"}
 
-    async def test_never_reads_the_main_only_tags_endpoint(
+    async def test_a_missing_tags_endpoint_never_fails_the_create(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
-        """REGRESSION (2.5.6): create_target must not touch /tags.
+        """REGRESSION (2.5.6): tags must never sit on the critical path.
 
-        2.5.6 read it on the critical path, so every migration against a real
-        Coolify died at create_target with a 404 — the endpoint exists only on
-        unreleased `main`. The mock below is registered precisely so it can be
-        asserted UNUSED; an unmocked call would also fail, but silently as a
-        connection error rather than as this named regression.
+        2.5.6 read /tags on the critical path, so every migration against a real
+        Coolify died at create_target with a 404 — no released version had the
+        route. The endpoint DOES exist from 4.2 onward and we now read it (to copy
+        tags), so "never call it" is no longer the property to protect.
+
+        The property that actually mattered then, and still does, is this one: a
+        404 from /tags must cost the tags and nothing else. The resource is still
+        created, and `tags` still never enters the create body — where an unlisted
+        field would 422 the whole resource on 4.1.2.
         """
         tags_route = respx_mock.get(f"{BASE}/databases/db1/tags").mock(
             return_value=httpx.Response(404, json={"message": "Not found."})
@@ -780,8 +788,8 @@ class TestCreateTarget:
         respx_mock.get(f"{BASE}/projects/p1").mock(
             return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
         )
-        respx_mock.get(f"{BASE}/servers/s2").mock(
-            return_value=httpx.Response(200, json={"uuid": "s2", "destinations": [{"uuid": "d1"}]})
+        respx_mock.get(f"{BASE}/servers/s2/destinations").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "d1", "network": "coolify"}])
         )
         respx_mock.get(f"{BASE}/databases/db1").mock(
             return_value=httpx.Response(200, json={"uuid": "db1", "postgres_password": "s3cret"})
@@ -791,9 +799,49 @@ class TestCreateTarget:
             return_value=httpx.Response(201, json={"uuid": "db2"})
         )
 
-        await steps.step_create_target(ctx)
-        assert not tags_route.called, "create_target read the main-only /tags endpoint"
+        result = await steps.step_create_target(ctx)
+
+        assert tags_route.called, "tags are read post-create; this asserts the 404 path"
+        assert result["target_uuids"] == {"db1": "db2"}, "a 404 on /tags must not fail the create"
         assert "tags" not in json.loads(route.calls[0].request.read().decode())
+
+    async def test_source_tags_are_copied_to_the_target(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """Tags reach the target by their own call, not by the create body."""
+        respx_mock.get(f"{BASE}/databases/db1/tags").mock(
+            return_value=httpx.Response(
+                200, json=[{"uuid": "t1", "name": "prod"}, {"uuid": "t2", "name": "billing"}]
+            )
+        )
+        tag_post = respx_mock.post(f"{BASE}/databases/db2/tags").mock(
+            return_value=httpx.Response(201, json=[])
+        )
+        respx_mock.get(f"{BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx_mock.get(f"{BASE}/projects/p1").mock(
+            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+        )
+        respx_mock.get(f"{BASE}/servers/s2/destinations").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "d1", "network": "coolify"}])
+        )
+        respx_mock.get(f"{BASE}/databases/db1").mock(
+            return_value=httpx.Response(200, json={"uuid": "db1", "postgres_password": "s3cret"})
+        )
+        respx_mock.get(f"{BASE}/databases/db1/envs").mock(return_value=httpx.Response(200, json=[]))
+        create = respx_mock.post(f"{BASE}/databases/postgresql").mock(
+            return_value=httpx.Response(201, json={"uuid": "db2"})
+        )
+
+        await steps.step_create_target(ctx)
+
+        assert tag_post.called
+        assert json.loads(tag_post.calls[0].request.read().decode()) == {
+            "tag_names": ["prod", "billing"]
+        }
+        # The create body stays clean — that is the 2.5.6 lesson.
+        assert "tags" not in json.loads(create.calls[0].request.read().decode())
 
 
 class TestTransferEndpoint:
@@ -1117,7 +1165,7 @@ class TestFinalize:
 
         result = await steps.step_finalize(ctx)
         assert "deleted postgres" in result["actions"]
-        assert route.calls[0].request.url.params["deleteVolumes"] == "true"
+        assert route.calls[0].request.url.params["delete_volumes"] == "true"
 
     async def test_finalize_revokes_the_ephemeral_key(
         self, ctx: MigrationContext, respx_mock: respx.Router
@@ -1144,7 +1192,7 @@ class TestCompensations:
             return_value=httpx.Response(200, json={})
         )
         await compensations.undo_create_target(ctx, {"target_uuids": {"db1": "db2"}})
-        assert route.calls[0].request.url.params["deleteVolumes"] == "true"
+        assert route.calls[0].request.url.params["delete_volumes"] == "true"
 
     async def test_delete_target_with_nothing_recorded_is_a_noop(
         self, ctx: MigrationContext

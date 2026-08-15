@@ -239,6 +239,11 @@ class CoolifyClient:
             hint=(
                 "Create a token with `root` or `read:sensitive` in Coolify under "
                 "Keys & Tokens > API tokens.\n"
+                "On Coolify >=4.2 the token scope is NOT sufficient on its own: "
+                "ApiSensitiveData computes `can_read_sensitive = (root OR "
+                "read:sensitive) AND isAdminOfTeam(...)`, so the token's OWNER must "
+                "also be an admin/owner of the team. A correctly scoped token held "
+                "by a regular member fails this check with no error of its own.\n"
                 "Without it Coolify silently OMITS environment variable values, "
                 "docker_compose_raw and database passwords from its responses — "
                 "HTTP 200, no error, keys simply absent. Migrating with such a "
@@ -326,8 +331,58 @@ class CoolifyClient:
         """
         return _as_list(await self.get(f"/{collection}/{uuid}/envs"))
 
-    # NO get_tag_names. ``/{collection}/{uuid}/tags`` is `main`-only and 404s on
-    # every published Coolify — see the tags note in api/fields.py.
+    async def _get_optional(self, path: str) -> Any | None:
+        """GET a route that may not exist on this Coolify. ``None`` when it 404s.
+
+        Coolify gained whole REST surfaces between 4.1 and 4.3 (destinations, tags),
+        and this tool must keep working against both. A 404 here means "this
+        instance is older", which is information, not an error — every other status
+        still raises.
+        """
+        try:
+            return await self.get(path)
+        except CoolifyApiError as exc:
+            if exc.status_code == 404:
+                log.debug("api.route_absent", path=path)
+                return None
+            raise
+
+    async def get_server_destinations(self, uuid: str) -> list[dict[str, Any]] | None:
+        """A server's docker destinations. ``None`` when the route does not exist.
+
+        This is the ONLY way to see them. ``GET /servers/{uuid}`` does
+        ``$server->load(['settings'])`` and nothing else — at v4.1.2 exactly as at
+        v4.3.3 — so ``destinations`` and ``standalone_dockers`` are absent from that
+        response on every version. Reading them from it (as this tool did until
+        2026-08-16) yields an empty list forever, which silently reads as "one
+        destination, nothing to choose".
+
+        The dedicated route arrived in 4.2; on 4.1.2 it 404s and the caller must
+        fall back to letting Coolify choose.
+        """
+        result = await self._get_optional(f"/servers/{uuid}/destinations")
+        return None if result is None else _as_list(result)
+
+    async def get_tag_names(self, collection: str, uuid: str) -> list[str] | None:
+        """A resource's tag names. ``None`` when the route does not exist.
+
+        Tags are NOT part of the resource GET — verified live against 4.3.2, where
+        ``GET /applications/{uuid}`` carries no ``tags`` key at all — so this
+        dedicated route is the only source. It does not exist at 4.1.2 (zero tag
+        routes in that release's ``routes/api.php``).
+        """
+        result = await self._get_optional(f"/{collection}/{uuid}/tags")
+        if result is None:
+            return None
+        return [str(t["name"]) for t in _as_list(result) if t.get("name")]
+
+    async def add_tags(self, collection: str, uuid: str, names: list[str]) -> Any:
+        """Attach tags by name. Upstream creates any that do not exist yet.
+
+        The body key is ``tag_names`` (an array); ``tag_name`` is the single-value
+        alternative. Upstream requires each name to be at least 2 characters.
+        """
+        return await self.post(f"/{collection}/{uuid}/tags", {"tag_names": names})
 
     # ── writes ───────────────────────────────────────────────────────────────
 
@@ -420,9 +475,27 @@ class CoolifyClient:
     async def delete_resource(
         self, collection: str, uuid: str, *, delete_volumes: bool = False
     ) -> Any:
+        """Delete a resource. ``delete_volumes`` controls its docker volumes.
+
+        The query parameter is ``delete_volumes``, snake_case — upstream reads
+        ``$request->boolean('delete_volumes', true)``, at v4.1.2 (:2159) exactly as
+        at v4.3.3 (:2560). This sent camelCase ``deleteVolumes`` until 2026-08-16,
+        which Laravel silently ignored, so **every delete fell through to upstream's
+        default of true** regardless of what the caller asked for.
+
+        That was survivable only by coincidence: both production call sites pass
+        True explicitly (compensations removes a half-built TARGET, finalize removes
+        a migrated-away SOURCE), so intent and effect happened to agree. Neither
+        changes behaviour now. What changes is that ``delete_volumes=False``
+        finally means it — before the fix it silently destroyed the volumes anyway.
+
+        The default stays False. Upstream defaults to true, but a tool whose whole
+        purpose is not losing data should not inherit a destructive default: an
+        orphaned volume is recoverable, a deleted one is not.
+        """
         return await self.delete(
             f"/{collection}/{uuid}",
-            deleteVolumes="true" if delete_volumes else "false",
+            delete_volumes="true" if delete_volumes else "false",
         )
 
     async def update_resource(self, collection: str, uuid: str, body: dict[str, Any]) -> Any:
@@ -451,15 +524,29 @@ def _to_error(method: str, path: str, response: httpx.Response) -> CoolifyApiErr
     if response.status_code == 401:
         hint = "Check COOLIFY_TOKEN. Coolify tokens are instance-specific."
     elif response.status_code == 403:
-        # Coolify returns 403 for BOTH "your token cannot do this" and "the API
-        # is switched off instance-wide", and the two need opposite fixes.
-        # Guessing sends the operator to re-issue a token that was never the
-        # problem. It tells us which in the body — read it.
+        # Coolify returns 403 for THREE unrelated conditions, each needing a
+        # different fix. Guessing sends the operator to re-issue a token that was
+        # never the problem. It tells us which in the body — read it.
+        #
+        # The order matters: ApiAllowed runs BEFORE any token check, so an
+        # allowlist rejection never reaches the ability middleware. A caller
+        # blocked by IP sees no token error because the token was never examined.
         if "API is disabled" in message:
             hint = (
                 "The instance has its API switched off. Enable it in Coolify under "
-                "Settings > API, or call GET /api/v1/enable with a write token.\n"
+                "Settings > API, or POST /api/v1/enable with a root token (it moved "
+                "from GET to POST in 4.2).\n"
                 "This is instance-wide and off by default; your token is fine."
+            )
+        elif "not allowed to access the API" in message:
+            # app/Http/Middleware/ApiAllowed.php — identical at v4.1.2 and v4.3.3.
+            # Found the hard way: this used to fall into the token branch below and
+            # sent us hunting a token problem that did not exist.
+            hint = (
+                "Your IP is not on the instance's API allowlist. Add it in Coolify "
+                "under Settings > API > Allowed IPs (or set 0.0.0.0 to allow all).\n"
+                "Your token is fine — this check runs before the token is even "
+                "looked at, so no token change can get past it."
             )
         else:
             hint = "The token lacks the ability for this call (needs write/deploy, or root)."

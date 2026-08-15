@@ -103,10 +103,65 @@ _TRUST_HOST_KEY_HELP = (
     "unattended runs; interactively you are asked with the fingerprint instead."
 )
 
-#: The Coolify version this tool is validated against. Coolify's API contract
-#: (field shapes, container labels, create validation) shifts between releases,
-#: so a different version is flagged as untested rather than silently trusted.
-TESTED_COOLIFY_VERSION = "4.1.2"
+#: The Coolify releases this tool's API contract has been validated against, as
+#: an INCLUSIVE range. Coolify's contract (field shapes, container labels, create
+#: validation) shifts between releases, so anything outside is flagged as untested
+#: rather than silently trusted.
+#:
+#: A range, not a single version, because a single one is wrong almost always. The
+#: whitelists in api/fields.py are transcribed from upstream source and match a
+#: SPAN of releases; pinning one value made every run against the 4.3.2 fleet warn
+#: about a version that had in fact been checked. A warning that fires on a
+#: correct setup trains operators to ignore warnings, which costs more than it
+#: ever saves.
+#:
+#: Verified 2026-08-16 by diffing every `$allowedFields` array and every API route
+#: between tags v4.1.2 and v4.3.3: nothing was removed, only added. Extend the
+#: upper bound only after repeating that diff — never because a newer tag exists.
+VALIDATED_COOLIFY_MIN = "4.1.2"
+VALIDATED_COOLIFY_MAX = "4.3.3"
+
+
+def _version_tuple(raw: str) -> tuple[int, ...] | None:
+    """``"4.3.2"`` -> ``(4, 3, 2)``. ``None`` when it is not a plain version. PURE.
+
+    Tolerates a trailing suffix (``4.4.0-beta.1`` -> ``(4, 4, 0)``) because Coolify
+    publishes long beta chains, and refuses to guess at anything else — an
+    unparseable version must not silently compare as "in range".
+    """
+    head = raw.strip().lstrip("v").split("-")[0].split("+")[0]
+    parts = head.split(".")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def coolify_version_warning(raw: str) -> str | None:
+    """Warn if this Coolify is outside the validated range. ``None`` if fine. PURE.
+
+    An unparseable version warns rather than passing: "we could not tell" is not
+    "it is fine", and this is the one place that would hide a genuinely exotic
+    build.
+    """
+    version = _version_tuple(raw)
+    if version is None:
+        return (
+            f"could not parse the Coolify version {raw.strip()!r}; this tool is "
+            f"validated against {VALIDATED_COOLIFY_MIN}-{VALIDATED_COOLIFY_MAX}"
+        )
+    # The bounds are module constants and always parse; the fallbacks exist only
+    # so a typo in them degrades to "warn about everything" rather than a crash.
+    low = _version_tuple(VALIDATED_COOLIFY_MIN) or (0,)
+    high = _version_tuple(VALIDATED_COOLIFY_MAX) or (0,)
+    if low <= version <= high:
+        return None
+    side = "older than" if version < low else "newer than"
+    return (
+        f"Coolify {raw.strip()} is {side} the validated range "
+        f"{VALIDATED_COOLIFY_MIN}-{VALIDATED_COOLIFY_MAX}. The API contract can "
+        "differ between releases (field shapes, container labels, create "
+        "validation) — verify a `plan` before you `run`."
+    )
 
 
 # ── doctor ───────────────────────────────────────────────────────────────────
@@ -157,15 +212,8 @@ async def _doctor(
     async with CoolifyClient(url, token, verify=settings.coolify_verify_tls) as api:
         version = await api.version()
         console.print(f"[ok]OK[/ok] Coolify {version} reachable at [path]{url}[/path]")
-        if version.strip() != TESTED_COOLIFY_VERSION:
-            console.print(
-                Text.assemble(
-                    ("WARN ", "warn"),
-                    f"validated against Coolify {TESTED_COOLIFY_VERSION}; {version.strip()} is "
-                    "untested. The API contract can differ between releases (field shapes, "
-                    "container labels, create validation) — verify a `plan` before you `run`.",
-                )
-            )
+        if warning := coolify_version_warning(version):
+            console.print(Text.assemble(("WARN ", "warn"), warning))
 
         # The check that matters. Without this scope every env var comes back
         # with no value at all - HTTP 200, no error, keys simply absent.

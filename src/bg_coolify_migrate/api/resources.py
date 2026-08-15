@@ -134,11 +134,27 @@ async def resolve_destination(api: CoolifyClient, server_uuid: str) -> str | Non
     ``destination_uuid`` is only mandatory if the server has several; sending it
     unnecessarily is harmless, but guessing wrong is not. Returns ``None`` when
     the server has a single destination and Coolify can pick it itself.
+
+    Reads the dedicated ``/servers/{uuid}/destinations`` route. This used to read
+    ``destinations`` / ``standalone_dockers`` off ``GET /servers/{uuid}``, where
+    they have never been present on any version — ``server_by_uuid`` loads only
+    ``['settings']`` — so the list was always empty, this always returned None, and
+    the multi-destination guard below was unreachable dead code. Discovered
+    2026-08-16 against a live 4.3.2 instance, where the fields came back ``null``.
     """
-    server = await api.get_server(server_uuid)
-    destinations = server.get("destinations") or server.get("standalone_dockers") or []
-    if not isinstance(destinations, list) or len(destinations) <= 1:
+    destinations = await api.get_server_destinations(server_uuid)
+
+    if destinations is None:
+        # Coolify <4.2 has no destinations route. We cannot enumerate them, so we
+        # cannot detect a multi-destination server — exactly the old behaviour,
+        # but now a known blind spot rather than an accident. Coolify picks, which
+        # is right for the single-destination case that this covers in practice.
+        log.debug("api.destinations.route_absent", server=server_uuid)
         return None
+
+    if len(destinations) <= 1:
+        return None
+
     # More than one: we must choose, and we cannot. Prefer the one Coolify marks
     # as the network for this server, else fail loudly rather than pick at random.
     for destination in destinations:
@@ -632,6 +648,58 @@ async def copy_envs(
     await api.set_envs_bulk(collection, target_uuid, entries)
     log.info("api.envs.copied", count=len(entries), target=target_uuid)
     return len(entries)
+
+
+# ── tags ─────────────────────────────────────────────────────────────────────
+
+#: Upstream requires each tag name to be at least 2 characters. A shorter one on
+#: the source is dropped rather than sent: it would 422 the call and take the
+#: whole (perfectly good) tag set with it.
+_MIN_TAG_LENGTH = 2
+
+
+async def copy_tags(
+    api: CoolifyClient, *, collection: str, source_uuid: str, target_uuid: str
+) -> int:
+    """Copy tags source -> target. Returns the count copied. NEVER raises.
+
+    Tags are cosmetic metadata, and this runs after the target exists. A failure
+    here must not fail a migration that has otherwise succeeded — losing a label
+    is an annoyance, aborting a cutover over one is an outage. So every failure
+    path is a warning and a zero.
+
+    Deliberately a separate post-create call rather than a ``tags`` create field.
+    Upstream does accept ``tags`` on create from 4.2 onward, but putting it in the
+    create body places cosmetic metadata on the critical path: on Coolify 4.1.2 an
+    unlisted create field is a 422 that destroys the whole resource. Shipping that
+    once (2.5.6) broke every migration against every instance that existed. This
+    shape works on both, and degrades to "no tags" on the version that lacks the
+    route instead of taking the resource down with it.
+    """
+    try:
+        names = await api.get_tag_names(collection, source_uuid)
+    except CoolifyApiError as exc:
+        log.warning("api.tags.read_failed", uuid=source_uuid, error=str(exc)[:200])
+        return 0
+
+    if names is None:
+        log.debug("api.tags.route_absent", uuid=source_uuid)
+        return 0
+
+    usable = [n for n in names if len(n) >= _MIN_TAG_LENGTH]
+    if dropped := [n for n in names if len(n) < _MIN_TAG_LENGTH]:
+        log.warning("api.tags.too_short", uuid=source_uuid, names=dropped)
+    if not usable:
+        return 0
+
+    try:
+        await api.add_tags(collection, target_uuid, usable)
+    except CoolifyApiError as exc:
+        log.warning("api.tags.copy_failed", target=target_uuid, error=str(exc)[:200])
+        return 0
+
+    log.info("api.tags.copied", count=len(usable), target=target_uuid)
+    return len(usable)
 
 
 # ── storages ─────────────────────────────────────────────────────────────────

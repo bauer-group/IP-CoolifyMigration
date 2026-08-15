@@ -23,7 +23,7 @@ from typing import Any
 import structlog
 
 from bg_coolify_migrate.api.client import CoolifyClient
-from bg_coolify_migrate.api.fields import database_health_check_warnings
+from bg_coolify_migrate.api.fields import database_health_check_warnings, env_key_warnings
 from bg_coolify_migrate.discovery import docker
 from bg_coolify_migrate.discovery.docker import (
     LABEL_ENVIRONMENT,
@@ -847,6 +847,16 @@ async def build_plan(
 
         if collection == "databases":
             warnings.extend(database_health_check_warnings(full))
+
+        # Env keys are validated by the TARGET's API at copy time, and Coolify
+        # >=4.2 rejects shapes its own older versions happily stored. Catching that
+        # here — reading only — turns a mid-cutover partial write into a line in
+        # the plan. Fail-soft for the same reason as api_storages above: an
+        # unreadable env list is a worse plan, not a reason to refuse to plan.
+        try:
+            warnings.extend(env_key_warnings(await api.get_envs(collection, snapshot.uuid)))
+        except Exception as exc:  # diagnostics only, never fatal
+            log.debug("planner.envs_unavailable", uuid=snapshot.uuid, error=str(exc)[:120])
 
         plans.append(
             ResourcePlan(

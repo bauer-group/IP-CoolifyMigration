@@ -273,6 +273,15 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
             target_uuid=target_uuid,
             kind=snapshot.kind,
         )
+        # Cosmetic metadata, and deliberately last: copy_tags never raises, so a
+        # missing tag route (Coolify <4.2) or a rejected name degrades to "no
+        # tags" instead of taking down a target that is otherwise complete.
+        await api_resources.copy_tags(
+            ctx.api,
+            collection=snapshot.collection,
+            source_uuid=snapshot.uuid,
+            target_uuid=target_uuid,
+        )
 
         # STILL inside CREATE, deliberately: the next step stops the source.
         if snapshot.kind is ResourceKind.APP_GIT_COMPOSE:

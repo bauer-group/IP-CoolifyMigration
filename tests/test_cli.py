@@ -16,7 +16,14 @@ import respx
 from typer.testing import CliRunner
 
 from bg_coolify_migrate import __version__
-from bg_coolify_migrate.cli import Selection, _parse_selector, app
+from bg_coolify_migrate.cli import (
+    VALIDATED_COOLIFY_MAX,
+    VALIDATED_COOLIFY_MIN,
+    Selection,
+    _parse_selector,
+    app,
+    coolify_version_warning,
+)
 from bg_coolify_migrate.errors import MigrationError
 from bg_coolify_migrate.journal.store import Journal
 from bg_coolify_migrate.observability.logging_setup import reset_logging
@@ -159,28 +166,87 @@ class TestDoctorExitCodes:
         )
 
     @respx.mock
-    def test_tested_version_prints_no_untested_warning(
+    def test_version_at_the_bottom_of_the_range_is_silent(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("COOLIFY_URL", HOST)
         monkeypatch.setenv("COOLIFY_TOKEN", "root-token")
-        self._happy_mocks("4.1.2")
+        self._happy_mocks(VALIDATED_COOLIFY_MIN)
         result = runner.invoke(app, ["doctor", "--no-check-servers"])
         assert result.exit_code == 0
-        assert "untested" not in result.stdout
+        assert "validated range" not in result.stdout
 
     @respx.mock
-    def test_untested_version_warns_but_still_exits_0(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # A different Coolify release may shift the API contract; warn, don't fail.
+    def test_version_inside_the_range_is_silent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The whole point of a range: 4.3.2 is checked, so it must not warn.
+
+        An exact-match check warned on every run against our own 4.3.2 fleet, which
+        is how a warning becomes furniture nobody reads.
+        """
         monkeypatch.setenv("COOLIFY_URL", HOST)
         monkeypatch.setenv("COOLIFY_TOKEN", "root-token")
-        self._happy_mocks("4.2.0")
+        self._happy_mocks("4.3.2")
         result = runner.invoke(app, ["doctor", "--no-check-servers"])
         assert result.exit_code == 0
-        assert "untested" in result.stdout
-        assert "4.2.0" in result.stdout
+        assert "validated range" not in result.stdout
+
+    @respx.mock
+    def test_version_above_the_range_warns_but_still_exits_0(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A newer Coolify may shift the API contract; warn, don't fail.
+        monkeypatch.setenv("COOLIFY_URL", HOST)
+        monkeypatch.setenv("COOLIFY_TOKEN", "root-token")
+        self._happy_mocks("4.9.0")
+        result = runner.invoke(app, ["doctor", "--no-check-servers"])
+        assert result.exit_code == 0
+        assert "newer than" in result.stdout
+        assert "4.9.0" in result.stdout
+
+    @respx.mock
+    def test_version_below_the_range_warns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COOLIFY_URL", HOST)
+        monkeypatch.setenv("COOLIFY_TOKEN", "root-token")
+        self._happy_mocks("4.0.9")
+        result = runner.invoke(app, ["doctor", "--no-check-servers"])
+        assert result.exit_code == 0
+        assert "older than" in result.stdout
+
+
+class TestCoolifyVersionWarning:
+    """The pure range check. Unit-tested because a bad comparison is silent.
+
+    A version check that wrongly passes says nothing at all — there is no output
+    to notice — so it cannot be caught by using the tool.
+    """
+
+    def test_bounds_are_inclusive(self) -> None:
+        assert coolify_version_warning(VALIDATED_COOLIFY_MIN) is None
+        assert coolify_version_warning(VALIDATED_COOLIFY_MAX) is None
+
+    def test_compares_numerically_not_lexically(self) -> None:
+        """'4.10.0' > '4.3.3' numerically but LESS lexically.
+
+        A string comparison would call 4.10 supported. Coolify will reach 4.10.
+        """
+        assert coolify_version_warning("4.10.0") is not None
+        assert "newer than" in coolify_version_warning("4.10.0") or ""
+
+    def test_tolerates_a_prerelease_suffix(self) -> None:
+        assert coolify_version_warning("4.3.0-beta.1") is None
+
+    def test_tolerates_a_v_prefix(self) -> None:
+        assert coolify_version_warning("v4.3.0") is None
+
+    def test_unparseable_version_warns_rather_than_passing(self) -> None:
+        """"We could not tell" is not "it is fine"."""
+        warning = coolify_version_warning("nightly")
+        assert warning is not None
+        assert "could not parse" in warning
+
+    def test_shorter_version_still_compares(self) -> None:
+        # (4, 2) sorts between (4, 1, 2) and (4, 3, 3) — no crash on ragged tuples.
+        assert coolify_version_warning("4.2") is None
 
 
 class TestStatus:

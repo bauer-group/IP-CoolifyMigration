@@ -20,6 +20,7 @@ from bg_coolify_migrate.api.resources import (
     build_env_entries,
     copy_envs,
     copy_storages,
+    copy_tags,
     create_resource,
     ensure_project,
     read_volume_endpoints,
@@ -154,27 +155,33 @@ class TestEnsureProject:
 
 
 class TestResolveDestination:
+    """Destinations come from /servers/{uuid}/destinations, never from the server GET.
+
+    They were read off ``GET /servers/{uuid}`` until 2026-08-16, where they have
+    never been present on any Coolify — ``server_by_uuid`` loads only
+    ``['settings']``. These tests passed anyway, because a mock will happily return
+    a field the real API does not have. Verified against a live 4.3.2: both
+    ``destinations`` and ``standalone_dockers`` come back ``null``.
+    """
+
     async def test_single_destination_needs_no_choice(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
-        respx_mock.get(f"{BASE}/servers/srv1").mock(
-            return_value=httpx.Response(200, json={"uuid": "srv1", "destinations": [{"uuid": "d1"}]})
+        respx_mock.get(f"{BASE}/servers/srv1/destinations").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "d1", "network": "coolify"}])
         )
         assert await resolve_destination(api, "srv1") is None
 
     async def test_multiple_destinations_prefers_the_coolify_network(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
-        respx_mock.get(f"{BASE}/servers/srv1").mock(
+        respx_mock.get(f"{BASE}/servers/srv1/destinations").mock(
             return_value=httpx.Response(
                 200,
-                json={
-                    "uuid": "srv1",
-                    "destinations": [
-                        {"uuid": "d1", "network": "other"},
-                        {"uuid": "d2", "network": "coolify"},
-                    ],
-                },
+                json=[
+                    {"uuid": "d1", "network": "other"},
+                    {"uuid": "d2", "network": "coolify"},
+                ],
             )
         )
         assert await resolve_destination(api, "srv1") == "d2"
@@ -182,20 +189,147 @@ class TestResolveDestination:
     async def test_ambiguous_destinations_refuse_rather_than_guess(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
-        respx_mock.get(f"{BASE}/servers/srv1").mock(
+        respx_mock.get(f"{BASE}/servers/srv1/destinations").mock(
             return_value=httpx.Response(
                 200,
-                json={
-                    "uuid": "srv1",
-                    "destinations": [
-                        {"uuid": "d1", "network": "a"},
-                        {"uuid": "d2", "network": "b"},
-                    ],
-                },
+                json=[
+                    {"uuid": "d1", "network": "a"},
+                    {"uuid": "d2", "network": "b"},
+                ],
             )
         )
         with pytest.raises(UnsupportedResource, match="will not guess"):
             await resolve_destination(api, "srv1")
+
+    async def test_older_coolify_without_the_route_lets_coolify_choose(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        """Coolify <4.2 has no destinations route; a 404 must not fail the migration.
+
+        The route arrived in 4.2 (zero destination routes in v4.1.2's api.php). On
+        an older instance we cannot enumerate them, so we send no destination_uuid
+        and let Coolify pick — which is correct for the single-destination case
+        that covers this in practice.
+        """
+        respx_mock.get(f"{BASE}/servers/srv1/destinations").mock(
+            return_value=httpx.Response(404, json={"message": "Not found."})
+        )
+        assert await resolve_destination(api, "srv1") is None
+
+    async def test_a_real_error_is_not_swallowed_as_absent(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        """Only 404 means "older Coolify". A 500 is a fault and must surface.
+
+        Treating every failure as "route absent" would turn a broken instance into
+        a silent wrong-destination placement.
+        """
+        respx_mock.get(f"{BASE}/servers/srv1/destinations").mock(
+            return_value=httpx.Response(500, json={"message": "boom"})
+        )
+        with pytest.raises(CoolifyApiError):
+            await resolve_destination(api, "srv1")
+
+
+class TestCopyTags:
+    """Tags are cosmetic and run after the target exists, so failure must be free.
+
+    The 2.5.6 outage was tags on the critical path: a 404 from /tags killed every
+    migration. These tests pin the property that prevents a repeat — every failure
+    path returns 0 rather than raising.
+    """
+
+    async def test_copies_names_through_the_dedicated_route(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.get(f"{BASE}/applications/src1/tags").mock(
+            return_value=httpx.Response(
+                200, json=[{"uuid": "t1", "name": "prod"}, {"uuid": "t2", "name": "eu"}]
+            )
+        )
+        post = respx_mock.post(f"{BASE}/applications/tgt1/tags").mock(
+            return_value=httpx.Response(201, json=[])
+        )
+        count = await copy_tags(
+            api, collection="applications", source_uuid="src1", target_uuid="tgt1"
+        )
+        assert count == 2
+        assert json.loads(post.calls[0].request.read().decode()) == {"tag_names": ["prod", "eu"]}
+
+    async def test_missing_route_is_not_an_error(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # Coolify <4.2 has no tag routes at all.
+        respx_mock.get(f"{BASE}/applications/src1/tags").mock(
+            return_value=httpx.Response(404, json={"message": "Not found."})
+        )
+        assert (
+            await copy_tags(api, collection="applications", source_uuid="src1", target_uuid="tgt1")
+            == 0
+        )
+
+    async def test_a_read_failure_never_raises(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.get(f"{BASE}/applications/src1/tags").mock(
+            return_value=httpx.Response(500, json={"message": "boom"})
+        )
+        assert (
+            await copy_tags(api, collection="applications", source_uuid="src1", target_uuid="tgt1")
+            == 0
+        )
+
+    async def test_a_write_failure_never_raises(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        """The important one: the target already exists at this point.
+
+        Raising here would abort a migration whose resource was created fine, over
+        a label.
+        """
+        respx_mock.get(f"{BASE}/applications/src1/tags").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "t1", "name": "prod"}])
+        )
+        respx_mock.post(f"{BASE}/applications/tgt1/tags").mock(
+            return_value=httpx.Response(422, json={"message": "nope"})
+        )
+        assert (
+            await copy_tags(api, collection="applications", source_uuid="src1", target_uuid="tgt1")
+            == 0
+        )
+
+    async def test_drops_names_upstream_would_reject(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        """Upstream requires >=2 characters. One short name must not cost the rest."""
+        respx_mock.get(f"{BASE}/applications/src1/tags").mock(
+            return_value=httpx.Response(
+                200, json=[{"uuid": "t1", "name": "x"}, {"uuid": "t2", "name": "prod"}]
+            )
+        )
+        post = respx_mock.post(f"{BASE}/applications/tgt1/tags").mock(
+            return_value=httpx.Response(201, json=[])
+        )
+        count = await copy_tags(
+            api, collection="applications", source_uuid="src1", target_uuid="tgt1"
+        )
+        assert count == 1
+        assert json.loads(post.calls[0].request.read().decode()) == {"tag_names": ["prod"]}
+
+    async def test_no_tags_means_no_write_at_all(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.get(f"{BASE}/applications/src1/tags").mock(
+            return_value=httpx.Response(200, json=[])
+        )
+        post = respx_mock.post(f"{BASE}/applications/tgt1/tags").mock(
+            return_value=httpx.Response(201, json=[])
+        )
+        assert (
+            await copy_tags(api, collection="applications", source_uuid="src1", target_uuid="tgt1")
+            == 0
+        )
+        assert not post.called
 
 
 class TestCreateDatabase:
