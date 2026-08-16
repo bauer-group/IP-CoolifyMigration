@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.8.0 (2026-08-16)
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`e8a1ce0`](https://github.com/bauer-group/IP-CoolifyMigration/commit/e8a1ce0ef1900d8fa8d82927d64fd99c4374d585))
+
+### Features
+
+- **api**: Aligned the API contract with Coolify 4.3
+  ([`b1e87aa`](https://github.com/bauer-group/IP-CoolifyMigration/commit/b1e87aa6eeeefabe68ea2cfcbe541d1d619cc7e4))
+
+
 ## v2.7.7 (2026-07-23)
 
 ### Bug Fixes
