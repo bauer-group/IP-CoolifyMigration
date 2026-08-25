@@ -230,7 +230,20 @@ class TestCoolifyVersionWarning:
         A string comparison would call 4.10 supported. Coolify will reach 4.10.
         """
         assert coolify_version_warning("4.10.0") is not None
-        assert "newer than" in coolify_version_warning("4.10.0") or ""
+        assert "newer than" in (coolify_version_warning("4.10.0") or "")
+
+    def test_double_digit_patch_inside_the_range_is_silent(self) -> None:
+        """REGRESSION: 4.3.10 is IN range, and a string compare says otherwise.
+
+        Coolify shipped 4.3.10 on 2026-08-21 and it became the upper bound. Under a
+        lexical comparison '4.3.10' < '4.3.3', so the tool would have warned
+        "newer than the validated range" about the exact version it was validated
+        against — while '4.3.9' passed. Pinned because the bug is invisible: a
+        wrong version check produces no output to notice.
+        """
+        assert coolify_version_warning("4.3.10") is None
+        assert coolify_version_warning("4.3.9") is None
+        assert coolify_version_warning("4.3.11") is not None
 
     def test_tolerates_a_prerelease_suffix(self) -> None:
         assert coolify_version_warning("4.3.0-beta.1") is None

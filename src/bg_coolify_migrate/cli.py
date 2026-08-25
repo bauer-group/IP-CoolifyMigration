@@ -118,8 +118,18 @@ _TRUST_HOST_KEY_HELP = (
 #: Verified 2026-08-16 by diffing every `$allowedFields` array and every API route
 #: between tags v4.1.2 and v4.3.3: nothing was removed, only added. Extend the
 #: upper bound only after repeating that diff — never because a newer tag exists.
+#:
+#: Re-verified 2026-08-21 for v4.3.10, that diff repeated: ApplicationsController,
+#: ServicesController, DatabasesController and ValidationPatterns are BYTE-IDENTICAL
+#: to v4.3.3, all 29 $allowedFields arrays unchanged, and no route removed since
+#: v4.1.2. The only changes are two added /settings/email routes and one reworded
+#: error string in the server-create path, which this tool never calls.
+#:
+#: Note 4.3.10 > 4.3.3 numerically but LESS lexically — the comparison is on int
+#: tuples for exactly this reason, and test_compares_numerically_not_lexically
+#: pins it. A string compare would have called 4.3.10 out of range.
 VALIDATED_COOLIFY_MIN = "4.1.2"
-VALIDATED_COOLIFY_MAX = "4.3.3"
+VALIDATED_COOLIFY_MAX = "4.3.10"
 
 
 def _version_tuple(raw: str) -> tuple[int, ...] | None:
