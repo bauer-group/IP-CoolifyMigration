@@ -71,6 +71,32 @@ a few seconds rather than a created target and a rollback.
 Found on 0047-20, 2026-08-26: a healthy container, up three days, invisible
 because its project had been renamed since it was last deployed.
 
+## What "the target is healthy" means
+
+The health gate polls the **target's daemon**, not Coolify's status column, for
+the same reason the stop gate does: every deploy endpoint is asynchronous, so
+"start returned" says nothing. Two things it deliberately does not demand.
+
+**Not "every container is running".** `docker ps -a` lists what a compose stack
+*finished* with as well as what it runs — a migration step, a permission fixer,
+anything one-shot sits at `exited (0)` forever. The source can never contradict
+that reading, because over there an exited container is the *success* condition.
+So the test is: at least one container serving, none broken, none still moving.
+Broken means a non-zero exit, `dead`, or a restart loop, and each of those still
+holds the gate shut for the full `deploy_timeout`.
+
+**Not the whole project.** The filter is the resource's own three name labels,
+the same ones PREFLIGHT and the pre-stop mount capture use. Filtering on project
+plus environment alone also matches resources on the target server that this
+migration never touched and that are legitimately stopped there.
+
+A timeout names every container it saw with its state and exit code. If it saw
+none, it re-asks by resource **uuid** — the probe described above, pointed at the
+target — so the refusal says whether the deploy failed or the filter is blind.
+
+Found 2026-08-27: a stack serving traffic while the gate waited out its entire
+15-minute window, because one compose service had done its job and exited.
+
 ## Why a SIGKILL is fatal, not a warning
 
 A container that exits with 137 hit the stop timeout and was killed. A killed

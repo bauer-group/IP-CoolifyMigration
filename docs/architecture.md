@@ -90,7 +90,8 @@ DNS_GATE       custom domain -> source?  STOP, exit 3, resumable
    |
 START_TARGET   deploy                                  undo: stop target
    |
-HEALTHCHECK    containers healthy
+HEALTHCHECK    per resource: one serving, none broken
+               (a one-shot service at exit 0 does not block)
    |
 FINALIZE       keep | rename | delete                  <- the only irreversible step
 ```

@@ -14,6 +14,7 @@ import asyncio
 import ipaddress
 import shlex
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
@@ -1365,33 +1366,205 @@ async def step_start_target(ctx: MigrationContext) -> dict[str, Any]:
     return {"started": started}
 
 
+#: Container states a deploy passes THROUGH. Seeing one means "not settled yet",
+#: never "unhealthy" — so the gate keeps waiting rather than judging.
+#:
+#: ``gone`` is in here for the same reason it is a *stopped* state in QUIESCE,
+#: read the other way round: on the target, a container that vanished between the
+#: ``docker ps`` and the ``docker inspect`` is one Coolify is replacing, not one
+#: that failed.
+_SETTLING_STATES = frozenset({"created", "restarting", "removing", "paused", docker.STATE_GONE})
+
+#: How often to re-ask the target's daemon during the health gate. Named, like
+#: ``_STOP_RETRY_INTERVAL``, rather than buried in the loop.
+_HEALTH_POLL_INTERVAL = 3.0
+
+
+@dataclass(frozen=True, slots=True)
+class _ResourceHealth:
+    """What the target's daemon says about one migrated resource."""
+
+    resource: str
+    labels: dict[str, str]
+    containers: tuple[docker.Container, ...]
+
+    @property
+    def running(self) -> tuple[docker.Container, ...]:
+        return tuple(c for c in self.containers if c.state == "running")
+
+    @property
+    def settling(self) -> tuple[docker.Container, ...]:
+        return tuple(c for c in self.containers if c.state in _SETTLING_STATES)
+
+    @property
+    def finished(self) -> tuple[docker.Container, ...]:
+        """Ran and exited CLEANLY — a one-shot service that has done its job."""
+        return tuple(
+            c
+            for c in self.containers
+            if c.state not in _SETTLING_STATES and c.state != "running" and c.exit_code == 0
+        )
+
+    @property
+    def failed(self) -> tuple[docker.Container, ...]:
+        return tuple(
+            c
+            for c in self.containers
+            if c.state not in _SETTLING_STATES and c.state != "running" and c.exit_code != 0
+        )
+
+    @property
+    def is_up(self) -> bool:
+        """At least one container serving, none broken, none still moving.
+
+        Deliberately NOT "every container is running" — see :func:`step_healthcheck`.
+        """
+        return bool(self.running) and not self.settling and not self.failed
+
+    def describe(self) -> str:
+        if not self.containers:
+            return f"  {self.resource}: nothing matched `{_describe_filter(self.labels)}`"
+        parts = [
+            f"{c.name} ({c.state}"
+            + (
+                f", exit {c.exit_code}"
+                if c.state not in _SETTLING_STATES and c.state != "running"
+                else ""
+            )
+            + ")"
+            for c in sorted(self.containers, key=lambda c: c.name)
+        ]
+        return f"  {self.resource}: " + ", ".join(parts)
+
+
+def _describe_filter(labels: dict[str, str]) -> str:
+    """The exact ``docker ps`` we ran, so an operator can re-run it. PURE."""
+    return "docker ps -a " + " ".join(
+        f"--filter label={key}={value}" for key, value in sorted(labels.items())
+    )
+
+
+async def _target_health(ctx: MigrationContext, resource: ResourcePlan) -> _ResourceHealth:
+    """One resource's containers on the target, with exit codes resolved.
+
+    Uses :func:`quiesce.snapshot` rather than a bare ``docker ps`` because
+    ``docker ps`` does not report exit codes, and telling a service that finished
+    from one that crashed is the entire question here. It inspects only the
+    non-running containers, so an ordinary stack costs exactly one round-trip per
+    poll and a stack with one-shot services costs one more per one-shot.
+    """
+    labels = resource_labels(
+        project=ctx.plan.project,
+        environment=ctx.plan.environment,
+        name=resource.snapshot.name,
+    )
+    report = await quiesce.snapshot(ctx.target_host, label_filters=labels)
+    return _ResourceHealth(
+        resource=resource.snapshot.name, labels=labels, containers=report.containers
+    )
+
+
+async def _containers_by_uuid(ctx: MigrationContext, resource: ResourcePlan) -> list[str]:
+    """Target containers carrying this resource's uuid, whatever their labels claim.
+
+    The question PREFLIGHT asks of the source, asked of the target: is "no
+    containers" a fact about the deploy, or a fact about our filter? Here we know
+    the uuid we just created, and :func:`~bg_coolify_migrate.discovery.docker.carries_uuid`
+    finds it in the container name, the built image tag or a label VALUE — none of
+    which a stale name label can hide.
+
+    Diagnostics only, and only on the failure path: it never decides the gate, it
+    only makes the refusal say which of the two happened.
+    """
+    target_uuid = ctx.target_uuids.get(resource.snapshot.uuid)
+    if not target_uuid:
+        return []
+    try:
+        managed = await docker.managed_containers(ctx.target_host)
+    except Exception as exc:  # a diagnostic must never mask the real failure
+        log.debug("healthcheck.uuid_probe_failed", error=str(exc)[:120])
+        return []
+    return sorted(f"{c.name} ({c.state})" for c in managed if docker.carries_uuid(c, target_uuid))
+
+
+async def _healthcheck_failure(
+    ctx: MigrationContext, health: list[_ResourceHealth], *, deadline: float
+) -> TransferError:
+    """Build the refusal, naming what the daemon actually showed us.
+
+    Separate from the gate because the message is the whole value of a timeout:
+    the previous one said only "not running: <no containers appeared>", which is
+    the same sentence for a stack that failed to deploy and for a filter that
+    cannot see it.
+    """
+    unhealthy = [h for h in health if not h.is_up]
+    blind = {h.resource for h in unhealthy if not h.containers}
+
+    probes: list[str] = []
+    for resource in ctx.plan.resources:
+        if resource.snapshot.name not in blind:
+            continue
+        found = await _containers_by_uuid(ctx, resource)
+        if found:
+            probes.append(f"  {resource.snapshot.name}: {', '.join(found)}")
+
+    hint = "Check the deployment logs in Coolify. The source is still intact."
+    if probes:
+        hint = (
+            "Containers for this resource ARE on the target — they carry its uuid — but "
+            "the Coolify name labels we filter on do not match:\n"
+            + "\n".join(probes)
+            + "\n\nThat is what a project renamed after a deploy looks like.\n"
+            + hint
+        )
+    return TransferError(
+        f"target did not become healthy within {deadline:.0f}s:\n"
+        + "\n".join(h.describe() for h in unhealthy),
+        hint=hint,
+    )
+
+
 async def step_healthcheck(ctx: MigrationContext) -> dict[str, Any]:
     """Wait for the target's containers to come up.
 
     A deploy is asynchronous, so "start returned" means nothing. We poll the
     target's daemon for the same reason we poll the source's. The window is
     deploy_timeout, not stop_timeout: a git-built app clones and builds here first.
+
+    Two things this must NOT demand. It demanded both until 2026-08-27, and each
+    on its own makes a stack that is serving traffic sit out the entire window:
+
+    * **Not "every container is running".** ``docker ps -a`` lists what a compose
+      stack FINISHED with as well as what it runs — a migration step, a
+      permission fixer, anything one-shot — and those stay listed at ``exited
+      (0)`` forever. Requiring ``running == total`` therefore makes such a stack
+      permanently unhealthy, and the source can never contradict it, because the
+      source gate wants the opposite: over there an exited container IS the
+      success condition. The test is now "at least one container serving, none
+      broken, none still moving", where broken means a non-zero exit, ``dead``,
+      or a restart loop — each of which still holds the gate shut.
+    * **Not the whole project.** The filter was the plan's — project plus
+      environment for an unscoped run — which on the TARGET also matches
+      resources that were never part of this migration and are legitimately
+      stopped there. Every other gate (PREFLIGHT, the pre-stop mount capture)
+      asks per resource with all three name labels; this one was the exception
+      and is no longer.
     """
     deadline = ctx.settings.deploy_timeout
-    labels = observed_labels(ctx.plan)
     waited = 0.0
-    interval = 3.0
 
-    while waited < deadline:
-        containers = await docker.list_containers(ctx.target_host, label_filters=labels)
-        running = [c for c in containers if c.state == "running"]
-        if containers and len(running) == len(containers):
-            return {"containers": len(containers), "waited": round(waited, 1)}
-        await asyncio.sleep(interval)
-        waited += interval
-
-    containers = await docker.list_containers(ctx.target_host, label_filters=labels)
-    not_running = [c.name for c in containers if c.state != "running"]
-    raise TransferError(
-        f"target did not become healthy within {deadline:.0f}s; not running: "
-        + ", ".join(not_running or ["<no containers appeared>"]),
-        hint="Check the deployment logs in Coolify. The source is still intact.",
-    )
+    while True:
+        health = [await _target_health(ctx, resource) for resource in ctx.plan.resources]
+        if all(h.is_up for h in health):
+            return {
+                "containers": sum(len(h.running) for h in health),
+                "finished": sum(len(h.finished) for h in health),
+                "waited": round(waited, 1),
+            }
+        if waited >= deadline:
+            raise await _healthcheck_failure(ctx, health, deadline=deadline)
+        await asyncio.sleep(_HEALTH_POLL_INTERVAL)
+        waited += _HEALTH_POLL_INTERVAL
 
 
 async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:

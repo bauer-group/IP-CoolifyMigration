@@ -690,7 +690,6 @@ class TestPreflight:
         with pytest.raises(QuiesceError, match="preview deployment"):
             await steps.step_preflight(ctx)
 
-
     async def test_a_stale_project_label_blocks_before_anything_is_created(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
@@ -1970,3 +1969,169 @@ class TestMaybeTunnel:
         await self._run(ctx)
         assert source.forwards == [("10.0.0.2", 22)]
         assert ctx.tunnel_port == 44087
+
+
+def _health_container(
+    *,
+    cid: str,
+    name: str,
+    state: str,
+    resource: str = "postgres",
+    project: str = "shop",
+) -> str:
+    return json.dumps(
+        {
+            "ID": cid,
+            "Names": name,
+            "Image": "postgres:16",
+            "State": state,
+            "Labels": (
+                f"coolify.managed=true,coolify.projectName={project},"
+                f"coolify.environmentName=production,coolify.resourceName={resource}"
+            ),
+        }
+    )
+
+
+def _health(*, containers: tuple[steps.docker.Container, ...]) -> steps._ResourceHealth:
+    return steps._ResourceHealth(
+        resource="postgres",
+        labels={
+            "coolify.projectName": "shop",
+            "coolify.environmentName": "production",
+            "coolify.resourceName": "postgres",
+        },
+        containers=containers,
+    )
+
+
+def _c(name: str, state: str, exit_code: int | None = None) -> steps.docker.Container:
+    return steps.docker.Container(id=name, name=name, state=state, labels={}, exit_code=exit_code)
+
+
+class TestHealthPredicate:
+    """What "the target came up" means.
+
+    Until 2026-08-27 it meant `running == len(docker ps -a)`, which no compose
+    stack containing a one-shot service can ever satisfy - and the source gate
+    can never contradict, because over there an exited container is the SUCCESS
+    condition.
+    """
+
+    def test_a_finished_one_shot_container_does_not_block(self) -> None:
+        # The reported case: a stack serving traffic while the gate waited out
+        # its full 15-minute window because one service had done its job.
+        assert _health(containers=(_c("web", "running"), _c("migrate", "exited", 0))).is_up
+
+    def test_a_crashed_container_is_not_finished(self) -> None:
+        health = _health(containers=(_c("web", "running"), _c("migrate", "exited", 1)))
+        assert not health.is_up
+        assert [c.name for c in health.failed] == ["migrate"]
+
+    def test_a_restart_loop_is_never_settled(self) -> None:
+        # `restarting` carries no exit code, so it must not be read as "exited 0".
+        assert not _health(containers=(_c("web", "running"), _c("side", "restarting"))).is_up
+
+    def test_a_stack_that_only_ever_exits_is_not_up(self) -> None:
+        # Something has to be SERVING. All-finished is indistinguishable from a
+        # deploy that has not started, and we just asked Coolify to start it.
+        assert not _health(containers=(_c("migrate", "exited", 0),)).is_up
+
+    def test_nothing_at_all_is_not_up(self) -> None:
+        assert not _health(containers=()).is_up
+
+    def test_describe_names_the_state_and_the_exit_code(self) -> None:
+        text = _health(containers=(_c("web", "running"), _c("migrate", "exited", 137))).describe()
+        assert "web (running)" in text
+        assert "migrate (exited, exit 137)" in text
+
+    def test_describe_prints_the_filter_when_nothing_matched(self) -> None:
+        # So the operator can paste it into the target's shell and see for
+        # themselves whether it is the deploy or the filter that is wrong.
+        text = _health(containers=()).describe()
+        assert "docker ps -a" in text
+        assert "--filter label=coolify.resourceName=postgres" in text
+
+
+class TestHealthcheck:
+    async def test_passes_with_a_finished_one_shot_alongside_a_running_one(
+        self, ctx: MigrationContext
+    ) -> None:
+        host = _target_host()
+        host.on(
+            r"docker ps -a .*coolify\.resourceName=postgres",
+            stdout=_health_container(cid="c1", name="postgres-db1-1", state="running")
+            + "\n"
+            + _health_container(cid="c2", name="postgres-init-db1", state="exited"),
+        )
+        host.on(r"docker inspect .*c2", stdout=json.dumps({"Status": "exited", "ExitCode": 0}))
+        ctx.target_host = host  # type: ignore[assignment]
+
+        result = await steps.step_healthcheck(ctx)
+        assert result["containers"] == 1
+        assert result["finished"] == 1
+
+    async def test_asks_per_resource_not_per_project(self, ctx: MigrationContext) -> None:
+        """A stopped SIBLING on the target must not hold the gate shut.
+
+        The old filter was the plan's - project + environment for an unscoped run
+        - which on the target also matches resources this migration never touched.
+        """
+        host = _target_host()
+        host.on(
+            r"docker ps -a .*coolify\.resourceName=postgres",
+            stdout=_health_container(cid="c1", name="postgres-db1-1", state="running"),
+        )
+        ctx.target_host = host  # type: ignore[assignment]
+
+        await steps.step_healthcheck(ctx)
+        ps = [c for c in host.commands if c.startswith("docker ps -a")]
+        assert ps, "the gate never asked the daemon"
+        assert all("coolify.resourceName=postgres" in c for c in ps)
+
+    async def test_times_out_naming_what_it_saw(
+        self, ctx: MigrationContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Deadline 0: the first poll is also the last, so the test never sleeps.
+        monkeypatch.setattr(ctx.settings, "deploy_timeout", 0.0)
+        host = _target_host()
+        host.on(
+            r"docker ps -a .*coolify\.resourceName=postgres",
+            stdout=_health_container(cid="c1", name="postgres-db1-1", state="running")
+            + "\n"
+            + _health_container(cid="c2", name="postgres-init-db1", state="exited"),
+        )
+        host.on(r"docker inspect .*c2", stdout=json.dumps({"Status": "exited", "ExitCode": 1}))
+        ctx.target_host = host  # type: ignore[assignment]
+
+        with pytest.raises(TransferError) as excinfo:
+            await steps.step_healthcheck(ctx)
+        assert "postgres-init-db1 (exited, exit 1)" in str(excinfo.value)
+
+    async def test_a_timeout_on_nothing_reports_the_uuid_probe(
+        self, ctx: MigrationContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ "Nothing matched" is two different failures; say which one this is.
+
+        The same question PREFLIGHT asks of the source: is the silence a fact
+        about the deploy, or about our label filter? On the target we know the
+        uuid we created, so we can answer it.
+        """
+        # Deadline 0: the first poll is also the last, so the test never sleeps.
+        monkeypatch.setattr(ctx.settings, "deploy_timeout", 0.0)
+        ctx.target_uuids["db1"] = "newdb1"
+        host = _target_host()
+        # The name-label query draws a blank; the managed query does not.
+        host.on(
+            r"--filter label=coolify\.managed=true",
+            stdout=_health_container(
+                cid="c9", name="postgres-newdb1-1", state="running", project="old-shop"
+            ),
+        )
+        host.on(r"docker ps -a", stdout="")
+        ctx.target_host = host  # type: ignore[assignment]
+
+        with pytest.raises(TransferError) as excinfo:
+            await steps.step_healthcheck(ctx)
+        assert "nothing matched" in str(excinfo.value)
+        assert "postgres-newdb1-1 (running)" in (excinfo.value.hint or "")
