@@ -32,6 +32,45 @@ So we poll the daemon: `docker ps -a --filter label=coolify.*Id={id}`, and requi
 Note the `-a`. Geczy's script uses bare `docker ps`, which is exactly why a
 stopped container's volume gets silently skipped there.
 
+## Why we check that the label filter can still see the stack
+
+The gates above all rest on one query: `docker ps -a --filter label=coolify.*`.
+If that query is wrong, it does not fail — **it returns an empty list**, and an
+empty list is indistinguishable from a quiesced stack.
+
+Coolify writes `coolify.projectName` / `coolify.environmentName` /
+`coolify.resourceName` into the compose it generates **at deploy time**, and does
+not re-write them when you rename a project. Rename one, and every container
+still running from before the rename keeps advertising the old slug. We AND all
+three labels, so a single stale field hides the whole stack from every gate at
+once — the stop gate reports quiesced, the mount capture finds nothing, and the
+mid-copy restart check watches an empty set while a live process writes.
+
+The consequences are not symmetric, which is why the check is unconditional:
+
+- Data in a **declared, named volume** still trips QUIESCE's "volumes but no
+  containers" guard. Survivable — a refusal and a rollback.
+- Data in a **bind mount or an anonymous volume** appears in no Coolify API, so
+  the manifest is empty, that guard never fires, Coolify stops the source from
+  its own DB rows regardless of labels, and the target starts empty. Silent data
+  loss, with no error at any point.
+
+So PREFLIGHT looks for each resource a second time, without using any name label:
+
+- every `coolify.managed=true` container carrying the resource **uuid** in its
+  name, image or label values — the uuid is the one handle a rename cannot touch;
+- every container mounting a volume the plan intends to migrate, via
+  `docker ps --filter volume=`, which reads no labels at all.
+
+Anything the second search finds that the first did not is reported as a refusal
+naming the container and the exact label that moved. This can only ever find
+*more* containers than the label query, never fewer, so it cannot cause a
+migration to under-copy; and it runs at PREFLIGHT, so the cost of being wrong is
+a few seconds rather than a created target and a rollback.
+
+Found on 0047-20, 2026-08-26: a healthy container, up three days, invisible
+because its project had been renamed since it was last deployed.
+
 ## Why a SIGKILL is fatal, not a warning
 
 A container that exits with 137 hit the stop timeout and was killed. A killed

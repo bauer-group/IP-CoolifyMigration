@@ -42,6 +42,7 @@ from bg_coolify_migrate.engine.planner import (
     inspect_all_mounts,
     observed_labels,
     resource_containers,
+    resource_labels,
 )
 from bg_coolify_migrate.errors import (
     DnsGateBlocked,
@@ -66,6 +67,122 @@ async def step_init(ctx: MigrationContext) -> dict[str, Any]:
         "target_server": ctx.plan.target_server.name,
         "resources": [r.snapshot.name for r in ctx.plan.resources],
     }
+
+
+async def _label_independent_containers(
+    ctx: MigrationContext, resource: ResourcePlan
+) -> list[docker.Container]:
+    """This resource's containers, found without trusting a single name label.
+
+    Two probes, unioned by container id:
+
+    * every ``coolify.managed`` container carrying the resource uuid in its name,
+      image or label values (:func:`~bg_coolify_migrate.discovery.docker.carries_uuid`)
+      — the uuid is the one handle a rename cannot touch;
+    * every container mounting a volume the plan intends to migrate, via
+      ``docker ps --filter volume=``, which reads no labels whatsoever.
+
+    Neither replaces the label query. They exist to answer the one question it
+    cannot: is "no containers" a fact about the stack, or a fact about our filter?
+    """
+    uuid = resource.snapshot.uuid
+    found = {
+        c.id: c
+        for c in await docker.managed_containers(ctx.source_host)
+        if docker.carries_uuid(c, uuid)
+    }
+    volumes = [i.source_name for i in resource.manifest.to_migrate if i.source_name]
+    if volumes:
+        for container in await docker.containers_mounting(ctx.source_host, volumes=volumes):
+            found.setdefault(container.id, container)
+    return list(found.values())
+
+
+def _label_disagreement(container: docker.Container, expected: dict[str, str]) -> list[str]:
+    """The labels on which this container and our filter disagree. PURE."""
+    return [
+        f"    {key}={container.labels.get(key, '<absent>')!r} - we filter on {value!r}"
+        for key, value in sorted(expected.items())
+        if container.labels.get(key) != value
+    ]
+
+
+async def _assert_containers_are_discoverable(ctx: MigrationContext) -> None:
+    """Refuse when containers demonstrably exist that our label filter cannot see.
+
+    Coolify stamps ``coolify.projectName`` / ``coolify.resourceName`` into the
+    compose it generates AT DEPLOY TIME and never re-stamps them. Rename a project
+    and every container still running from before the rename keeps advertising the
+    old slug. We AND all three labels, so one stale field hides the whole stack -
+    and ``docker ps`` answers an empty list, not an error.
+
+    The consequences are not symmetric, which is why this check does NOT depend on
+    the manifest having found anything:
+
+    * Data in a DECLARED, NAMED volume trips QUIESCE's "volumes but no containers"
+      guard. Survivable - a refusal and a rollback.
+    * Data in a BIND MOUNT or an anonymous volume appears in no API, so the
+      manifest is empty, that guard never fires, Coolify stops the source from its
+      own DB rows regardless of labels, and the target starts empty. Silent data
+      loss.
+
+    Runs at PREFLIGHT, on the cheapest evidence available, so the cost is a few
+    seconds and no state - rather than at QUIESCE, which costs a created target and
+    a rollback. QUIESCE's guard stays where it is; this does not replace it.
+    """
+    for resource in ctx.plan.resources:
+        snapshot = resource.snapshot
+        expected = resource_labels(
+            project=ctx.plan.project, environment=ctx.plan.environment, name=snapshot.name
+        )
+        by_label = await resource_containers(
+            ctx.source_host,
+            project=ctx.plan.project,
+            environment=ctx.plan.environment,
+            name=snapshot.name,
+        )
+        probed = await _label_independent_containers(ctx, resource)
+
+        # Compared as SETS, not counts, and for every resource rather than only for
+        # the ones the label query drew a blank on: a compose stack redeployed
+        # service-by-service can carry current labels on one container and stale
+        # ones on the next, and a count would call that agreement.
+        seen = {c.id for c in by_label}
+        missed = [c for c in probed if c.id not in seen]
+
+        if missed:
+            running = [c for c in missed if not c.is_stopped]
+            detail = _label_disagreement(missed[0], expected)
+            raise PreflightError(
+                f"{snapshot.name}: {len(missed)} container(s) exist on "
+                f"{ctx.plan.source_server.name} that the Coolify label filter cannot see"
+                + (f", {len(running)} of them RUNNING" if running else "")
+                + f": {', '.join(sorted(c.name for c in missed))}",
+                hint=(
+                    "Coolify writes the project/resource name labels when it deploys and "
+                    "does NOT re-write them when you rename a project, so containers "
+                    "deployed before a rename still advertise the old name:\n"
+                    + ("\n".join(detail) or "    (no label differs - please report this)")
+                    + "\n\nEvery gate that proves the source is quiet filters on those "
+                    "labels, so migrating now would mirror volumes with a live writer "
+                    "attached and then verify the tear byte-for-byte.\n"
+                    f"Redeploy {snapshot.name} on {ctx.plan.source_server.name} to re-stamp "
+                    "its labels, then migrate.\n"
+                    "Nothing has been changed and the source is untouched."
+                ),
+            )
+
+        # A resource that neither route can find is genuinely stopped, not hidden.
+        # Not refused here: QUIESCE already refuses it when the manifest holds
+        # volumes, and duplicating that decision in two places is how the two
+        # drift apart. What this run HAS established is that the silence is real,
+        # which is exactly what QUIESCE could not tell on its own.
+        log.debug(
+            "preflight.labels_current",
+            resource=snapshot.name,
+            containers=len(by_label),
+            probed=len(probed),
+        )
 
 
 async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
@@ -94,6 +211,11 @@ async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
         await rsync.ensure_installed(host, label=label)
         if not await host.which("docker"):
             raise PreflightError(f"docker is not installed on the {label} server")
+
+    # Before anything expensive: can we actually SEE this stack? Everything that
+    # follows - the quiesce gate, the mount capture, the mid-copy restart check -
+    # trusts a label filter that a project rename silently invalidates.
+    await _assert_containers_are_discoverable(ctx)
 
     await _assert_target_can_read_git(ctx)
 
@@ -503,9 +625,17 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
         for resource in ctx.plan.resources:
             if not resource.snapshot.has_previews:
                 continue
-            containers = await docker.list_containers(
+            # NOT `coolify.applicationId`: that label holds Coolify's NUMERIC id,
+            # which every API controller makeHidden()s and we therefore never have.
+            # Filtering a uuid against it matched nothing, always - so
+            # --delete-previews deleted no previews and the preflight gate then
+            # refused the migration over the very previews it had been asked to
+            # remove.
+            containers = await resource_containers(
                 ctx.source_host,
-                label_filters={"coolify.applicationId": resource.snapshot.uuid},
+                project=ctx.plan.project,
+                environment=ctx.plan.environment,
+                name=resource.snapshot.name,
             )
             for container in containers:
                 if container.is_preview:
@@ -627,9 +757,12 @@ async def _capture_mounts(ctx: MigrationContext) -> dict[str, list[str]]:
                     f"on {ctx.plan.source_server.name}",
                     hint=(
                         "Coolify removes containers when it stops them, so a running "
-                        "stack is the only chance to see what its volumes mounted. Start "
-                        "the resource, then migrate. If it IS running, its containers may "
-                        "not carry the labels we filter on."
+                        "stack is the only chance to see what its volumes mounted - bind "
+                        "mounts and anonymous volumes appear in no API.\n"
+                        "PREFLIGHT already looked for this resource WITHOUT the Coolify "
+                        "name labels (by resource uuid, and by which containers mount "
+                        "these volumes) and found none either, so this is a stopped "
+                        "resource rather than a label mismatch. Start it, then migrate."
                     ),
                 )
             # Record an EXPLICIT empty capture, not nothing: DISCOVER treats a

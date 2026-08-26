@@ -470,3 +470,60 @@ class TestKilledSince:
         assert "--since 1700000000" in events
         assert "--until 1700000100" in events
         assert "--filter label=coolify.projectName=shop" in events
+
+
+class TestCarriesUuid:
+    """The uuid is the only handle on a resource that a rename cannot invalidate."""
+
+    def test_matches_a_compose_container_name(self) -> None:
+        from bg_coolify_migrate.discovery.docker import carries_uuid
+
+        c = Container(
+            id="i",
+            name="github-backup-czdimihye6nt4d7p6v4wyq7z-124552483218",
+            state="running",
+            labels={},
+        )
+        assert carries_uuid(c, "czdimihye6nt4d7p6v4wyq7z")
+
+    def test_matches_a_built_compose_image_tag(self) -> None:
+        # Coolify tags a compose service's build output {uuid}_{service}, so the
+        # image identifies the resource even for a container named after nothing.
+        from bg_coolify_migrate.discovery.docker import carries_uuid
+
+        c = Container(
+            id="i",
+            name="anything",
+            state="running",
+            labels={},
+            image="czdimihye6nt4d7p6v4wyq7z_github-backup:674af46",
+        )
+        assert carries_uuid(c, "czdimihye6nt4d7p6v4wyq7z")
+
+    def test_matches_coolify_name_whose_value_survives_a_rename(self) -> None:
+        # coolify.name is a label, but its VALUE is the container name - so unlike
+        # coolify.projectName it stays true when the project is renamed.
+        from bg_coolify_migrate.discovery.docker import carries_uuid
+
+        c = Container(
+            id="i",
+            name="short",
+            state="running",
+            labels={
+                "coolify.projectName": "the-old-name",
+                "coolify.name": "github-backup-czdimihye6nt4d7p6v4wyq7z-124552483218",
+            },
+        )
+        assert carries_uuid(c, "czdimihye6nt4d7p6v4wyq7z")
+
+    def test_does_not_match_an_unrelated_container(self) -> None:
+        from bg_coolify_migrate.discovery.docker import carries_uuid
+
+        c = Container(
+            id="i",
+            name="redis-abcdefghijklmnopqrstuvwx-1",
+            state="running",
+            labels={"coolify.projectName": "shop"},
+            image="redis:7",
+        )
+        assert not carries_uuid(c, "czdimihye6nt4d7p6v4wyq7z")

@@ -187,6 +187,63 @@ def _target_host(*, free_kb: str = "99999999") -> FakeHost:
     return host
 
 
+def _relabelled_source_host() -> FakeHost:
+    """A source whose container was deployed BEFORE its project was renamed.
+
+    0047-20 on 2026-08-26, reduced: ``coolify.resourceName`` and
+    ``coolify.environmentName`` still agree with what we compute, and only
+    ``coolify.projectName`` carries the pre-rename slug. The three are ANDed, so
+    the resource query matches nothing while a query that mentions no name at all
+    still finds the container.
+
+    Route order is load-bearing - FakeHost matches in insertion order and every
+    one of these commands begins ``docker ps -a``.
+    """
+    stale = json.dumps(
+        {
+            "ID": "c5d9c6356803",
+            "Names": "postgres-db1-124552483218",
+            "Image": "postgres:16",
+            "State": "running",
+            "Labels": (
+                "coolify.managed=true,coolify.projectName=old-shop,"
+                "coolify.environmentName=production,coolify.resourceName=postgres,"
+                "coolify.name=postgres-db1-124552483218"
+            ),
+        }
+    )
+    host = FakeHost()
+    host.on(r"--filter label=coolify\.managed=true", stdout=stale)
+    host.on(r"--filter volume=", stdout=stale)
+    host.on(r"command -v rsync", exit_status=0)
+    host.on(r"command -v docker", exit_status=0)
+    host.on(r"docker ps", stdout="")
+    host.on(r"command -v bash", stdout="REACH")
+    return host
+
+
+def _current_source_host() -> FakeHost:
+    """The same container after a redeploy: every discovery route agrees on it."""
+    current = json.dumps(
+        {
+            "ID": "c5d9c6356803",
+            "Names": "postgres-db1-124552483218",
+            "Image": "postgres:16",
+            "State": "running",
+            "Labels": (
+                "coolify.managed=true,coolify.projectName=shop,"
+                "coolify.environmentName=production,coolify.resourceName=postgres"
+            ),
+        }
+    )
+    host = FakeHost()
+    host.on(r"command -v rsync", exit_status=0)
+    host.on(r"command -v docker", exit_status=0)
+    host.on(r"docker ps", stdout=current)
+    host.on(r"command -v bash", stdout="REACH")
+    return host
+
+
 @pytest.fixture
 async def ctx(tmp_path: Path):  # type: ignore[no-untyped-def]
     api = CoolifyClient(HOST, "tok", max_retries=0)
@@ -632,6 +689,138 @@ class TestPreflight:
 
         with pytest.raises(QuiesceError, match="preview deployment"):
             await steps.step_preflight(ctx)
+
+
+    async def test_a_stale_project_label_blocks_before_anything_is_created(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """0047-20, 2026-08-26.
+
+        Coolify stamps the name labels into the compose it generates AT DEPLOY
+        TIME and never re-stamps them, so renaming a project leaves every
+        already-running container advertising a name that no longer exists. The
+        filter then matches nothing and `docker ps` answers an EMPTY LIST rather
+        than an error - so the quiesce gate, the mount capture and the mid-copy
+        restart check all go blind at once, and the copy mirrors a live writer and
+        then verifies the tear byte-for-byte.
+        """
+        respx_mock.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"private_key": "x"}])
+        )
+        ctx.source_host = _relabelled_source_host()  # type: ignore[assignment]
+
+        with pytest.raises(PreflightError, match="the Coolify label filter cannot see") as exc:
+            await steps.step_preflight(ctx)
+
+        # It must name the label that MOVED. "no containers" is what the operator
+        # already saw, and it is what sent them looking at a stopped resource.
+        assert "coolify.projectName" in (exc.value.hint or "")
+        assert "old-shop" in (exc.value.hint or "")
+        assert "RUNNING" in str(exc.value)
+
+    async def test_a_stale_label_blocks_even_with_an_empty_manifest(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """The dangerous half of the bug, and why this check is unconditional.
+
+        Bind mounts and anonymous volumes appear in no Coolify API, so a hidden
+        stack keeping its data in one has an EMPTY manifest. QUIESCE's "volumes but
+        no containers" guard therefore never fires; Coolify stops the source from
+        its own DB rows regardless of labels; the target starts empty. Silent data
+        loss, with no error at any point. Gating this check on the manifest having
+        found something would reproduce it exactly.
+        """
+        respx_mock.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"private_key": "x"}])
+        )
+        ctx.plan = _plan(
+            resources=(
+                ResourcePlan(
+                    snapshot=_snapshot(),
+                    strategy=Strategy.REBUILD,
+                    manifest=VolumeManifest(items=()),
+                ),
+            )
+        )
+        ctx.source_host = _relabelled_source_host()  # type: ignore[assignment]
+
+        with pytest.raises(PreflightError, match="the Coolify label filter cannot see"):
+            await steps.step_preflight(ctx)
+
+    async def test_current_labels_are_not_refused(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """The check must cost a redeployed stack nothing.
+
+        Both routes find the same container id, the sets agree, and preflight
+        proceeds - otherwise this gate would refuse the migrations it exists to
+        protect.
+        """
+        respx_mock.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"private_key": "x"}])
+        )
+        ctx.source_host = _current_source_host()  # type: ignore[assignment]
+
+        await steps.step_preflight(ctx)  # must not raise
+
+    async def test_previews_are_deleted_by_label_not_by_a_hidden_numeric_id(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """`coolify.applicationId` holds Coolify's NUMERIC id, never the uuid.
+
+        Every API controller makeHidden()s that id, so we can never have it -
+        filtering a uuid against it matched nothing, always. --delete-previews
+        therefore deleted no previews, and the preview gate a few lines later then
+        refused the migration over the very containers it had been asked to remove.
+        """
+        respx_mock.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"private_key": "x"}])
+        )
+        deleted = respx_mock.delete(f"{BASE}/applications/db1/previews/7").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        preview = json.dumps(
+            {
+                "ID": "p1",
+                "Names": "postgres-db1-pr-7",
+                "Image": "postgres:16",
+                "State": "running",
+                "Labels": (
+                    "coolify.managed=true,coolify.projectName=shop,"
+                    "coolify.environmentName=production,coolify.resourceName=postgres,"
+                    "coolify.pullRequestId=7"
+                ),
+            }
+        )
+        host = FakeHost()
+        host.on(r"command -v rsync", exit_status=0)
+        host.on(r"command -v docker", exit_status=0)
+        # The old filter, answered HONESTLY: no container carries the uuid in
+        # coolify.applicationId, because that label holds a numeric id. Without
+        # this route the stub would answer every `docker ps` alike and the test
+        # would pass against the bug it exists to catch.
+        host.on(r"--filter label=coolify\.applicationId", stdout="")
+        host.on(r"docker ps", stdout=preview)
+        host.on(r"command -v bash", stdout="REACH")
+        ctx.source_host = host  # type: ignore[assignment]
+        ctx.delete_previews = True
+        ctx.plan = _plan(
+            resources=(
+                ResourcePlan(
+                    snapshot=_snapshot(has_previews=True),
+                    strategy=Strategy.COPY_DATA,
+                    manifest=_manifest(),
+                ),
+            )
+        )
+
+        from bg_coolify_migrate.engine.steps import step_quiesce
+
+        # Only the deletion call matters here; the stop that follows is another
+        # test's subject, so let this fail afterwards however it likes.
+        with pytest.raises(Exception):  # noqa: B017
+            await step_quiesce(ctx)
+        assert deleted.called, "the preview was never deleted - the filter matched nothing"
 
 
 class TestCreateTarget:

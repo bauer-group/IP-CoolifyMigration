@@ -60,6 +60,14 @@ class Container:
     """created | restarting | running | removing | paused | exited | dead"""
     labels: dict[str, str]
     exit_code: int | None = None
+    image: str = ""
+    """The image reference, as ``docker ps`` reports it.
+
+    Carried for identification, not for deployment: Coolify tags a compose
+    service's build output ``{resource_uuid}_{service}``, which makes the image
+    one of the few places a resource's uuid survives a project rename. See
+    :func:`carries_uuid`.
+    """
 
     @property
     def is_stopped(self) -> bool:
@@ -159,9 +167,78 @@ async def list_containers(
                 name=str(entry.get("Names", "")),
                 state=str(entry.get("State", "")).lower(),
                 labels=_parse_labels(str(entry.get("Labels", ""))),
+                image=str(entry.get("Image", "")),
             )
         )
     return containers
+
+
+def carries_uuid(container: Container, uuid: str) -> bool:
+    """Does this container advertise ``uuid`` somewhere a rename cannot reach? PURE.
+
+    The name labels are not identity. Coolify writes ``coolify.projectName`` and
+    ``coolify.resourceName`` into the compose it generates AT DEPLOY TIME and
+    never re-stamps them, so a project rename leaves every already-running
+    container advertising a name that no longer exists.
+
+    The resource uuid does not move. It appears in the container name
+    (``{service}-{uuid}-{n}``, or the bare uuid for a standalone database), in a
+    compose service's built image tag (``{uuid}_{service}:{sha}``), and inside
+    ``coolify.name`` — which is a label, but one whose VALUE is the container
+    name and therefore immune to the rename that invalidates its neighbours.
+
+    Matching a 24-character random uuid as a substring is safe by construction:
+    nothing else on the daemon contains it by accident.
+    """
+    if uuid in container.name or uuid in container.image:
+        return True
+    return any(uuid in value for value in container.labels.values())
+
+
+async def managed_containers(host: RemoteHost) -> list[Container]:
+    """Every Coolify-managed container, whatever names its labels claim.
+
+    ``coolify.managed=true`` is the one label of the set that cannot go stale —
+    it encodes no name. Filtering on it alone and narrowing in Python with
+    :func:`carries_uuid` finds a resource's containers across a rename, where the
+    project/resource/environment triple finds nothing and reports no error.
+    """
+    return await list_containers(host, label_filters={LABEL_MANAGED: "true"})
+
+
+async def containers_mounting(host: RemoteHost, *, volumes: list[str]) -> list[Container]:
+    """Containers mounting any of these volumes. Consults no labels at all.
+
+    ``docker ps --filter volume=`` asks the daemon what is actually attached,
+    which makes it the only discovery path in this codebase that survives a
+    resource being unlabelled, mislabelled or renamed. Used as a cross-check, not
+    as the primary route: it can only find containers for volumes we already know
+    the names of, so it says nothing about bind mounts.
+
+    Results are unioned by container id; a container mounting three of the
+    volumes is returned once.
+    """
+    found: dict[str, Container] = {}
+    for volume in volumes:
+        result = await host.run(
+            f"docker ps -a --filter {shlex.quote(f'volume={volume}')} --format '{{{{json .}}}}'"
+        )
+        if not result.ok:
+            # Diagnostics, never fatal: this probe exists to ADD certainty to the
+            # label query, and a daemon that will not answer it leaves us exactly
+            # where we would have been without it.
+            log.debug("docker.volume_probe_failed", volume=volume, error=result.stderr[:120])
+            continue
+        for entry in _json_lines(result.stdout):
+            container = Container(
+                id=str(entry.get("ID", "")),
+                name=str(entry.get("Names", "")),
+                state=str(entry.get("State", "")).lower(),
+                labels=_parse_labels(str(entry.get("Labels", ""))),
+                image=str(entry.get("Image", "")),
+            )
+            found.setdefault(container.id, container)
+    return list(found.values())
 
 
 async def inspect_state(host: RemoteHost, container: str) -> tuple[str, int | None]:
