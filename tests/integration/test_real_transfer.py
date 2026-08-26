@@ -325,6 +325,80 @@ class TestChunkedTransfer:
         assert (await target.run(f"test -e {DATA}/a/f")).ok
         assert not (await target.run(f"test -e {DATA}/b/f")).ok
 
+    async def test_hash_named_entries_are_not_read_as_comments(
+        self, source: RemoteHost, target: RemoteHost
+    ) -> None:
+        """A MySQL datadir survives a chunked copy. Regression, 0055-00 2026-08-26.
+
+        rsync drops any ``--files-from`` line starting with ``#`` or ``;``
+        (``flist.c:read_filesfrom_line()``, "Dump comments") and exits 0. A MySQL
+        8 datadir's top level is ``#innodb_redo/``, ``#innodb_temp/`` and
+        ``#ib_16384_*.dblwr``, so every chunked MySQL volume lost its entire redo
+        log with no error anywhere -- 32 files, caught only by verify, one step
+        before the source would have been finalised.
+
+        Unreachable from the command builder: the string was always well formed.
+        Only real rsync reads that list.
+        """
+        await source.run_checked(f"mkdir -p {DATA}/'#innodb_redo' {DATA}/mysql")
+        await source.run_checked(
+            f"echo redo > {DATA}/'#innodb_redo'/'#ib_redo10_tmp' && "
+            f"echo dbl > {DATA}/'#ib_16384_0.dblwr' && "
+            f"echo tbl > {DATA}/mysql/user.ibd"
+        )
+        await source.run_checked(f"chown -R 999:999 {DATA} && chmod 700 {DATA}")
+
+        identity = await _install_key(source)
+        base = {
+            "source_path": DATA,
+            "target_path": DATA,
+            "target_host": "host.docker.internal",
+            "target_port": TARGET_PORT,
+            "identity_file": identity,
+        }
+        # The two chunks a split plan would produce, then the root-metadata pass.
+        await rsync.run(source, rsync.RsyncSpec(**base, paths=("#innodb_redo", "mysql")))
+        await rsync.run(source, rsync.RsyncSpec(**base, paths=("#ib_16384_0.dblwr",)))
+        await rsync.run(source, rsync.RsyncSpec(**base, dirs_only=True))
+
+        report = await verify.verify_volume(
+            source, target, source_path=DATA, target_path=DATA
+        )
+        assert report.ok, [d.describe() for d in report.differences]
+
+    async def test_root_metadata_pass_creates_no_children(
+        self, source: RemoteHost, target: RemoteHost
+    ) -> None:
+        """The metadata pass carries metadata; it must not invent structure.
+
+        ``--files-from`` implies ``--dirs``, and ``-d`` copies the contents of a
+        directory named exactly ``.`` one level deep. That is what disguised a
+        wholly skipped ``#innodb_redo/`` as "32 files missing": the empty
+        directory was there, correctly owned, so verify only saw the leaves.
+        """
+        await source.run_checked(f"mkdir -p {DATA}/sub && echo x > {DATA}/sub/f")
+        await source.run_checked(f"echo y > {DATA}/top && chown -R 999:999 {DATA}")
+
+        identity = await _install_key(source)
+        await rsync.run(
+            source,
+            rsync.RsyncSpec(
+                source_path=DATA,
+                target_path=DATA,
+                target_host="host.docker.internal",
+                target_port=TARGET_PORT,
+                identity_file=identity,
+                dirs_only=True,
+            ),
+        )
+
+        # The root's ownership crossed over -- that is the pass's whole job.
+        owner = await target.run_checked(f"stat -c '%u:%g' {DATA}")
+        assert owner.stdout.strip() == "999:999"
+        # ...and nothing below it was manufactured.
+        assert not (await target.run(f"test -e {DATA}/sub")).ok
+        assert not (await target.run(f"test -e {DATA}/top")).ok
+
 
 class TestVerifyIdentical:
     async def test_checksum_dry_run_is_silent_when_identical(

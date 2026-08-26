@@ -129,6 +129,40 @@ class TestRsyncCommand:
         assert "--files-from" not in build_command(_spec(paths=(".",)))
 
 
+class TestFilesFromCommentTrap:
+    """rsync silently drops list lines starting with ``#`` or ``;``.
+
+    ``flist.c:read_filesfrom_line()`` ends in a "Dump comments" branch: the line
+    is skipped, the next one read, and rsync exits 0 having never seen the entry.
+    A MySQL 8 datadir's top level is full of such names, so a chunked MySQL
+    volume lost its entire ``#innodb_redo/`` directory (0055-00, 2026-08-26 --
+    32 files missing on the target, caught by verify).
+
+    Verified against real rsync 3.4.3: a bare ``#innodb_redo`` line transfers
+    nothing at all, a ``./#innodb_redo`` line transfers the tree.
+    """
+
+    def test_hash_entry_is_dot_anchored(self) -> None:
+        cmd = build_command(_spec(paths=("#innodb_redo", "mysql")))
+        assert "./#innodb_redo" in cmd
+
+    @pytest.mark.parametrize("name", ["#innodb_redo", "#ib_16384_0.dblwr", ";weird"])
+    def test_no_list_line_can_be_read_as_a_comment(self, name: str) -> None:
+        cmd = build_command(_spec(paths=(name, "mysql")))
+        listing = cmd.split(" | ", 1)[0].split("' ", 1)[1].strip("'")
+        assert listing.splitlines(), "no file list emitted"
+        for line in listing.splitlines():
+            assert not line.startswith(("#", ";")), line
+
+    def test_ordinary_names_still_reach_the_same_destination(self) -> None:
+        # --relative normalises "./" away, so the layout is unchanged.
+        cmd = build_command(_spec(paths=("base", "pg_wal")))
+        assert "./base" in cmd and "./pg_wal" in cmd
+
+    def test_anchoring_is_idempotent(self) -> None:
+        assert build_command(_spec(paths=("./base", "x"))).count("././") == 0
+
+
 class TestRootMetadataPass:
     """The chunked-transfer root-ownership gap (covalida, 2026-07-23).
 
@@ -153,6 +187,20 @@ class TestRootMetadataPass:
         # --delete on a non-recursive single-entry pass does nothing useful and
         # is a foot-gun; it must not appear.
         assert "--delete" not in build_command(_spec(dirs_only=True))
+
+    def test_dirs_only_excludes_every_child(self) -> None:
+        """The metadata pass must carry metadata, not manufacture structure.
+
+        ``--files-from`` implies ``--dirs``, and ``-d`` DOES copy the contents of
+        a directory named exactly ``.`` -- one level deep. Without the exclude,
+        this pass created a bare node for every top-level entry, including ones
+        the chunked transfer had skipped. That is what disguised "the whole
+        #innodb_redo directory is missing" as "32 files are missing": the empty
+        directory was present, with correct ownership, so verify only ever saw
+        the leaves.
+        """
+        cmd = build_command(_spec(dirs_only=True))
+        assert "--exclude=/*" in cmd
 
     def test_dirs_only_keeps_ownership_flags(self) -> None:
         # The whole point is to carry owner/perms across, so -a and

@@ -139,6 +139,31 @@ def build_ssh_option(spec: RsyncSpec) -> str:
     return " ".join(parts)
 
 
+def _files_from_line(path: str) -> str:
+    """Render one ``--files-from`` entry so rsync cannot mistake it for a comment.
+
+    **rsync silently drops any list line that starts with ``#`` or ``;``.**
+    ``flist.c:read_filesfrom_line()`` ends in a "Dump comments" branch that skips
+    the line and reads the next one: no warning, no non-zero exit, the entry
+    simply never enters the file list. ``--from0`` does not help — the comment
+    check runs before the separator is even considered.
+
+    MySQL walks straight into it. A MySQL 8 datadir's top level holds
+    ``#innodb_redo/``, ``#innodb_temp/`` and ``#ib_16384_*.dblwr``, so on any
+    volume large enough to be chunked the whole redo-log directory is skipped
+    while rsync exits 0 (0055-00, 2026-08-26: all 32 redo files missing on the
+    target — caught by verify, one step before the source would have been
+    finalised).
+
+    Anchoring every entry as ``./name`` moves the ``#`` off the first column.
+    ``--relative`` normalises the ``./`` back off again, so the destination
+    layout is exactly what it was without it.
+    """
+    if path == "." or path.startswith("./"):
+        return path
+    return f"./{path}"
+
+
 def build_command(spec: RsyncSpec) -> str:
     """Build the rsync command to run **on the source host**.
 
@@ -167,17 +192,26 @@ def build_command(spec: RsyncSpec) -> str:
 
     # Root-metadata-only pass after a split (see RsyncSpec.dirs_only).
     #
-    # `--files-from` with `.` and NO `-r` transfers exactly the named directory
-    # NODE — the volume root — carrying its perms/owner/times without touching a
-    # single byte of content. `--delete` is dropped: there is nothing to delete
-    # in a non-recursive, single-entry transfer, and keeping it here would only
-    # be a foot-gun.
+    # `--files-from` with `.` carries the volume root's perms/owner/times without
+    # touching a byte of content. `--delete` is dropped: there is nothing to
+    # delete in a single-entry transfer, and keeping it here would only be a
+    # foot-gun.
+    #
+    # `--exclude=/*` is load-bearing, and NOT redundant next to the absent `-r`:
+    # `--files-from` implies `--dirs`, and `-d` DOES copy the contents of a
+    # directory named exactly `.`, one level deep. Without the exclude this pass
+    # silently manufactures a bare node for every top-level entry — including
+    # entries the chunked transfer never copied. That is what turned "rsync
+    # skipped the whole #innodb_redo directory" into "32 files are missing"
+    # (0055-00, 2026-08-26): the empty directory was sitting there with correct
+    # ownership, so verify reported only the leaves and the cause stayed hidden.
+    # A metadata pass must carry metadata, never invent structure.
     if spec.dirs_only:
         meta_flags = [f for f in flags if f != "--delete"]
-        meta_parts = ["rsync", *meta_flags, "--files-from=-"]
+        meta_parts = ["rsync", *meta_flags, "--exclude=/*", "--files-from=-"]
         return (
             "printf '%s\\n' . | "
-            + " ".join(shlex.quote(p) if " " in p else p for p in meta_parts)
+            + " ".join(shlex.quote(p) for p in meta_parts)
             + f" -e {shlex.quote(build_ssh_option(spec))}"
             + f" {shlex.quote(source)}"
             + f" {shlex.quote(f'{spec.target_user}@{spec.target_host}:{target}')}"
@@ -193,11 +227,11 @@ def build_command(spec: RsyncSpec) -> str:
     # file inside is missing. A silent partial copy, on exactly the large volumes
     # that get chunked in the first place.
     if tuple(spec.paths) != (".",):
-        listing = "\n".join(spec.paths)
+        listing = "\n".join(_files_from_line(p) for p in spec.paths)
         parts += ["--files-from=-", "--relative", "-r"]
         cmd = (
             f"printf '%s\\n' {shlex.quote(listing)} | "
-            + " ".join(shlex.quote(p) if " " in p else p for p in parts)
+            + " ".join(shlex.quote(p) for p in parts)
             + f" -e {shlex.quote(build_ssh_option(spec))}"
             + f" {shlex.quote(source)}"
             + f" {shlex.quote(f'{spec.target_user}@{spec.target_host}:{target}')}"

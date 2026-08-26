@@ -1144,7 +1144,13 @@ async def _copy_one(ctx: MigrationContext, source_path: str, target_path: str) -
         f"cd {shlex.quote(source_path)} 2>/dev/null && ls -A 2>/dev/null"
     )
     if listing.ok:
-        for name in listing.stdout.split():
+        # splitlines(), not split(): `ls -A` writes one name per line when its
+        # stdout is a pipe, and splitting on whitespace tears a top-level entry
+        # with a space in its name into two names that do not exist -- which
+        # rsync then rejects with exit 23, after the source is already stopped.
+        for name in listing.stdout.splitlines():
+            if not name.strip():
+                continue
             size, _ = await docker.path_size(ctx.source_host, f"{source_path}/{name}")
             entries.append(PathEntry(relpath=name, bytes=size))
 
