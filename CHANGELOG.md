@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v2.8.2 (2026-08-26)
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`1e5704c`](https://github.com/bauer-group/IP-CoolifyMigration/commit/1e5704cf4aca3bfa838d05c07be13cd3d7b00e50))
+
+
 ## v2.8.1 (2026-08-26)
 
 ### Bug Fixes
@@ -10,6 +18,9 @@
 
 - **preflight**: Caught stale Coolify name labels
   ([`019f029`](https://github.com/bauer-group/IP-CoolifyMigration/commit/019f029a57a8538ac704af08caf5b350f891e167))
+
+- **transfer**: Fixed #-named entries being skipped
+  ([`d0853ef`](https://github.com/bauer-group/IP-CoolifyMigration/commit/d0853ef8ec712dff8d2c0a9dfbef8ed3d1e25ae2))
 
 - **ui**: Sorted every list the operator picks from
   ([`46d7e21`](https://github.com/bauer-group/IP-CoolifyMigration/commit/46d7e21d18ef8d27c3e65f25c1d5b6faf286159d))
