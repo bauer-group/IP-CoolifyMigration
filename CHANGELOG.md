@@ -1,6 +1,25 @@
 # CHANGELOG
 
 
+## v2.8.1 (2026-08-26)
+
+### Bug Fixes
+
+- **cli**: Extended the validated range to Coolify 4.3.10
+  ([`ee60bde`](https://github.com/bauer-group/IP-CoolifyMigration/commit/ee60bdef7cf4e5015e17eed1bffb7fc01aaa926b))
+
+- **preflight**: Caught stale Coolify name labels
+  ([`019f029`](https://github.com/bauer-group/IP-CoolifyMigration/commit/019f029a57a8538ac704af08caf5b350f891e167))
+
+- **ui**: Sorted every list the operator picks from
+  ([`46d7e21`](https://github.com/bauer-group/IP-CoolifyMigration/commit/46d7e21d18ef8d27c3e65f25c1d5b6faf286159d))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`689ec89`](https://github.com/bauer-group/IP-CoolifyMigration/commit/689ec89cc86eb3eb82e94aa299450e296e93ed83))
+
+
 ## v2.8.0 (2026-08-16)
 
 ### Documentation
