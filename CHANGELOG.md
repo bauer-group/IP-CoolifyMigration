@@ -1,7 +1,23 @@
 # CHANGELOG
 
 
+## v2.8.3 (2026-08-26)
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`85b201b`](https://github.com/bauer-group/IP-CoolifyMigration/commit/85b201bbfebdcd7a62e5179b1452b1f0a8780333))
+
+
 ## v2.8.2 (2026-08-26)
+
+### Bug Fixes
+
+- **engine**: Fixed health gate on exited containers
+  ([`100f427`](https://github.com/bauer-group/IP-CoolifyMigration/commit/100f427bb8933582b8e7ee933930d490e9871813))
+
+- **quiesce**: Scoped refusals to the data at risk
+  ([`1bb615b`](https://github.com/bauer-group/IP-CoolifyMigration/commit/1bb615bb94032b1865551d3f5e9a48689a351972))
 
 ### Documentation
 
