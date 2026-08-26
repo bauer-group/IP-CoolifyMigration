@@ -346,4 +346,16 @@ def reconcile(
                 "container mounts it; it is NOT migrated (delete it, or attach it first)"
             )
 
+    # 4. Nothing to inspect. An already-stopped resource is migratable — the API
+    # is the intent and `volume ls` is the residue, and above they agree — but
+    # the authority is missing, so say what that costs while the operator can
+    # still decide. An anonymous volume or an undeclared bind mount appears in
+    # NEITHER remaining source; only a container would have shown it.
+    if not docker_mounts and any(i.decision is Decision.MIGRATE for i in items):
+        warnings.append(
+            "no container was available to inspect, so these mounts come from Coolify's "
+            "declared storages and `docker volume ls` alone — an anonymous volume or an "
+            "undeclared bind mount appears in neither and cannot be ruled out"
+        )
+
     return VolumeManifest(items=tuple(items), warnings=tuple(warnings))

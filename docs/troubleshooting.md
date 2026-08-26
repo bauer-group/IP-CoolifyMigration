@@ -108,12 +108,17 @@ the precise check and the one that matters.
 
 ## Quiesce failed: SIGKILL (exit 5)
 
-A container exited 137 — the stop timeout was hit and Docker killed it. A killed
+A container exited 137 — the stop timeout was hit and Docker killed it — **and
+it was one of the containers mounting a volume this migration copies**. A killed
 database has not flushed, so its volume is a torn snapshot.
 
 Raise the resource's stop grace period in Coolify, or raise `STOP_TIMEOUT`, and
 retry. This is fatal by design: mirroring an unflushed data directory
 byte-exactly just gives you a faithful copy of corruption.
+
+A kill of a container that mounts none of the migrated volumes — an app server,
+a worker, a sidecar — is logged as `quiesce.killed_without_data` and does not
+stop the run. Nothing it held is being copied. Fix its shutdown path anyway.
 
 ## Quiesce failed: preview deployments present
 

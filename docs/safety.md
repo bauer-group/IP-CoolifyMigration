@@ -97,12 +97,44 @@ target — so the refusal says whether the deploy failed or the filter is blind.
 Found 2026-08-27: a stack serving traffic while the gate waited out its entire
 15-minute window, because one compose service had done its job and exited.
 
-## Why a SIGKILL is fatal, not a warning
+## Why a SIGKILL is fatal, and when it is not
 
 A container that exits with 137 hit the stop timeout and was killed. A killed
 database has not flushed. Mirroring an unflushed data directory byte-exactly just
 gives you a faithful copy of corruption — so this is a hard failure with no
 `--force`. Raise the resource's stop grace period and retry.
+
+That reasoning is about the **bytes**, not about the signal, and the check is
+scoped to match. QUIESCE records, before it stops anything, which containers
+mount the volumes in the manifest. A kill is fatal when the killed container is
+one of them. A kill of a container that owns none of the data being copied — an
+application server, a worker, a sidecar that ignores SIGTERM — is reported with
+its name and does not stop the migration: no byte it could have torn is going
+anywhere. Raise that resource's grace period anyway; an unclean stop is a bug in
+its shutdown path, just not one this migration inherits.
+
+## Migrating a stack that is already stopped
+
+Supported, and safe for the same reason the label probe exists. A stopped stack
+has no containers to inspect, and `docker ps` answers an empty list rather than
+an error — so "no containers" used to be ambiguous between a stopped resource
+and a filter that could not see a running one, and QUIESCE refused rather than
+guess.
+
+PREFLIGHT removed the ambiguity: it looks for every resource by **uuid** and by
+**mounted volume**, using no name label at all, and refuses when it finds a
+container the label query missed. Reaching QUIESCE with nothing found therefore
+means the stack really is down. `reconcile` then migrates every declared
+persistent storage whose docker volume exists, whether or not anything mounts it
+— the API is the intent, `docker volume ls` is the residue — and warns about any
+volume that looks like this stack's and is *not* being moved.
+
+What is genuinely lost is discovery of a mount that appears in no Coolify API: an
+anonymous volume, or a bind mount the compose does not declare. Only a container
+would have shown it. That is stated as a warning in the plan you confirm, next to
+the list of volumes that will move, rather than as a refusal — refusing makes a
+stopped stack permanently unmigratable, which is a worse answer than an informed
+operator.
 
 ## Security invariants
 

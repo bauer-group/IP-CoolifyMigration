@@ -238,7 +238,10 @@ class TestApiCrossCheck:
         assert item.mount_path == "/var/globaleaks"
         assert item.source_path == "/var/lib/docker/volumes/u1_data/_data"
         # and it is NOT also reported as an orphan
-        assert manifest.warnings == ()
+        assert not any("orphan" in w or "no container mounts it" in w for w in manifest.warnings)
+        # It IS reported as discovered without the authority, because that is what
+        # an already-stopped resource costs: nothing rules out an anonymous volume.
+        assert any("no container was available to inspect" in w for w in manifest.warnings)
 
     def test_declared_storage_for_an_already_migrating_volume_is_not_duplicated(self) -> None:
         # Seen in the wild: Coolify declared `uploads` at /srv/uploads (an older compose

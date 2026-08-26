@@ -27,6 +27,7 @@ from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.dns import wildcard as dns_wildcard
 from bg_coolify_migrate.dns.gate import Resolution, build_report, explain_why_blocking_matters
 from bg_coolify_migrate.domain.kinds import GitAuth, ResourceKind
+from bg_coolify_migrate.domain.manifest import DockerMount
 from bg_coolify_migrate.domain.naming import (
     VolumeEndpoint,
     VolumePairingError,
@@ -174,10 +175,10 @@ async def _assert_containers_are_discoverable(ctx: MigrationContext) -> None:
             )
 
         # A resource that neither route can find is genuinely stopped, not hidden.
-        # Not refused here: QUIESCE already refuses it when the manifest holds
-        # volumes, and duplicating that decision in two places is how the two
-        # drift apart. What this run HAS established is that the silence is real,
-        # which is exactly what QUIESCE could not tell on its own.
+        # Not refused: an already-stopped stack is migratable, and this is the
+        # check that makes it SAFE to migrate one. Establishing that the silence
+        # is real is exactly what QUIESCE cannot tell on its own — so QUIESCE
+        # proceeds on this finding, with a warning, rather than refusing.
         log.debug(
             "preflight.labels_current",
             resource=snapshot.name,
@@ -669,18 +670,7 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
         ctx.source_host, since=since, label_filters=observed_labels(ctx.plan)
     )
     if killed:
-        names = ", ".join(sorted(name for name, _ in killed))
-        raise QuiesceError(
-            f"container(s) were SIGKILLed rather than stopping cleanly: {names}",
-            hint=(
-                "Exit code 137 means the stop grace period elapsed and Docker killed the "
-                "process. A killed database has not flushed, so its volume is a torn "
-                "snapshot, and mirroring it byte-exactly would give you a faithful copy "
-                "of the tear.\n"
-                "Raise the stop grace period on the resource in Coolify and retry. "
-                "Nothing has been copied."
-            ),
-        )
+        _refuse_if_killed_data_holder(ctx, killed)
 
     # Counts come from the PRE-stop capture. The report cannot know them: a
     # Coolify stop removes containers as it stops them, so the final snapshot is
@@ -718,6 +708,85 @@ async def _storages_or_none(
         return None
 
 
+def _refuse_if_killed_data_holder(ctx: MigrationContext, killed: list[tuple[str, int]]) -> None:
+    """Fail the stop only when a SIGKILLed container owned bytes we are about to copy.
+
+    Exit code 137 means the stop grace period elapsed and Docker killed the
+    process. Why that is fatal has always been about the DATA, never about the
+    signal: a database killed mid-write has not flushed, so mirroring its volume
+    byte-exactly gives you a faithful copy of the tear. There is no ``--force``
+    for that and there should not be.
+
+    But the check refused on ANY killed container in the stack, and most stacks
+    contain containers that own no bytes at all — an application server, a
+    worker, a sidecar. One of those ignoring SIGTERM costs this migration
+    precisely nothing, and blocking on it makes an otherwise sound stack
+    unmigratable for a reason unrelated to its data. QUIESCE captured which
+    containers mounted the volumes in the manifest (:func:`_containers_holding_data`),
+    so the question can be asked exactly.
+
+    A kill we let through is still reported — loudly, with names — because it
+    means the resource's stop grace period is too short and the operator should
+    know, even though this run is unaffected.
+    """
+    holders = {name for names in ctx.data_containers.values() for name in names}
+    at_risk = sorted(name for name, _ in killed if name in holders)
+    harmless = sorted(name for name, _ in killed if name not in holders)
+
+    if harmless:
+        log.warning(
+            "quiesce.killed_without_data",
+            containers=harmless,
+            hint=(
+                "SIGKILLed at the stop grace period, but mounted none of the volumes "
+                "being migrated - no bytes are at risk. Raise the resource's stop grace "
+                "period in Coolify anyway; an unclean stop is a bug in its shutdown path."
+            ),
+        )
+    if not at_risk:
+        return
+
+    raise QuiesceError(
+        "container(s) holding migrated data were SIGKILLed rather than stopping "
+        f"cleanly: {', '.join(at_risk)}",
+        hint=(
+            "Exit code 137 means the stop grace period elapsed and Docker killed the "
+            "process. A killed database has not flushed, so its volume is a torn "
+            "snapshot, and mirroring it byte-exactly would give you a faithful copy "
+            "of the tear.\n"
+            "Raise the stop grace period on the resource in Coolify and retry. "
+            "Nothing has been copied."
+        ),
+    )
+
+
+def _containers_holding_data(
+    resource: ResourcePlan, containers: list[docker.Container], mounts: list[DockerMount]
+) -> tuple[str, ...]:
+    """Names of the containers that mount data this migration will copy. PURE.
+
+    The join `docker events` cannot do for us. A mount records the handle it was
+    inspected by — the container id — while the event log reports a container by
+    NAME, and by the time we read the log the containers are gone, so neither can
+    be resolved into the other after the fact.
+
+    Used by the SIGKILL check to tell the two cases apart: a killed process that
+    owned bytes we are about to mirror (a torn snapshot, fatal) from one that
+    owned none (a stateless app container that ignored SIGTERM, which costs this
+    migration nothing).
+    """
+    migrating_names = {i.source_name for i in resource.manifest.to_migrate if i.source_name}
+    migrating_paths = {i.source_path for i in resource.manifest.to_migrate if i.source_path}
+    by_id = {c.id or c.name: c.name for c in containers}
+
+    holders = {
+        by_id.get(m.container, m.container)
+        for m in mounts
+        if (m.name and m.name in migrating_names) or (m.source and m.source in migrating_paths)
+    }
+    return tuple(sorted(holders))
+
+
 async def _capture_mounts(ctx: MigrationContext) -> dict[str, list[str]]:
     """Record every container mount before the stop erases the containers.
 
@@ -746,41 +815,53 @@ async def _capture_mounts(ctx: MigrationContext) -> dict[str, list[str]]:
             name=snapshot.name,
         )
         if not containers:
-            # No containers is only a problem when there is data to copy. The plan's
-            # manifest is the signal: if it found volumes, a running stack is the ONLY
-            # chance to capture them, so refuse (silently copying nothing for a
-            # stateful resource is the failure we exist to prevent). If it found none
-            # — a stateless/rebuilt resource, or one that is simply stopped — there is
-            # nothing to capture, so carry on and let it be recreated on the target.
-            if resource.manifest.to_migrate:
-                raise PreflightError(
-                    f"{snapshot.name}: has volumes to migrate but no running containers "
-                    f"on {ctx.plan.source_server.name}",
-                    hint=(
-                        "Coolify removes containers when it stops them, so a running "
-                        "stack is the only chance to see what its volumes mounted - bind "
-                        "mounts and anonymous volumes appear in no API.\n"
-                        "PREFLIGHT already looked for this resource WITHOUT the Coolify "
-                        "name labels (by resource uuid, and by which containers mount "
-                        "these volumes) and found none either, so this is a stopped "
-                        "resource rather than a label mismatch. Start it, then migrate."
-                    ),
-                )
+            # An ALREADY-STOPPED resource. Migrating one is legitimate and this
+            # used to refuse it, on the grounds that a running stack is the only
+            # chance to see bind mounts and anonymous volumes. Two things make
+            # that refusal wrong now:
+            #
+            # * The manifest no longer needs a container. `reconcile` migrates a
+            #   DECLARED persistent storage whose docker volume EXISTS even when
+            #   nothing mounts it - the API is the intent, `volume ls` the
+            #   residue - and warns, in the plan the operator confirms, about any
+            #   volume that looks like this stack's and is not being moved.
+            # * "No containers" is no longer ambiguous. PREFLIGHT looks for each
+            #   resource by uuid and by mounted volume, using no name label at
+            #   all, and refuses when it finds one the label query missed. So
+            #   reaching here means the silence is a fact about the stack.
+            #
+            # What is genuinely lost is the ability to DISCOVER a mount that
+            # appears in no Coolify API - an anonymous volume, an undeclared bind.
+            # That is a warning (raised at plan time too, so it is visible before
+            # the operator commits), not a refusal: refusing makes a stopped stack
+            # unmigratable, and the operator can see exactly which volumes move.
+            #
             # Record an EXPLICIT empty capture, not nothing: DISCOVER treats a
             # missing key (None) as a lost capture and aborts, but an empty list
             # correctly means "this resource had no mounts".
             ctx.pre_stop_mounts[snapshot.uuid] = []
+            ctx.data_containers[snapshot.uuid] = ()
             captured[snapshot.uuid] = []
-            log.info("quiesce.no_containers_no_volumes", resource=snapshot.name)
+            if resource.manifest.to_migrate:
+                log.warning(
+                    "quiesce.stopped_resource",
+                    resource=snapshot.name,
+                    volumes=[i.source_name for i in resource.manifest.to_migrate],
+                    hint="no container to inspect; undeclared mounts cannot be ruled out",
+                )
+            else:
+                log.info("quiesce.no_containers_no_volumes", resource=snapshot.name)
             continue
         mounts = await inspect_all_mounts(ctx.source_host, containers)
         ctx.pre_stop_mounts[snapshot.uuid] = mounts
+        ctx.data_containers[snapshot.uuid] = _containers_holding_data(resource, containers, mounts)
         captured[snapshot.uuid] = sorted(c.name for c in containers)
         log.info(
             "quiesce.mounts_captured",
             resource=snapshot.name,
             containers=len(containers),
             mounts=len(mounts),
+            holding_data=len(ctx.data_containers[snapshot.uuid]),
         )
 
     # Journal it before the stop. The context dies with the process and the

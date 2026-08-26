@@ -19,7 +19,12 @@ from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.domain.compose import MountClass
 from bg_coolify_migrate.domain.drift import DriftAxis, DriftFinding, RebuildDriftReport, Severity
 from bg_coolify_migrate.domain.kinds import DatabaseEngine, GitAuth, ResourceKind
-from bg_coolify_migrate.domain.manifest import Decision, VolumeItem, VolumeManifest
+from bg_coolify_migrate.domain.manifest import (
+    Decision,
+    DockerMount,
+    VolumeItem,
+    VolumeManifest,
+)
 from bg_coolify_migrate.domain.naming import VolumeEndpoint, VolumePair
 from bg_coolify_migrate.domain.plan import (
     MigrationPlan,
@@ -35,6 +40,7 @@ from bg_coolify_migrate.errors import (
     CoolifyApiError,
     DnsGateBlocked,
     PreflightError,
+    QuiesceError,
     RebuildDriftBlocked,
     TransferError,
     VerificationError,
@@ -261,17 +267,28 @@ async def ctx(tmp_path: Path):  # type: ignore[no-untyped-def]
 
 
 class TestCaptureMounts:
-    """The 'no containers' guard protects stateful resources from silently copying
-    nothing - but a stateless / no-volume resource must migrate, not abort."""
+    """A stateless / no-volume resource must migrate rather than abort - and so
+    must an ALREADY-STOPPED one, which this used to refuse outright."""
 
-    async def test_refuses_when_there_are_volumes_but_no_containers(
+    async def test_migrates_an_already_stopped_resource_with_volumes(
         self, ctx: MigrationContext
     ) -> None:
+        """A stopped stack is migratable; refusing made it permanently stuck.
+
+        PREFLIGHT has already established, by uuid and by mounted volume, that
+        the silence is a fact about the stack rather than about our label filter,
+        and `reconcile` migrates a declared storage whose volume exists without
+        needing a container. So there is nothing left to refuse over.
+        """
         # Default ctx: a COPY_DATA resource with a volume, source `docker ps` empty.
         from bg_coolify_migrate.engine.steps import _capture_mounts
 
-        with pytest.raises(PreflightError, match="has volumes to migrate"):
-            await _capture_mounts(ctx)
+        captured = await _capture_mounts(ctx)
+
+        assert captured["db1"] == []
+        # EXPLICIT empty, not missing: DISCOVER reads a missing key as a lost capture.
+        assert ctx.pre_stop_mounts["db1"] == []
+        assert ctx.data_containers["db1"] == ()
 
     async def test_proceeds_when_a_no_volume_resource_has_no_containers(
         self, ctx: MigrationContext
@@ -2135,3 +2152,69 @@ class TestHealthcheck:
             await steps.step_healthcheck(ctx)
         assert "nothing matched" in str(excinfo.value)
         assert "postgres-newdb1-1 (running)" in (excinfo.value.hint or "")
+
+
+class TestKilledContainers:
+    """A SIGKILL is fatal because of the BYTES, not because of the signal.
+
+    Refusing on any killed container in the stack blocked migrations over an
+    application server that ignored SIGTERM while every volume being copied
+    belonged to containers that had stopped cleanly.
+    """
+
+    def test_holders_are_resolved_from_the_id_back_to_the_name(self) -> None:
+        resource = ResourcePlan(
+            snapshot=_snapshot(), strategy=Strategy.COPY_DATA, manifest=_manifest()
+        )
+        containers = [
+            steps.docker.Container(id="aaa", name="postgres-db1-1", state="running", labels={}),
+            steps.docker.Container(id="bbb", name="app-db1-1", state="running", labels={}),
+        ]
+        mounts = [
+            DockerMount(
+                container="aaa",
+                type="volume",
+                name="postgres-data-db1",
+                source="/var/lib/docker/volumes/postgres-data-db1/_data",
+                destination="/var/lib/postgresql/data",
+            ),
+            DockerMount(
+                container="bbb",
+                type="bind",
+                source="/etc/localtime",
+                destination="/etc/localtime",
+            ),
+        ]
+        assert steps._containers_holding_data(resource, containers, mounts) == ("postgres-db1-1",)
+
+    def test_a_killed_container_holding_no_data_does_not_fail_the_stop(
+        self, ctx: MigrationContext
+    ) -> None:
+        # The reported case: `documenso-server` was SIGKILLed while the two
+        # volumes being migrated belonged to the database and object store.
+        ctx.data_containers["db1"] = ("postgres-db1-1",)
+        steps._refuse_if_killed_data_holder(ctx, [("documenso-server-db1-2255", 137)])
+
+    def test_a_killed_data_holder_still_fails_the_stop(self, ctx: MigrationContext) -> None:
+        ctx.data_containers["db1"] = ("postgres-db1-1",)
+        with pytest.raises(QuiesceError, match="postgres-db1-1"):
+            steps._refuse_if_killed_data_holder(ctx, [("postgres-db1-1", 137)])
+
+    def test_one_killed_data_holder_condemns_the_whole_stop(self, ctx: MigrationContext) -> None:
+        # A stateless kill alongside a stateful one must not dilute the refusal.
+        ctx.data_containers["db1"] = ("postgres-db1-1",)
+        with pytest.raises(QuiesceError) as excinfo:
+            steps._refuse_if_killed_data_holder(
+                ctx, [("documenso-server-db1-2255", 137), ("postgres-db1-1", 137)]
+            )
+        assert "postgres-db1-1" in str(excinfo.value)
+        assert "documenso-server" not in str(excinfo.value)
+
+    def test_nothing_captured_means_nothing_is_a_holder(self, ctx: MigrationContext) -> None:
+        """An already-stopped resource records no holders, so no kill can be one.
+
+        Nothing was killed by us either - the capture is empty precisely because
+        the containers were gone before we arrived.
+        """
+        ctx.data_containers["db1"] = ()
+        steps._refuse_if_killed_data_holder(ctx, [("postgres-db1-1", 137)])

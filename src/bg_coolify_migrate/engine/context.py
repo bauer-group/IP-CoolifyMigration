@@ -73,6 +73,15 @@ class MigrationContext:
     #: manifest copies nothing without complaining once.
     pre_stop_mounts: dict[str, list[DockerMount]] = field(default_factory=dict)
 
+    #: source resource uuid -> names of the containers that mounted data this
+    #: migration will copy, recorded by QUIESCE alongside the mounts.
+    #:
+    #: Exists so the SIGKILL check can tell a torn volume from a killed process
+    #: that owned no bytes. `docker events` reports a container by NAME, while a
+    #: mount records the id it was inspected by, so the two cannot be joined
+    #: after the fact — the containers are gone by then.
+    data_containers: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
     #: source resource uuid -> verification reports, one per volume
     verifications: dict[str, list[VerificationReport]] = field(default_factory=dict)
 
