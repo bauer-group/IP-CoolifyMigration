@@ -19,7 +19,7 @@ from rich.markup import escape
 from bg_coolify_migrate.domain.plan import MigrationPlan
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.ui import report as report_mod
-from bg_coolify_migrate.ui.console import get_console, human_bytes
+from bg_coolify_migrate.ui.console import get_console, human_bytes, natural_key
 
 _STYLE = questionary.Style(
     [
@@ -46,13 +46,18 @@ def _ask(prompt: Any) -> Any:
 
 
 def choose_server(servers: list[dict[str, Any]], *, message: str, exclude: str | None = None) -> str:
-    """Pick a server. Returns its uuid."""
+    """Pick a server. Returns its uuid.
+
+    Sorted, like every list here: the API imposes no ORDER BY, so an unsorted menu
+    is reshuffled between runs and the entry you want is never twice in the same
+    place. See :func:`~bg_coolify_migrate.ui.console.natural_key`.
+    """
     choices = [
         questionary.Choice(
             title=f"{s.get('name')}  ({s.get('ip')})",
             value=str(s.get("uuid")),
         )
-        for s in servers
+        for s in sorted(servers, key=lambda s: natural_key(str(s.get("name") or "")))
         if s.get("uuid") != exclude
     ]
     if not choices:
@@ -63,7 +68,7 @@ def choose_server(servers: list[dict[str, Any]], *, message: str, exclude: str |
 def choose_project(projects: list[dict[str, Any]]) -> str:
     choices = [
         questionary.Choice(title=str(p.get("name")), value=str(p.get("name")))
-        for p in projects
+        for p in sorted(projects, key=lambda p: natural_key(str(p.get("name") or "")))
     ]
     if not choices:
         raise Cancelled("no projects visible")
@@ -75,9 +80,11 @@ def choose_environment(environments: list[str]) -> str:
         return "production"
     if len(environments) == 1:
         return environments[0]
-    return str(
-        _ask(questionary.select("Which environment?", choices=environments, style=_STYLE))
-    )
+    # Bound to a typed local: inlining it makes mypy infer the sorted() element
+    # type from questionary's `str | Choice | dict` parameter instead of from
+    # `environments`, and natural_key then no longer matches.
+    ordered: list[str] = sorted(environments, key=natural_key)
+    return str(_ask(questionary.select("Which environment?", choices=ordered, style=_STYLE)))
 
 
 #: Sentinel value for the "everything at this level" choice. A plain ``None``
@@ -92,7 +99,10 @@ def choose_scope_environment(environments: list[str]) -> str | None:
     The migration atom is the resource; this is one layer of the selector the
     picker offers when no ``project/environment/resource`` path was given.
     """
-    choices = [questionary.Choice(title=e, value=e) for e in environments]
+    choices = [questionary.Choice(title=e, value=e) for e in sorted(environments, key=natural_key)]
+    # Pinned last rather than sorted among the names: it is an action, not an
+    # environment, and a moving "- all ..." row is the same paper cut as a moving
+    # list.
     choices.append(
         questionary.Choice(title="- all environments (migrate the whole project)", value=_ALL)
     )
@@ -107,11 +117,15 @@ def choose_scope_resource(resources: list[tuple[str, dict[str, Any]]]) -> str | 
 
     ``resources`` is the ``(collection, record)`` list from ``environment_resources``.
     """
+    # Pinned first, for the same reason the environment sentinel is pinned last.
     choices = [
         questionary.Choice(title="- all resources (migrate the whole environment)", value=_ALL)
     ]
-    for _collection, record in resources:
-        name = str(record.get("name") or record.get("uuid") or "?")
+    names = sorted(
+        (str(record.get("name") or record.get("uuid") or "?") for _collection, record in resources),
+        key=natural_key,
+    )
+    for name in names:
         choices.append(questionary.Choice(title=name, value=name))
     answer = questionary.select("Which resource?", choices=choices, style=_STYLE).ask()
     if answer is None:

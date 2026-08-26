@@ -12,6 +12,7 @@ flag.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from functools import lru_cache
 
@@ -58,6 +59,38 @@ def is_interactive() -> bool:
     if os.environ.get("CI"):
         return False
     return sys.stdout.isatty() and sys.stderr.isatty()
+
+
+_DIGIT_RUN = re.compile(r"(\d+)")
+
+
+def natural_key(value: str) -> tuple[tuple[tuple[int, int, str], ...], str]:
+    """Sort key for names an operator reads: case-insensitive and digit-aware. PURE.
+
+    Every list the operator picks from goes through this, because the API returns
+    rows in whatever order the query planner produced - which is not stable
+    between calls, so the same menu came back shuffled each run.
+
+    Plain lexicographic order is not enough on its own here. It puts '11.0
+    Service' before '2.0 Service', which reads as unsorted to anyone whose
+    projects are numbered - the same complaint, differently caused. Comparing runs
+    of digits as integers fixes that, and for a name containing no digits the
+    result is exactly case-insensitive alphabetical.
+
+    Each part is a ``(rank, number, text)`` triple rather than a bare int or str so
+    that comparison never crosses types. Digits take rank 0 so that a numbered name
+    sorts before an unnumbered one, which is what plain lexicographic order does
+    too ('0' < 'A') and therefore what "alphabetical" is expected to mean here. The
+    raw value is appended as a final tiebreaker to make the order TOTAL: '01' and '1' compare equal on their
+    digit runs alone, and a tie would leave those two entries in exactly the
+    arbitrary API order this exists to replace.
+    """
+    parts = tuple(
+        (0, int(part), "") if part.isdigit() else (1, 0, part)
+        for part in _DIGIT_RUN.split(value.casefold())
+        if part
+    )
+    return parts, value
 
 
 def human_bytes(value: int | None) -> str:

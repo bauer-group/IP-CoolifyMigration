@@ -328,3 +328,45 @@ class TestMarkupSafety:
         assert "shop [x]" in out
         assert "p1" in out  # project uuid, for uuid-based selection
         assert "rsc-9" in out  # resource uuid
+
+
+class TestNaturalKey:
+    """The one ordering every operator-facing list goes through."""
+
+    def test_numbers_compare_as_numbers(self) -> None:
+        from bg_coolify_migrate.ui.console import natural_key
+
+        names = ["11.0 Service", "2.0 Service", "10.0 Service", "1.0 Service"]
+        assert sorted(names, key=natural_key) == [
+            "1.0 Service",
+            "2.0 Service",
+            "10.0 Service",
+            "11.0 Service",
+        ]
+
+    def test_is_case_insensitive(self) -> None:
+        from bg_coolify_migrate.ui.console import natural_key
+
+        assert sorted(["beta", "Alpha", "gamma"], key=natural_key) == ["Alpha", "beta", "gamma"]
+
+    def test_numbered_names_sort_before_unnumbered_ones(self) -> None:
+        # As plain lexicographic order does ('0' < 'A'), which is what
+        # "alphabetical" is expected to mean.
+        from bg_coolify_migrate.ui.console import natural_key
+
+        assert sorted(["shop", "01 Legacy"], key=natural_key) == ["01 Legacy", "shop"]
+
+    def test_the_order_is_total(self) -> None:
+        # '01' and '1' tie on their digit runs alone. Without the raw-value
+        # tiebreaker they would keep whatever order the API returned them in -
+        # the arbitrary ordering this exists to replace.
+        from bg_coolify_migrate.ui.console import natural_key
+
+        assert natural_key("01 Foo") != natural_key("1 Foo")
+        assert sorted(["1 Foo", "01 Foo"], key=natural_key) == ["01 Foo", "1 Foo"]
+        assert sorted(["01 Foo", "1 Foo"], key=natural_key) == ["01 Foo", "1 Foo"]
+
+    def test_handles_names_with_no_digits_and_the_empty_name(self) -> None:
+        from bg_coolify_migrate.ui.console import natural_key
+
+        assert sorted(["", "a", "B"], key=natural_key) == ["", "a", "B"]

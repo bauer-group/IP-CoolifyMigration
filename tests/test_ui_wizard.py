@@ -28,6 +28,8 @@ from bg_coolify_migrate.ui.wizard import (
     choose_environment,
     choose_finalize_policy,
     choose_project,
+    choose_scope_environment,
+    choose_scope_resource,
     choose_server,
     confirm_destructive,
     confirm_plan,
@@ -138,6 +140,75 @@ class TestChooseEnvironment:
     def test_several_are_offered(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch(monkeypatch, "select", "staging")
         assert choose_environment(["production", "staging"]) == "staging"
+
+
+class TestSelectionIsOrdered:
+    """Every menu is sorted, because the API's answer is not.
+
+    Coolify issues no ORDER BY, so rows come back in whatever order the query
+    planner produced - and that changes as rows are updated. An unsorted menu is
+    therefore reshuffled between runs and the entry you want is never twice in the
+    same place. Reported 2026-08-26.
+    """
+
+    def test_projects_are_offered_in_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = _patch(monkeypatch, "select", "x")
+        choose_project(
+            [
+                {"uuid": "p3", "name": "11.0 Production Service"},
+                {"uuid": "p1", "name": "2.0 Alpha"},
+                {"uuid": "p2", "name": "01 Legacy"},
+                {"uuid": "p4", "name": "shop"},
+            ]
+        )
+        titles = [c.title for c in calls[0]["kwargs"]["choices"]]
+        # Digit-aware: '2.0' before '11.0'. Plain lexicographic order inverts those
+        # two, which reads as unsorted to anyone whose projects are numbered.
+        assert titles == ["01 Legacy", "2.0 Alpha", "11.0 Production Service", "shop"]
+
+    def test_servers_are_offered_in_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = _patch(monkeypatch, "select", "s1")
+        choose_server(
+            [
+                {"uuid": "s2", "name": "0047-20", "ip": "10.0.0.2"},
+                {"uuid": "s3", "name": "0100-20", "ip": "10.0.0.3"},
+                {"uuid": "s1", "name": "0046-20", "ip": "10.0.0.1"},
+            ],
+            message="Target server?",
+        )
+        titles = [c.title for c in calls[0]["kwargs"]["choices"]]
+        assert [t.split()[0] for t in titles] == ["0046-20", "0047-20", "0100-20"]
+
+    def test_environments_are_offered_in_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = _patch(monkeypatch, "select", "production")
+        choose_environment(["staging", "production", "development"])
+        assert list(calls[0]["kwargs"]["choices"]) == ["development", "production", "staging"]
+
+    def test_scope_resources_are_sorted_under_a_pinned_sentinel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = _patch(monkeypatch, "select", "x")
+        choose_scope_resource(
+            [
+                ("applications", {"name": "web", "uuid": "u1"}),
+                ("databases", {"name": "postgres", "uuid": "u2"}),
+                ("applications", {"name": "api", "uuid": "u3"}),
+            ]
+        )
+        titles = [c.title for c in calls[0]["kwargs"]["choices"]]
+        # The sentinel is an action, not a name: it stays put rather than sorting
+        # among them, so it does not move around either.
+        assert titles[0].startswith("- all resources")
+        assert titles[1:] == ["api", "postgres", "web"]
+
+    def test_scope_environments_are_sorted_above_a_pinned_sentinel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = _patch(monkeypatch, "select", "x")
+        choose_scope_environment(["staging", "production"])
+        titles = [c.title for c in calls[0]["kwargs"]["choices"]]
+        assert titles[:-1] == ["production", "staging"]
+        assert titles[-1].startswith("- all environments")
 
 
 class TestChooseFinalizePolicy:

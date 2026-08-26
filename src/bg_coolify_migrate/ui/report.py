@@ -19,7 +19,7 @@ from bg_coolify_migrate.dns.gate import DnsGateReport, Verdict
 from bg_coolify_migrate.domain.drift import RebuildDriftReport, Severity
 from bg_coolify_migrate.domain.manifest import Decision, VolumeManifest
 from bg_coolify_migrate.domain.plan import MigrationPlan, ResourceRow, ServerRef
-from bg_coolify_migrate.ui.console import human_bytes
+from bg_coolify_migrate.ui.console import human_bytes, natural_key
 
 _DECISION_STYLE = {
     Decision.MIGRATE: "ok",
@@ -245,7 +245,7 @@ def resource_tree(rows: Iterable[ResourceRow], servers: Iterable[ServerRef]) -> 
 
     lines: list[Text] = []
     for (server_name, server_uuid), server_rows in sorted(
-        by_server.items(), key=lambda kv: kv[0][0].lower()
+        by_server.items(), key=lambda kv: natural_key(kv[0][0])
     ):
         header = Text()
         header.append(server_name, style="host")
@@ -259,7 +259,7 @@ def resource_tree(rows: Iterable[ResourceRow], servers: Iterable[ServerRef]) -> 
             by_project.setdefault((row.project, row.project_uuid), []).append(row)
 
         for (project_name, project_uuid), project_rows in sorted(
-            by_project.items(), key=lambda kv: kv[0][0].lower()
+            by_project.items(), key=lambda kv: natural_key(kv[0][0])
         ):
             project_line = Text("  ")
             project_line.append(project_name, style="bold")
@@ -271,9 +271,9 @@ def resource_tree(rows: Iterable[ResourceRow], servers: Iterable[ServerRef]) -> 
             for row in project_rows:
                 by_env.setdefault(row.environment, []).append(row)
 
-            for environment, env_rows in sorted(by_env.items()):
+            for environment, env_rows in sorted(by_env.items(), key=lambda kv: natural_key(kv[0])):
                 lines.append(Text(f"    {environment}", style="muted"))
-                for row in sorted(env_rows, key=lambda r: r.name.lower()):
+                for row in sorted(env_rows, key=lambda r: natural_key(r.name)):
                     resource_line = Text("      ")
                     resource_line.append(row.name)
                     resource_line.append(f"  {row.kind}", style="muted")
@@ -295,7 +295,13 @@ def plain_resource_tree(rows: Iterable[ResourceRow]) -> str:
         f"{r.server or '?'}\t{r.project}\t{r.project_uuid}\t{r.environment}\t"
         f"{r.name}\t{r.kind}\t{r.uuid}"
         for r in sorted(
-            rows, key=lambda r: (r.server.lower(), r.project.lower(), r.environment, r.name.lower())
+            rows,
+            key=lambda r: (
+                natural_key(r.server),
+                natural_key(r.project),
+                natural_key(r.environment),
+                natural_key(r.name),
+            ),
         )
     )
 
