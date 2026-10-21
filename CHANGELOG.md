@@ -1,6 +1,37 @@
 # CHANGELOG
 
 
+## v2.8.4 (2026-10-21)
+
+### Bug Fixes
+
+- **plan**: Warned on dropped app naming settings
+  ([`dcf9add`](https://github.com/bauer-group/IP-CoolifyMigration/commit/dcf9addeefb731aebd258502a837490cf0801e6c))
+
+### Chores
+
+- **ci**: Removed issue AI summary workflow
+  ([`fdfba14`](https://github.com/bauer-group/IP-CoolifyMigration/commit/fdfba1477fb4349e0d6387527c4a21ab518d50dd))
+
+### Continuous Integration
+
+- **security**: Disabled Gitleaks scanning
+  ([`d338747`](https://github.com/bauer-group/IP-CoolifyMigration/commit/d338747ddcc11fc6d1fb54bf7530018d81ff6edf))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`aad5f1d`](https://github.com/bauer-group/IP-CoolifyMigration/commit/aad5f1dd2ba71cc63a85f7e27d0abbd30caea023))
+
+- **security**: Regenerated policy for 2.8.x
+  ([`63a45dc`](https://github.com/bauer-group/IP-CoolifyMigration/commit/63a45dc1c69f34f34b7c80f770f023e1f9643024))
+
+### Testing
+
+- **api**: Triaged the container name prefix field
+  ([`6218ca9`](https://github.com/bauer-group/IP-CoolifyMigration/commit/6218ca9530d11f86b2e6e998284b20486179d524))
+
+
 ## v2.8.3 (2026-08-26)
 
 ### Documentation
