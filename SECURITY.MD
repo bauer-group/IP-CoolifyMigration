@@ -1,4 +1,4 @@
-<!-- AUTO-GENERATED FILE. DO NOT EDIT. Edit docs/SECURITY.template.MD instead. Generated 2026-07-16. -->
+<!-- AUTO-GENERATED FILE. DO NOT EDIT. Edit docs/SECURITY.template.MD instead. Generated 2026-10-21. -->
 # Security Policy
 
 > **BAUER GROUP** | bauer-group/IP-CoolifyMigration
@@ -7,13 +7,12 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 1.0.x   | :white_check_mark: |
-| < 1.0 | :x:                |
+| 2.8.x   | :white_check_mark: |
+| < 2.8 | :x:                |
 
 ## Reporting a Vulnerability
 
-Report security issues privately to **security@bauer-group.com** or via
-[GitHub Security Advisories](https://github.com/bauer-group/IP-CoolifyMigration/security/advisories/new).
+Report security issues privately via [GitHub Security Advisories](https://github.com/bauer-group/IP-CoolifyMigration/security/advisories/new).
 
 Please do not open a public issue for a vulnerability. We aim to acknowledge
 within 2 business days and to ship a fix or mitigation within 30 days.
@@ -67,4 +66,4 @@ Secret scanning (gitleaks + GitGuardian) runs on every push via the
 
 ---
 
-_Last updated: 2026-07-16_
+_Last updated: 2026-10-21_
