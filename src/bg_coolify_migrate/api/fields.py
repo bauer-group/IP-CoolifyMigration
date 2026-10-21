@@ -297,10 +297,12 @@ APPLICATION_CREATE: frozenset[str] = frozenset(
         # since added `->with('settings')` to application_by_uuid, so they DO come
         # back on the GET now — but nested under a `settings` object, whereas the
         # create body takes them flat. filter_body reads the flat dict, so the
-        # values never arrive and the target comes up on defaults. That is an
-        # accepted outcome, not a gap to close: Coolify's defaults already enable
-        # the settings worth having. See KNOWN_APPLICATION_GAP in
-        # tests/test_api_fields.py for the reasoning and the 13 sibling fields.
+        # values never arrive and the target comes up on defaults. For the boolean
+        # settings that is an accepted outcome: Coolify's defaults already enable
+        # the ones worth having. The free-text naming settings are not covered by
+        # that argument, so the planner reports them instead — see
+        # application_settings_warnings below, and KNOWN_APPLICATION_GAP in
+        # tests/test_api_fields.py for the full reasoning.
         "is_static",
         "is_spa",
         "is_auto_deploy_enabled",
@@ -349,6 +351,53 @@ APPLICATION_ROUTE_REQUIRED: dict[str, frozenset[str]] = {
 }
 
 APPLICATION_REQUIRED: frozenset[str] = frozenset({"project_uuid", "server_uuid"})
+
+
+def application_settings_warnings(source: dict[str, Any]) -> list[str]:
+    """Warn about naming settings the migration drops on the way to the target. PURE.
+
+    ``source`` is the application GET. Coolify >=4.2 nests the settings under
+    ``settings``; the create body takes them flat and filter_body only reads the
+    flat dict, so the target always comes up with these unset. Most settings are
+    booleans whose defaults are what people want anyway — these two are text the
+    operator chose, and dropping them changes what the application is called:
+
+    * ``custom_internal_name`` — the container name, and with it the hostname
+      other containers on the network reach the app by. Which mode makes it apply
+      flipped in 4.4: up to 4.3.x it is used when
+      ``is_consistent_container_name_enabled`` is OFF (ApplicationDeploymentJob
+      v4.3.2:263); from 4.4.0 only when it is ON (the API turns it on implicitly
+      when the name is set). Losing it can break service-to-service traffic.
+    * ``custom_container_name_prefix`` (4.4.0+) — replaces the uuid at the start of
+      the generated, per-deploy container name. Cosmetic: nothing can depend on a
+      name that changes on every deploy.
+
+    Empty when neither is set, which is the overwhelmingly common case — a warning
+    on every stock application would teach operators to skip the warnings panel.
+    """
+    settings = source.get("settings")
+    if not isinstance(settings, dict):
+        # 4.1.x does not eager-load settings: nothing to read, nothing to claim.
+        return []
+    out: list[str] = []
+    # Deliberately NOT conditioned on is_consistent_container_name_enabled: the
+    # flag's meaning flipped in 4.4 and the planner does not know the version
+    # here. A rare false alarm costs a glance; a missed one costs reachability.
+    if internal := settings.get("custom_internal_name"):
+        out.append(
+            f"custom_internal_name={internal!r} cannot be migrated, so the target "
+            "comes up with Coolify's generated container name. If other containers "
+            f"reach this application as {internal!r}, they will not find it on the "
+            "target. Set it on the target by hand (Advanced > Container Names) "
+            "before switching traffic over."
+        )
+    if prefix := settings.get("custom_container_name_prefix"):
+        out.append(
+            f"custom_container_name_prefix={prefix!r} cannot be migrated, so the "
+            "target's containers are named after its uuid instead. Cosmetic — re-set "
+            "it on the target by hand if you rely on it in `docker ps` or logs."
+        )
+    return out
 
 # ── Storages ─────────────────────────────────────────────────────────────────
 # POST /v1/{kind}/{uuid}/storages.

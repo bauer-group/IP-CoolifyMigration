@@ -23,7 +23,11 @@ from typing import Any
 import structlog
 
 from bg_coolify_migrate.api.client import CoolifyClient
-from bg_coolify_migrate.api.fields import database_health_check_warnings, env_key_warnings
+from bg_coolify_migrate.api.fields import (
+    application_settings_warnings,
+    database_health_check_warnings,
+    env_key_warnings,
+)
 from bg_coolify_migrate.discovery import docker
 from bg_coolify_migrate.discovery.docker import (
     LABEL_ENVIRONMENT,
@@ -847,6 +851,8 @@ async def build_plan(
 
         if collection == "databases":
             warnings.extend(database_health_check_warnings(full))
+        elif collection == "applications":
+            warnings.extend(application_settings_warnings(full))
 
         # Env keys are validated by the TARGET's API at copy time, and Coolify
         # >=4.2 rejects shapes its own older versions happily stored. Catching that

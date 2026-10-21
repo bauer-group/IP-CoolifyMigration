@@ -28,6 +28,7 @@ from bg_coolify_migrate.api.fields import (
     STORAGE_CREATE_SERVICE,
     STORAGE_FILE_ONLY,
     STORAGE_PERSISTENT_ONLY,
+    application_settings_warnings,
     database_allowed,
     database_health_check_warnings,
     env_key_rejection,
@@ -626,6 +627,76 @@ class TestDatabaseHealthCheckWarnings:
         for field in DATABASE_HEALTH_CHECK_DEFAULTS:
             assert field not in DATABASE_COMMON
             assert field not in database_allowed("postgresql")
+
+
+class TestApplicationSettingsWarnings:
+    """The naming settings ride under `settings` and never reach the create body.
+
+    Silence is half the contract: a warning on every stock application would teach
+    operators that this panel is furniture, exactly as for the health checks.
+    """
+
+    def test_silent_when_the_get_carries_no_settings(self) -> None:
+        # 4.1.x does not eager-load settings at all.
+        assert application_settings_warnings({"name": "api"}) == []
+
+    def test_silent_when_settings_is_not_an_object(self) -> None:
+        assert application_settings_warnings({"settings": None}) == []
+
+    def test_silent_on_a_stock_application(self) -> None:
+        stock = {
+            "settings": {
+                "custom_internal_name": None,
+                "custom_container_name_prefix": None,
+                "is_consistent_container_name_enabled": False,
+                "is_static": False,
+            }
+        }
+        assert application_settings_warnings(stock) == []
+
+    def test_silent_on_empty_strings(self) -> None:
+        # Coolify slugs '' to null on write, but older rows can still hold ''.
+        blank = {"settings": {"custom_internal_name": "", "custom_container_name_prefix": ""}}
+        assert application_settings_warnings(blank) == []
+
+    def test_reports_an_internal_name_with_the_value_and_the_remedy(self) -> None:
+        warnings = application_settings_warnings({"settings": {"custom_internal_name": "shop-db-proxy"}})
+        assert len(warnings) == 1
+        assert "'shop-db-proxy'" in warnings[0]
+        # The operator has to act before cutover, so it must say what to do.
+        assert "by hand" in warnings[0]
+        assert "before switching traffic" in warnings[0]
+
+    def test_reports_the_internal_name_whatever_the_consistent_naming_flag(self) -> None:
+        """The flag's meaning flipped in 4.4, and the planner cannot tell which applies.
+
+        Up to 4.3.x the name is used when consistent naming is OFF; from 4.4.0 only
+        when it is ON. Conditioning on it would silence the warning on exactly one
+        of the two lines, so both settings of the flag must report.
+        """
+        for flag in (True, False):
+            source = {
+                "settings": {
+                    "custom_internal_name": "api",
+                    "is_consistent_container_name_enabled": flag,
+                }
+            }
+            assert len(application_settings_warnings(source)) == 1
+
+    def test_reports_a_prefix_as_cosmetic(self) -> None:
+        warnings = application_settings_warnings(
+            {"settings": {"custom_container_name_prefix": "shop-api"}}
+        )
+        assert len(warnings) == 1
+        assert "'shop-api'" in warnings[0]
+        assert "Cosmetic" in warnings[0]
+
+    def test_reports_both_separately(self) -> None:
+        # Different consequences, different actions: one line each.
+        source = {
+            "settings": {"custom_internal_name": "api", "custom_container_name_prefix": "shop"}
+        }
+        assert len(application_settings_warnings(source)) == 2
 
 
 class TestEnvKeyRejection:
