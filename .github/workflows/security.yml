@@ -1,12 +1,27 @@
 # =============================================================================
 #  🔒 Security Management
 # -----------------------------------------------------------------------------
-#  WHAT         : Secret scanning (gitleaks + GitGuardian) and dependency review.
+#  WHAT         : Dependency vulnerability scanning (Trivy). Secret scanning is
+#                 GitHub's own: secret scanning, push protection, validity
+#                 checks, non-provider patterns and AI detection are enabled on
+#                 this repo.
 #  WHEN         : Push, PR, and weekly.
-#  PRODUCES     : Security findings; fails the build on a leaked credential.
+#  PRODUCES     : Trivy findings; fails the build on a medium-or-worse finding.
 #  WHY IT MATTERS HERE : this repo's users hold a Coolify root token, SSH private
 #                 keys and APP_KEY. A credential committed here is a fleet-wide
 #                 incident, not a repo-scoped one.
+#  WHY GITLEAKS IS OFF : scan-engine 'none' is the org default for repositories
+#                 with native secret scanning and push protection. This caller
+#                 ran 'both', i.e. gitleaks-action, which refuses an org repo
+#                 without GITLEAKS_LICENSE -- and a Dependabot-triggered run reads
+#                 only the Dependabot secret store, so every Dependabot PR went
+#                 red on a missing licence, not on a finding (PR #4). Its default
+#                 rules also miss the two credentials named above that are easiest
+#                 to leak: the Coolify API token (`N|<40 chars>`) and Laravel's
+#                 `APP_KEY=base64:...`. Push protection stops provider patterns at
+#                 push time; Gitleaks only reported after the fact.
+#                 To re-enable: scan-engine: 'gitleaks' (.gitleaks.toml is kept),
+#                 and the licence must then reach Dependabot runs as well.
 #  PERMISSIONS  : Must be granted here. A called workflow's `permissions:` block
 #                 is a request ceiling, not a grant -- the token is minted from
 #                 the caller's scopes. These three mirror what
@@ -32,6 +47,6 @@ jobs:
   security:
     uses: bauer-group/automation-templates/.github/workflows/modules-security-scan.yml@main
     with:
-      scan-engine: 'both'
+      scan-engine: 'none'
       scan-type: 'all'
     secrets: inherit

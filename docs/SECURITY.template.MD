@@ -59,8 +59,10 @@ These are enforced in code and must never be weakened. See `AGENTS.md`.
 
 ## Scanning
 
-Secret scanning (gitleaks + GitGuardian) runs on every push via the
-`security-management` reusable workflow. Dependencies are monitored by Dependabot.
+Secret scanning is GitHub's own: secret scanning with push protection, validity
+checks, non-provider patterns and AI detection are enabled on this repository.
+Dependencies are scanned with Trivy on every push, pull request and weekly (the
+`security.yml` workflow), and monitored by Dependabot.
 
 ---
 
