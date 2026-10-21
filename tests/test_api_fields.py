@@ -417,9 +417,10 @@ async def test_whitelists_match_upstream_openapi() -> None:
     )
 
 
-#: POST /applications/* documents 17 fields APPLICATION_CREATE does not carry.
+#: Fields POST /applications/* documents that APPLICATION_CREATE does not carry —
+#: a log, extended release by release; each block below adjudicates one batch.
 #:
-#: ADJUDICATED against ApplicationsController — all 17 are genuinely accepted on
+#: ADJUDICATED against ApplicationsController — the first 17 are genuinely accepted on
 #: create, none is a documentation artifact: 13 arrive via the
 #: ``...self::APPLICATION_SETTING_FIELDS`` spread at the end of the create
 #: $allowedFields (:1123, constant at :38), and autogenerate_domain,
@@ -474,9 +475,32 @@ async def test_whitelists_match_upstream_openapi() -> None:
 #: Revisit as a post-create PATCH (all three ARE in the 4.3.3 update list) if
 #: someone actually loses a template they wanted — that needs version detection, so
 #: it is a feature, not a whitelist entry.
+#:
+#: EXTENDED 2026-10-21 for Coolify 4.4.x: custom_container_name_prefix. It shipped
+#: in v4.4.0 (2026-10-06, PR #11704), not in v4.4.7 — the canary has been red since
+#: its first run after v4.4.0, and v4.4.6 -> v4.4.7 touched no API code. Read at
+#: v4.4.7: one more member of APPLICATION_SETTING_FIELDS (const :44, field :66),
+#: spread into the create array (:1251) and the update array (:3253); validated
+#: `string|nullable|max:30` (api.php:216), slugified, and 422'd when another app on
+#: the same SERVER already uses it as a uuid, prefix or custom_internal_name. Stored
+#: on application_settings (migration 2026_09_08_214513), so the GET returns it only
+#: under `settings`. Not backported: absent from v4.3.24, v4.2.1, v4.1.3 and v4.0.1.
+#:
+#: Not whitelisted, and the deciding reason is mechanical, not version skew:
+#: filter_body reads the flat GET, the value lives under `settings`, so a whitelist
+#: entry would carry nothing.
+#:
+#: The cost is real but cosmetic, and unlike the boolean settings above it is NOT
+#: covered by "the defaults are what you want": it is operator-chosen text. A source
+#: that set it comes up with `{uuid}-{YmdTHis}` container names instead of
+#: `{prefix}-{YmdTHis}`. Nothing depends on that name: it changes on every deploy,
+#: routing keys on the uuid, and discovery finds the container through the
+#: `coolify.applicationUuid` label 4.4.0 introduced alongside it (locked by
+#: TestCarriesUuid.test_matches_a_v44_prefixed_container_through_its_uuid_label).
 KNOWN_APPLICATION_GAP: frozenset[str] = frozenset(
     {
         "autogenerate_domain",
+        "custom_container_name_prefix",
         "custom_internal_name",
         "disable_build_cache",
         "docker_images_to_keep",
@@ -508,12 +532,24 @@ KNOWN_APPLICATION_GAP: frozenset[str] = frozenset(
 )
 
 
+def test_known_application_gap_is_disjoint_from_the_whitelist() -> None:
+    """A field is either sent or adjudicated as not sent — never both.
+
+    The gap canary only runs on the weekly schedule, so without this a later
+    whitelisting of a gap field (custom_container_name_prefix is the obvious
+    candidate) would leave its "not migrated" rationale standing, unread, next to
+    code that now migrates it. Offline, so every push checks it.
+    """
+    assert KNOWN_APPLICATION_GAP.isdisjoint(APPLICATION_CREATE)
+    assert KNOWN_TAGS_GAP.isdisjoint(APPLICATION_CREATE)
+
+
 @pytest.mark.integration
 async def test_application_gap_does_not_grow() -> None:
     """The application whitelist gap is known; this fails if it WIDENS.
 
     Pinning the gap instead of excluding the whole route keeps the canary useful:
-    a newly documented application field still breaks CI, but the 17 already
+    a newly documented application field still breaks CI, but the ones already
     triaged do not cry every week.
     """
     tag, spec = await released_openapi()

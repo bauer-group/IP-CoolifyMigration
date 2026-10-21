@@ -516,6 +516,30 @@ class TestCarriesUuid:
         )
         assert carries_uuid(c, "czdimihye6nt4d7p6v4wyq7z")
 
+    def test_matches_a_v44_prefixed_container_through_its_uuid_label(self) -> None:
+        """Coolify 4.4's custom_container_name_prefix takes the uuid out of the name.
+
+        A compose service of a prefixed app is ``{service}-{prefix}-{YmdTHis}``, and
+        coolify.name is the slug of that, so neither carries the uuid; a pulled image
+        does not either. What 4.4.0 added in the same release is
+        ``coolify.applicationUuid``. Without it this container would be invisible to
+        the uuid probe, and the preflight cross-check would refuse a stack whose
+        containers it cannot account for.
+        """
+        from bg_coolify_migrate.discovery.docker import carries_uuid
+
+        c = Container(
+            id="i",
+            name="web-shop-api-20260908T141530",
+            state="running",
+            labels={
+                "coolify.name": "web-shop-api-20260908t141530",
+                "coolify.applicationUuid": "czdimihye6nt4d7p6v4wyq7z",
+            },
+            image="nginx:1.27",
+        )
+        assert carries_uuid(c, "czdimihye6nt4d7p6v4wyq7z")
+
     def test_does_not_match_an_unrelated_container(self) -> None:
         from bg_coolify_migrate.discovery.docker import carries_uuid
 
