@@ -98,11 +98,14 @@ decision, the decision is in the wrong layer.
 
 ## Verified upstream facts (do not re-derive)
 
-Checked against `coollabsio/coolify@main`:
+First checked against `coollabsio/coolify@main`; re-checked against the release
+tags v4.1.2 through v4.5.0 (2026-10-26). Read upstream at a **release tag**, never
+`main` — see the 2.5.6 tags regression.
 
-- `can_read_sensitive = token->can('root') || token->can('read:sensitive')`.
-  Without it, `value`, `real_value`, `docker_compose_raw` **vanish** from
-  responses — HTTP 200, no error, no marker.
+- `can_read_sensitive = (token->can('root') || token->can('read:sensitive'))
+  && owner->isAdminOfTeam()` — the admin clause since 4.2. Without it, `value`,
+  `real_value`, `docker_compose_raw` **vanish** from responses — HTTP 200, no
+  error, no marker.
 - **`git_commit_sha` does not pin a deploy.** `check_git_if_build_needed()` runs
   `git ls-remote refs/heads/{branch}` and overwrites it
   (`ApplicationDeploymentJob.php:2329-2349`). The API never sets `rollback:`.
@@ -116,10 +119,14 @@ Checked against `coollabsio/coolify@main`:
   never be preserved.
 - Service compose volumes are `{svc_uuid}` **`_`** `{slug}`; application compose
   volumes are `{app_uuid}` **`-`** `{name}`. Never convert one into the other.
-- `GET /applications/{uuid}` does **not** return `settings` (no `$with`, no eager
-  load). ~33 fields are settable-but-unreadable.
+- `GET /applications/{uuid}` does **not** return `settings` on 4.1.x. From 4.2 it
+  eager-loads them — but NESTED under `settings`, while create takes them flat, so
+  `filter_body` still never carries one. ~33 fields are settable-but-uncarried.
 - Standalone DB mount path depends on the image tag (Postgres ≥18 moves to
   `/var/lib/postgresql`). Always pin `image`.
+- Every request body passes `TrimStrings` and **`ConvertEmptyStringsToNull`**
+  (`Kernel.php:61-62`): an empty string we send arrives as `null`. From 4.5 an
+  empty and a null env value render differently, so "send `""`" is never a fix.
 
 ### Learned the hard way, from a real instance
 
@@ -139,22 +146,25 @@ shipped inside a green unit suite. `tests/e2e/README.md` has the full table.
 - **The environment endpoint has no `databases` key.** It has one per engine
   (`postgresqls`, `redis`, `mongodbs`, `mysqls`, `mariadbs`) — and the controller
   eager-loads only 7 of 10 relations, so **keydb, dragonfly and clickhouse are
-  invisible there**. Cross-check `/databases`, which merges all eight.
+  invisible there** (and SQLite, 4.4+). Cross-check `/databases`, which merges
+  them all.
 - **Only services carry `server_uuid`.** Applications and databases reach their
   server through `destination` (a morphTo). Use `planner.server_uuid_of`.
 - **`is_reachable` lives under `settings`**, not at the top level.
 - **`GET /version` returns a bare string**, not JSON.
 - **The API is off instance-wide by default** — a 403 is not necessarily the
   token.
-- **`health_check_*` is readable but in no `$allowedFields`.** Sending one 422s
-  the whole request. Defaults are 15/5/5/5 (not 30/30/3/30).
+- **`health_check_*` (databases) is readable but in no CREATE `$allowedFields`.**
+  Sending one on create 422s the whole request; the UPDATE array has accepted them
+  since 4.1.2. Defaults are 15/5/5/5 (not 30/30/3/30).
 - **`connect_to_docker_network` is rejected on service *create*.** There are two
   `$allowedFields` in `create_service` — line 296 (without it) and line 505
   (with it) — but the extra-field rejection at line 332 runs against 296 for
   BOTH the templated and the compose branch, so 505 never applies to validation.
   It is settable only on update. `create_service` sends it via a follow-up PATCH.
   This broke the compose-service (90%) migration until the e2e suite hit it —
-  a source-reading whitelist that matched the wrong one of two arrays.
+  a source-reading whitelist that matched the wrong one of two arrays. v4.5.0
+  finally accepts it on create; 4.1.2-4.4.7 do not, so it stays a PATCH.
 - **`/stop` 400s "already stopped" off a background-maintained column** and
   dispatches nothing. It lags the daemon, so it refuses to stop containers that
   are serving traffic. Re-ask until the daemon agrees; never conclude from it
@@ -170,6 +180,10 @@ shipped inside a green unit suite. `tests/e2e/README.md` has the full table.
   indistinguishable from a cleanly stopped stack.** Both read as quiesced. The
   broken label filter above looked exactly like success for the same reason, so
   treat "no containers" as a question, never as an answer.
+  One exception (4.4.0+): a ClickHouse whose data sits in an unregistered
+  anonymous volume is only `docker stop`ped, and `/start`/`/restart` then 422
+  until someone clicks "Keep current data". The manifest refuses such a volume at
+  plan time, so a run never reaches it.
 - **Exit code 137 cannot be polled for**, for the same reason: both commands go
   out in one SSH invocation, so a SIGKILLed container exists for milliseconds.
   The guard that makes invariant 9 mean anything reads the **daemon event log**
@@ -184,6 +198,39 @@ shipped inside a green unit suite. `tests/e2e/README.md` has the full table.
   therefore uses **`/restart`** (`api.restart`), whose `action_restart` carries
   no guard and actually redeploys. Found by the e2e rollback test; the single
   postgres test never rolled back, so it never hit this.
+
+### Learned from the v4.3.10 -> v4.5.0 audit (release tags, not yet a live run)
+
+The drift canary went red on 8 documented fields; the release-tag audit found the
+rest. Each is refused or reported at plan time by `domain/fidelity.py`, gated on
+the release it starts in — read that module before adding a rule.
+
+- **The openapi canary is blind to undocumented create fields.**
+  `custom_network_aliases`, `health_check_type` and `health_check_command` sat in
+  the application create array from 4.1.2 on, documented nowhere, and every
+  migration dropped them. `test_controller_arrays_are_adjudicated` reads the
+  enforcement arrays FORWARD now; a field accepted but not documented still fails.
+- **A locked (`is_shown_once`) variable's value is in no API read** — even for a
+  root token (applications/services since 4.2, databases since 4.4). The target
+  is created without it; a locked generated credential (`SERVICE_PASSWORD_*`,
+  Redis `REDIS_PASSWORD`) would leave the target holding a different secret
+  than the copied data, so the plan refuses those.
+- **`host_path` left every storage create array in 4.3.22** (backported). Dropping
+  it instead of refusing would mount an empty volume over the mirrored bind data,
+  and VERIFY would pass.
+- **A domain's explicit port moved into hidden `domain_port_overrides` (4.3.15).**
+  The GET shows a portless fqdn; only the generated proxy labels still show the
+  routing. Parking the source's domains erases the override on the source too.
+- **Env rows saved before 4.5 keep the legacy escaping; every row we create is
+  exact** (`uses_legacy_escaping`, hidden, unsettable). The row's `version` field
+  tells which is which. Values with `\ " '`, a ` #` tail or quoted literals reach
+  the container differently on the target.
+- **A service is created from the INSTANCE's template catalog**, not the source's
+  compose — 95 templates changed between 4.3.10 and 4.5.0. CREATE therefore
+  rehearses the volume pairing for services while the source still serves, and
+  services pair by compose volume key (`{uuid}_{key}`), like compose apps.
+- **DELETE needs `write` AND `deploy` from 4.5** (rollback deletes targets);
+  the token docs say root, or `read:sensitive` + `write` + `deploy`.
 
 ## Verify + ship
 
@@ -200,10 +247,11 @@ Conventional Commits, **past-tense** subject (`added`, `fixed`, `updated`), max
 | Question | File |
 |---|---|
 | What kind of resource is this, and does it build? | `domain/kinds.py`, `domain/compose.py` |
-| Which volume maps to which? | `domain/naming.py` (`pair_by_mount_path`) |
+| Which volume maps to which? | `domain/naming.py` (`pair_by_mount_path`, `pair_by_name_suffix`) |
 | What are we copying, and why not that? | `domain/manifest.py` |
 | Will the rebuild ship different code? | `domain/drift.py` |
 | What happens on failure? | `domain/statemachine.py`, `engine/executor.py` |
 | Is it safe to start the target? | `dns/gate.py` |
 | Is the stack really stopped? | `discovery/quiesce.py` |
 | Which fields may we send? | `api/fields.py` |
+| What can the target NOT reproduce? | `domain/fidelity.py` |
