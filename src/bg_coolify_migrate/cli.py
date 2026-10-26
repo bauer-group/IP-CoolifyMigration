@@ -129,8 +129,21 @@ _TRUST_HOST_KEY_HELP = (
 #: Note 4.3.10 > 4.3.3 numerically but LESS lexically — the comparison is on int
 #: tuples for exactly this reason, and test_compares_numerically_not_lexically
 #: pins it. A string compare would have called 4.3.10 out of range.
+#:
+#: Re-verified 2026-10-26 for v4.5.0, and this time the diff was NOT clean —
+#: v4.3.10 -> v4.5.0 is the first span since 4.1.2 that broke the contract, so the
+#: bound moved only together with the code that answers it. Removed: `host_path`
+#: from every storage create array (v4.3.22, backported). Tightened: manual
+#: webhook secrets >= 16 chars (4.4.0), http_basic_auth_password <= 72 (4.5.0).
+#: New and invisible to the API: hidden domain port overrides (4.3.15), secret
+#: manager references (4.4.0), external/driver_opts compose volumes used as
+#: written (4.4.0), server roles (4.4.0), SQLite (4.4.0), and legacy env escaping
+#: that new rows do not inherit (4.5.0). Each is now refused or reported at plan
+#: time — see domain/fidelity.py — and the routes, stop/start/restart guards,
+#: container labels, volume names and mount paths this tool depends on are
+#: unchanged. Audited against release tags, not a live 4.5.0.
 VALIDATED_COOLIFY_MIN = "4.1.2"
-VALIDATED_COOLIFY_MAX = "4.3.10"
+VALIDATED_COOLIFY_MAX = "4.5.0"
 
 
 def coolify_version_warning(raw: str) -> str | None:

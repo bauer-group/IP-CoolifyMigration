@@ -243,7 +243,16 @@ class TestCoolifyVersionWarning:
         """
         assert coolify_version_warning("4.3.10") is None
         assert coolify_version_warning("4.3.9") is None
-        assert coolify_version_warning("4.3.11") is not None
+
+    def test_the_upper_bound_is_4_5_0_and_nothing_past_it(self) -> None:
+        """4.5.0 was audited (2026-10-26); its first patch release was not.
+
+        The 4.4.x line between the old bound and this one was covered by the same
+        v4.3.10 -> v4.5.0 diff, so it is in range too.
+        """
+        assert coolify_version_warning("4.5.0") is None
+        assert coolify_version_warning("4.4.7") is None
+        assert coolify_version_warning("4.5.1") is not None
 
     def test_tolerates_a_prerelease_suffix(self) -> None:
         assert coolify_version_warning("4.3.0-beta.1") is None
