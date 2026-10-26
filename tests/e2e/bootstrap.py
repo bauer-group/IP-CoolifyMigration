@@ -100,9 +100,16 @@ def create_root_user() -> None:
 def mint_token() -> str:
     # Coolify's createToken reads session("currentTeam")->id, and tinker has no
     # HTTP context — so we put the team in the session ourselves.
+    # The token is scoped to $team, and EnsureTokenBelongsToCurrentTeamMember
+    # answers 401 "Invalid token." unless the user is a MEMBER of exactly that
+    # team. create_root_user picks its team the same way, but on a fresh 4.5.0 the
+    # Root Team (id 0) can appear between the two calls — the user then belonged to
+    # its personal team 1 while the token said 0. Guarantee membership here.
     out = tinker(
         f'$u = App\\Models\\User::where("email","{ROOT_EMAIL}")->first();'
         '$team = App\\Models\\Team::find(0) ?? App\\Models\\Team::first();'
+        'if (!$u->teams()->where("teams.id", $team->id)->exists()) '
+        '{ $u->teams()->attach($team->id, ["role" => "owner"]); }'
         'session(["currentTeam" => $team]);'
         '$u->tokens()->delete();'
         'echo PHP_EOL."TOKEN=".$u->createToken("e2e-rig", ["root"])->plainTextToken.PHP_EOL;'

@@ -50,4 +50,7 @@ ENV PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-CMD ["pytest", "-m", "e2e", "-v"]
+# tests/e2e only: five unit modules import respx, which this image deliberately
+# does not carry, and `-m e2e` filters AFTER collection — so
+# the bare `pytest -m e2e` stopped at five import errors before any e2e test ran.
+CMD ["pytest", "tests/e2e", "-m", "e2e", "-v"]

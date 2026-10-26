@@ -32,6 +32,7 @@ from bg_coolify_migrate.domain.statemachine import FinalizePolicy, Outcome
 from bg_coolify_migrate.engine.planner import build_plan, server_uuid_of
 from bg_coolify_migrate.engine.runner import run_migration
 from bg_coolify_migrate.settings.base import Settings
+from bg_coolify_migrate.transfer.ssh import SshError
 
 from .conftest import db_exec, ssh_to, wait_until_healthy
 
@@ -203,6 +204,32 @@ async def _deploy(
     return str(created["uuid"])
 
 
+async def _seed_once_ready(source: Any, container: str, engine: Engine, *, timeout: float = 120) -> None:
+    """Seed, retrying while the image is still initialising its data directory.
+
+    "healthy" is not "ready" on first boot. mysql:8's entrypoint runs a TEMPORARY
+    server to initialise the data directory and only then the real one, and
+    Coolify's `mysqladmin ping` health check passes against the temporary one —
+    mysqladmin even exits 0 on "Access denied". A seed in that window fails with
+    ERROR 2002 (the socket is gone between the two servers) or 1045 (root's
+    password is not set yet), seen on consecutive 4.5.0 runs. That is the image
+    starting up, not the migration; the migration only ever starts a target whose
+    data directory already exists.
+    """
+    import asyncio
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        try:
+            await db_exec(source, container, engine.seed_argv, stdin=engine.seed_stdin)
+            return
+        except SshError as exc:
+            initialising = "ERROR 2002" in str(exc) or "ERROR 1045" in str(exc)
+            if not initialising or asyncio.get_running_loop().time() >= deadline:
+                raise
+            await asyncio.sleep(5)
+
+
 @pytest_asyncio.fixture
 async def engine_stack(
     request: pytest.FixtureRequest,
@@ -223,7 +250,7 @@ async def engine_stack(
         db_uuid = await _deploy(api, rig, engine, project_uuid=project_uuid, name=db_name)
         async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source:
             await wait_until_healthy(source, db_uuid)
-            await db_exec(source, db_uuid, engine.seed_argv, stdin=engine.seed_stdin)
+            await _seed_once_ready(source, db_uuid, engine)
             if engine.persist_argv:
                 await db_exec(source, db_uuid, engine.persist_argv)
             fingerprint = await db_exec(source, db_uuid, engine.fingerprint_argv)
