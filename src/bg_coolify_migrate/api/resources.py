@@ -30,6 +30,7 @@ from __future__ import annotations
 import base64
 import json
 from typing import Any
+from urllib.parse import urlsplit
 
 import structlog
 
@@ -49,7 +50,7 @@ from bg_coolify_migrate.api.fields import (
 from bg_coolify_migrate.dns import wildcard as dns_wildcard
 from bg_coolify_migrate.dns.extract import normalise_host
 from bg_coolify_migrate.domain.kinds import ResourceKind, create_route
-from bg_coolify_migrate.domain.naming import VolumeEndpoint
+from bg_coolify_migrate.domain.naming import VolumeEndpoint, resource_config_dir
 from bg_coolify_migrate.domain.plan import ResourceSnapshot
 from bg_coolify_migrate.errors import CoolifyApiError, UnsupportedResource
 
@@ -100,14 +101,29 @@ def _encode_compose(raw: str) -> str:
 #: app; the other two would 422 next for a dockerfile / custom-nginx app.
 _BASE64_CREATE_FIELDS = ("custom_labels", "custom_nginx_configuration", "dockerfile")
 
+#: The same asymmetry on every database create route, since at least v4.1.2
+#: (DatabasesController: `isBase64Encoded($request->postgres_conf)` -> 422 "The
+#: postgres_conf should be base64 encoded."). Copied verbatim, any source with a
+#: custom config could never be migrated: the create 422'd before the stop.
+_BASE64_DATABASE_FIELDS = (
+    "postgres_conf",
+    "mysql_conf",
+    "mariadb_conf",
+    "mongo_conf",
+    "redis_conf",
+    "keydb_conf",
+)
 
-def _encode_base64_fields(body: dict[str, Any]) -> None:
+
+def _encode_base64_fields(
+    body: dict[str, Any], fields: tuple[str, ...] = _BASE64_CREATE_FIELDS
+) -> None:
     """Base64-encode the plaintext-in/base64-out create fields, in place.
 
     An empty value is dropped, not encoded: Coolify decodes then runs a UTF-8
     check that an empty string fails, so sending ``""`` is itself a 422.
     """
-    for field in _BASE64_CREATE_FIELDS:
+    for field in fields:
         if field not in body:
             continue
         value = body[field]
@@ -211,6 +227,8 @@ async def create_database(
     body = filter_body({**source, **placement.as_body()}, allowed)
     body["name"] = snapshot.name
     body["instant_deploy"] = False
+    # The GET returns the stored plaintext config; the create validates base64.
+    _encode_base64_fields(body, _BASE64_DATABASE_FIELDS)
     if snapshot.image:
         body["image"] = snapshot.image
     # A public port on the source would collide or expose the target prematurely.
@@ -324,13 +342,29 @@ def _remap_domains(
             # Coolify auto-generate a working URL via autogenerate_domain.
             remapped = dns_wildcard.remap_host(host, source_wildcard, target_wildcard)
             if remapped:
-                urls.append(f"https://{remapped}")
+                urls.append(_with_host(stripped, remapped))
         else:
             # Custom (or, with no source wildcard known, treated as custom): it is
             # server-independent and moves with the app verbatim.
             urls.append(stripped)
     # Dedup while preserving order — a source can list the same host twice.
     return ",".join(dict.fromkeys(urls))
+
+
+def _with_host(url: str, host: str) -> str:
+    """``url`` with its host replaced, keeping scheme, port and path. PURE.
+
+    The port is the one that matters: Coolify routes a domain written with
+    ``:8080`` to 8080 (from 4.3.15 by moving it into a hidden per-domain
+    override on save) and everything else to the first exposed port. Rebuilding
+    the URL from the bare host silently moved such an app onto the wrong port.
+    """
+    parts = urlsplit(url if "://" in url else f"https://{url}")
+    try:
+        port = f":{parts.port}" if parts.port else ""
+    except ValueError:
+        port = ""
+    return f"{parts.scheme or 'https'}://{host}{port}{parts.path.rstrip('/')}"
 
 
 def _parse_compose_domains(raw: object) -> dict[str, str]:
@@ -765,7 +799,9 @@ async def copy_storages(
                 # pass the bare name and let it do that.
                 "name": _strip_uuid_prefix(str(entry.get("name", "")), source_uuid),
                 "mount_path": entry.get("mount_path"),
-                "host_path": entry.get("host_path"),
+                # `or None`: a cleared form stores '' — filter_body keeps '', and
+                # v4.3.22+ 422s the key itself, whatever its value.
+                "host_path": entry.get("host_path") or None,
             },
             allowed,
         )
@@ -785,13 +821,19 @@ async def copy_storages(
             # The API cannot round-trip it; the manifest already warned, and the
             # path is mirrored with rsync instead.
             continue
+        is_host_file = entry.get("is_host_file") is True
         body = filter_body(
             {
                 "type": "file",
                 "mount_path": entry.get("mount_path"),
-                "content": content,
+                # A host-file mount points at a file the server already has; the
+                # create 422s "Content is not valid for host file mounts" on any.
+                "content": None if is_host_file else content,
                 "is_directory": entry.get("is_directory"),
-                "fs_path": entry.get("fs_path"),
+                "is_host_file": entry.get("is_host_file"),
+                "fs_path": retarget_fs_path(
+                    entry.get("fs_path"), kind=kind, source_uuid=source_uuid, target_uuid=target_uuid
+                ),
             },
             allowed,
         )
@@ -802,6 +844,27 @@ async def copy_storages(
 
     log.info("api.storages.created", count=created, target=target_uuid)
     return created
+
+
+def retarget_fs_path(
+    fs_path: object, *, kind: ResourceKind, source_uuid: str, target_uuid: str
+) -> object:
+    """Move a file mount's host path from the source's config dir to the target's. PURE.
+
+    The GET returns ``fs_path`` absolute — ``/data/coolify/applications/{source}/…``.
+    Up to 4.3.x the create ignored it for files and confined them to the new
+    resource's dir; from 4.4 it honours an absolute path verbatim. Sent unchanged,
+    the target's files would live under the SOURCE uuid on the target host, a tree
+    no deletion of the target ever removes (and writing outside the resource dir
+    needs the deploy ability). Paths outside the config dir are genuine host paths
+    and pass through untouched.
+    """
+    if not isinstance(fs_path, str):
+        return fs_path
+    source_dir = resource_config_dir(kind, source_uuid)
+    if fs_path == source_dir or fs_path.startswith(f"{source_dir}/"):
+        return resource_config_dir(kind, target_uuid) + fs_path[len(source_dir) :]
+    return fs_path
 
 
 def _strip_uuid_prefix(name: str, uuid: str) -> str:

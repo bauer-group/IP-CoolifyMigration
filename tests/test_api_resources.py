@@ -25,6 +25,7 @@ from bg_coolify_migrate.api.resources import (
     ensure_project,
     read_volume_endpoints,
     resolve_destination,
+    retarget_fs_path,
     storage_endpoints,
 )
 from bg_coolify_migrate.domain.kinds import DatabaseEngine, GitAuth, ResourceKind
@@ -399,6 +400,32 @@ class TestCreateDatabase:
         snapshot = self._snapshot().model_copy(update={"engine": None})
         with pytest.raises(UnsupportedResource, match="no engine"):
             await create_resource(api, snapshot, _placement(), {})
+
+    async def test_a_custom_config_is_sent_base64_encoded(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        """REGRESSION: every DB create route has required base64 *_conf since 4.1.2.
+
+        The GET returns the stored plaintext; sent verbatim it was a 422 "The
+        postgres_conf should be base64 encoded.", so no database with a custom
+        config could ever be migrated.
+        """
+        route = respx_mock.post(f"{BASE}/databases/postgresql").mock(
+            return_value=httpx.Response(201, json={"uuid": "db2"})
+        )
+        conf = "max_connections = 200\nshared_buffers = 1GB\n"
+        await create_resource(api, self._snapshot(), _placement(), {"postgres_conf": conf})
+        body = json.loads(route.calls[0].request.read().decode())
+        assert base64.b64decode(body["postgres_conf"]).decode() == conf
+
+    async def test_an_empty_config_is_left_out(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        route = respx_mock.post(f"{BASE}/databases/postgresql").mock(
+            return_value=httpx.Response(201, json={"uuid": "db2"})
+        )
+        await create_resource(api, self._snapshot(), _placement(), {"postgres_conf": ""})
+        assert "postgres_conf" not in json.loads(route.calls[0].request.read().decode())
 
 
 class TestCreateService:
@@ -896,6 +923,18 @@ class TestRemapDomains:
     def test_custom_domain_is_kept_verbatim(self) -> None:
         assert self._remap("https://shop.example.com") == "https://shop.example.com"
 
+    def test_a_server_bound_url_keeps_its_port_scheme_and_path(self) -> None:
+        """REGRESSION: rebuilding from the bare host dropped `:8080`.
+
+        Coolify routes a domain written with a port to that port (from 4.3.15 by
+        moving it into a hidden override on save) and everything else to the first
+        exposed port — so the target silently routed to the wrong one.
+        """
+        assert (
+            self._remap("http://admin.app.0046-20.cloud.bauer-group.com:8080/panel/")
+            == "http://admin.app.0047-20.cloud.bauer-group.com:8080/panel"
+        )
+
     def test_mixed_list_rewrites_only_the_server_bound_one(self) -> None:
         out = self._remap(
             "https://pdf-tool.app.0046-20.cloud.bauer-group.com,https://shop.example.com"
@@ -1341,6 +1380,132 @@ class TestCopyStorages:
             kind=ResourceKind.APP_GIT_BUILD,
         )
         assert count == 0
+
+    async def test_a_blank_host_path_is_not_sent(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        """A cleared form stores '' — and v4.3.22+ 422s the key whatever its value."""
+        respx_mock.get(f"{BASE}/applications/a1/storages").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "persistent_storages": [
+                        {"name": "a1-data", "mount_path": "/app/storage", "host_path": ""}
+                    ],
+                    "file_storages": [],
+                },
+            )
+        )
+        route = respx_mock.post(f"{BASE}/applications/a2/storages").mock(
+            return_value=httpx.Response(201, json={})
+        )
+        await copy_storages(
+            api, collection="applications", source_uuid="a1", target_uuid="a2", kind=ResourceKind.APP_GIT_BUILD
+        )
+        assert "host_path" not in json.loads(route.calls[0].request.read().decode())
+
+    async def test_a_host_file_mount_keeps_its_flag_and_sends_no_content(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        """Without the flag a 4.4+ target treats /etc/timezone as managed content.
+
+        It then 422s on a symlink, or touches and chmods the target host's file.
+        """
+        respx_mock.get(f"{BASE}/applications/a1/storages").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "persistent_storages": [],
+                    "file_storages": [
+                        {
+                            "mount_path": "/etc/timezone",
+                            "fs_path": "/etc/timezone",
+                            "content": "",
+                            "is_directory": False,
+                            "is_host_file": True,
+                        }
+                    ],
+                },
+            )
+        )
+        route = respx_mock.post(f"{BASE}/applications/a2/storages").mock(
+            return_value=httpx.Response(201, json={})
+        )
+        await copy_storages(
+            api, collection="applications", source_uuid="a1", target_uuid="a2", kind=ResourceKind.APP_GIT_BUILD
+        )
+        body = json.loads(route.calls[0].request.read().decode())
+        assert body["is_host_file"] is True
+        assert body["fs_path"] == "/etc/timezone"
+        # "Content is not valid for host file mounts." — even an empty one.
+        assert "content" not in body
+
+    async def test_a_managed_file_moves_into_the_targets_own_directory(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # 4.4+ honours an absolute fs_path verbatim; unchanged, the target's file
+        # would live under the SOURCE uuid on the target host, forever.
+        respx_mock.get(f"{BASE}/applications/a1/storages").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "persistent_storages": [],
+                    "file_storages": [
+                        {
+                            "mount_path": "/app/config.yml",
+                            "fs_path": "/data/coolify/applications/a1/app/config.yml",
+                            "content": "debug: false",
+                            "is_directory": False,
+                            "is_host_file": False,
+                        }
+                    ],
+                },
+            )
+        )
+        route = respx_mock.post(f"{BASE}/applications/a2/storages").mock(
+            return_value=httpx.Response(201, json={})
+        )
+        await copy_storages(
+            api, collection="applications", source_uuid="a1", target_uuid="a2", kind=ResourceKind.APP_GIT_BUILD
+        )
+        body = json.loads(route.calls[0].request.read().decode())
+        assert body["fs_path"] == "/data/coolify/applications/a2/app/config.yml"
+        assert body["content"] == "debug: false"
+
+
+class TestRetargetFsPath:
+    def test_rewrites_the_resource_directory(self) -> None:
+        assert (
+            retarget_fs_path(
+                "/data/coolify/applications/a1/x/y.conf",
+                kind=ResourceKind.APP_GIT_BUILD,
+                source_uuid="a1",
+                target_uuid="a2",
+            )
+            == "/data/coolify/applications/a2/x/y.conf"
+        )
+
+    def test_a_genuine_host_path_passes_through(self) -> None:
+        assert (
+            retarget_fs_path(
+                "/srv/shared/config", kind=ResourceKind.APP_GIT_BUILD, source_uuid="a1", target_uuid="a2"
+            )
+            == "/srv/shared/config"
+        )
+
+    def test_a_sibling_whose_uuid_merely_starts_the_same_is_left_alone(self) -> None:
+        # Prefix matching on the bare uuid would rewrite another resource's path.
+        path = "/data/coolify/applications/a1b2/conf"
+        assert (
+            retarget_fs_path(path, kind=ResourceKind.APP_GIT_BUILD, source_uuid="a1", target_uuid="a2")
+            == path
+        )
+
+    def test_absent_stays_absent(self) -> None:
+        assert (
+            retarget_fs_path(None, kind=ResourceKind.APP_GIT_BUILD, source_uuid="a1", target_uuid="a2")
+            is None
+        )
 
 
 class TestReadVolumeEndpoints:

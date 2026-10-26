@@ -244,6 +244,26 @@ class TestApplicationFields:
         for field in ("is_static", "is_force_https_enabled", "connect_to_docker_network"):
             assert field in APPLICATION_CREATE
 
+    def test_undocumented_but_accepted_fields_are_carried(self) -> None:
+        """REGRESSION: accepted on create since v4.1.2, documented by no openapi.
+
+        Invisible to the openapi canary, so every migration dropped them: the
+        network aliases other containers reach the app by, and the CMD health check
+        a worker without an HTTP listener depends on.
+        """
+        for field in ("custom_network_aliases", "health_check_type", "health_check_command"):
+            assert field in APPLICATION_CREATE
+
+    def test_basic_auth_hash_costs_are_carried_but_not_the_algorithm(self) -> None:
+        """argon2id 422s the whole create unless the target runs Caddy >= 2.11."""
+        for field in (
+            "http_basic_auth_bcrypt_cost",
+            "http_basic_auth_argon2id_memory_cost",
+            "http_basic_auth_argon2id_time_cost",
+        ):
+            assert field in APPLICATION_CREATE
+        assert "http_basic_auth_hash_algorithm" not in APPLICATION_CREATE
+
 
 class TestStorageFields:
     def test_services_need_resource_uuid_to_target_the_sub_resource(self) -> None:
@@ -259,14 +279,24 @@ class TestStorageFields:
         # are invalid for persistent; `name`/`host_path` invalid for file.
         assert frozenset() == STORAGE_PERSISTENT_ONLY & STORAGE_FILE_ONLY
 
+    def test_host_file_mounts_keep_their_flag(self) -> None:
+        """Without is_host_file a 4.4+ target treats /etc/timezone as managed content.
+
+        It then 422s on a symlink, or touches and chmods the target's host file.
+        """
+        assert "is_host_file" in STORAGE_CREATE
+        assert "is_host_file" in STORAGE_FILE_ONLY
+
 
 class TestEnvFields:
     def test_core_fields(self) -> None:
         assert {"key", "value"} <= ENV_FIELDS
 
     def test_is_shown_once_is_a_real_field(self) -> None:
-        # It is UI-only and does NOT hide values from API reads, but it IS
-        # settable and must round-trip.
+        # Settable, so it must round-trip. NOT merely cosmetic: a locked variable's
+        # value is removed from every API read (applications and services since
+        # 4.2, databases since 4.4), even for a root token — which is why
+        # fidelity.env_warnings reports every locked variable it cannot carry.
         assert "is_shown_once" in ENV_FIELDS
 
     def test_build_and_runtime_flags(self) -> None:
@@ -391,7 +421,13 @@ async def test_whitelists_match_upstream_openapi() -> None:
         # disagree the arrays win, and this is the recorded exception — verified
         # against the running instance by the e2e compose-service migration.
         openapi_only = {"connect_to_docker_network"}
-        missing = documented - SERVICE_CREATE_CUSTOM_COMPOSE - openapi_only - KNOWN_TAGS_GAP
+        missing = (
+            documented
+            - SERVICE_CREATE_CUSTOM_COMPOSE
+            - openapi_only
+            - KNOWN_TAGS_GAP
+            - KNOWN_SERVICE_GAP
+        )
         if missing:
             drift["POST /services"] = sorted(missing)
 
@@ -498,6 +534,26 @@ async def test_whitelists_match_upstream_openapi() -> None:
 #: routing keys on the uuid, and discovery finds the container through the
 #: `coolify.applicationUuid` label 4.4.0 introduced alongside it (locked by
 #: TestCarriesUuid.test_matches_a_v44_prefixed_container_through_its_uuid_label).
+#:
+#: EXTENDED 2026-10-26 for Coolify 4.5.0 (the canary went red on its first run
+#: after v4.5.0, 2026-10-23). Seven fields documented; all read in
+#: ApplicationsController AT v4.5.0 (create array :1340, update :3363). Three are
+#: WHITELISTED, not gapped — http_basic_auth_{bcrypt_cost, argon2id_memory_cost,
+#: argon2id_time_cost} are top-level columns whose existence and acceptance ship
+#: in the same release, so filter_body can never send them where they 422. The
+#: other four stay out, each for its own reason:
+#:
+#:   * http_basic_auth_hash_algorithm — top-level, but `argon2id` 422s the WHOLE
+#:     create unless the target server runs Caddy >= 2.11, which the planner
+#:     cannot see. The credentials survive either way (bcrypt of the same
+#:     plaintext); fidelity.application_warnings names an argon2id source.
+#:   * is_permanent_redirect_enabled, traefik_certificate_resolver,
+#:     redact_all_env_values_in_logs — application_settings columns, so they come
+#:     back only under `settings` and filter_body could not carry them anyway.
+#:     The resolver is also SERVER-scoped (a name defined in the source server's
+#:     Traefik config), so copying it blindly could be as wrong as dropping it.
+#:     The first two are warned about at plan time; redaction is not, because its
+#:     default (true) is at least as protective as any source value.
 KNOWN_APPLICATION_GAP: frozenset[str] = frozenset(
     {
         "autogenerate_domain",
@@ -510,6 +566,7 @@ KNOWN_APPLICATION_GAP: frozenset[str] = frozenset(
         "gpu_device_ids",
         "gpu_driver",
         "gpu_options",
+        "http_basic_auth_hash_algorithm",
         "include_source_commit_in_build",
         "inject_build_args_to_dockerfile",
         "is_consistent_container_name_enabled",
@@ -520,6 +577,7 @@ KNOWN_APPLICATION_GAP: frozenset[str] = frozenset(
         "is_gpu_enabled",
         "is_gzip_enabled",
         "is_log_drain_enabled",
+        "is_permanent_redirect_enabled",
         "is_pr_deployments_public_enabled",
         "is_preview_deployments_enabled",
         "is_raw_compose_deployment_enabled",
@@ -527,10 +585,23 @@ KNOWN_APPLICATION_GAP: frozenset[str] = frozenset(
         "max_restart_count",
         "noindex_domains",
         "preview_url_template",
+        "redact_all_env_values_in_logs",
         "stop_grace_period",
+        "traefik_certificate_resolver",
         "use_build_secrets",
     }
 )
+
+#: Fields POST /services documents that SERVICE_CREATE does not carry.
+#:
+#: ADJUDICATED against ServicesController at v4.5.0: redact_all_env_values_in_logs
+#: is in both create arrays and the update array, stored top-level on `services`
+#: with DB default true for new and existing rows. Not carried: the target then
+#: redacts every env value in Coolify's logs, which is at least as protective as
+#: any source setting — a source that turned redaction OFF loses only log
+#: verbosity, never protection. Gapped rather than whitelisted for symmetry with
+#: applications (nested, uncarriable) and databases (no create route accepts it).
+KNOWN_SERVICE_GAP: frozenset[str] = frozenset({"redact_all_env_values_in_logs"})
 
 
 def test_known_application_gap_is_disjoint_from_the_whitelist() -> None:
@@ -543,6 +614,7 @@ def test_known_application_gap_is_disjoint_from_the_whitelist() -> None:
     """
     assert KNOWN_APPLICATION_GAP.isdisjoint(APPLICATION_CREATE)
     assert KNOWN_TAGS_GAP.isdisjoint(APPLICATION_CREATE)
+    assert KNOWN_SERVICE_GAP.isdisjoint(SERVICE_CREATE)
 
 
 @pytest.mark.integration
@@ -918,6 +990,58 @@ async def test_we_never_send_a_field_upstream_rejects() -> None:
         f"An unlisted field is rejected wholesale — the resource is NOT created. "
         f"Remove them from api/fields.py, or confirm against the controller at this "
         f"tag that the extraction missed a branch."
+    )
+
+
+#: Fields a create array accepts that we leave out by DESIGN, not as a lost
+#: setting — so they belong in neither a whitelist nor a gap.
+#:
+#:   * applications `type` — the ROUTE decides it (create_application($request,
+#:     $type), ApplicationsController v4.5.0:1320); a body `type` is never read.
+#:   * services `connect_to_docker_network` — carried by a follow-up PATCH, which
+#:     works on every version; create accepts it only from v4.5.0.
+#:   * databases `sqlite_databases` — SQLite (v4.4.0) is refused at plan time.
+_NOT_SENT_BY_DESIGN = {
+    "applications": frozenset({"type"}),
+    "services": frozenset({"connect_to_docker_network"}),
+    "databases": frozenset({"sqlite_databases"}),
+}
+
+
+@pytest.mark.integration
+async def test_controller_arrays_are_adjudicated() -> None:
+    """Every field a released create array accepts is either sent or adjudicated.
+
+    The openapi canaries above only see what upstream DOCUMENTS. Measured
+    2026-10-26: custom_network_aliases, health_check_type and health_check_command
+    sat in the application create array from v4.1.2 on, documented by no schema,
+    and every migration silently dropped them — the aliases other containers
+    resolve the app by, and the CMD health check of every worker. Reading the
+    enforcement arrays forward closes that blind spot: a field upstream accepts but
+    never documents still fails here until someone decides about it.
+    """
+    tag, sources = await released_controllers()
+
+    adjudicated = {
+        "applications": APPLICATION_CREATE | KNOWN_APPLICATION_GAP | KNOWN_TAGS_GAP,
+        "services": SERVICE_CREATE | KNOWN_SERVICE_GAP | KNOWN_TAGS_GAP,
+        "databases": frozenset().union(*(database_allowed(e) for e in DATABASE_ENGINE_FIELDS))
+        | KNOWN_TAGS_GAP,
+    }
+    undecided: dict[str, list[str]] = {}
+    for key, php in sources.items():
+        arrays = create_allowed_fields(php)
+        assert arrays, f"found no {key} create $allowedFields at {tag}"
+        accepted: set[str] = set().union(*arrays)
+        if extra := sorted(accepted - adjudicated[key] - _NOT_SENT_BY_DESIGN[key]):
+            undecided[key] = extra
+
+    assert not undecided, (
+        f"Coolify {tag} accepts these create fields that we neither send nor have "
+        f"adjudicated: {undecided}. Read each at {tag}: where is it stored, does the "
+        f"GET return it flat or under `settings`, and since which tag is it accepted? "
+        f"Then whitelist it in api/fields.py or record it in a KNOWN_*_GAP with the "
+        f"reason. The openapi canary cannot see these — upstream did not document them."
     )
 
 

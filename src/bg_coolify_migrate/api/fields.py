@@ -13,14 +13,15 @@ and the difference is a 422 per extra field. Every request body this tool sends
 is therefore filtered through an explicit whitelist declared here.
 
 **Keeping it honest.** These lists are transcribed from upstream source, which
-means they can drift when Coolify changes. ``tests/test_api_fields.py`` validates
-them against the live ``openapi.json``, and a scheduled CI job re-runs that
-against Coolify ``main`` — so drift breaks our CI rather than someone's
-production migration. Note that OpenAPI and ``$allowedFields`` genuinely disagree
-in places (the attributes are documentation; the arrays are the enforcement), so
-where they conflict, **the arrays win** and the test records the exception.
+means they can drift when Coolify changes. ``tests/test_api_fields.py`` diffs
+them against ``openapi.json`` AND the controllers' ``$allowedFields`` at the
+newest RELEASE tag (never ``main`` — see the 2.5.6 tags regression), and a weekly
+CI job runs that — so drift breaks our CI rather than someone's production
+migration. OpenAPI and ``$allowedFields`` genuinely disagree in places (the
+attributes are documentation; the arrays are the enforcement), so where they
+conflict, **the arrays win** and the test records the exception.
 
-Verified against coollabsio/coolify@main.
+Verified against the release tags v4.1.2 through v4.5.0.
 """
 
 from __future__ import annotations
@@ -60,12 +61,12 @@ DATABASE_COMMON: frozenset[str] = frozenset(
         "limits_cpu_shares",
         # NOT tags — carried post-create by resources.copy_tags. See SERVICE_CREATE.
         # NOT health_check_*. They come back in every GET, and the obvious move is
-        # to send them on. Coolify lists them in no $allowedFields — not on create,
-        # not on update — so any request carrying one is rejected wholesale with
-        # 422 and nothing is created at all.
+        # to send them on. No CREATE $allowedFields lists them, so a create carrying
+        # one is rejected wholesale with 422 and nothing is created at all. (The
+        # UPDATE array does accept them, at every tag since 4.1.2 — a follow-up
+        # PATCH could carry them; this tool does not do that yet.)
         #
-        # Readable, never settable: the mirror image of the settings gap on
-        # applications. Unsettable is not the same as unimportant, so the planner
+        # Unsettable on create is not the same as unimportant, so the planner
         # reports a source whose health check deviates rather than quietly
         # dropping it — see database_health_check_warnings below.
     }
@@ -101,7 +102,7 @@ def database_health_check_warnings(source: dict[str, object]) -> list[str]:
         return []
     return [
         "health check settings cannot be migrated — Coolify accepts them on no "
-        "endpoint, so the target starts with defaults. Re-apply by hand: "
+        "create endpoint, so the target starts with defaults. Re-apply by hand: "
         + ", ".join(deviations)
     ]
 
@@ -194,6 +195,9 @@ SERVICE_CREATE: frozenset[str] = frozenset(
 #: create carrying ``connect_to_docker_network`` is rejected 422 before line 505
 #: is ever reached. The field is settable only on update; ``create_service``
 #: carries it with a follow-up PATCH. Found by the e2e compose-service migration.
+#:
+#: v4.5.0 finally accepts it on create (both arrays), but v4.1.2-v4.4.7 still
+#: reject it, and the PATCH works on all of them — so it stays a PATCH.
 SERVICE_CREATE_CUSTOM_COMPOSE: frozenset[str] = SERVICE_CREATE
 
 #: PATCH /v1/services/{uuid}. Unlike applications, compose IS updatable here.
@@ -264,9 +268,21 @@ APPLICATION_CREATE: frozenset[str] = frozenset(
         "custom_labels",
         "custom_docker_run_options",
         "custom_nginx_configuration",
+        # Extra Docker network aliases other containers reach the app by. In every
+        # create array since v4.1.2 and top-level in the GET, but documented by no
+        # openapi schema — so the openapi canary never saw it, and every migration
+        # before 2026-10-26 silently dropped the aliases (service-to-service DNS
+        # breaks after cutover). test_controller_arrays_are_adjudicated now catches this
+        # class: accepted by the array, invisible to the documentation.
+        "custom_network_aliases",
         "watch_paths",
         # NOT tags — carried post-create by resources.copy_tags. See SERVICE_CREATE.
         "health_check_enabled",
+        # Same story as custom_network_aliases: accepted since v4.1.2, undocumented.
+        # Without them a CMD health check (a worker with no HTTP listener) came up
+        # on the target as an HTTP one and was marked unhealthy.
+        "health_check_type",
+        "health_check_command",
         "health_check_path",
         "health_check_port",
         "health_check_host",
@@ -313,7 +329,21 @@ APPLICATION_CREATE: frozenset[str] = frozenset(
         "is_preserve_repository_enabled",
         "is_http_basic_auth_enabled",
         "http_basic_auth_username",
+        # Stored with Laravel's `encrypted` cast and returned DECRYPTED to a
+        # read:sensitive token at every tag — no hashing on save — so the target
+        # hashes the same plaintext the source did. Since 4.5.0 it is max:72 on
+        # create; fidelity.application_refusals stops a longer one at plan time.
         "http_basic_auth_password",
+        # The hash COST of the label hash (v4.5.0). These columns, and their
+        # acceptance on create, ship in the same release, so a GET can only carry
+        # them where the create accepts them — filter_body never sends a key the
+        # source GET lacks. Carried so a hardened source does not come back with a
+        # weaker label hash. NOT http_basic_auth_hash_algorithm: argon2id 422s the
+        # whole create unless the TARGET server runs Caddy >= 2.11, so it is a gap
+        # with a plan warning (KNOWN_APPLICATION_GAP, fidelity.application_warnings).
+        "http_basic_auth_bcrypt_cost",
+        "http_basic_auth_argon2id_memory_cost",
+        "http_basic_auth_argon2id_time_cost",
     }
 )
 
@@ -407,8 +437,31 @@ def application_settings_warnings(source: dict[str, Any]) -> list[str]:
 #
 # Services additionally require `resource_uuid` to target the sub-resource.
 
+#
+# `host_path` is accepted only up to v4.3.21: v4.3.22 (backported) and v4.4.0
+# removed it from every storage create array, so it is a 422 there. It stays in
+# the whitelist for the older instances, and never reaches a newer one because
+# fidelity.storage_refusals refuses such a source at plan time. Dropping it
+# instead would be silent data loss: the target would mount an empty named volume
+# while rsync mirrored the bytes to a host path nothing reads — and VERIFY would
+# compare those two copies and pass.
+#
+# `is_host_file` (v4.2.0) marks a mount of an existing HOST file (e.g.
+# /etc/timezone) rather than content Coolify manages. Without it a 4.4+ target
+# takes the managed-file branch for an absolute fs_path: it 422s on a symlink
+# and otherwise `touch`es and `chmod +x`es that host file on the target server.
+
 STORAGE_CREATE: frozenset[str] = frozenset(
-    {"type", "name", "mount_path", "host_path", "content", "is_directory", "fs_path"}
+    {
+        "type",
+        "name",
+        "mount_path",
+        "host_path",
+        "content",
+        "is_directory",
+        "is_host_file",
+        "fs_path",
+    }
 )
 STORAGE_CREATE_SERVICE: frozenset[str] = STORAGE_CREATE | {"resource_uuid"}
 STORAGE_REQUIRED: frozenset[str] = frozenset({"type", "mount_path"})
@@ -416,7 +469,7 @@ STORAGE_REQUIRED: frozenset[str] = frozenset({"type", "mount_path"})
 #: Fields valid only for `type=persistent`.
 STORAGE_PERSISTENT_ONLY: frozenset[str] = frozenset({"name", "host_path"})
 #: Fields valid only for `type=file`.
-STORAGE_FILE_ONLY: frozenset[str] = frozenset({"content", "is_directory", "fs_path"})
+STORAGE_FILE_ONLY: frozenset[str] = frozenset({"content", "is_directory", "is_host_file", "fs_path"})
 
 # ── Environment variables ────────────────────────────────────────────────────
 # Identical for single create and bulk. Bulk body is {"data": [...]} — the key is
