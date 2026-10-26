@@ -524,32 +524,46 @@ def _to_error(method: str, path: str, response: httpx.Response) -> CoolifyApiErr
     if response.status_code == 401:
         hint = "Check COOLIFY_TOKEN. Coolify tokens are instance-specific."
     elif response.status_code == 403:
-        # Coolify returns 403 for THREE unrelated conditions, each needing a
+        # Coolify returns 403 for several unrelated conditions, each needing a
         # different fix. Guessing sends the operator to re-issue a token that was
         # never the problem. It tells us which in the body — read it.
         #
-        # The order matters: ApiAllowed runs BEFORE any token check, so an
-        # allowlist rejection never reaches the ability middleware. A caller
-        # blocked by IP sees no token error because the token was never examined.
+        # Middleware order (v4.3.10 = v4.5.0): auth:sanctum, the token's team,
+        # ApiAllowed (which delegates the IP check to ApiIpAllowed from 4.5.0),
+        # then the route's ability. So a bad token is a 401 and a non-admin token
+        # owner a 403 BEFORE the allowlist is consulted — but an allowlist
+        # rejection still means the token itself passed.
         if "API is disabled" in message:
             hint = (
                 "The instance has its API switched off. Enable it in Coolify under "
-                "Settings > API, or POST /api/v1/enable with a root token (it moved "
-                "from GET to POST in 4.2).\n"
+                "Settings > API (Coolify 4.5 removed the /api/v1/enable route; on "
+                "4.2-4.4 a root token could POST it).\n"
                 "This is instance-wide and off by default; your token is fine."
             )
         elif "not allowed to access the API" in message:
-            # app/Http/Middleware/ApiAllowed.php — identical at v4.1.2 and v4.3.3.
+            # ApiAllowed (v4.1.2-v4.4.x) / ApiIpAllowed (v4.5.0), same message.
             # Found the hard way: this used to fall into the token branch below and
             # sent us hunting a token problem that did not exist.
             hint = (
                 "Your IP is not on the instance's API allowlist. Add it in Coolify "
                 "under Settings > API > Allowed IPs (or set 0.0.0.0 to allow all).\n"
-                "Your token is fine — this check runs before the token is even "
-                "looked at, so no token change can get past it."
+                "Your token is fine — no token change can get past this check."
+            )
+        elif "team role" in message or "current role" in message:
+            # ApiAbility: an elevated token held by a mere team MEMBER.
+            hint = (
+                "The token's OWNER is not an admin of its team, and Coolify (4.2+) "
+                "refuses elevated tokens held by members. Have a team admin or owner "
+                "issue the token — re-issuing it as the same user will not help."
             )
         else:
-            hint = "The token lacks the ability for this call (needs write/deploy, or root)."
+            hint = (
+                "The token lacks the ability for this call. This tool needs root, or "
+                "read + read:sensitive + write + deploy (DELETE needs write AND deploy "
+                "from Coolify 4.5)"
+                + (f" — Coolify says: {message}" if "permissions" in message else "")
+                + "."
+            )
     elif response.status_code == 422:
         # Coolify names the offending field, which is the single most useful
         # thing when a whitelist in api/fields.py has drifted from upstream.

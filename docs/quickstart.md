@@ -51,7 +51,7 @@ pip install bg-coolify-migrate
 
 ```bash
 export COOLIFY_URL="https://coolify.example.com"
-export COOLIFY_TOKEN="..."          # MUST have root or read:sensitive
+export COOLIFY_TOKEN="..."          # root, or read:sensitive + write + deploy
 
 coolify-migrate doctor                                # verify token + reachability
 coolify-migrate list                                  # everything, recursively

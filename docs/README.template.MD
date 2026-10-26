@@ -62,7 +62,8 @@ external orchestrator has none of those constraints. That is what this is.
 | `ui/` | Rich dashboard, wizard, and a plain non-TTY fallback |
 
 > **Requires the instance API switched on (Settings > API — off by default) and a
-> token with `root` or `read:sensitive`.** Without the switch every call is
+> token with `root`, or `read:sensitive` + `write` + `deploy`, issued by a team
+> admin.** Without the switch every call is
 > `403 "API is disabled."`, which looks like a token problem but is not. Without
 > the scope, Coolify's `ApiSensitiveData` middleware silently omits `value`,
 > `real_value` and `docker_compose_raw` from responses — no error, no redaction
@@ -74,7 +75,7 @@ external orchestrator has none of those constraints. That is what this is.
 pip install bg-coolify-migrate
 
 export COOLIFY_URL="https://coolify.example.com"
-export COOLIFY_TOKEN="..."          # root or read:sensitive
+export COOLIFY_TOKEN="..."          # root, or read:sensitive + write + deploy
 
 coolify-migrate doctor                 # verify token scope + server reachability
 coolify-migrate list                   # everything: server -> project -> env -> resource

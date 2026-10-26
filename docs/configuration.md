@@ -9,11 +9,12 @@ for the fully commented reference.
 | Variable | Notes |
 | --- | --- |
 | `COOLIFY_URL` | e.g. `https://coolify.example.com` (with or without `/api/v1`) |
-| `COOLIFY_TOKEN` | **Must** carry `root` or `read:sensitive` |
+| `COOLIFY_TOKEN` | **Must** carry `root`, or `read:sensitive` + `write` + `deploy` — owned by a team admin |
 
 !!! danger "Why the token scope is not optional"
     Coolify's `ApiSensitiveData` middleware computes
-    `can_read_sensitive = token->can('root') || token->can('read:sensitive')`.
+    `can_read_sensitive = (token->can('root') || token->can('read:sensitive'))`
+    `&& owner->isAdminOfTeam()` (the admin clause since 4.2).
     Without it, controllers call `makeHidden(['value', 'real_value', ...])` and
     the keys **vanish** from the JSON — HTTP 200, no error, no redaction marker.
     A migration driven by a plain `read` token would happily recreate every

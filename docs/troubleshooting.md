@@ -2,8 +2,10 @@
 
 ## `doctor` says the token cannot read sensitive data (exit 10)
 
-Create a new token in Coolify under **Keys & Tokens > API tokens** with `root` or
-`read:sensitive`.
+Create a new token in Coolify under **Keys & Tokens > API tokens** with `root`, or
+`read:sensitive` + `write` + `deploy` — as an admin or owner of the team. Since
+4.2 a token held by a plain member is treated as unable to read sensitive data
+whatever its abilities, and its 403 says `Missing required team role.`
 
 This is not a nicety. Coolify's `ApiSensitiveData` middleware omits `value`,
 `real_value` and `docker_compose_raw` for tokens without that scope — **HTTP 200,
@@ -13,8 +15,8 @@ recreate every environment variable empty and every service without its compose.
 ## `403 API is disabled.` on every call
 
 Coolify ships with its REST API **off instance-wide**, separately from your
-token. Turn it on under **Settings > API**, or `GET /api/v1/enable` with a write
-token.
+token. Turn it on under **Settings > API**. (On 4.2-4.4 a root token could also
+`POST /api/v1/enable`; Coolify 4.5 removed that route.)
 
 This reads exactly like a token or permission problem and is neither — your token
 is fine, the instance switch just has not been flipped. It is off by default and

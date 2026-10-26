@@ -177,8 +177,57 @@ class TestErrorMapping:
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
         respx_mock.get(f"{BASE}/servers").mock(return_value=httpx.Response(403))
-        with pytest.raises(CoolifyApiError, match="write/deploy"):
+        with pytest.raises(CoolifyApiError, match=r"write \+ deploy"):
             await api.list_servers()
+
+    async def test_403_names_the_missing_permission_coolify_reported(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # Coolify 4.5 DELETE needs write AND deploy; its message names the gap.
+        respx_mock.get(f"{BASE}/servers").mock(
+            return_value=httpx.Response(403, json={"message": "Missing required permissions: deploy"})
+        )
+        with pytest.raises(CoolifyApiError, match="Missing required permissions: deploy"):
+            await api.list_servers()
+
+    async def test_403_for_a_member_owned_token_points_at_the_role_not_the_token(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        """Re-issuing the token as the same user cannot fix this; the hint must say so."""
+        respx_mock.get(f"{BASE}/servers").mock(
+            return_value=httpx.Response(403, json={"message": "Missing required team role."})
+        )
+        with pytest.raises(CoolifyApiError, match="not an admin of its team"):
+            await api.list_servers()
+
+    async def test_403_from_api_ability_for_a_member_gets_the_same_hint(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # ApiAbility's own wording (v4.5.0 ApiAbility.php:32) for the same condition.
+        respx_mock.get(f"{BASE}/servers").mock(
+            return_value=httpx.Response(
+                403,
+                json={
+                    "message": "This API token has permissions (write, deploy) that exceed "
+                    "your current role as a team member. Members are restricted to "
+                    "read-only API access. Please revoke this token and create a new one "
+                    "with only read permissions."
+                },
+            )
+        )
+        with pytest.raises(CoolifyApiError, match="not an admin of its team"):
+            await api.list_servers()
+
+    async def test_403_api_disabled_points_at_the_ui(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # Coolify 4.5 removed /api/v1/enable; the UI is the only switch left.
+        respx_mock.get(f"{BASE}/servers").mock(
+            return_value=httpx.Response(403, json={"message": "API is disabled."})
+        )
+        with pytest.raises(CoolifyApiError, match=r"Settings > API") as exc:
+            await api.list_servers()
+        assert "removed the /api/v1/enable route" in str(exc.value)
 
     async def test_404_hint_mentions_api_disabled(
         self, api: CoolifyClient, respx_mock: respx.Router

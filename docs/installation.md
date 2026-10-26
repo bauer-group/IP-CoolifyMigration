@@ -23,8 +23,10 @@
   disabled."`, even with a perfectly valid token, which makes it look like a
   token problem when it is not. This is separate from the token and only has to
   be done once per instance.
-- An API token with **`root`** or **`read:sensitive`**
-  (Keys & Tokens > API tokens).
+- An API token with **`root`**, or **`read:sensitive` + `write` + `deploy`**
+  (Keys & Tokens > API tokens), issued by an admin or owner of the team —
+  Coolify 4.2+ refuses elevated tokens held by plain members, and 4.5 requires
+  `deploy` in addition to `write` to delete a resource (rollback and finalize do).
 
 ## Install
 
