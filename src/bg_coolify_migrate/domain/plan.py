@@ -142,8 +142,9 @@ class ResourceSnapshot(BaseModel):
     """Resolved from ``private_key_id`` via /security/keys, same reasoning."""
 
     docker_compose_raw: str | None = None
-    """Decoded, not base64. Coolify re-dumps this through Yaml::dump(Yaml::parse())
-    on the service path, which destroys comments and formatting — warn the user."""
+    """Decoded, not base64. Before 4.4 Coolify re-dumped this through
+    Yaml::dump(Yaml::parse()) on the service path, destroying comments and
+    formatting; from 4.4 it is stored verbatim."""
 
     running_image: str | None = None
     """From `docker inspect` of the running container. The ONLY trustworthy
@@ -179,6 +180,10 @@ class ResourcePlan(BaseModel):
     manifest: VolumeManifest = Field(default_factory=VolumeManifest)
     drift: RebuildDriftReport | None = None
     warnings: tuple[str, ...] = ()
+    refusals: tuple[str, ...] = ()
+    """What the target provably cannot reproduce — a create that will 422, a
+    deploy that will fail after the stop, data that would be left behind. Decided
+    by domain/fidelity.py from the captured GETs."""
 
     @property
     def hard_blocking_reasons(self) -> tuple[str, ...]:
@@ -188,7 +193,7 @@ class ResourcePlan(BaseModel):
         drift``) and these are not. Conflating the two makes the flag a lie: it
         gets accepted, and the migration aborts anyway on the generic check.
         """
-        out: list[str] = []
+        out: list[str] = list(self.refusals)
         out.extend(f"{i.source_name or i.mount_path}: {i.reason}" for i in self.manifest.refused)
         if self.snapshot.has_previews:
             out.append(
@@ -255,6 +260,9 @@ class MigrationPlan(BaseModel):
     environment — the quiesce gates then watch the stack. Non-empty means a scoped
     run: the gates watch only these, so siblings left running do not make the stop
     gate wait forever or the restart check trip."""
+    notes: tuple[str, ...] = ()
+    """Warnings about the move as a whole rather than one resource — e.g. the two
+    servers issuing certificates differently."""
 
     @property
     def is_resource_scoped(self) -> bool:
@@ -274,7 +282,7 @@ class MigrationPlan(BaseModel):
 
     @property
     def warnings(self) -> tuple[str, ...]:
-        out: list[str] = []
+        out: list[str] = list(self.notes)
         for r in self.resources:
             out.extend(f"{r.snapshot.name}: {w}" for w in r.warnings)
             out.extend(f"{r.snapshot.name}: {w}" for w in r.manifest.warnings)

@@ -280,3 +280,23 @@ class TestMigrationPlan:
     def test_empty_plan_is_not_blocked(self) -> None:
         assert self._plan().is_blocked is False
         assert self._plan().total_bytes == 0
+
+    def test_a_fidelity_refusal_blocks_like_a_refused_volume(self) -> None:
+        """Refusals feed the ONE source of truth for blocking, not a second list.
+
+        A parallel check would drift apart from it, and the dangerous direction is
+        a reason printed in the plan while the run proceeds anyway.
+        """
+        r = ResourcePlan(
+            snapshot=_snap(name="api"),
+            strategy=Strategy.COPY_DATA,
+            refusals=("the HTTP basic auth password is 80 characters",),
+        )
+        assert r.is_blocked
+        assert r.blocking_reasons == ("the HTTP basic auth password is 80 characters",)
+        assert self._plan(r).is_blocked
+
+    def test_plan_level_notes_lead_the_warnings_unprefixed(self) -> None:
+        r = ResourcePlan(snapshot=_snap(name="minio"), strategy=Strategy.COPY_DATA, warnings=("w",))
+        plan = self._plan(r).model_copy(update={"notes": ("servers issue certificates differently",)})
+        assert plan.warnings == ("servers issue certificates differently", "minio: w")

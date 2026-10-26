@@ -358,3 +358,205 @@ class TestResolveGitAuth:
             {"git_repository": "x/y", "private_key_id": 0},
         )
         assert (gh, pk) == (None, "localhost-key")
+
+
+# ── build_plan feeds what the API cannot carry into the plan ─────────────────
+# domain/fidelity.py is tested on its own; these pin the WIRING, because a rule
+# nobody calls protects nothing and reports nothing — the failure mode this whole
+# suite exists for.
+
+
+class _PlanApi:
+    """Just enough Coolify for build_plan once snapshot/manifest are stubbed."""
+
+    def __init__(
+        self,
+        *,
+        version: str | Exception,
+        envs: list[dict[str, Any]],
+        storages: dict[str, Any] | None = None,
+        server_role: str = "both",
+    ) -> None:
+        self._version = version
+        self._envs = envs
+        self._storages = storages or {"persistent_storages": [], "file_storages": []}
+        self._role = server_role
+
+    async def get_server(self, uuid: str) -> dict[str, Any]:
+        return {
+            "uuid": uuid,
+            "name": uuid,
+            "ip": "10.0.0.2",
+            "settings": {"traefik_certificate_resolver": None, "server_role": self._role},
+        }
+
+    async def version(self) -> str:
+        if isinstance(self._version, Exception):
+            raise self._version
+        return self._version
+
+    async def get_storages(self, collection: str, uuid: str) -> dict[str, Any]:
+        return self._storages
+
+    async def get_envs(self, collection: str, uuid: str) -> list[dict[str, Any]]:
+        return self._envs
+
+
+async def _plan_one_app(
+    monkeypatch: pytest.MonkeyPatch,
+    full: dict[str, Any],
+    *,
+    version: str | Exception = "4.5.0",
+    envs: list[dict[str, Any]] | None = None,
+    storages: dict[str, Any] | None = None,
+    server_role: str = "both",
+    snapshot: dict[str, Any] | None = None,
+) -> Any:
+    from bg_coolify_migrate.domain.kinds import BuildPack, ResourceKind
+    from bg_coolify_migrate.domain.manifest import VolumeManifest
+    from bg_coolify_migrate.domain.plan import ResourceSnapshot
+    from bg_coolify_migrate.engine import planner
+
+    shape = snapshot or {
+        "collection": "applications",
+        "kind": ResourceKind.APP_DOCKERIMAGE,
+        "build_pack": BuildPack.DOCKERIMAGE,
+    }
+
+    async def fake_find_project(api: Any, project: str) -> dict[str, Any]:
+        return {"uuid": "p1", "name": "shop"}
+
+    async def fake_find_server(api: Any, name: str) -> dict[str, Any]:
+        return {"uuid": "s2", "name": name}
+
+    async def fake_env_resources(api: Any, project_uuid: str, environment: str) -> Any:
+        return [(shape["collection"], {"uuid": "a1", "name": "api"})]
+
+    async def fake_snapshot(api: Any, host: Any, **kw: Any) -> Any:
+        return ResourceSnapshot(uuid="a1", name="api", **shape), [], full
+
+    async def fake_resolve_server(api: Any, resource: Any) -> dict[str, Any]:
+        return {
+            "uuid": "s1",
+            "name": "old",
+            "ip": "10.0.0.1",
+            "settings": {"traefik_certificate_resolver": "letsencrypt"},
+        }
+
+    async def fake_manifest(host: Any, **kw: Any) -> VolumeManifest:
+        return VolumeManifest()
+
+    async def no_drift(host: Any, snapshot: Any) -> None:
+        return None
+
+    async def no_mounts(host: Any, containers: Any) -> list[Any]:
+        return []
+
+    monkeypatch.setattr(planner, "find_project", fake_find_project)
+    monkeypatch.setattr(planner, "find_server", fake_find_server)
+    monkeypatch.setattr(planner, "environment_resources", fake_env_resources)
+    monkeypatch.setattr(planner, "snapshot_resource", fake_snapshot)
+    monkeypatch.setattr(planner, "resolve_server", fake_resolve_server)
+    monkeypatch.setattr(planner, "build_manifest", fake_manifest)
+    monkeypatch.setattr(planner, "assess_drift", no_drift)
+    monkeypatch.setattr(planner, "inspect_all_mounts", no_mounts)
+
+    return await planner.build_plan(
+        _PlanApi(  # type: ignore[arg-type]
+            version=version, envs=envs or [], storages=storages, server_role=server_role
+        ),
+        object(),  # type: ignore[arg-type]
+        project="shop",
+        environment="production",
+        target_server="new",
+    )
+
+
+class TestBuildPlanFidelity:
+    async def test_a_create_coolify_would_reject_blocks_the_plan(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        plan = await _plan_one_app(monkeypatch, {"manual_webhook_secret_github": "short"})
+        assert plan.is_blocked
+        assert "manual webhook secret" in plan.resources[0].blocking_reasons[0]
+
+    async def test_the_rule_respects_the_instance_version(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 4.3.x still accepts a short webhook secret on create.
+        plan = await _plan_one_app(
+            monkeypatch, {"manual_webhook_secret_github": "short"}, version="4.3.10"
+        )
+        assert not plan.is_blocked
+
+    async def test_an_unreadable_version_applies_every_rule(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        plan = await _plan_one_app(
+            monkeypatch,
+            {"manual_webhook_secret_github": "short"},
+            version=RuntimeError("version endpoint down"),
+        )
+        assert plan.is_blocked
+
+    async def test_env_rules_see_the_source_envs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        plan = await _plan_one_app(
+            monkeypatch,
+            {},
+            envs=[{"key": "DB_URL", "value": "{{vault.DB}}", "is_literal": False}],
+        )
+        assert any("secret manager" in r for r in plan.resources[0].refusals)
+
+    async def test_server_level_differences_become_plan_notes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        plan = await _plan_one_app(monkeypatch, {})
+        assert not plan.is_blocked
+        assert any("letsencrypt" in n for n in plan.notes)
+
+    async def test_compose_shapes_refuse_a_compose_backed_resource(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from bg_coolify_migrate.domain.kinds import ResourceKind
+
+        plan = await _plan_one_app(
+            monkeypatch,
+            {},
+            snapshot={
+                "collection": "services",
+                "kind": ResourceKind.SERVICE_COMPOSE,
+                "docker_compose_raw": (
+                    "services:\n  a:\n    image: x\nvolumes:\n  d:\n    external: true\n"
+                ),
+            },
+        )
+        assert any("is external" in r for r in plan.resources[0].refusals)
+
+    async def test_a_host_path_storage_refuses_a_plain_application(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        plan = await _plan_one_app(
+            monkeypatch,
+            {},
+            storages={
+                "persistent_storages": [{"name": "a1-d", "mount_path": "/d", "host_path": "/srv/d"}],
+                "file_storages": [],
+            },
+        )
+        assert any("host path" in r for r in plan.resources[0].refusals)
+
+    async def test_an_engine_this_tool_cannot_recreate_refuses(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from bg_coolify_migrate.domain.kinds import ResourceKind
+
+        plan = await _plan_one_app(
+            monkeypatch,
+            {"type": "standalone-sqlite"},
+            snapshot={"collection": "databases", "kind": ResourceKind.DATABASE},
+        )
+        assert any("SQLite" in r for r in plan.resources[0].refusals)
+
+    async def test_a_build_server_target_refuses(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        plan = await _plan_one_app(monkeypatch, {}, server_role="build")
+        assert any("build server" in r for r in plan.resources[0].refusals)

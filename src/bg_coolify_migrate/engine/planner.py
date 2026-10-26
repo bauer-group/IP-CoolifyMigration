@@ -35,6 +35,7 @@ from bg_coolify_migrate.discovery.docker import (
     LABEL_RESOURCE,
 )
 from bg_coolify_migrate.domain import compose as compose_mod
+from bg_coolify_migrate.domain import fidelity
 from bg_coolify_migrate.domain.drift import RebuildDriftReport, assess_rebuild_drift
 from bg_coolify_migrate.domain.kinds import (
     BuildPack,
@@ -62,6 +63,7 @@ from bg_coolify_migrate.domain.plan import (
     select_strategy,
 )
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
+from bg_coolify_migrate.domain.versions import parse_version
 from bg_coolify_migrate.errors import (
     EmptyEnvironment,
     MigrationError,
@@ -789,6 +791,15 @@ async def build_plan(
     if target_uuid:
         target = await api.get_server(target_uuid) or target
 
+    # PREFLIGHT records the version too; it is read here because several
+    # refusals below exist only from a given release on (domain/fidelity.py).
+    # Fail-soft and fail-TOWARD-checking: an unknown version applies every rule.
+    try:
+        coolify_version = parse_version(await api.version())
+    except Exception as exc:  # diagnostics only, never fatal
+        log.debug("planner.version_unavailable", error=str(exc)[:120])
+        coolify_version = None
+
     resources = await environment_resources(api, project_uuid, environment)
     if not resources:
         raise EmptyEnvironment(
@@ -843,26 +854,62 @@ async def build_plan(
         )
 
         warnings: list[str] = []
+        refusals: list[str] = []
+        compose_backed = snapshot.kind in (
+            ResourceKind.APP_GIT_COMPOSE,
+            ResourceKind.SERVICE_TEMPLATE,
+            ResourceKind.SERVICE_COMPOSE,
+        )
         if snapshot.kind is ResourceKind.SERVICE_COMPOSE:
-            warnings.append(
-                "Coolify re-dumps compose through Yaml::dump(Yaml::parse(...)); "
-                "comments and formatting will be lost on the target"
+            warnings.extend(fidelity.compose_redump_warning(version=coolify_version))
+        if compose_backed:
+            refusals.extend(
+                fidelity.compose_refusals(snapshot.docker_compose_raw, version=coolify_version)
             )
+        refusals.extend(fidelity.server_refusals(target, collection=collection, source=full))
 
         if collection == "databases":
             warnings.extend(database_health_check_warnings(full))
+            warnings.extend(fidelity.database_warnings(full))
+            if snapshot.engine is None:
+                refusals.append(fidelity.unsupported_engine_refusal(full))
         elif collection == "applications":
             warnings.extend(application_settings_warnings(full))
+            warnings.extend(fidelity.application_warnings(full, version=coolify_version))
+            refusals.extend(fidelity.application_refusals(full, version=coolify_version))
+            # Only plain applications POST their storages (resources.copy_storages);
+            # compose volumes are materialised by Coolify itself.
+            if not compose_backed:
+                refusals.extend(fidelity.storage_refusals(api_storages, version=coolify_version))
+        else:
+            warnings.extend(fidelity.service_warnings(full))
 
         # Env keys are validated by the TARGET's API at copy time, and Coolify
         # >=4.2 rejects shapes its own older versions happily stored. Catching that
         # here — reading only — turns a mid-cutover partial write into a line in
         # the plan. Fail-soft for the same reason as api_storages above: an
-        # unreadable env list is a worse plan, not a reason to refuse to plan.
+        # unreadable env list is a worse plan, not a reason to refuse to plan
+        # (CREATE reads it again, and fails loudly there).
+        envs: list[dict[str, Any]] = []
         try:
-            warnings.extend(env_key_warnings(await api.get_envs(collection, snapshot.uuid)))
+            envs = await api.get_envs(collection, snapshot.uuid)
         except Exception as exc:  # diagnostics only, never fatal
             log.debug("planner.envs_unavailable", uuid=snapshot.uuid, error=str(exc)[:120])
+        warnings.extend(env_key_warnings(envs))
+        refusals.extend(
+            fidelity.env_refusals(
+                envs, collection=collection, engine=snapshot.engine, version=coolify_version
+            )
+        )
+        warnings.extend(
+            fidelity.env_warnings(
+                envs,
+                collection=collection,
+                engine=snapshot.engine,
+                compose=snapshot.docker_compose_raw if compose_backed else None,
+                version=coolify_version,
+            )
+        )
 
         plans.append(
             ResourcePlan(
@@ -871,6 +918,7 @@ async def build_plan(
                 manifest=manifest,
                 drift=drift,
                 warnings=tuple(warnings),
+                refusals=tuple(refusals),
             )
         )
 
@@ -894,6 +942,7 @@ async def build_plan(
         environment=environment,
         source_server=source_ref,
         target_server=target_ref,
+        notes=tuple(fidelity.server_warnings(source_server, target)),
         resources=tuple(plans),
         finalize_policy=finalize_policy,
         transfer_mode=transfer_mode,

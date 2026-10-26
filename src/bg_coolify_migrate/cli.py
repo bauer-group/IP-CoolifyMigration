@@ -38,6 +38,7 @@ from rich.text import Text
 from bg_coolify_migrate import __version__
 from bg_coolify_migrate.domain.plan import MigrationPlan, TransferMode
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
+from bg_coolify_migrate.domain.versions import parse_version
 from bg_coolify_migrate.errors import EmptyEnvironment, MigrationError, PreflightError
 from bg_coolify_migrate.observability.logging_setup import setup_logging
 from bg_coolify_migrate.settings.base import Settings
@@ -132,20 +133,6 @@ VALIDATED_COOLIFY_MIN = "4.1.2"
 VALIDATED_COOLIFY_MAX = "4.3.10"
 
 
-def _version_tuple(raw: str) -> tuple[int, ...] | None:
-    """``"4.3.2"`` -> ``(4, 3, 2)``. ``None`` when it is not a plain version. PURE.
-
-    Tolerates a trailing suffix (``4.4.0-beta.1`` -> ``(4, 4, 0)``) because Coolify
-    publishes long beta chains, and refuses to guess at anything else — an
-    unparseable version must not silently compare as "in range".
-    """
-    head = raw.strip().lstrip("v").split("-")[0].split("+")[0]
-    parts = head.split(".")
-    if not parts or not all(p.isdigit() for p in parts):
-        return None
-    return tuple(int(p) for p in parts)
-
-
 def coolify_version_warning(raw: str) -> str | None:
     """Warn if this Coolify is outside the validated range. ``None`` if fine. PURE.
 
@@ -153,7 +140,7 @@ def coolify_version_warning(raw: str) -> str | None:
     "it is fine", and this is the one place that would hide a genuinely exotic
     build.
     """
-    version = _version_tuple(raw)
+    version = parse_version(raw)
     if version is None:
         return (
             f"could not parse the Coolify version {raw.strip()!r}; this tool is "
@@ -161,8 +148,8 @@ def coolify_version_warning(raw: str) -> str | None:
         )
     # The bounds are module constants and always parse; the fallbacks exist only
     # so a typo in them degrades to "warn about everything" rather than a crash.
-    low = _version_tuple(VALIDATED_COOLIFY_MIN) or (0,)
-    high = _version_tuple(VALIDATED_COOLIFY_MAX) or (0,)
+    low = parse_version(VALIDATED_COOLIFY_MIN) or (0,)
+    high = parse_version(VALIDATED_COOLIFY_MAX) or (0,)
     if low <= version <= high:
         return None
     side = "older than" if version < low else "newer than"
