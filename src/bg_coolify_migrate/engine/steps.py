@@ -30,14 +30,15 @@ from bg_coolify_migrate.domain.kinds import GitAuth, ResourceKind
 from bg_coolify_migrate.domain.manifest import DockerMount
 from bg_coolify_migrate.domain.naming import (
     VolumeEndpoint,
+    VolumePair,
     VolumePairingError,
     compose_volume_suffix,
     pair_by_mount_path,
     pair_by_name_suffix,
 )
-from bg_coolify_migrate.domain.plan import ResourcePlan
+from bg_coolify_migrate.domain.plan import ResourcePlan, ResourceSnapshot
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
-from bg_coolify_migrate.engine import keys
+from bg_coolify_migrate.engine import compensations, keys
 from bg_coolify_migrate.engine.context import MigrationContext, serialise_mounts
 from bg_coolify_migrate.engine.planner import (
     build_manifest,
@@ -347,69 +348,102 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
     parked: dict[str, dict[str, Any]] = {}
     tag = ctx.migration_id.split("-")[-1]
     source_wildcard = ctx.plan.source_server.wildcard_domain or None
-    for resource in ctx.plan.resources:
-        snapshot = resource.snapshot
-        source_full = await ctx.api.get_resource(snapshot.collection, snapshot.uuid)
+    try:
+        for resource in ctx.plan.resources:
+            snapshot = resource.snapshot
+            source_full = await ctx.api.get_resource(snapshot.collection, snapshot.uuid)
 
-        # NO TAG TRANSFER. Tags are deliberately not carried — see the note on
-        # SERVICE_CREATE in api/fields.py. Coolify's tag endpoints and the `tags`
-        # create field exist only on unreleased `main`; on every published release
-        # the read 404s and the create 422s.
+            # NO TAG TRANSFER. Tags are deliberately not carried — see the note on
+            # SERVICE_CREATE in api/fields.py. Coolify's tag endpoints and the `tags`
+            # create field exist only on unreleased `main`; on every published release
+            # the read 404s and the create 422s.
 
-        # Free the source's custom domains so the target can claim them — Coolify
-        # 409s on a duplicate. Journal the restore body BEFORE creating, so a
-        # failed create still un-parks them on rollback. Server-bound domains are
-        # remapped onto the target's wildcard and never collide, so park leaves
-        # them alone.
-        restore_body = await api_resources.park_source_domains(
-            ctx.api, snapshot, source_full, source_wildcard=source_wildcard, tag=tag
-        )
-        if restore_body is not None:
-            parked[snapshot.uuid] = restore_body
+            # Free the source's custom domains so the target can claim them — Coolify
+            # 409s on a duplicate. Journal the restore body BEFORE creating, so a
+            # failed create still un-parks them on rollback. Server-bound domains are
+            # remapped onto the target's wildcard and never collide, so park leaves
+            # them alone.
+            restore_body = await api_resources.park_source_domains(
+                ctx.api, snapshot, source_full, source_wildcard=source_wildcard, tag=tag
+            )
+            if restore_body is not None:
+                parked[snapshot.uuid] = restore_body
+                ctx.journal.append(
+                    "step_started",
+                    state="create_target",
+                    detail={"target_uuids": dict(created), "parked_domains": dict(parked)},
+                )
+
+            target_uuid = await api_resources.create_resource(ctx.api, snapshot, placement, source_full)
+            created[snapshot.uuid] = target_uuid
+            ctx.target_uuids[snapshot.uuid] = target_uuid
+
+            # Journal each creation IMMEDIATELY: a crash after creating the third of
+            # five resources must still be able to delete all three (and un-park).
             ctx.journal.append(
                 "step_started",
                 state="create_target",
                 detail={"target_uuids": dict(created), "parked_domains": dict(parked)},
             )
 
-        target_uuid = await api_resources.create_resource(ctx.api, snapshot, placement, source_full)
-        created[snapshot.uuid] = target_uuid
-        ctx.target_uuids[snapshot.uuid] = target_uuid
+            await api_resources.copy_envs(
+                ctx.api,
+                collection=snapshot.collection,
+                source_uuid=snapshot.uuid,
+                target_uuid=target_uuid,
+            )
+            await api_resources.copy_storages(
+                ctx.api,
+                collection=snapshot.collection,
+                source_uuid=snapshot.uuid,
+                target_uuid=target_uuid,
+                kind=snapshot.kind,
+            )
+            # Cosmetic metadata, and deliberately last: copy_tags never raises, so a
+            # missing tag route (Coolify <4.2) or a rejected name degrades to "no
+            # tags" instead of taking down a target that is otherwise complete.
+            await api_resources.copy_tags(
+                ctx.api,
+                collection=snapshot.collection,
+                source_uuid=snapshot.uuid,
+                target_uuid=target_uuid,
+            )
 
-        # Journal each creation IMMEDIATELY: a crash after creating the third of
-        # five resources must still be able to delete all three (and un-park).
-        ctx.journal.append(
-            "step_started",
-            state="create_target",
-            detail={"target_uuids": dict(created), "parked_domains": dict(parked)},
-        )
-
-        await api_resources.copy_envs(
-            ctx.api,
-            collection=snapshot.collection,
-            source_uuid=snapshot.uuid,
-            target_uuid=target_uuid,
-        )
-        await api_resources.copy_storages(
-            ctx.api,
-            collection=snapshot.collection,
-            source_uuid=snapshot.uuid,
-            target_uuid=target_uuid,
-            kind=snapshot.kind,
-        )
-        # Cosmetic metadata, and deliberately last: copy_tags never raises, so a
-        # missing tag route (Coolify <4.2) or a rejected name degrades to "no
-        # tags" instead of taking down a target that is otherwise complete.
-        await api_resources.copy_tags(
-            ctx.api,
-            collection=snapshot.collection,
-            source_uuid=snapshot.uuid,
-            target_uuid=target_uuid,
-        )
-
-        # STILL inside CREATE, deliberately: the next step stops the source.
-        if snapshot.kind is ResourceKind.APP_GIT_COMPOSE:
-            await _assert_compose_target_ready(ctx, resource, target_uuid=target_uuid)
+            # STILL inside CREATE, deliberately: the next step stops the source.
+            if snapshot.kind is ResourceKind.APP_GIT_COMPOSE:
+                await _assert_compose_target_ready(ctx, resource, target_uuid=target_uuid)
+            elif snapshot.kind in (ResourceKind.SERVICE_TEMPLATE, ResourceKind.SERVICE_COMPOSE):
+                # A service is created from the INSTANCE's template catalog, not the
+                # source's compose, and v4.3.10 -> v4.5.0 changed 95 templates (some
+                # moved or dropped volume mounts). Its storage rows exist as soon as
+                # POST /services returns (`parse(isNew: true)`, synchronous), so the
+                # pairing DISCOVER will need can be rehearsed now — while the source
+                # still serves — instead of refusing after the stop.
+                await _pair_volumes(
+                    ctx,
+                    snapshot,
+                    [
+                        VolumeEndpoint(name=i.source_name, mount_path=i.mount_path)
+                        for i in resource.manifest.to_migrate
+                        if i.source_name
+                    ],
+                    target_uuid=target_uuid,
+                    consequence="The source was never stopped; the created target will be deleted.",
+                )
+    except Exception:
+        # The saga compensates only COMPLETED steps, so a refusal part-way
+        # through CREATE — the compose gate, the service rehearsal, a 422 on
+        # the third of five resources — would strand the targets already made
+        # and leave the source's domains parked in Coolify's DB, where its next
+        # redeploy would serve only old-<tag> hosts. Undo exactly what this
+        # step did, then let the original error speak.
+        try:
+            await compensations.undo_create_target(
+                ctx, {"target_uuids": dict(created), "parked_domains": dict(parked)}
+            )
+        except Exception as undo_exc:  # never mask the original failure
+            log.error("create.undo_failed", error=str(undo_exc)[:200])
+        raise
 
     return {"target_uuids": created}
 
@@ -1001,6 +1035,182 @@ async def _await_target_volumes(
     return endpoints
 
 
+#: Kinds whose volumes Coolify names ``{uuid}{sep}{compose volume key}``.
+_COMPOSE_KINDS = frozenset(
+    {ResourceKind.APP_GIT_COMPOSE, ResourceKind.SERVICE_TEMPLATE, ResourceKind.SERVICE_COMPOSE}
+)
+_SERVICE_KINDS = frozenset({ResourceKind.SERVICE_TEMPLATE, ResourceKind.SERVICE_COMPOSE})
+
+
+async def _pair_volumes(
+    ctx: MigrationContext,
+    snapshot: ResourceSnapshot,
+    source_eps: list[VolumeEndpoint],
+    *,
+    target_uuid: str,
+    consequence: str,
+) -> list[VolumePair]:
+    """Pair source volumes with what Coolify actually created on the target.
+
+    Shared by DISCOVER (authoritative, after the stop) and CREATE (a rehearsal
+    for services, before it) so the two can never disagree about what pairs.
+
+    Compose volumes pair by their uuid-stripped name suffix — the compose volume
+    KEY — because mount_path identifies nothing there: one volume can be mounted
+    at several paths by several services (some behind never-running `profiles:`),
+    and two volumes can share one path across services (15 of the 386 v4.5.0
+    service templates do, budibase's minio_data and redis_data both at /data).
+    Services get the same treatment since their volumes are ``{uuid}_{key}``;
+    until 2026-10-26 they paired by mount path and refused those templates after
+    the stop. Falls back to mount-path pairing when a source name does not carry
+    the uuid prefix.
+
+    Raises:
+        TransferError: When pairing refuses — an ambiguity or a source volume
+            with no target counterpart, i.e. data that would be left behind.
+    """
+    if not source_eps:
+        return []
+    by_suffix = snapshot.kind in _COMPOSE_KINDS and all(
+        compose_volume_suffix(e.name, snapshot.uuid) for e in source_eps
+    )
+    is_service = snapshot.kind in _SERVICE_KINDS
+
+    def suffix_key(e: VolumeEndpoint, uuid: str = target_uuid) -> str | None:
+        return compose_volume_suffix(e.name, uuid)
+
+    if is_service:
+        # POST /services parses inline (`parse(isNew: true)`, v4.1.2 through
+        # v4.5.0), so the rows exist when it returns: polling could never make
+        # a missing key appear, it would only delay the refusal by the timeout.
+        target_eps = await api_resources.read_volume_endpoints(
+            ctx.api, collection=snapshot.collection, uuid=target_uuid
+        )
+    else:
+        # A dockercompose target loads its compose — and its persistent
+        # storages — via an async job at create, so /storages is empty for the
+        # first seconds. Wait for the volumes we need before pairing, or this
+        # races the queue and reports a real volume unpairable.
+        target_eps = await _await_target_volumes(
+            ctx,
+            collection=snapshot.collection,
+            target_uuid=target_uuid,
+            expected=(
+                {s for e in source_eps if (s := compose_volume_suffix(e.name, snapshot.uuid))}
+                if by_suffix
+                else {e.mount_path for e in source_eps}
+            ),
+            compose_from_git=snapshot.kind is ResourceKind.APP_GIT_COMPOSE,
+            key=suffix_key if by_suffix else None,
+        )
+
+    # Both pairers refuse ambiguity and unpaired source volumes — data left
+    # behind if allowed through. Those refusals are diagnoses, not crashes:
+    # name both sides so the operator can see WHICH compose disagrees,
+    # instead of a raw traceback wrapped as "unexpected error in discover"
+    # (which is what this was).
+    try:
+        if not by_suffix:
+            return pair_by_mount_path(source_eps, target_eps)
+        pairs = pair_by_name_suffix(
+            source_eps, target_eps, source_uuid=snapshot.uuid, target_uuid=target_uuid
+        )
+    except VolumePairingError as exc:
+        raise TransferError(
+            f"{snapshot.name}: {exc}",
+            hint=(
+                "Volumes are paired by "
+                + ("compose volume key" if by_suffix else "mount_path")
+                + ", read back from what Coolify actually created on the target "
+                "— never predicted.\n"
+                f"Source volumes: {sorted(f'{e.name} @ {e.mount_path}' for e in source_eps)}\n"
+                "Target declares: "
+                f"{sorted(f'{e.name} @ {e.mount_path}' for e in target_eps) or 'nothing'}\n"
+                "A mismatch usually means the target was created from a different "
+                "compose than the source runs — the branch HEAD moved, or (services) "
+                "the instance's template catalog changed since the source was "
+                f"created. {consequence}"
+            ),
+        ) from exc
+    if is_service:
+        await _assert_template_kept_its_mounts(
+            ctx, snapshot, source_eps, target_eps, target_uuid=target_uuid, consequence=consequence
+        )
+    # Target volumes with no source counterpart are legitimate here: compose
+    # volumes of profile-gated services that never ran on the source, or a
+    # template's newer volume. They start empty on the target exactly as they
+    # would on the source — say so, but do not refuse.
+    paired = {p.target.name for p in pairs}
+    unpaired = sorted(e.name for e in target_eps if e.name not in paired)
+    if unpaired:
+        log.info("discover.target_volumes_start_empty", resource=snapshot.name, volumes=unpaired)
+    return pairs
+
+
+async def _assert_template_kept_its_mounts(
+    ctx: MigrationContext,
+    snapshot: ResourceSnapshot,
+    source_eps: list[VolumeEndpoint],
+    target_eps: list[VolumeEndpoint],
+    *,
+    target_uuid: str,
+    consequence: str,
+) -> None:
+    """Refuse a service whose template moved a volume's mount path.
+
+    Key pairing answers WHICH volume is which; it never asks WHERE the target
+    mounts it. A template service's target is built from the instance's current
+    catalog, and between v4.1.2 and v4.5.0 several templates kept a volume key and
+    moved its mount — opnform's `postgresql-data` went from /var/lib/postgresql/data
+    (postgres 16) to /var/lib/postgresql (postgres 18). Paired by key alone, the
+    bytes are copied, VERIFY compares two identical volumes and passes, and the
+    target's database starts empty beside them.
+
+    Every path the TARGET declares for a key must be one the source declares
+    (Coolify's own parse of its compose) or mounts live. Declarations alone
+    would refuse a source whose row is stale — an older path the containers no
+    longer use — and live mounts alone would miss a second sighting of a volume
+    two services share; the union admits both and still catches a moved mount.
+    """
+
+    def by_key(endpoints: list[VolumeEndpoint], uuid: str) -> dict[str, set[str]]:
+        out: dict[str, set[str]] = {}
+        for e in endpoints:
+            if key := compose_volume_suffix(e.name, uuid):
+                out.setdefault(key, set()).add(e.mount_path.rstrip("/") or "/")
+        return out
+
+    known = by_key(source_eps, snapshot.uuid)
+    for key, paths in by_key(
+        await api_resources.read_volume_endpoints(
+            ctx.api, collection=snapshot.collection, uuid=snapshot.uuid
+        ),
+        snapshot.uuid,
+    ).items():
+        known.setdefault(key, set()).update(paths)
+    declared = by_key(target_eps, target_uuid)
+    moved = {
+        key: (sorted(known[key]), sorted(paths))
+        for key, paths in sorted(declared.items())
+        if key in known and not paths <= known[key]
+    }
+    if moved:
+        raise TransferError(
+            f"{snapshot.name}: the target mounts volume(s) {sorted(moved)} at a different "
+            "path than the source",
+            hint=(
+                "A service is recreated from the instance's CURRENT template catalog, and "
+                "that template has moved where these volumes are mounted since the source "
+                "was created — usually together with a new image (a major database "
+                "upgrade). Copying the bytes across would pass verification and still "
+                "start the target on an empty data directory.\n"
+                + "\n".join(f"  {k}: source {s} -> target {t}" for k, (s, t) in moved.items())
+                + "\nUpgrade the source to the current template first, or migrate this "
+                f"service by hand. {consequence}"
+            ),
+        )
+
+
 async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
     """The authoritative manifest, taken with nothing able to write.
 
@@ -1051,82 +1261,13 @@ async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
             for i in manifest.to_migrate
             if i.source_name
         ]
-        # Compose volumes pair by their uuid-stripped name suffix — the compose
-        # volume KEY — because one volume can be mounted at several different
-        # paths by several services (some behind never-running `profiles:`), so
-        # mount_path identifies nothing. Falls back to mount-path pairing when a
-        # source name does not carry the uuid prefix (a pinned external name).
-        by_suffix = snapshot.kind is ResourceKind.APP_GIT_COMPOSE and all(
-            compose_volume_suffix(e.name, snapshot.uuid) for e in source_eps
+        pairs = await _pair_volumes(
+            ctx,
+            snapshot,
+            source_eps,
+            target_uuid=target_uuid,
+            consequence="The source will be restarted and the target deleted.",
         )
-        # A dockercompose target loads its compose — and its persistent storages —
-        # via an async job at create, so /storages is empty for the first seconds.
-        # Wait for the volumes we need before pairing, or DISCOVER races the queue
-        # and reports a real volume unpairable.
-        if source_eps:
-
-            def suffix_key(e: VolumeEndpoint, uuid: str = target_uuid) -> str | None:
-                return compose_volume_suffix(e.name, uuid)
-
-            target_eps = await _await_target_volumes(
-                ctx,
-                collection=snapshot.collection,
-                target_uuid=target_uuid,
-                expected=(
-                    {s for e in source_eps if (s := compose_volume_suffix(e.name, snapshot.uuid))}
-                    if by_suffix
-                    else {e.mount_path for e in source_eps}
-                ),
-                compose_from_git=snapshot.kind is ResourceKind.APP_GIT_COMPOSE,
-                key=suffix_key if by_suffix else None,
-            )
-        else:
-            target_eps = await api_resources.read_volume_endpoints(
-                ctx.api, collection=snapshot.collection, uuid=target_uuid
-            )
-
-        # Both pairers refuse ambiguity and unpaired source volumes — data left
-        # behind if allowed through. Those refusals are diagnoses, not crashes:
-        # name both sides so the operator can see WHICH compose disagrees,
-        # instead of a raw traceback wrapped as "unexpected error in discover"
-        # (which is what this was).
-        try:
-            if not source_eps:
-                pairs = []
-            elif by_suffix:
-                pairs = pair_by_name_suffix(
-                    source_eps, target_eps, source_uuid=snapshot.uuid, target_uuid=target_uuid
-                )
-                # Target volumes with no source counterpart are legitimate here:
-                # compose volumes of profile-gated services that never ran on the
-                # source. They start empty on the target exactly as they would on
-                # the source — say so, but do not refuse.
-                paired = {p.target.name for p in pairs}
-                unpaired = sorted(e.name for e in target_eps if e.name not in paired)
-                if unpaired:
-                    log.info(
-                        "discover.target_volumes_start_empty",
-                        resource=snapshot.name,
-                        volumes=unpaired,
-                    )
-            else:
-                pairs = pair_by_mount_path(source_eps, target_eps)
-        except VolumePairingError as exc:
-            raise TransferError(
-                f"{snapshot.name}: {exc}",
-                hint=(
-                    "Volumes are paired by "
-                    + ("compose volume key" if by_suffix else "mount_path")
-                    + ", read back from what Coolify actually created on the target "
-                    "— never predicted.\n"
-                    f"Source volumes: {sorted(f'{e.name} @ {e.mount_path}' for e in source_eps)}\n"
-                    "Target declares: "
-                    f"{sorted(f'{e.name} @ {e.mount_path}' for e in target_eps) or 'nothing'}\n"
-                    "A mismatch usually means the compose at the branch HEAD no longer "
-                    "matches what the source is running. The source will be restarted "
-                    "and the target deleted."
-                ),
-            ) from exc
         ctx.volume_pairs[snapshot.uuid] = pairs
 
         pairs_recorded[snapshot.uuid] = [

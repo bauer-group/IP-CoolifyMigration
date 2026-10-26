@@ -931,9 +931,15 @@ class TestCreateTarget:
         respx_mock.get(f"{BASE}/applications/tgt1/storages").mock(
             return_value=httpx.Response(200, json={"persistent_storages": []})
         )
+        delete = respx_mock.delete(url__startswith=f"{BASE}/applications/tgt1").mock(
+            return_value=httpx.Response(200, json={"message": "queued"})
+        )
 
         with pytest.raises(TransferError, match="declares no volume for key"):
             await steps.step_create_target(ctx)
+        # REGRESSION: the saga compensates only COMPLETED steps, so a refusal
+        # inside CREATE used to strand the target its hint promised to delete.
+        assert delete.called
 
     async def test_compose_gate_matches_volume_keys_not_mount_paths(
         self, ctx: MigrationContext, respx_mock: respx.Router
@@ -968,6 +974,173 @@ class TestCreateTarget:
 
         result = await steps.step_create_target(ctx)
         assert result["target_uuids"] == {"app1": "tgt1"}
+
+    @staticmethod
+    def _service_plan() -> MigrationPlan:
+        """budibase, reduced: two volumes of one template both mount at /data."""
+
+        def item(name: str) -> VolumeItem:
+            return VolumeItem(
+                mount_class=MountClass.NAMED,
+                decision=Decision.MIGRATE,
+                reason="named volume",
+                source_name=name,
+                source_path=f"/var/lib/docker/volumes/{name}/_data",
+                mount_path="/data",
+                bytes=1024,
+            )
+
+        return _plan(
+            resources=(
+                ResourcePlan(
+                    snapshot=_snapshot(
+                        uuid="svc1",
+                        name="budibase",
+                        collection="services",
+                        kind=ResourceKind.SERVICE_TEMPLATE,
+                        engine=None,
+                        image=None,
+                        service_type="budibase",
+                    ),
+                    strategy=Strategy.COPY_DATA,
+                    manifest=VolumeManifest(items=(item("svc1_minio-data"), item("svc1_redis-data"))),
+                ),
+            )
+        )
+
+    @staticmethod
+    def _mock_service_create(
+        respx_mock: respx.Router,
+        *,
+        target_volumes: list[dict[str, str]],
+        source_volumes: list[dict[str, str]] | None = None,
+    ) -> respx.Route:
+        """CREATE for the budibase plan. Returns the target's DELETE route."""
+        respx_mock.get(f"{BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx_mock.get(f"{BASE}/projects/p1").mock(
+            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+        )
+        respx_mock.get(f"{BASE}/servers/s2/destinations").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "d1", "network": "coolify"}])
+        )
+        respx_mock.get(f"{BASE}/services/svc1").mock(
+            return_value=httpx.Response(200, json={"uuid": "svc1", "name": "budibase"})
+        )
+        respx_mock.post(f"{BASE}/services").mock(return_value=httpx.Response(201, json={"uuid": "tgt1"}))
+        respx_mock.get(f"{BASE}/services/svc1/envs").mock(return_value=httpx.Response(200, json=[]))
+        respx_mock.get(f"{BASE}/services/svc1/tags").mock(return_value=httpx.Response(200, json=[]))
+        respx_mock.get(f"{BASE}/services/svc1/storages").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "persistent_storages": source_volumes
+                    if source_volumes is not None
+                    else [
+                        {"name": "svc1_minio-data", "mount_path": "/data"},
+                        {"name": "svc1_redis-data", "mount_path": "/data"},
+                    ]
+                },
+            )
+        )
+        respx_mock.get(f"{BASE}/services/tgt1/storages").mock(
+            return_value=httpx.Response(200, json={"persistent_storages": target_volumes})
+        )
+        return respx_mock.delete(url__startswith=f"{BASE}/services/tgt1").mock(
+            return_value=httpx.Response(200, json={"message": "Service deletion request queued."})
+        )
+
+    async def test_a_service_pairs_its_volumes_by_key_before_the_stop(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """Two volumes at one path refused mount-path pairing — after the stop.
+
+        15 of the 386 v4.5.0 templates mount two volumes at one path. Paired by
+        compose volume key, they migrate; rehearsed in CREATE, a real mismatch
+        would surface while the source still serves.
+        """
+        ctx.plan = self._service_plan()
+        delete = self._mock_service_create(
+            respx_mock,
+            target_volumes=[
+                {"name": "tgt1_minio-data", "mount_path": "/data"},
+                {"name": "tgt1_redis-data", "mount_path": "/data"},
+            ],
+        )
+        result = await steps.step_create_target(ctx)
+        assert result["target_uuids"] == {"svc1": "tgt1"}
+        assert not delete.called
+
+    async def test_template_catalog_drift_refuses_before_the_stop_and_cleans_up(
+        self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The instance's catalog dropped a volume the source still has.
+
+        v4.3.10 -> v4.5.0 rewrote 95 templates. A dropped volume used to surface
+        in DISCOVER, after QUIESCE — an outage plus a rollback. Here it refuses in
+        CREATE, deletes the target it just made (the saga compensates only
+        COMPLETED steps), and does so at once: service rows are written inside
+        POST /services, so there is nothing to poll for.
+        """
+
+        async def no_polling(_seconds: float) -> None:
+            raise AssertionError("a service's storage rows are synchronous; do not poll")
+
+        monkeypatch.setattr(steps.asyncio, "sleep", no_polling)
+        ctx.plan = self._service_plan()
+        delete = self._mock_service_create(
+            respx_mock, target_volumes=[{"name": "tgt1_minio-data", "mount_path": "/data"}]
+        )
+        with pytest.raises(TransferError, match="no counterpart on the target") as exc_info:
+            await steps.step_create_target(ctx)
+        hint = exc_info.value.hint or ""
+        assert "never stopped" in hint
+        assert "template catalog" in hint
+        assert delete.called, "the half-made target must not be stranded"
+
+    async def test_a_template_that_moved_a_mount_refuses_before_the_stop(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """REVIEW: key pairing alone would copy into a volume mounted elsewhere.
+
+        opnform's template kept `postgresql-data` and moved it from
+        /var/lib/postgresql/data (postgres 16) to /var/lib/postgresql (18). Paired
+        by key, the bytes copy, VERIFY compares two identical volumes and passes,
+        and the target's database starts empty beside them.
+        """
+        ctx.plan = self._service_plan()
+        delete = self._mock_service_create(
+            respx_mock,
+            target_volumes=[
+                {"name": "tgt1_minio-data", "mount_path": "/data"},
+                {"name": "tgt1_redis-data", "mount_path": "/var/lib/redis"},
+            ],
+        )
+        with pytest.raises(TransferError, match="different path") as exc_info:
+            await steps.step_create_target(ctx)
+        hint = exc_info.value.hint or ""
+        assert "redis-data: source ['/data'] -> target ['/var/lib/redis']" in hint
+        assert delete.called
+
+    async def test_a_stale_source_row_does_not_count_as_a_move(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """The live mount agrees with the target; only an old declaration differs."""
+        ctx.plan = self._service_plan()
+        self._mock_service_create(
+            respx_mock,
+            source_volumes=[
+                {"name": "svc1_minio-data", "mount_path": "/data"},
+                {"name": "svc1_redis-data", "mount_path": "/old/path"},
+            ],
+            target_volumes=[
+                {"name": "tgt1_minio-data", "mount_path": "/data"},
+                {"name": "tgt1_redis-data", "mount_path": "/data/"},
+            ],
+        )
+        result = await steps.step_create_target(ctx)
+        assert result["target_uuids"] == {"svc1": "tgt1"}
 
     async def test_a_missing_tags_endpoint_never_fails_the_create(
         self, ctx: MigrationContext, respx_mock: respx.Router
@@ -1822,6 +1995,68 @@ class TestDiscoverPairing:
                 "target": "tgt1_uploads",
                 "mount_path": "/var/www/html/wp-content/uploads",
             },
+        ]
+
+    async def test_service_volumes_pair_by_key_too(
+        self, ctx: MigrationContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Service volumes are ``{uuid}_{key}``; mount_path pairing refused these.
+
+        Before 2026-10-26 services paired on mount_path alone, so a template with
+        two volumes at /data (budibase, plane, posthog, ...) was refused here —
+        after the source had already been stopped.
+        """
+        from bg_coolify_migrate.domain.manifest import DockerMount
+
+        manifest = VolumeManifest(
+            items=tuple(
+                VolumeItem(
+                    mount_class=MountClass.NAMED,
+                    decision=Decision.MIGRATE,
+                    reason="named volume",
+                    source_name=name,
+                    source_path=f"/var/lib/docker/volumes/{name}/_data",
+                    mount_path="/data",
+                    bytes=1,
+                )
+                for name in ("svc1_minio-data", "svc1_redis-data")
+            )
+        )
+        ctx.plan = _plan(
+            resources=(
+                ResourcePlan(
+                    snapshot=_snapshot(
+                        uuid="svc1",
+                        name="budibase",
+                        collection="services",
+                        kind=ResourceKind.SERVICE_TEMPLATE,
+                        engine=None,
+                        image=None,
+                    ),
+                    strategy=Strategy.COPY_DATA,
+                    manifest=manifest,
+                ),
+            )
+        )
+        ctx.target_uuids = {"svc1": "tgt1"}
+        ctx.pre_stop_mounts = {
+            "svc1": [DockerMount(container="minio", type="volume", name="svc1_minio-data", destination="/data")]
+        }
+        object.__setattr__(ctx.settings, "target_storage_timeout", 0.0)
+
+        async def fake_manifest(host, *, mounts, api_storages, uuid, measure):  # type: ignore[no-untyped-def]
+            return manifest
+
+        async def fake_read(api, *, collection, uuid):  # type: ignore[no-untyped-def]
+            return [VolumeEndpoint("tgt1_redis-data", "/data"), VolumeEndpoint("tgt1_minio-data", "/data")]
+
+        monkeypatch.setattr(steps, "build_manifest", fake_manifest)
+        monkeypatch.setattr("bg_coolify_migrate.api.resources.read_volume_endpoints", fake_read)
+
+        result = await steps.step_discover(ctx)
+        assert [(p["source"], p["target"]) for p in result["volume_pairs"]["svc1"]] == [
+            ("svc1_minio-data", "tgt1_minio-data"),
+            ("svc1_redis-data", "tgt1_redis-data"),
         ]
 
 
