@@ -1,6 +1,47 @@
 # CHANGELOG
 
 
+## v2.9.0 (2026-10-26)
+
+### Bug Fixes
+
+- **api**: Aligned create requests with Coolify 4.5
+  ([`c1086ac`](https://github.com/bauer-group/IP-CoolifyMigration/commit/c1086ac1d0bc708dfecf889e6a044dda99b7039d))
+
+- **api**: Corrected the 403 hints and token docs
+  ([`a150525`](https://github.com/bauer-group/IP-CoolifyMigration/commit/a150525277d78df5293ec19ddafd5129b253fc40))
+
+- **cli**: Extended the validated range to 4.5.0
+  ([`b65f22d`](https://github.com/bauer-group/IP-CoolifyMigration/commit/b65f22d7df1849a402c0c6acbd29134e88957c74))
+
+- **engine**: Rehearsed service pairing pre-stop
+  ([`463ba53`](https://github.com/bauer-group/IP-CoolifyMigration/commit/463ba53fdd2e08f6e0acfc3b1e778874cca256c0))
+
+### Chores
+
+- **ci**: Updated actions/setup-python to v7
+  ([#4](https://github.com/bauer-group/IP-CoolifyMigration/pull/4),
+  [`43d8b6b`](https://github.com/bauer-group/IP-CoolifyMigration/commit/43d8b6b35884867a70e6ed2486dd4e5e5c1284fd))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`6db64ff`](https://github.com/bauer-group/IP-CoolifyMigration/commit/6db64ffcb7a7b3cc03e8ce4a0c420025897f046b))
+
+- **agents**: Recorded the Coolify 4.5.0 audit
+  ([`70b057c`](https://github.com/bauer-group/IP-CoolifyMigration/commit/70b057c7f9864423e2b80f2b4bc9ea8d35288a0d))
+
+### Features
+
+- **plan**: Refused what the API cannot recreate
+  ([`b788a8c`](https://github.com/bauer-group/IP-CoolifyMigration/commit/b788a8c1f780069949ac4284e70065d5e7133597))
+
+### Testing
+
+- **e2e**: Made the rig run against Coolify 4.5
+  ([`ff5cb78`](https://github.com/bauer-group/IP-CoolifyMigration/commit/ff5cb7870da8fd4758b19752186ed4ed7ef6f456))
+
+
 ## v2.8.4 (2026-10-21)
 
 ### Bug Fixes
