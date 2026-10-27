@@ -614,25 +614,19 @@ class TestReleaseSourcePins:
         assert [c for c in _src(ctx).commands if c.startswith("docker rm")] == []
 
 
-async def test_rollback_unpins_source_after_domain_restore(
+async def test_rollback_unpins_source_after_restart_and_delete(
     ctx: MigrationContext, respx_mock: respx.Router
 ) -> None:
-    """The domains go back before the restart; the unpin comes after everything.
+    """The unpin comes after everything: the restart and the target delete.
 
-    /restart redeploys and builds its proxy labels from the application row at
-    job time; the domain restore is a PATCH, so it must land first. The unpin
-    waits for the restarted source to remount its volumes, so it runs last —
-    after the restart and the target delete.
+    It waits for the restarted source to remount its volumes; nothing else may
+    wait behind that (the domain restore, for a resource with domains, runs
+    before the restart - tests/test_rollback_domains_engine.py).
     """
     source = _src(ctx)
     source.add("src-pin", state="created", labels=_labels(pins.SOURCE), volumes=(VOL,))
     ctx.journal.append(
-        "step_completed",
-        state="create_target",
-        detail={
-            "target_uuids": {"db1": "db2"},
-            "parked_domains": {"db1": {"domains": "https://x.example"}},
-        },
+        "step_completed", state="create_target", detail={"target_uuids": {"db1": "db2"}}
     )
     ctx.journal.append("step_completed", state="quiesce", detail={})
     order: list[str] = []
@@ -651,7 +645,6 @@ async def test_rollback_unpins_source_after_domain_restore(
 
     respx_mock.post(f"{BASE}/databases/db1/restart").mock(side_effect=restart)
     respx_mock.delete(f"{BASE}/databases/db2").mock(side_effect=record("delete"))
-    respx_mock.patch(f"{BASE}/databases/db1").mock(side_effect=record("restore"))
     source.on_command = lambda c: order.append("unpin") if c.startswith("docker rm ") else None
 
     result = await Saga(
@@ -662,7 +655,7 @@ async def test_rollback_unpins_source_after_domain_restore(
     ).rollback()
 
     assert result.outcome is Outcome.ROLLED_BACK
-    assert order == ["restore", "restart", "delete", "unpin"]
+    assert order == ["restart", "delete", "unpin"]
 
 
 async def test_a_kept_pin_reaches_the_report_and_the_outcome_stays_rolled_back(

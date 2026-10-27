@@ -137,11 +137,12 @@ async def _resource_on(
 
 # ── the source's domain survives a rollback ──────────────────────────────────
 #
-# CREATE parks the source's custom domain (old-<tag>.<host>) so the target can
-# claim it. A domain PATCH only writes Coolify's database; the proxy labels are
-# baked into the container at deploy time, and the rollback's /restart IS a
-# deploy. Restarting before the restore brought the source back answering only
-# on its parked host. The unit respx test (test_rollback_domains_engine.py) is
+# The source keeps its custom domain until FINALIZE releases it (make-before-
+# break: the target claims it at CREATE). A domain PATCH only writes Coolify's
+# database; the proxy labels are baked into the container at deploy time, and
+# the rollback's /restart IS a deploy. Restarting before the restore brought a
+# released source back without its host (and, up to 2.9, a parked one back on
+# its old-<tag>. host). The unit respx test (test_rollback_domains_engine.py) is
 # the regression lock on call ORDER; this confirms on 4.5.0 that the order gives
 # the restarted container the right labels.
 #
@@ -246,7 +247,7 @@ async def _assert_source_serves_its_domain(
     *,
     tag: str,
 ) -> None:
-    """A NEW running source container carries Host(<custom>) and no parked host."""
+    """A NEW running source container carries Host(<custom>) and no old-<tag>. host."""
     import asyncio
 
     full = await api.get_resource("applications", app["app_uuid"])
@@ -270,8 +271,7 @@ async def _assert_source_serves_its_domain(
         f"the restarted source has no router for {app['host']}: {values}"
     )
     assert not any(f"old-{tag}." in v for v in values), (
-        "the restarted source still carries its PARKED host - the restart ran "
-        "before the domain restore"
+        "the restarted source carries an old-<tag>. host - something parked it"
     )
 
 
@@ -330,10 +330,11 @@ async def test_rollback_after_rename_restores_domains(
 ) -> None:
     """Run to DONE with RENAME, then roll back: name AND blanked domains come back.
 
-    FINALIZE(rename) blanks the source's domains (release_fqdn sends
-    ``{"domains": ""}``, which 4.5 accepts and stores as null), so this is also
-    the first live run of that PATCH. RENAME only — a rollback after DELETE is
-    refused, because the target is then the only copy.
+    FINALIZE(rename) releases the source's custom domains as its last step
+    (``{"domains": ""}`` for an app with only a custom host, which 4.5 accepts and
+    stores as null), so this is also the first live run of that PATCH. RENAME
+    only — a rollback after DELETE is refused, because the target is then the
+    only copy.
     """
     async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source_host:
         plan = await build_plan(

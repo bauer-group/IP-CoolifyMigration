@@ -86,8 +86,7 @@ names (usually a redeploy of the source since the plan), then run again.
 
 Working as designed. It is a resumable stop, not a failure — the target is created
 and its data is verified. The gate checks the domains the **target** will serve
-(the source's may have been parked to free a custom domain for the target) and
-compares them against the servers' **resolved** addresses (Coolify's `ip` is often
+(it claimed the source's custom domains at create) and compares them against the servers' **resolved** addresses (Coolify's `ip` is often
 a hostname). It fires for a **custom domain** (`shop.example.com`) that still
 points at the source. Server-bound URLs under a server's wildcard
 (`pdf-tool.app.0046-20…`) are rewritten onto the target's wildcard automatically
@@ -261,11 +260,14 @@ coolify-migrate run ... --delete-previews
 
 ## "still answers on old-xxxxxx.…, parked by an earlier migration"
 
+(Versions up to 2.9 parked a source's custom domains at CREATE; current versions
+never touch the source before FINALIZE.)
+
 An earlier migration of this project freed the source's custom domain for its
 target by renaming it to `old-<tag>.<host>` in Coolify — and its rollback could
 not give it back. The tag is the same for every run of this project and
-environment, so a new run would read the parked host as the real one, park it a
-second time and lose the real domain from every record.
+environment, so a new run would read the parked host as the real one, carry it
+to the target and lose the real domain from every record.
 
 Set the domain back to the host the message names (without the `old-…` prefix)
 on the source in Coolify, redeploy the source, then plan again.
@@ -274,8 +276,9 @@ on the source in Coolify, redeploy the source, then plan again.
 
 Coolify >= 4.4 moves the `:port` of a compose domain into a hidden column that
 no API read returns, and routes the domain there. The target would route it to
-the service's first exposed port instead, and parking the source's domains would
-erase the port on the source as well — a rollback could not bring it back.
+the service's first exposed port instead, and releasing the source's domains at
+finalize would erase the port on the source as well — a rollback after finalize
+could not bring it back.
 
 Make the port the service's **first** `expose:` entry in the compose (in git),
 redeploy the source so Coolify regenerates its labels, then migrate. Otherwise
@@ -332,7 +335,7 @@ General tab.
 
 The same check runs again when the target is created, so a server attached
 between plan and run stops the migration before anything of that application is
-parked or created; whatever the run created before it is deleted again.
+created; whatever the run created before it is deleted again.
 
 ## "TLS is on for this database … the target starts WITHOUT TLS"
 
@@ -430,7 +433,8 @@ cannot obtain a certificate for them.
 ### "creating the target failed, and undoing it did not complete"
 
 CREATE failed before anything was stopped, then could not fully undo itself —
-a target is left on the new server, or the source's domains are still parked.
+a target is left on the new server (kept while it holds custom domains its
+source does not, or because its delete failed).
 The source never stopped and is still serving. Fix what the message names (often
 the same outage that failed the create), then let the tool finish the undo:
 
@@ -444,9 +448,9 @@ deleted.
 
 ### `domains NOT restored: shop -> https://shop.example.com (...)`
 
-The rollback could not give the source its own domains back. Everything else
-still ran — a stopped source was restarted — so it is up, but it answers only on
-its parked `old-<tag>.` hosts (or, after a finalize with `rename`, on none).
+The rollback could not give the source its own domains back — they were
+released at FINALIZE. Everything else still ran — a stopped source was
+restarted — so it is up, but without its custom hosts.
 
 Set exactly the listed domains back on the source in Coolify, then **Restart**
 it: Coolify writes a domain change to its database only and bakes the proxy
@@ -455,7 +459,30 @@ domain live again.
 
 `held by <name>/<uuid>, which this migration did not create - not forcing` means
 another resource claims the same domain. We override a conflict only with this
-migration's own targets; anything else is yours to decide.
+migration's own sources and targets; anything else is yours to decide.
+
+### `target(s) KEPT, holding custom domains their source does not hold`
+
+A rollback deletes a target that holds custom domains only once its source holds
+them again: deleting the last holder makes Coolify (4.4+) delete a DNS record it
+manages at Cloudflare, for good. The target is stopped and harmless. Give the
+source its domains back (the message above it names them), then run
+`coolify-migrate rollback <id>` again — it deletes the target now.
+
+### `the target cannot claim its domain(s), held elsewhere: ...`
+
+CREATE refused before anything was stopped: another resource of the team — or
+the Coolify instance's own URL — holds a custom domain of the source. The message
+names each holder by type and uuid (an orphaned target of an earlier run carries
+the source's name, so the uuid is what tells them apart). Free the domain there,
+then migrate again.
+
+### `the target does not hold [...] after claiming its domains`
+
+Coolify accepted the domain update but did not keep it: the target server's
+proxy is off (Coolify ignores domains then), or a compose service of that name
+is missing from the target's compose. The source was never stopped; the target
+is deleted. Fix the target server or the compose, then migrate again.
 
 ## Scheduled tasks
 
@@ -562,11 +589,11 @@ and the source keeps serving.
   and the template now names those containers differently, so their domains
   would be served by nothing. Migrate the service by hand, or re-create the
   source from the current template first.
-- **"the target cannot claim its domain(s): Domain ... is already in use by
-  ..."** — another resource of the team, or the Coolify instance itself, holds a
-  hostname the service serves. The tool forces a domain away only from the
-  source service itself, never from anything else. Free it on the resource the
-  message names, then run again.
+- **"the target cannot claim its domain(s), held elsewhere: ..."** — another
+  resource of the team, or the Coolify instance itself, holds a hostname the
+  service serves. The tool forces a domain away only from this migration's own
+  sources and targets, never from anything else. Free it on the resource the
+  message names (by type and uuid), then run again.
 
 ## `422 This field is not allowed`
 

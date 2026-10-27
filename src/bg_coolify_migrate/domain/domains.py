@@ -1,15 +1,32 @@
-"""Parking a source's domains, and giving them back.
+"""A source's domains on their way to the target — and back on a rollback.
 
 PURE module: no IO.
 
-A custom domain (``shop.example.com``) is the same on source and target, and
-Coolify 409s a create that asks for a domain another resource holds. So CREATE
-parks the source's custom hosts under an ``old-<tag>.`` prefix — in Coolify's
-database only — and journals the body that restores them. Everything that
-decides *what* is parked, *what* a restore sends and *when* a restore may
-override a conflict lives here; ``engine/`` only performs it.
+Make-before-break, for applications and services alike
+-------------------------------------------------------
+A custom domain (``shop.example.com``) is the same on source and target. The
+source keeps holding it until FINALIZE; the TARGET claims it first, with
+``force_domain_override`` sent only when every holder Coolify names in the 409
+is this migration's own (:func:`only_own_holders`). The source lets go only at
+FINALIZE, as its last mutation, and a rollback after that gives it back BEFORE
+the target that holds it is deleted.
 
-Two upstream facts make the restore's timing matter (verified v4.1.2-v4.5.0):
+Why the order is load-bearing (Coolify managed DNS, v4.4.0..v4.5.0): removing a
+hostname from a resource queues a release job (ApplicationsController
+v4.4.0:3252,3595, v4.5.0:3361,3784 -> ManagedDnsRecordCleanup::
+queueReleaseOfRemovedHostnames v4.4.0/v4.5.0:76-93), and so does deleting a
+resource that references a record (Traits/ReleasesManagedDnsRecords). The job
+DELETES a Coolify-owned Cloudflare record when no live application, preview or
+service application of the team HOLDS the hostname in ``fqdn`` or
+``docker_compose_domains`` at the moment it runs, and only re-references it
+otherwise (ManagedDnsRecordCleanup v4.4.0:229-285, v4.5.0:294-350; holders
+v4.5.0:358-398). Parking the source before the target held the host — what
+this tool did up to 2.9 — raced that job and could delete the record of a live
+site before QUIESCE. With the hand-over below some live resource holds every
+custom host at every instant, so Coolify can only ever re-reference the record,
+never delete it.
+
+Two upstream facts make a rollback's restore order matter as well (v4.1.2-v4.5.0):
 
 * A domain PATCH only writes the database. It deploys nothing unless
   ``instant_deploy`` is sent (ApplicationsController v4.1.2:2660-2680,
@@ -18,21 +35,19 @@ Two upstream facts make the restore's timing matter (verified v4.1.2-v4.5.0):
 * Every deploy, ``/restart`` included, bakes the stored labels into the new
   container (ApplicationDeploymentJob v4.1.2:3099-3113, v4.5.0:4118-4132).
 
-So a source restarted while its row still holds the parked hosts comes back on
-``old-<tag>.`` hosts only, and no later PATCH changes the running container.
-The rollback planner therefore restores the domains BEFORE it restarts the
-source (``statemachine._PRECEDENCE``).
+So the rollback planner restores the domains BEFORE it restarts the source
+(``statemachine._PRECEDENCE``), and deletes a target holding custom hosts only
+once its source holds them again.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Collection, Mapping
-from dataclasses import dataclass
+from collections.abc import Collection, Iterable, Mapping
 from typing import Any
 
-from bg_coolify_migrate.dns.extract import normalise_host
+from bg_coolify_migrate.dns.extract import is_generated, normalise_host
 from bg_coolify_migrate.dns.wildcard import under_wildcard
 from bg_coolify_migrate.domain.kinds import ResourceKind
 from bg_coolify_migrate.domain.plan import ResourceSnapshot
@@ -47,7 +62,8 @@ NOINDEX_DOMAINS_SINCE: Version = (4, 3, 0)
 def parking_tag(project: str, environment: str) -> str:
     """The ``<tag>`` in ``old-<tag>.<host>``: six hex digits of the project/env.
 
-    The same digest ends every migration id of this project and environment
+    Versions up to 2.9 parked a source's custom hosts under this prefix. The same
+    digest ends every migration id of this project and environment
     (``runner.make_migration_id``), and it is deliberately STABLE across runs:
     that is what lets the planner recognise hosts an earlier run parked and
     never gave back (:func:`leftover_parking_refusals`).
@@ -80,99 +96,295 @@ def compose_domains(raw: object) -> dict[str, str]:
     return out
 
 
-def park_hosts(domain_str: object, *, source_wildcard: str | None, tag: str) -> str:
-    """Rename the CUSTOM hosts in a comma-separated domain string.
+# ── which hosts are contested ────────────────────────────────────────────────
 
-    A custom host (``speakup.bauer-group.com``) is the same on source and target,
-    so creating the target 409s while the source still holds it. Prefixing an
-    ``old-<tag>.`` marker frees the real host for the target; the source keeps
-    serving the real one until quiesce (we do not redeploy it). Server-bound hosts
-    are remapped onto the target's wildcard and never collide, so they pass
-    through untouched.
+
+def _parts(domain_str: object) -> list[str]:
+    return [p.strip() for p in str(domain_str or "").split(",") if p.strip()]
+
+
+def is_custom(host: str, *, source_wildcard: str | None) -> bool:
+    """A host source and target would BOTH hold: neither generated nor server-bound.
+
+    A server-bound host (under the source server's wildcard) is rewritten onto
+    the target's wildcard, and a generated one (``*.sslip.io``) names the source
+    server's IP and is not carried — so neither is ever claimed by both sides.
     """
-    if not domain_str:
-        return ""
+    return not is_generated(host) and not under_wildcard(host, source_wildcard)
+
+
+def custom_hosts(domain_str: object, *, source_wildcard: str | None) -> list[str]:
+    """The custom hosts in a comma-separated domain string, deduplicated, in order."""
     out: list[str] = []
-    for part in str(domain_str).split(","):
-        stripped = part.strip()
-        if not stripped:
-            continue
-        host = normalise_host(stripped)
-        if host and not under_wildcard(host, source_wildcard):
-            out.append(f"https://old-{tag}.{host}")
-        else:
-            out.append(stripped)
-    return ",".join(out)
+    for part in _parts(domain_str):
+        host = normalise_host(part)
+        if host and is_custom(host, source_wildcard=source_wildcard):
+            out.append(host)
+    return list(dict.fromkeys(out))
 
 
-@dataclass(frozen=True)
-class DomainParking:
-    """What CREATE sends to free a source's domains, and what gives them back."""
-
-    restore: dict[str, Any] | None
-    """The body that restores the source's ORIGINAL domains. ``None`` only when
-    the source has no domains at all. Present even when nothing is parked:
-    FINALIZE(rename) blanks the domains on success, and a later rollback needs
-    the originals."""
-
-    park: dict[str, Any] | None
-    """The body that parks the custom hosts. ``None`` when nothing would change
-    (only server-bound hosts, which never collide)."""
+def without_custom(domain_str: object, *, source_wildcard: str | None) -> str:
+    """``domain_str`` without its custom hosts — server-bound and generated parts kept."""
+    return ",".join(
+        part
+        for part in _parts(domain_str)
+        if not ((host := normalise_host(part)) and is_custom(host, source_wildcard=source_wildcard))
+    )
 
 
-def domain_parking(
+def without_generated(domain_str: object) -> str:
+    """``domain_str`` without Coolify-generated (sslip.io-style) hosts.
+
+    A generated host is ``{name}-{uuid}.{server-ip}.sslip.io`` (shared.php
+    v4.5.0:1494-1522): it names the SOURCE's uuid and IP, so on the target it
+    would route a hostname that resolves to the source. The target generates
+    its own instead.
+    """
+    return ",".join(
+        part for part in _parts(domain_str) if not ((host := normalise_host(part)) and is_generated(host))
+    )
+
+
+def resource_custom_hosts(
+    snapshot: ResourceSnapshot, source: Mapping[str, Any], *, source_wildcard: str | None
+) -> list[str]:
+    """Every custom host an APPLICATION source holds (fqdn or compose domains)."""
+    if snapshot.kind is ResourceKind.APP_GIT_COMPOSE:
+        values: Iterable[str] = compose_domains(source.get("docker_compose_domains")).values()
+    else:
+        values = [str(source.get("fqdn") or "")]
+    out: list[str] = []
+    for value in values:
+        out.extend(custom_hosts(value, source_wildcard=source_wildcard))
+    return list(dict.fromkeys(out))
+
+
+# ── what a resource holds ────────────────────────────────────────────────────
+
+
+def held_hosts(resource: Mapping[str, Any]) -> set[str]:
+    """Every host a resource GET says it holds — what Coolify's holder check reads.
+
+    ``fqdn`` and ``docker_compose_domains`` of an application, the ``url`` /
+    ``fqdn`` of each of a service's applications (ManagedDnsRecordCleanup
+    ::hostnamesOf v4.5.0:378-398 reads exactly these columns).
+    """
+    hosts: set[str] = set()
+    values = [str(resource.get("fqdn") or ""), *compose_domains(resource.get("docker_compose_domains")).values()]
+    for app in resource.get("applications") or []:
+        if isinstance(app, Mapping):
+            values.append(str(app.get("url") or ""))
+            values.append(str(app.get("fqdn") or ""))
+    for value in values:
+        for part in _parts(value):
+            host = normalise_host(part)
+            if host:
+                hosts.add(host)
+    return hosts
+
+
+def body_hosts(body: Mapping[str, Any]) -> list[str]:
+    """Every host a journalled restore body names, deduplicated, in order."""
+    values: list[str] = []
+    if "domains" in body:
+        values.append(str(body.get("domains") or ""))
+    for key, field in (("docker_compose_domains", "domain"), ("urls", "url")):
+        entries = body.get(key)
+        if isinstance(entries, list):
+            values.extend(str(e.get(field) or "") for e in entries if isinstance(e, Mapping))
+    out: list[str] = []
+    for value in values:
+        out.extend(h for h in (normalise_host(p) for p in _parts(value)) if h)
+    return list(dict.fromkeys(out))
+
+
+def missing_custom_hosts(
+    body: Mapping[str, Any], resource: Mapping[str, Any], *, source_wildcard: str | None
+) -> list[str]:
+    """The custom hosts of a restore body that ``resource`` does NOT hold now."""
+    held = held_hosts(resource)
+    return [
+        h
+        for h in body_hosts(body)
+        if is_custom(h, source_wildcard=source_wildcard) and h not in held
+    ]
+
+
+# ── restoring ────────────────────────────────────────────────────────────────
+
+
+def restore_body(
     snapshot: ResourceSnapshot,
     source: Mapping[str, Any],
     *,
-    source_wildcard: str | None,
-    tag: str,
     version: Version | None = None,
-) -> DomainParking:
-    """Decide the park and restore bodies for one source resource.
+) -> dict[str, Any] | None:
+    """The body that gives an APPLICATION back its original domains, or ``None``.
 
-    ``source`` is the resource GET. A dockercompose app carries its domains per
-    compose service (``docker_compose_domains``; its ``domains`` field 422s),
-    everything else in ``fqdn``. Services and databases have no top-level fqdn,
-    so they are neither parked nor restored here.
+    Journalled by CREATE before any write for the resource. Before FINALIZE the
+    source never lost a host, so a rollback finds nothing to send
+    (:func:`restore_patch`); after FINALIZE released its custom hosts this is
+    what puts them back. ``source`` is the resource GET: a dockercompose app
+    carries its domains per compose service (``docker_compose_domains``; its
+    ``domains`` field 422s), every other application in ``fqdn``. Services and
+    databases have no top-level fqdn — a service's body is built from its
+    sub-applications (``api/resources.service_restore_body``).
 
-    The restore body also carries ``noindex_domains`` when the source flags any
-    (Coolify >= 4.3.0). Parking changes the fqdn, and the save hook's
+    The body also carries ``noindex_domains`` when the source flags any (Coolify
+    >= 4.3.0). The release changes the fqdn, and the save hook's
     ``syncNoindexDomains`` drops the flags of domains the app no longer has
     (Application.php v4.3.0:280, HasNoindexDomains v4.3.0:49), so restoring the
-    domains alone would bring them back indexable. The update applies the flags AFTER the fqdn and keeps only those
-    for domains the app then has, so one PATCH restores both.
+    domains alone would bring them back indexable. The update applies the flags
+    AFTER the fqdn and keeps only those for domains the app then has, so one
+    PATCH restores both.
     """
-    restore: dict[str, Any]
-    park: dict[str, Any] | None
+    body: dict[str, Any]
     if snapshot.kind is ResourceKind.APP_GIT_COMPOSE:
         parsed = compose_domains(source.get("docker_compose_domains"))
         if not parsed:
-            return DomainParking(restore=None, park=None)
-        original = [{"name": name, "domain": domain} for name, domain in parsed.items()]
-        parked = [
-            {"name": name, "domain": park_hosts(domain, source_wildcard=source_wildcard, tag=tag)}
-            for name, domain in parsed.items()
-        ]
-        restore = {"docker_compose_domains": original}
-        park = {"docker_compose_domains": parked} if parked != original else None
+            return None
+        body = {"docker_compose_domains": [{"name": n, "domain": d} for n, d in parsed.items()]}
+    elif snapshot.collection == "applications":
+        original = str(source.get("fqdn") or "")
+        if not original:
+            return None
+        body = {"domains": original}
     else:
-        original_fqdn = str(source.get("fqdn") or "")
-        if not original_fqdn:
-            return DomainParking(restore=None, park=None)
-        parked_fqdn = park_hosts(original_fqdn, source_wildcard=source_wildcard, tag=tag)
-        restore = {"domains": original_fqdn}
-        park = {"domains": parked_fqdn} if parked_fqdn != original_fqdn else None
-
+        return None
     noindex = _noindex_domains(source.get("noindex_domains"))
     if noindex and at_least(version, NOINDEX_DOMAINS_SINCE):
-        restore["noindex_domains"] = noindex
-    return DomainParking(restore=restore, park=park)
+        body["noindex_domains"] = noindex
+    return body
 
 
 def _noindex_domains(raw: object) -> list[str]:
     if not isinstance(raw, list):
         return []
     return [d for d in raw if isinstance(d, str) and d.strip()]
+
+
+def url_key(value: object) -> tuple[str, ...]:
+    """A URL list in comparable form: Coolify lowercases and strips the slash."""
+    return tuple(sorted(p.rstrip("/").lower() for p in _parts(value)))
+
+
+def restore_patch(body: Mapping[str, Any], current: Mapping[str, Any]) -> dict[str, Any] | None:
+    """What an application's restore must PATCH, or ``None`` when nothing differs.
+
+    ``current`` is the source's GET. Not writing when the source already holds
+    its domains matters: before FINALIZE that is every rollback, and a PATCH
+    would queue Coolify's release machinery for nothing (and, on a live source,
+    re-render its labels). The whole journalled body goes out once anything
+    differs — the noindex flags ride along.
+    """
+    if "domains" in body:
+        if url_key(body.get("domains")) == url_key(current.get("fqdn")):
+            return None
+        return dict(body)
+    entries = body.get("docker_compose_domains")
+    if isinstance(entries, list):
+        now = compose_domains(current.get("docker_compose_domains"))
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            if url_key(entry.get("domain")) != url_key(now.get(str(entry.get("name")), "")):
+                return dict(body)
+        return None
+    return None
+
+
+def restore_summary(body: Mapping[str, Any]) -> str:
+    """The domains a restore body asks for, as one line an operator can retype.
+
+    Domains are not secrets, and the operator needs exactly these to set them
+    back by hand when the restore fails.
+    """
+    if "domains" in body:
+        return str(body.get("domains") or "")
+    for key in ("docker_compose_domains", "urls"):
+        entries = body.get(key)
+        if isinstance(entries, list):
+            return ", ".join(
+                f"{e.get('name')}={e.get('domain') or e.get('url') or ''}"
+                for e in entries
+                if isinstance(e, dict)
+            )
+    return "?"
+
+
+# ── conflicts ────────────────────────────────────────────────────────────────
+
+
+def _conflicts(conflict_body: object) -> list[Any] | None:
+    if not isinstance(conflict_body, dict):
+        return None
+    conflicts = conflict_body.get("conflicts")
+    return conflicts if isinstance(conflicts, list) else None
+
+
+def only_own_holders(conflict_body: object, own_uuids: Collection[str]) -> bool:
+    """Whether a domain 409 may be retried with ``force_domain_override``.
+
+    The ONE rule for every claim and every restore: only when EVERY holder
+    Coolify names is this migration's own — the plan's source resources, the
+    sub-applications of its source services, the targets this run created and
+    their sub-applications. The conflict check is team-wide and excludes only
+    the resource being updated (domains.php v4.1.2:142-184, v4.5.0:250-310), so a
+    target claiming its source's host 409s on the source, and a source taking
+    its host back 409s on the target. Overriding THOSE is the hand-over.
+
+    Anything else is not ours to take. A third-party resource, the instance's own
+    fqdn (``resource_uuid`` null), or a body we cannot read means a real
+    ambiguity, and the operator decides. A service conflict names the
+    ServiceApplication's uuid, not the service's (v4.5.0:304-310), which is why
+    sub-application uuids belong in ``own_uuids``.
+    """
+    conflicts = _conflicts(conflict_body)
+    if not conflicts:
+        return False
+    for conflict in conflicts:
+        if not isinstance(conflict, dict):
+            return False
+        holder = conflict.get("resource_uuid")
+        if not isinstance(holder, str) or holder not in own_uuids:
+            return False
+    return True
+
+
+def conflict_holders(conflict_body: object) -> list[str]:
+    """``name/uuid`` of every resource a 409 names, for the operator."""
+    out: list[str] = []
+    for conflict in _conflicts(conflict_body) or []:
+        if isinstance(conflict, dict):
+            out.append(f"{conflict.get('resource_name')}/{conflict.get('resource_uuid')}")
+    return out
+
+
+def foreign_holders(conflict_body: object, own_uuids: Collection[str]) -> list[str]:
+    """The holders a 409 names that are NOT ours, each with its type and uuid.
+
+    The message must let an operator tell a stray resource from their own
+    source: a service conflict reads "already in use by service 'NAME'" and an
+    orphaned target carries the source's NAME, so the uuid is what tells them
+    apart. A holder Coolify did not identify (the instance fqdn) says so.
+    """
+    out: list[str] = []
+    for conflict in _conflicts(conflict_body) or []:
+        if not isinstance(conflict, dict):
+            continue
+        holder = conflict.get("resource_uuid")
+        if isinstance(holder, str) and holder in own_uuids:
+            continue
+        domain = conflict.get("domain") or "?"
+        if not isinstance(holder, str) or not holder:
+            out.append(f"{domain}: the Coolify instance itself (its own fqdn)")
+            continue
+        kind = conflict.get("resource_type") or "resource"
+        out.append(f"{domain}: {kind} {conflict.get('resource_name')!r} (uuid {holder})")
+    return out
+
+
+# ── leftovers of the old parking ─────────────────────────────────────────────
 
 
 def leftover_parked_hosts(fqdn: object, compose_domains_raw: object, tag: str) -> list[str]:
@@ -195,12 +407,12 @@ def leftover_parked_hosts(fqdn: object, compose_domains_raw: object, tag: str) -
 def leftover_parking_refusals(source: Mapping[str, Any], *, name: str, tag: str) -> list[str]:
     """Refuse a source whose domains an earlier migration parked and never gave back.
 
-    Not a judgement call. The tag is stable per project/environment, so a run
-    would read ``old-<tag>.shop`` as the source's domain: it would park it again
-    (``old-<tag>.old-<tag>.shop``), journal the PARKED host as the one to
-    restore, and create the target on it — the real domain then exists in no
-    record this tool can see. Checks applications (``fqdn``, compose domains)
-    and a service's applications alike.
+    Versions up to 2.9 parked a source's custom hosts under ``old-<tag>.`` at
+    CREATE. Not a judgement call: the tag is stable per project/environment, so a
+    run now would read ``old-<tag>.shop`` as the source's domain, carry the
+    PARKED host to the target and journal it as the one to restore — the real
+    domain then exists in no record this tool can see. Checks applications
+    (``fqdn``, compose domains) and a service's applications alike.
     """
     found = leftover_parked_hosts(source.get("fqdn"), source.get("docker_compose_domains"), tag)
     for app in source.get("applications") or []:
@@ -218,74 +430,11 @@ def leftover_parking_refusals(source: Mapping[str, Any], *, name: str, tag: str)
         f"{name} still answers on {', '.join(dict.fromkeys(found))}, parked by an earlier "
         f"migration of this project that never gave it back. Set its domain back to "
         f"{', '.join(dict.fromkeys(real))} in Coolify and redeploy, then migrate — a run "
-        "now would park the parked host again and lose the real one."
+        "now would carry the parked host to the target and lose the real one."
     ]
 
 
-# ── restoring ────────────────────────────────────────────────────────────────
-
-
-def may_force_domain_restore(conflict_body: object, own_uuids: Collection[str]) -> bool:
-    """Whether a restore that 409'd may be retried with ``force_domain_override``.
-
-    Only when EVERY holder Coolify names is a resource this migration created.
-    The conflict check is team-wide and excludes only the resource being updated
-    (domains.php v4.1.2:142-184, v4.5.0:250-310), so a target that still exists
-    — or, before v4.3.11, one whose DELETE is still queued — makes the source's
-    own restore 409. Overriding THAT is correct: the domain is the source's, and
-    the target is being torn down.
-
-    Anything else is not ours to take. A third-party resource, the instance's own
-    fqdn (``resource_uuid`` null), or a body we cannot read means a real
-    ambiguity, and the operator decides. A service conflict names the
-    ServiceApplication's uuid, not the service's (v4.5.0:304-310), so callers
-    include target services' sub-application uuids in ``own_uuids``.
-    """
-    if not isinstance(conflict_body, dict):
-        return False
-    conflicts = conflict_body.get("conflicts")
-    if not isinstance(conflicts, list) or not conflicts:
-        return False
-    for conflict in conflicts:
-        if not isinstance(conflict, dict):
-            return False
-        holder = conflict.get("resource_uuid")
-        if not isinstance(holder, str) or holder not in own_uuids:
-            return False
-    return True
-
-
-def conflict_holders(conflict_body: object) -> list[str]:
-    """``name/uuid`` of every resource a 409 names, for the operator."""
-    if not isinstance(conflict_body, dict):
-        return []
-    conflicts = conflict_body.get("conflicts")
-    if not isinstance(conflicts, list):
-        return []
-    out: list[str] = []
-    for conflict in conflicts:
-        if isinstance(conflict, dict):
-            out.append(f"{conflict.get('resource_name')}/{conflict.get('resource_uuid')}")
-    return out
-
-
-def restore_summary(body: Mapping[str, Any]) -> str:
-    """The domains a restore body asks for, as one line an operator can retype.
-
-    Domains are not secrets, and the operator needs exactly these to set them
-    back by hand when the restore fails.
-    """
-    if "domains" in body:
-        return str(body.get("domains") or "")
-    for key in ("docker_compose_domains", "urls"):
-        entries = body.get(key)
-        if isinstance(entries, list):
-            return ", ".join(
-                f"{e.get('name')}={e.get('domain') or e.get('url') or ''}"
-                for e in entries
-                if isinstance(e, dict)
-            )
-    return "?"
+# ── DNS after a rollback ─────────────────────────────────────────────────────
 
 
 def dns_rollback_note(

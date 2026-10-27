@@ -232,8 +232,9 @@ Every state that mutates anything has a compensating action, journalled to disk
 with enough information to run after a total crash of your machine.
 
 ```text
-CREATE_TARGET  -> delete the target; give the source its own domains back;
-                  then, last of all, unpin the source's volumes
+CREATE_TARGET  -> delete the target (only once its source holds its domains);
+                  give the source its own domains back; then, last of all,
+                  unpin the source's volumes
 QUIESCE        -> restart the source
 COPY           -> drop the target's volumes, revoke the ephemeral key
 START_TARGET   -> stop the target
@@ -245,13 +246,38 @@ dropped, and its volumes dropped before the resource is deleted, or we leak
 volumes nothing references.
 
 One step is moved forward: **the source's domains are restored before the
-source is restarted.** CREATE parks the source's custom domains (`old-<tag>.`)
-so the target can claim them, and FINALIZE(rename) blanks them. A domain change
-in Coolify only writes its database; the proxy labels are baked into the
-container at deploy time, and the restart is a deploy. Restarting first brought
-the source back answering only on its parked hosts. The restore overrides a
-domain conflict (`force_domain_override`) only when every holder Coolify names
-is a target this migration created — never a third party's resource.
+source is restarted.** A domain change in Coolify only writes its database; the
+proxy labels are baked into the container at deploy time, and the restart is a
+deploy. Restarting first brought the source back without its custom hosts. The
+restore overrides a domain conflict (`force_domain_override`) only when every
+holder Coolify names is this migration's own — never a third party's resource.
+
+## Domains change hands make-before-break
+
+A custom domain (`shop.example.com`) always has a live holder of this migration:
+
+* **CREATE never writes to the source.** The target is created without the
+  custom hosts its source still holds, passes its checks, and then claims them,
+  overriding Coolify's conflict check only when every holder it names is this
+  migration's own (its sources and targets). The target is read back and must
+  hold every one; a third-party holder refuses the migration before the source
+  is stopped.
+* **FINALIZE releases the source's custom hosts last** — after the rename and
+  the key revoke, journalled before it happens — under `keep` and `rename` alike
+  (`delete` releases them by deleting). Server-bound and generated hosts stay
+  on the source.
+* **A rollback before FINALIZE writes nothing to the source's domains**: it never
+  lost them. After FINALIZE the source gets them back BEFORE it is restarted, and
+  a target that holds them is deleted only once the source holds them again. If
+  the source cannot take them back, the target is kept (stopped), named in the
+  report, and the rollback ends `rollback_failed` — give the source its domains,
+  then `coolify-migrate rollback <id>` again.
+
+Why: from Coolify 4.4.0, a DNS record Coolify manages at Cloudflare is DELETED
+when a hostname is removed from its last live holder, and never recreated. A
+hand-over in this order leaves Coolify nothing to do but re-reference the
+record. Coolify never re-points a record either, so the DNS cutover stays yours
+— see the plan warning for Cloudflare-hosted domains.
 
 **Rollback is cheap because the source is never destroyed until FINALIZE.** That
 is the one thing Geczy's script gets right, and it is the backbone of the whole
@@ -268,7 +294,7 @@ A crash mid-step is covered too. CREATE journals each target and each restore
 body before it writes them, so `coolify-migrate rollback <id>` also undoes the
 step a run was *inside* when it died, not only the ones it finished; `resume`
 first undoes an interrupted CREATE, then creates afresh — never a second set of
-targets, never a parked host parked again. QUIESCE journals that it asked for a
+targets. QUIESCE journals that it asked for a
 stop *before* asking: from then on the source is restarted on rollback even if
 QUIESCE never completed (a SIGKILLed data holder, a stop gate that timed out),
 and a crash before that request leaves a running source alone.

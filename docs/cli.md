@@ -127,13 +127,15 @@ healthy:
 
 | Policy | Effect |
 | --- | --- |
-| `keep` | Leave the source stopped and untouched. Safest. |
+| `keep` | Leave the source stopped. Only its custom domains are released (the target serves them), so a restart cannot claim them twice. Safest. |
 | `rename` | Rename to `{name}-old-{stamp}`, leave stopped. **Default.** |
 | `delete` | Delete the source and its volumes. **Irreversible** — requires typed confirmation. |
 
-`rename` also releases the FQDN on the source. Without that, the old host's
-Traefik still claims the hostname and keeps trying to renew its certificate — so
-"keep the old one around just in case" quietly costs you ACME rate limit budget.
+`keep` and `rename` release the source's **custom** domains, as finalize's last
+step. Without that, a restarted old stack's Traefik would claim the hostname
+next to the target and keep trying to renew its certificate — quietly costing
+ACME rate-limit budget. Its server-bound and generated URLs stay: they collide
+with nothing on the target.
 
 ## Domains & DNS
 
@@ -162,10 +164,17 @@ same way, so a compose stack keeps every service's address on the new server.
 Services keep a domain per **sub-application** (each container of the stack),
 and each is carried the same way: server-bound URLs rewritten, custom domains
 carried verbatim with their port, Coolify-generated `sslip.io` names left for the
-target to generate its own. A service's source is never written to before
-finalize. Under `keep` as well as `rename`, finalize then clears the custom
-domains from the stopped source, so restarting it by hand cannot put a second
-router on a hostname the target now serves.
+target to generate its own.
+
+Custom domains change hands **make-before-break**, for applications and services
+alike. The source is never written to before finalize: the target is created
+without the source's custom domains and then claims them, overriding Coolify's
+domain-conflict check only over this migration's own resources. Under `keep` as
+well as `rename`, finalize then clears the custom domains from the stopped
+source as its last step, so restarting it by hand cannot put a second router on
+a hostname the target now serves. That order also keeps a DNS record Coolify
+(4.4+) manages at Cloudflare alive: Coolify deletes one only when its hostname
+loses its last holder.
 
 **Custom domains** — `shop.example.com` and the like. These are
 server-independent: they move *with* the app, by repointing their DNS record at

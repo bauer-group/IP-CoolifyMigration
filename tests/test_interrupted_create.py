@@ -1,6 +1,7 @@
 """An interrupted or half-undone CREATE must still converge.
 
-Three routes left a CREATE's partial work — targets made, source domains parked —
+Three routes left a CREATE's partial work — targets made (and, up to 2.9, source
+domains parked) —
 with nothing that would ever undo it:
 
 * a crash, SIGKILL or Ctrl-C mid-CREATE (BaseException skips the in-step undo,
@@ -213,14 +214,19 @@ class TestRollbackAfterACrash:
 
             return handler
 
+        # Make-before-break: the source kept its host, so the target may go and
+        # the restore finds nothing to send.
+        respx_mock.get(f"{BASE}/applications/app1").mock(
+            return_value=httpx.Response(200, json={"uuid": "app1", "fqdn": SHOP})
+        )
         respx_mock.delete(f"{BASE}/applications/appT").mock(side_effect=rec("delete"))
         patch = respx_mock.patch(f"{BASE}/applications/app1").mock(side_effect=rec("patch"))
 
         result = await _saga(ctx).rollback()
 
         assert result.outcome is Outcome.ROLLED_BACK
-        assert order == ["delete", "patch"]
-        assert json.loads(patch.calls[0].request.read()) == {"domains": SHOP}
+        assert order == ["delete"]
+        assert not patch.called
         assert result.compensations_run == [
             Compensation.DELETE_TARGET_RESOURCE,
             Compensation.RESTORE_SOURCE_FQDN,
@@ -302,25 +308,25 @@ class TestRollbackAfterACrash:
 
 
 class TestAFailedUndoIsRecoverable:
-    async def test_an_unpark_failure_during_create_undo_is_loud(
+    async def test_a_delete_failure_during_create_undo_is_loud(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
-        _mock_create(
-            respx_mock, create=[httpx.Response(422, json={"message": "Validation failed."})]
+        _mock_create(respx_mock, create=[httpx.Response(201, json={"uuid": "appT"})])
+        # Readable for the pre-pass, then failing in copy_envs, after the create.
+        respx_mock.get(f"{BASE}/applications/app1/envs").mock(
+            side_effect=[httpx.Response(200, json=[]), httpx.Response(500)]
         )
-        respx_mock.patch(f"{BASE}/applications/app1").mock(
-            side_effect=[httpx.Response(200, json={}), httpx.Response(500)]
-        )
+        respx_mock.delete(f"{BASE}/applications/appT").mock(return_value=httpx.Response(500))
 
         with pytest.raises(RollbackError) as exc:
             await steps.step_create_target(ctx)
 
         assert exc.value.exit_code == 8
         assert isinstance(exc.value.__cause__, CoolifyApiError)
-        assert exc.value.__cause__.status_code == 422
+        assert exc.value.__cause__.status_code == 500
         assert "never stopped" in (exc.value.hint or "")
-        assert "dockerimage failed" in (exc.value.hint or "")  # the original speaks
-        assert "domains NOT restored: shop" in str(exc.value)
+        assert "envs failed" in (exc.value.hint or "")  # the original speaks
+        assert "could not delete target(s): appT" in str(exc.value)
         assert ctx.journal.undo_incomplete_states() == [CREATE]
 
     async def test_the_run_ends_rollback_failed_and_rollback_finishes_it(
@@ -331,27 +337,22 @@ class TestAFailedUndoIsRecoverable:
         respx_mock.get(f"{BASE}/applications/app1/envs").mock(
             side_effect=[httpx.Response(200, json=[]), httpx.Response(500)]
         )
-        patch = respx_mock.patch(f"{BASE}/applications/app1").mock(
-            side_effect=[httpx.Response(200, json={}), httpx.Response(500)]
-        )
-        respx_mock.delete(f"{BASE}/applications/appT").mock(
-            return_value=httpx.Response(200, json={})
+        delete = respx_mock.delete(f"{BASE}/applications/appT").mock(
+            side_effect=[httpx.Response(500), httpx.Response(200, json={})]
         )
 
         result = await _saga(ctx, {State.CREATE_TARGET: steps.step_create_target}).run()
 
-        # Not FAILED ("nothing changed"): the source is still parked.
+        # Not FAILED ("nothing changed"): a target is still standing.
         assert result.outcome is Outcome.ROLLBACK_FAILED
         assert result.exit_code == 8
         assert isinstance(result.error, RollbackError)
         assert ctx.journal.is_finished  # resume refuses ...
 
         # ... so the explicit rollback is the retry, and it converges.
-        patch.side_effect = None
-        patch.return_value = httpx.Response(200, json={})
         again = await _saga(ctx).rollback()
         assert again.outcome is Outcome.ROLLED_BACK
-        assert json.loads(patch.calls[-1].request.read()) == {"domains": SHOP}
+        assert delete.call_count == 2
 
 
 class TestResumeAfterACrash:
@@ -380,16 +381,20 @@ class TestResumeAfterACrash:
         respx_mock.get(f"{BASE}/applications/app1/envs").mock(
             return_value=httpx.Response(200, json=[])
         )
-        respx_mock.patch(f"{BASE}/applications/app1").mock(side_effect=patch)
+        source_writes = respx_mock.patch(f"{BASE}/applications/app1")
+        respx_mock.patch(f"{BASE}/applications/appNew").mock(side_effect=patch)
+        respx_mock.get(f"{BASE}/applications/appNew").mock(
+            return_value=httpx.Response(200, json={"uuid": "appNew", "fqdn": SHOP})
+        )
         respx_mock.delete(f"{BASE}/applications/appOld").mock(side_effect=delete)
 
         result = await steps.step_create_target(ctx)
 
-        assert order == ["delete appOld", "patch", "patch", "create"]
-        assert bodies[0] == {"domains": SHOP}  # un-parked first ...
-        parked = bodies[1]["domains"]
-        # ... so the fresh park starts from the REAL host, never old-x.old-x.
-        assert parked.count("old-") == 1 and parked.endswith(".shop.example.com")
+        # The orphan goes first (its source holds the host), then a fresh target
+        # that claims it — the source itself is never written.
+        assert order == ["delete appOld", "create", "patch"]
+        assert bodies == [{"domains": SHOP}]
+        assert not source_writes.called
         assert result == {"target_uuids": {"app1": "appNew"}}
         assert ctx.target_uuids == {"app1": "appNew"}
         info = ctx.journal.undo_info(CREATE)
@@ -400,6 +405,9 @@ class TestResumeAfterACrash:
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
         _interrupted(ctx, target="appOld")
+        respx_mock.get(f"{BASE}/applications/app1").mock(
+            return_value=httpx.Response(200, json={"uuid": "app1", "fqdn": SHOP})
+        )
         respx_mock.delete(f"{BASE}/applications/appOld").mock(return_value=httpx.Response(500))
         respx_mock.patch(f"{BASE}/applications/app1").mock(
             return_value=httpx.Response(200, json={})
@@ -422,8 +430,11 @@ class TestResumeAfterACrash:
         respx_mock.get(f"{BASE}/applications/app1/envs").mock(
             return_value=httpx.Response(200, json=[])
         )
-        respx_mock.patch(f"{BASE}/applications/app1").mock(
+        respx_mock.patch(f"{BASE}/applications/appT").mock(
             return_value=httpx.Response(200, json={})
+        )
+        respx_mock.get(f"{BASE}/applications/appT").mock(
+            return_value=httpx.Response(200, json={"uuid": "appT", "fqdn": SHOP})
         )
         result = await steps.step_create_target(ctx)
         assert result == {"target_uuids": {"app1": "appT"}}

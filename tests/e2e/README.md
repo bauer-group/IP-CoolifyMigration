@@ -144,7 +144,7 @@ typo away from silently copying nothing.
   application tests (the rig's first: the fixture errors at setup if an nginx
   app cannot deploy at all) roll back a source on a custom domain — once mid-run,
   once after a `rename` finalize — and assert the RESTARTED container routes
-  `Host(<domain>)` and carries no parked `old-<tag>.` host. They confirm on
+  `Host(<domain>)` and carries no `old-<tag>.` host. They confirm on
   4.5.0 what the respx call-order test locks: domains restored before restart.
 - `test_cleanup_guard.py` — runs **Coolify's own Docker cleanup** with the volume
   prune forced on (`POST /servers/{uuid}/docker-cleanup/run`, 4.3.0+) on both

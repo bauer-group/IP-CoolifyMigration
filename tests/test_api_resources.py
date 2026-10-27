@@ -605,11 +605,11 @@ class TestCreateApplication:
         # fqdn is Coolify's stored column, not the create input — never sent.
         assert "fqdn" not in body
 
-    async def test_carries_a_custom_domain_to_the_target(
+    async def test_creates_without_a_custom_domain_the_source_still_holds(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
-        # A custom domain is server-independent: it moves with the app and is set
-        # on the target verbatim (the DNS gate reasons about its cutover).
+        # Make-before-break: the source keeps its custom domain; the target claims
+        # it after its gates (claim_application_domains), never in the create.
         import json
 
         route = respx_mock.post(f"{BASE}/applications/public").mock(
@@ -627,13 +627,16 @@ class TestCreateApplication:
             },
         )
         body = json.loads(route.calls[0].request.read())
-        assert body["domains"] == "https://shop.example.com"
+        assert "domains" not in body
+        # Nothing to create with: no generated placeholder the claim would replace.
+        assert body["autogenerate_domain"] is False
 
-    async def test_without_wildcards_a_server_bound_url_is_left_intact(
+    async def test_without_wildcards_every_real_host_is_claimed_later(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
-        # No wildcard configured on either side => nothing to rewrite onto; the
-        # host is carried unchanged rather than dropped or corrupted.
+        # No wildcard configured on either side => nothing tells a server-bound
+        # host from a custom one, so every real host is claimed after the create
+        # (unchanged, never dropped or corrupted).
         import json
 
         route = respx_mock.post(f"{BASE}/applications/public").mock(
@@ -651,7 +654,7 @@ class TestCreateApplication:
             },
         )
         body = json.loads(route.calls[0].request.read())
-        assert body["domains"] == "https://shop.example.com"
+        assert "domains" not in body
 
     async def test_compose_app_sends_custom_labels_base64_encoded(
         self, api: CoolifyClient, respx_mock: respx.Router
@@ -757,14 +760,14 @@ class TestCreateApplication:
             },
         )
         body = json.loads(route.calls[0].request.read())
-        # Both custom URLs carried, the empty service preserved as blank.
+        # Every service is listed; the custom URLs are claimed after the compose
+        # gate (a forced compose CREATE is ignored before 4.5), so none here.
         assert body["docker_compose_domains"] == [
-            {"name": "minio-server", "domain": "https://assets.bauer-group.com"},
-            {"name": "admin-console", "domain": "https://console.assets.bauer-group.com"},
+            {"name": "minio-server", "domain": ""},
+            {"name": "admin-console", "domain": ""},
             {"name": "minio-init", "domain": ""},
         ]
-        # Domains were sent, so we must NOT suppress auto-generation.
-        assert "autogenerate_domain" not in body
+        assert body["autogenerate_domain"] is False
 
     async def test_domainless_compose_stack_suppresses_autogenerate(
         self, api: CoolifyClient, respx_mock: respx.Router
@@ -806,12 +809,34 @@ class TestCreateApplication:
             api, _git_build_snapshot(), _placement_wc(),
             {
                 "git_repository": "https://github.com/x/y", "git_branch": "main",
-                "build_pack": "nixpacks", "fqdn": "https://shop.example.com",
+                "build_pack": "nixpacks",
+                "fqdn": "https://shop.example.com,https://pdf.app.0046-20.cloud.bauer-group.com",
             },
         )
         body = json.loads(route.calls[0].request.read())
-        assert body["domains"] == "https://shop.example.com"
+        assert body["domains"] == "https://pdf.app.0047-20.cloud.bauer-group.com"
         assert "autogenerate_domain" not in body  # a domain is set; leave the default
+
+    async def test_a_generated_host_is_dropped_and_regenerated(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # An sslip.io host names the SOURCE's IP: carrying it would route a host
+        # that resolves to the source. The target generates its own.
+        import json
+
+        route = respx_mock.post(f"{BASE}/applications/public").mock(
+            return_value=httpx.Response(201, json={"uuid": "a2"})
+        )
+        await create_resource(
+            api, _git_build_snapshot(), _placement_wc(),
+            {
+                "git_repository": "https://github.com/x/y", "git_branch": "main",
+                "build_pack": "nixpacks", "fqdn": "http://a1.10.0.0.1.sslip.io",
+            },
+        )
+        body = json.loads(route.calls[0].request.read())
+        assert "domains" not in body
+        assert "autogenerate_domain" not in body
 
     async def test_dropped_server_bound_url_still_allows_autogenerate_fallback(
         self, api: CoolifyClient, respx_mock: respx.Router
@@ -1075,37 +1100,72 @@ class TestComposeDomains:
         assert _compose_domains_body(None, source_wildcard=self.SRC, target_wildcard=self.TGT) is None
         assert _compose_domains_body("{bad", source_wildcard=self.SRC, target_wildcard=self.TGT) is None
 
-    def test_blank_empties_every_service_domain(self) -> None:
-        from bg_coolify_migrate.api.resources import _blank_compose_domains
-
-        assert _blank_compose_domains(self._raw()) == [
-            {"name": "pairdrop", "domain": ""},
-            {"name": "config-generator", "domain": ""},
-        ]
-
-
-class TestReleaseFqdn:
-    async def test_plain_app_clears_the_domains_field(
-        self, api: CoolifyClient, respx_mock: respx.Router
-    ) -> None:
+    def test_the_create_body_leaves_the_custom_hosts_out(self) -> None:
         import json
 
-        from bg_coolify_migrate.api.resources import release_fqdn
+        from bg_coolify_migrate.api.resources import _compose_domains_body
 
+        raw = json.dumps(
+            {"web": {"domain": "https://shop.example.com,https://w.app.0046-20.cloud.bauer-group.com"}}
+        )
+        out = _compose_domains_body(
+            raw, source_wildcard=self.SRC, target_wildcard=self.TGT, with_custom=False
+        )
+        assert out == [{"name": "web", "domain": "https://w.app.0047-20.cloud.bauer-group.com"}]
+
+
+class TestReleaseApplicationDomains:
+    SRC = "app.0046-20.cloud.bauer-group.com"
+
+    def _snapshot(self, kind: ResourceKind = ResourceKind.APP_GIT_BUILD) -> ResourceSnapshot:
+        return ResourceSnapshot(
+            uuid="a1", name="shop", collection="applications", kind=kind, git_auth=GitAuth.PUBLIC
+        )
+
+    async def test_only_the_custom_hosts_go(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # The target holds them; the source's own server-bound host collides with
+        # nothing, and removing it would let Coolify delete its record.
+        import json
+
+        from bg_coolify_migrate.api.resources import release_application_domains
+
+        respx_mock.get(f"{BASE}/applications/a1").mock(
+            return_value=httpx.Response(
+                200, json={"uuid": "a1", "fqdn": f"https://shop.example.com,https://x.{self.SRC}"}
+            )
+        )
         route = respx_mock.patch(f"{BASE}/applications/a1").mock(
             return_value=httpx.Response(200, json={"uuid": "a1"})
         )
-        await release_fqdn(api, "applications", "a1", kind=ResourceKind.APP_GIT_BUILD)
-        assert json.loads(route.calls[0].request.read()) == {"domains": ""}
+        ok = await release_application_domains(api, self._snapshot(), source_wildcard=self.SRC)
+        assert ok is True
+        assert json.loads(route.calls[0].request.read()) == {"domains": f"https://x.{self.SRC}"}
 
-    async def test_compose_app_blanks_docker_compose_domains_not_domains(
+    async def test_a_custom_only_app_is_left_without_domains(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
-        # The `domains` field 422s for dockercompose; release must go through
-        # docker_compose_domains with blanked entries instead.
         import json
 
-        from bg_coolify_migrate.api.resources import release_fqdn
+        from bg_coolify_migrate.api.resources import release_application_domains
+
+        respx_mock.get(f"{BASE}/applications/a1").mock(
+            return_value=httpx.Response(200, json={"uuid": "a1", "fqdn": "https://shop.example.com"})
+        )
+        route = respx_mock.patch(f"{BASE}/applications/a1").mock(
+            return_value=httpx.Response(200, json={"uuid": "a1"})
+        )
+        await release_application_domains(api, self._snapshot(), source_wildcard=self.SRC)
+        assert json.loads(route.calls[0].request.read()) == {"domains": ""}
+
+    async def test_compose_app_goes_through_docker_compose_domains(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # The `domains` field 422s for dockercompose.
+        import json
+
+        from bg_coolify_migrate.api.resources import release_application_domains
 
         respx_mock.get(f"{BASE}/applications/a1").mock(
             return_value=httpx.Response(
@@ -1113,7 +1173,10 @@ class TestReleaseFqdn:
                 json={
                     "uuid": "a1",
                     "docker_compose_domains": json.dumps(
-                        {"pairdrop": {"domain": "https://airdrop.app.0046-20.cloud.bauer-group.com"}}
+                        {
+                            "web": {"domain": "https://shop.example.com"},
+                            "cfg": {"domain": f"https://cfg.{self.SRC}"},
+                        }
                     ),
                 },
             )
@@ -1121,164 +1184,285 @@ class TestReleaseFqdn:
         route = respx_mock.patch(f"{BASE}/applications/a1").mock(
             return_value=httpx.Response(200, json={"uuid": "a1"})
         )
-        await release_fqdn(api, "applications", "a1", kind=ResourceKind.APP_GIT_COMPOSE)
+        await release_application_domains(
+            api, self._snapshot(ResourceKind.APP_GIT_COMPOSE), source_wildcard=self.SRC
+        )
         body = json.loads(route.calls[0].request.read())
-        assert body == {"docker_compose_domains": [{"name": "pairdrop", "domain": ""}]}
-        assert "domains" not in body
+        assert body == {
+            "docker_compose_domains": [
+                {"name": "web", "domain": ""},
+                {"name": "cfg", "domain": f"https://cfg.{self.SRC}"},
+            ]
+        }
 
-    async def test_non_application_is_a_noop(
+    @pytest.mark.parametrize(
+        "source",
+        [
+            {"fqdn": "https://x.app.0046-20.cloud.bauer-group.com"},
+            {"fqdn": None},
+        ],
+    )
+    async def test_nothing_custom_writes_nothing(
+        self, api: CoolifyClient, respx_mock: respx.Router, source: dict[str, object]
+    ) -> None:
+        from bg_coolify_migrate.api.resources import release_application_domains
+
+        respx_mock.get(f"{BASE}/applications/a1").mock(
+            return_value=httpx.Response(200, json={"uuid": "a1", **source})
+        )
+        assert await release_application_domains(api, self._snapshot(), source_wildcard=self.SRC)
+        assert [c.request.method for c in respx_mock.calls] == ["GET"]
+
+    async def test_compose_nothing_custom_writes_nothing(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
-        # Databases/services have no fqdn to release this way.
-        from bg_coolify_migrate.api.resources import release_fqdn
+        import json
 
-        await release_fqdn(api, "databases", "db1")
+        from bg_coolify_migrate.api.resources import release_application_domains
+
+        respx_mock.get(f"{BASE}/applications/a1").mock(
+            return_value=httpx.Response(
+                200,
+                json={"docker_compose_domains": json.dumps({"cfg": {"domain": f"https://c.{self.SRC}"}})},
+            )
+        )
+        assert await release_application_domains(
+            api, self._snapshot(ResourceKind.APP_GIT_COMPOSE), source_wildcard=self.SRC
+        )
+        assert [c.request.method for c in respx_mock.calls] == ["GET"]
+
+    async def test_a_failure_is_reported_never_raised(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        from bg_coolify_migrate.api.resources import release_application_domains
+
+        respx_mock.get(f"{BASE}/applications/a1").mock(return_value=httpx.Response(500))
+        assert (
+            await release_application_domains(api, self._snapshot(), source_wildcard=self.SRC)
+            is False
+        )
+
+    async def test_databases_have_nothing_to_release(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        from bg_coolify_migrate.api.resources import release_source_domains
+
+        snapshot = ResourceSnapshot(
+            uuid="db1", name="pg", collection="databases", kind=ResourceKind.DATABASE
+        )
+        assert await release_source_domains(api, snapshot, source_wildcard=None)
         assert not respx_mock.calls
 
 
-class TestParkHosts:
+class TestTargetDomainValues:
     SRC = "app.0046-20.cloud.bauer-group.com"
+    TGT = "app.0047-20.cloud.bauer-group.com"
 
-    def _park(self, domains: str) -> str:
-        from bg_coolify_migrate.api.resources import _park_hosts
+    def test_create_leaves_custom_out_and_the_claim_carries_it(self) -> None:
+        from bg_coolify_migrate.api.resources import target_domain_values
 
-        return _park_hosts(domains, source_wildcard=self.SRC, tag="t1")
-
-    def test_custom_domain_is_marked_and_freed(self) -> None:
-        assert (
-            self._park("https://speakup.bauer-group.com")
-            == "https://old-t1.speakup.bauer-group.com"
+        value = (
+            f"https://shop.example.com:8443,https://pdf.{self.SRC},http://a.10.0.0.1.sslip.io"
         )
-
-    def test_server_bound_domain_is_left_alone(self) -> None:
-        host = "https://x.app.0046-20.cloud.bauer-group.com"
-        assert self._park(host) == host
-
-    def test_only_the_custom_host_in_a_mixed_list_is_parked(self) -> None:
-        out = self._park(
-            "https://speakup.bauer-group.com,https://x.app.0046-20.cloud.bauer-group.com"
+        create, claim = target_domain_values(
+            value, source_wildcard=self.SRC, target_wildcard=self.TGT
         )
-        assert out == (
-            "https://old-t1.speakup.bauer-group.com,https://x.app.0046-20.cloud.bauer-group.com"
-        )
+        assert create == f"https://pdf.{self.TGT}"
+        assert claim == f"https://shop.example.com:8443,https://pdf.{self.TGT}"
+
+    def test_nothing_in_nothing_out(self) -> None:
+        from bg_coolify_migrate.api.resources import target_domain_values
+
+        assert target_domain_values(None, source_wildcard=None, target_wildcard=None) == ("", "")
 
 
-class TestParkSourceDomains:
+def _conflict(*holders: str | None) -> httpx.Response:
+    return httpx.Response(
+        409,
+        json={
+            "message": "Domain conflicts detected. Use force_domain_override=true to proceed.",
+            "conflicts": [
+                {
+                    "domain": "shop.example.com",
+                    "resource_name": "shop",
+                    "resource_uuid": h,
+                    "resource_type": "application",
+                }
+                for h in holders
+            ],
+        },
+    )
+
+
+class TestClaimApplicationDomains:
+    """Phase two of the claim: the target takes the custom hosts after its gates."""
+
     SRC = "app.0046-20.cloud.bauer-group.com"
+    TGT = "app.0047-20.cloud.bauer-group.com"
 
-    async def test_compose_parks_custom_domain_and_returns_restore_body(
+    def _snapshot(self, kind: ResourceKind = ResourceKind.APP_GIT_BUILD) -> ResourceSnapshot:
+        return ResourceSnapshot(
+            uuid="a1", name="shop", collection="applications", kind=kind, git_auth=GitAuth.PUBLIC
+        )
+
+    def _placement(self) -> Placement:
+        return Placement(
+            project_uuid="p",
+            environment_name="production",
+            server_uuid="s",
+            source_wildcard=self.SRC,
+            target_wildcard=self.TGT,
+        )
+
+    async def _claim(
+        self, api: CoolifyClient, source: dict[str, object], **kw: object
+    ) -> list[str]:
+        from bg_coolify_migrate.api.resources import claim_application_domains
+
+        return await claim_application_domains(
+            api,
+            kw.pop("snapshot", self._snapshot()),  # type: ignore[arg-type]
+            self._placement(),
+            source,  # type: ignore[arg-type]
+            "a2",
+            own=kw.pop("own", frozenset({"a1", "a2"})),  # type: ignore[arg-type]
+        )
+
+    async def test_a_conflict_with_the_source_is_forced_then_read_back(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
         import json
 
-        from bg_coolify_migrate.api.resources import park_source_domains
-
-        route = respx_mock.patch(f"{BASE}/applications/a1").mock(
-            return_value=httpx.Response(200, json={"uuid": "a1"})
+        route = respx_mock.patch(f"{BASE}/applications/a2").mock(
+            side_effect=[_conflict("a1"), httpx.Response(200, json={})]
         )
-        snapshot = ResourceSnapshot(
-            uuid="a1",
-            name="wb",
-            collection="applications",
-            kind=ResourceKind.APP_GIT_COMPOSE,
-            git_auth=GitAuth.PUBLIC,
-        )
-        source = {
-            "docker_compose_domains": json.dumps(
-                {"globaleaks": {"domain": "https://speakup.bauer-group.com"}}
+        respx_mock.get(f"{BASE}/applications/a2").mock(
+            return_value=httpx.Response(
+                200, json={"uuid": "a2", "fqdn": f"https://shop.example.com,https://p.{self.TGT}"}
             )
-        }
-        restore = await park_source_domains(
-            api, snapshot, source, source_wildcard=self.SRC, tag="t1"
         )
-        # The source is PATCHed with the parked (freed) domain...
-        assert json.loads(route.calls[0].request.read()) == {
-            "docker_compose_domains": [
-                {"name": "globaleaks", "domain": "https://old-t1.speakup.bauer-group.com"}
-            ]
-        }
-        # ...and the restore body carries the original for rollback.
-        assert restore == {
-            "docker_compose_domains": [
-                {"name": "globaleaks", "domain": "https://speakup.bauer-group.com"}
-            ]
-        }
+        source = {"fqdn": f"https://shop.example.com,https://p.{self.SRC}"}
+        assert await self._claim(api, source) == ["shop.example.com"]
+        bodies = [json.loads(c.request.read()) for c in route.calls]
+        assert bodies == [
+            {"domains": f"https://shop.example.com,https://p.{self.TGT}"},
+            {"domains": f"https://shop.example.com,https://p.{self.TGT}", "force_domain_override": True},
+        ]
 
-    async def test_only_server_bound_makes_no_patch_but_still_records_restore(
+    async def test_no_custom_host_means_no_claim(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
-        import json
-
-        from bg_coolify_migrate.api.resources import park_source_domains
-
-        snapshot = ResourceSnapshot(
-            uuid="a1",
-            name="wb",
-            collection="applications",
-            kind=ResourceKind.APP_GIT_COMPOSE,
-            git_auth=GitAuth.PUBLIC,
-        )
-        # Only a server-bound domain: remapped on the target, never collides, so
-        # nothing is parked — but the original is still recorded so a rollback can
-        # swing the URL back (finalize blanks it on success).
-        source = {
-            "docker_compose_domains": json.dumps(
-                {"web": {"domain": "https://x.app.0046-20.cloud.bauer-group.com"}}
-            )
-        }
-        restore = await park_source_domains(
-            api, snapshot, source, source_wildcard=self.SRC, tag="t1"
-        )
-        assert restore == {
-            "docker_compose_domains": [
-                {"name": "web", "domain": "https://x.app.0046-20.cloud.bauer-group.com"}
-            ]
-        }
-        assert not respx_mock.calls  # no PATCH: nothing was parked
-
-    async def test_no_domains_at_all_returns_none(
-        self, api: CoolifyClient, respx_mock: respx.Router
-    ) -> None:
-        from bg_coolify_migrate.api.resources import park_source_domains
-
-        snapshot = ResourceSnapshot(
-            uuid="a1",
-            name="web",
-            collection="applications",
-            kind=ResourceKind.APP_GIT_BUILD,
-            git_auth=GitAuth.PUBLIC,
-        )
-        assert (
-            await park_source_domains(api, snapshot, {}, source_wildcard=self.SRC, tag="t1")
-            is None
-        )
+        assert await self._claim(api, {"fqdn": f"https://p.{self.SRC}"}) == []
         assert not respx_mock.calls
 
-    async def test_regular_app_parks_its_fqdn_via_domains(
+    async def test_a_foreign_holder_is_never_forced(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        route = respx_mock.patch(f"{BASE}/applications/a2").mock(
+            return_value=_conflict("a1", None)
+        )
+        with pytest.raises(CoolifyApiError, match="the Coolify instance itself") as exc:
+            await self._claim(api, {"fqdn": "https://shop.example.com"})
+        assert exc.value.status_code == 409
+        assert "never stopped" in (exc.value.hint or "")
+        assert route.call_count == 1
+
+    async def test_other_errors_propagate(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.patch(f"{BASE}/applications/a2").mock(return_value=httpx.Response(422))
+        with pytest.raises(CoolifyApiError) as exc:
+            await self._claim(api, {"fqdn": "https://shop.example.com"})
+        assert exc.value.status_code == 422
+
+    async def test_a_target_that_did_not_keep_the_host_is_refused(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        from bg_coolify_migrate.errors import UnsupportedResource
+
+        respx_mock.patch(f"{BASE}/applications/a2").mock(return_value=httpx.Response(200, json={}))
+        respx_mock.get(f"{BASE}/applications/a2").mock(
+            return_value=httpx.Response(200, json={"uuid": "a2", "fqdn": None})
+        )
+        with pytest.raises(UnsupportedResource, match=r"does not hold \['shop\.example\.com'\]"):
+            await self._claim(api, {"fqdn": "https://shop.example.com"})
+
+    async def test_a_compose_app_claims_through_docker_compose_domains(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # The update honours the force at every tag; a forced compose CREATE is
+        # ignored before 4.5 (the strip runs before the check).
+        import json
+
+        raw = json.dumps(
+            {
+                "globaleaks": {"domain": "https://speakup.bauer-group.com"},
+                "config": {"domain": f"https://cfg.{self.SRC}"},
+                "admin": {"domain": "https://admin.bauer-group.com"},
+            }
+        )
+        route = respx_mock.patch(f"{BASE}/applications/a2").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        respx_mock.get(f"{BASE}/applications/a2").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "docker_compose_domains": json.dumps(
+                        {
+                            "globaleaks": {"domain": "https://speakup.bauer-group.com"},
+                            "admin": {"domain": "https://admin.bauer-group.com"},
+                        }
+                    )
+                },
+            )
+        )
+        hosts = await self._claim(
+            api,
+            {"docker_compose_domains": raw},
+            snapshot=self._snapshot(ResourceKind.APP_GIT_COMPOSE),
+        )
+        assert hosts == ["speakup.bauer-group.com", "admin.bauer-group.com"]
+        assert json.loads(route.calls[0].request.read()) == {
+            "docker_compose_domains": [
+                {"name": "globaleaks", "domain": "https://speakup.bauer-group.com"},
+                {"name": "config", "domain": f"https://cfg.{self.TGT}"},
+                {"name": "admin", "domain": "https://admin.bauer-group.com"},
+            ]
+        }
+
+
+class TestRestoreApplicationDomains:
+    async def test_patches_only_a_difference_and_passes_force_on(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
         import json
 
-        from bg_coolify_migrate.api.resources import park_source_domains
+        from bg_coolify_migrate.api.resources import restore_application_domains
 
+        respx_mock.get(f"{BASE}/applications/a1").mock(
+            return_value=httpx.Response(200, json={"uuid": "a1", "fqdn": None})
+        )
         route = respx_mock.patch(f"{BASE}/applications/a1").mock(
-            return_value=httpx.Response(200, json={"uuid": "a1"})
+            return_value=httpx.Response(200, json={})
         )
-        snapshot = ResourceSnapshot(
-            uuid="a1",
-            name="web",
-            collection="applications",
-            kind=ResourceKind.APP_GIT_BUILD,
-            git_auth=GitAuth.PUBLIC,
+        body = {"domains": "https://shop.example.com", "force_domain_override": True}
+        assert await restore_application_domains(api, "a1", body) is True
+        assert json.loads(route.calls[0].request.read()) == body
+
+    async def test_a_source_that_holds_them_is_not_written(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        from bg_coolify_migrate.api.resources import restore_application_domains
+
+        respx_mock.get(f"{BASE}/applications/a1").mock(
+            return_value=httpx.Response(200, json={"uuid": "a1", "fqdn": "https://shop.example.com"})
         )
-        restore = await park_source_domains(
-            api, snapshot, {"fqdn": "https://speakup.bauer-group.com"},
-            source_wildcard=self.SRC, tag="t1",
+        assert (
+            await restore_application_domains(api, "a1", {"domains": "https://shop.example.com"})
+            is False
         )
-        assert json.loads(route.calls[0].request.read()) == {
-            "domains": "https://old-t1.speakup.bauer-group.com"
-        }
-        assert restore == {"domains": "https://speakup.bauer-group.com"}
+        assert [c.request.method for c in respx_mock.calls] == ["GET"]
 
 
 class TestCopyEnvs:
@@ -1555,41 +1739,3 @@ class TestMultiServiceDomains:
             {"name": "config", "domain": "https://cfg.app.0047-20.cloud.bauer-group.com"},
             {"name": "admin", "domain": "https://admin.bauer-group.com"},
         ]
-
-    async def test_park_frees_every_custom_service_and_records_full_original(
-        self, api: CoolifyClient, respx_mock: respx.Router
-    ) -> None:
-        import json
-
-        from bg_coolify_migrate.api.resources import park_source_domains
-
-        route = respx_mock.patch(f"{BASE}/applications/a1").mock(
-            return_value=httpx.Response(200, json={"uuid": "a1"})
-        )
-        snapshot = ResourceSnapshot(
-            uuid="a1",
-            name="wb",
-            collection="applications",
-            kind=ResourceKind.APP_GIT_COMPOSE,
-            git_auth=GitAuth.PUBLIC,
-        )
-        restore = await park_source_domains(
-            api, snapshot, {"docker_compose_domains": self._raw()},
-            source_wildcard=self.SRC, tag="t1",
-        )
-        # Both custom services are parked; the bound one is left alone.
-        assert json.loads(route.calls[0].request.read()) == {
-            "docker_compose_domains": [
-                {"name": "globaleaks", "domain": "https://old-t1.speakup.bauer-group.com"},
-                {"name": "config", "domain": "https://cfg.app.0046-20.cloud.bauer-group.com"},
-                {"name": "admin", "domain": "https://old-t1.admin.bauer-group.com"},
-            ]
-        }
-        # The restore body carries every service's ORIGINAL domain.
-        assert restore == {
-            "docker_compose_domains": [
-                {"name": "globaleaks", "domain": "https://speakup.bauer-group.com"},
-                {"name": "config", "domain": "https://cfg.app.0046-20.cloud.bauer-group.com"},
-                {"name": "admin", "domain": "https://admin.bauer-group.com"},
-            ]
-        }

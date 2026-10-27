@@ -485,7 +485,6 @@ def order(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, Any]]:
     monkeypatch.setattr(api_resources, "ensure_project", recorder("ensure_project", "p1"))
     monkeypatch.setattr(api_resources, "ensure_environment", recorder("ensure_environment", "e1"))
     monkeypatch.setattr(api_resources, "resolve_destination", recorder("resolve_destination", "d1"))
-    monkeypatch.setattr(api_resources, "park_source_domains", recorder("park", None))
     monkeypatch.setattr(api_resources, "create_resource", recorder("create", "db2"))
     monkeypatch.setattr(api_resources, "copy_envs", recorder("copy_envs", 1))
     monkeypatch.setattr(api_resources, "copy_storages", recorder("copy_storages", 0))

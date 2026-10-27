@@ -373,101 +373,207 @@ def _with_host(url: str, host: str) -> str:
     return f"{parts.scheme or 'https'}://{host}{port}{parts.path.rstrip('/')}"
 
 
-#: Moved to the pure domain layer with the rest of the parking logic; the old
-#: private names stay so callers (and their tests) keep working.
+#: Moved to the pure domain layer; the old private name stays so callers (and
+#: their tests) keep working.
 _parse_compose_domains = domains.compose_domains
-_park_hosts = domains.park_hosts
+
+
+def target_domain_values(
+    value: object,
+    *,
+    source_wildcard: str | None,
+    target_wildcard: str | None,
+) -> tuple[str, str]:
+    """What CREATE sends for one domain string, and what the claim sends. PURE.
+
+    Generated hosts are dropped (they name the source's IP), server-bound ones
+    rewritten onto the target's wildcard (:func:`_remap_domains`), and custom
+    ones carried verbatim — but only in the SECOND value. The target is created
+    without its source's custom hosts, which the source still holds, and claims
+    them once its gates passed (:func:`claim_application_domains`).
+    """
+    kept = domains.without_generated(value)
+    claim = _remap_domains(kept, source_wildcard=source_wildcard, target_wildcard=target_wildcard)
+    create = _remap_domains(
+        domains.without_custom(kept, source_wildcard=source_wildcard),
+        source_wildcard=source_wildcard,
+        target_wildcard=target_wildcard,
+    )
+    return create, claim
 
 
 def _compose_domains_body(
-    raw: object, *, source_wildcard: str | None, target_wildcard: str | None
+    raw: object,
+    *,
+    source_wildcard: str | None,
+    target_wildcard: str | None,
+    with_custom: bool = True,
 ) -> list[dict[str, str]] | None:
-    """Rewrite a compose app's per-service domains for the target create body.
+    """Rewrite a compose app's per-service domains for the target. PURE.
 
     The create route wants an ARRAY of ``{name, domain}`` (it 422s on ``domains``
-    for a dockercompose app). Read the source's per-service domains, remap the
-    server-bound URLs inside each onto the target's wildcard (custom domains
-    kept), and return the array. ``None`` when there is nothing to send.
+    for a dockercompose app), and so does the update. Read the source's
+    per-service domains, remap each with :func:`target_domain_values` — the
+    create body without the custom hosts (``with_custom=False``), the claim body
+    with them — and return the array. ``None`` when there is nothing to send.
     """
     parsed = _parse_compose_domains(raw)
     if not parsed:
         return None
-    return [
-        {
-            "name": name,
-            "domain": _remap_domains(
-                domain, source_wildcard=source_wildcard, target_wildcard=target_wildcard
-            ),
-        }
-        for name, domain in parsed.items()
-    ]
+    out: list[dict[str, str]] = []
+    for name, domain in parsed.items():
+        create, claim = target_domain_values(
+            domain, source_wildcard=source_wildcard, target_wildcard=target_wildcard
+        )
+        out.append({"name": name, "domain": claim if with_custom else create})
+    return out
 
 
-def _blank_compose_domains(raw: object) -> list[dict[str, str]] | None:
-    """The docker_compose_domains array with every domain blanked. PURE.
-
-    Releasing a compose app's domains cannot go through the ``domains`` field
-    (422 for dockercompose); it is done by resubmitting each service with an
-    empty domain. ``None`` when the source had none to release.
-    """
-    parsed = _parse_compose_domains(raw)
-    if not parsed:
-        return None
-    return [{"name": name, "domain": ""} for name in parsed]
-
-
-def source_domain_parking(
+def source_restore_body(
     snapshot: ResourceSnapshot,
     source: dict[str, Any],
     *,
     source_wildcard: str | None,
-    tag: str,
     version: Version | None = None,
-) -> domains.DomainParking:
-    """The park and restore bodies for one source resource. PURE.
+) -> dict[str, Any] | None:
+    """The body that gives a source back its domains, journalled before CREATE writes.
 
-    Services are never parked — only their restore body is kept
-    (:func:`service_restore_body`): the target claims a service's custom hosts
-    with a scoped force instead (:func:`finish_service_target`). Everything else
-    is decided by :func:`domains.domain_parking`.
+    Applications: their original domains (:func:`domains.restore_body`). Services:
+    the original URLs of their sub-applications holding custom hosts
+    (:func:`service_restore_body`). ``None`` when there is nothing to give back.
     """
     if snapshot.collection == "services":
-        return domains.DomainParking(
-            restore=service_restore_body(source, source_wildcard=source_wildcard), park=None
-        )
-    return domains.domain_parking(
-        snapshot, source, source_wildcard=source_wildcard, tag=tag, version=version
+        return service_restore_body(source, source_wildcard=source_wildcard)
+    return domains.restore_body(snapshot, source, version=version)
+
+
+def _holder_refusal(
+    name: str, kind: str, exc: CoolifyApiError, own: Collection[str]
+) -> CoolifyApiError:
+    """The refusal for a claim that some resource NOT ours blocks."""
+    held = "; ".join(domains.foreign_holders(exc.body, own)) or "Coolify named no holder"
+    return CoolifyApiError(
+        f"{kind} {name!r}: the target cannot claim its domain(s), held elsewhere: {held}",
+        status_code=409,
+        body=exc.body,
+        hint=(
+            "Another resource of this team — or the Coolify instance itself — holds "
+            "it; the uuid tells it apart from the source, which may carry the same "
+            "name. Free it there, then migrate again: this tool forces a domain away "
+            "only from this migration's own sources and targets. The source was "
+            "never stopped and keeps serving; the created target will be deleted."
+        ),
     )
 
 
-async def park_source_domains(
+async def claim_application_domains(
     api: CoolifyClient,
     snapshot: ResourceSnapshot,
+    placement: Placement,
     source: dict[str, Any],
+    target_uuid: str,
     *,
-    source_wildcard: str | None,
-    tag: str,
-) -> dict[str, Any] | None:
-    """Free the source's custom domains so the target can claim them.
+    own: Collection[str],
+) -> list[str]:
+    """Let an application TARGET take its source's custom hosts. Returns them.
 
-    Coolify 409s ("Domain conflicts detected") when a create asks for a domain
-    another resource already holds. So before creating the target we rename the
-    source's custom domains with an ``old-<tag>`` marker (in Coolify's DB only —
-    the running source is not redeployed, so it keeps serving the real domain
-    until quiesce).
+    Phase two of a two-phase claim, on every release: the target was created
+    without the hosts its source still holds, and has passed its gates. One
+    PATCH sets its full domain list (``domains``, or ``docker_compose_domains``
+    for a dockercompose app); a 409 is retried ONCE with
+    ``force_domain_override``, and only when :func:`domains.only_own_holders`
+    says every holder is ours. Two upstream facts make it a PATCH, not the
+    create: before v4.5.0 a dockercompose CREATE strips the flag before its
+    conflict check reads it (bootstrap/helpers/api.php v4.4.0:459, checked at
+    ApplicationsController v4.4.0:1518; fixed v4.5.0:1329-1330), whereas the
+    UPDATE checks before it strips at every tag (v4.1.2:2522/2591 vs :2657,
+    v4.4.0:3409/3478 vs :3569, v4.5.0:3589/3658 vs :3749). And the update keeps
+    compose entries only for services in the loaded compose (v4.5.0:3667-3682),
+    which the compose gate has just proven.
 
-    A thin shell over :func:`source_domain_parking`, which decides both bodies.
-    CREATE does not use this wrapper: it journals the restore body BEFORE the
-    park PATCH, which a single call that does both cannot offer.
+    Then the target is read back: Coolify ignores ``domains`` on a server whose
+    proxy should not run, and drops compose entries for unknown services
+    (v4.5.0:3566, :3672), so a 2xx alone proves nothing. A host the target does
+    not hold refuses CREATE — before QUIESCE, so the source never stopped.
 
-    Returns the body that restores the source's ORIGINAL domains, or ``None``
-    when the source has none.
+    The SOURCE is not touched: it keeps every host until FINALIZE.
     """
-    parking = source_domain_parking(snapshot, source, source_wildcard=source_wildcard, tag=tag)
-    if parking.park is not None:
-        await api.update_resource(snapshot.collection, snapshot.uuid, parking.park)
-        log.info("api.source_domains.parked", uuid=snapshot.uuid, tag=tag)
-    return parking.restore
+    hosts = domains.resource_custom_hosts(
+        snapshot, source, source_wildcard=placement.source_wildcard
+    )
+    if not hosts:
+        return []
+    body: dict[str, Any]
+    if snapshot.kind is ResourceKind.APP_GIT_COMPOSE:
+        entries = _compose_domains_body(
+            source.get("docker_compose_domains"),
+            source_wildcard=placement.source_wildcard,
+            target_wildcard=placement.target_wildcard,
+        )
+        body = {"docker_compose_domains": entries or []}
+    else:
+        _, claim = target_domain_values(
+            source.get("fqdn"),
+            source_wildcard=placement.source_wildcard,
+            target_wildcard=placement.target_wildcard,
+        )
+        body = {"domains": claim}
+
+    try:
+        await api.update_resource("applications", target_uuid, body)
+    except CoolifyApiError as exc:
+        if exc.status_code != 409:
+            raise
+        if not domains.only_own_holders(exc.body, own):
+            raise _holder_refusal(snapshot.name, "application", exc, own) from exc
+        log.info("api.application.domains_forced", name=snapshot.name, target=target_uuid)
+        await api.update_resource(
+            "applications", target_uuid, {**body, "force_domain_override": True}
+        )
+
+    target = await api.get_resource("applications", target_uuid)
+    held = domains.held_hosts(target)
+    missing = [h for h in hosts if h not in held]
+    if missing:
+        raise UnsupportedResource(
+            f"application {snapshot.name!r}: the target does not hold {missing} after "
+            "claiming its domains",
+            hint=(
+                "Coolify accepted the domains but did not keep them — its proxy is off on "
+                "the target server (domains are ignored then), or a compose service of "
+                "that name no longer exists in the target's compose. The source was "
+                "never stopped and keeps every domain; the created target will be "
+                "deleted. Fix the target server's proxy or the compose, then migrate again."
+            ),
+        )
+    log.info(
+        "api.application.domains_claimed", name=snapshot.name, target=target_uuid, hosts=hosts
+    )
+    return hosts
+
+
+async def restore_application_domains(
+    api: CoolifyClient, uuid: str, body: dict[str, Any]
+) -> bool:
+    """Give an application back the domains in ``body``, PATCHing only a difference.
+
+    GET, compare (:func:`domains.restore_patch`), and PATCH only when the source
+    does not already hold them — before FINALIZE that is every rollback, which
+    therefore writes nothing to the source. A ``force_domain_override`` in
+    ``body`` is passed on (the caller's 409 retry). Returns whether a PATCH was
+    sent.
+    """
+    current = await api.get_resource("applications", uuid)
+    wanted = {k: v for k, v in body.items() if k != "force_domain_override"}
+    patch = domains.restore_patch(wanted, current)
+    if patch is None:
+        log.debug("api.application.domains_unchanged", uuid=uuid)
+        return False
+    if body.get("force_domain_override"):
+        patch["force_domain_override"] = True
+    await api.update_resource("applications", uuid, patch)
+    log.info("api.application.domains_restored", uuid=uuid)
+    return True
 
 
 def _unrewritable_server_bound(
@@ -516,15 +622,18 @@ async def create_application(
 
     # Rewrite the URLs onto the TARGET rather than dropping or copying them.
     # Server-bound URLs (under the source server's wildcard) move to the target's
-    # wildcard so the app keeps its subdomain on the new host; custom domains are
-    # carried as-is (they move by DNS cutover, gated separately). coolify-mover
+    # wildcard so the app keeps its subdomain on the new host. coolify-mover
     # copies fqdn verbatim, pointing two servers at the same server-bound
     # hostname — which can never work: the wildcard binds it to one server.
+    # Custom domains are NOT in the create: the source still holds them, and the
+    # target claims them once it passed its gates (claim_application_domains) —
+    # make-before-break, so no Coolify-managed DNS record ever loses its last
+    # holder. Generated (sslip.io) hosts name the source's IP and are dropped.
     # Read from the SOURCE, not the filtered body: Coolify stores the URL in the
     # `fqdn` column, which is not a create input (``domains`` is) and so is
     # filtered out of `body`.
     raw_fqdn = source.get("fqdn") or source.get("domains")
-    target_domains = _remap_domains(
+    target_domains, _ = target_domain_values(
         raw_fqdn,
         source_wildcard=placement.source_wildcard,
         target_wildcard=placement.target_wildcard,
@@ -554,13 +663,15 @@ async def create_application(
         # build_pack=dockercompose loads the compose from git (drop the raw) and
         # REJECTS `domains` — per-service domains live in docker_compose_domains,
         # which the create route wants as an ARRAY of {name, domain}. Remap the
-        # server-bound URLs inside onto the target so the app keeps its URLs.
+        # server-bound URLs inside onto the target; the custom ones are claimed
+        # after the compose gate (a forced compose CREATE is ignored before 4.5).
         body.pop("docker_compose_raw", None)
         body.pop("domains", None)
         compose_domains = _compose_domains_body(
             source.get("docker_compose_domains"),
             source_wildcard=placement.source_wildcard,
             target_wildcard=placement.target_wildcard,
+            with_custom=False,
         )
         if compose_domains:
             body["docker_compose_domains"] = compose_domains
@@ -574,13 +685,17 @@ async def create_application(
     # A domain-less stack (e.g. one reached only through a cloudflared tunnel)
     # must STAY domain-less. Coolify auto-generates a wildcard/sslip.io domain
     # when none is given (autogenerate_domain defaults to true), which would plant
-    # a URL the source never had. Suppress it ONLY when the SOURCE itself had no
-    # domains — not when we merely dropped a server-bound URL we could not remap
-    # (no target wildcard), where the sslip.io fallback is the wanted behaviour.
+    # a URL the source never had. Suppress it when the SOURCE itself had no
+    # domains, and when the claim will set them (custom hosts, nothing else to
+    # create with) — not when we merely dropped a server-bound or generated URL
+    # we could not carry, where the generated fallback is the wanted behaviour.
     source_has_domains = bool(source.get("fqdn")) or bool(
         _parse_compose_domains(source.get("docker_compose_domains"))
     )
-    if not source_has_domains:
+    claims_later = bool(
+        domains.resource_custom_hosts(snapshot, source, source_wildcard=placement.source_wildcard)
+    )
+    if not source_has_domains or (claims_later and not target_domains):
         body["autogenerate_domain"] = False
 
     required = frozenset({"project_uuid", "server_uuid"}) | APPLICATION_ROUTE_REQUIRED[segment]
@@ -618,12 +733,12 @@ async def create_resource(
 # {name, url} ('array:name,url', ServicesController v4.1.2:971, v4.5.0:1259);
 # the per-sub-application PATCH exists only from 4.2.0.
 #
-# Services are NOT parked before the stop, unlike applications. The target takes
-# the source's hosts with force_domain_override, and only when every conflicting
-# holder is one of the source's own sub-applications. So nothing is written to
-# the live source before FINALIZE: no re-parse of its compose, no 4.5 updateCompose
+# Make-before-break, exactly like applications (domain/domains.py): the target
+# takes the source's hosts with force_domain_override, and only when every
+# conflicting holder is this migration's own. Nothing is written to the live
+# source before FINALIZE: no re-parse of its compose, no 4.5 updateCompose
 # rewrite of its env rows, no managed-DNS release job (4.4+) deleting a record it
-# still serves — and nothing for a rollback to put back.
+# still serves — and nothing for a rollback before FINALIZE to put back.
 
 
 def service_app_urls(source: dict[str, Any]) -> dict[str, str]:
@@ -648,17 +763,8 @@ def service_app_urls(source: dict[str, Any]) -> dict[str, str]:
     return out
 
 
-def _drop_generated(value: str) -> str:
-    """``value`` without its Coolify-generated (sslip.io-style) hosts. PURE.
-
-    A generated host is ``{name}-{uuid}.{server-ip}.sslip.io`` (shared.php
-    v4.5.0:1494-1522): it names the SOURCE's uuid and IP, so on the target it
-    would route a hostname that resolves to the source. The target's own parse
-    generates its own instead.
-    """
-    return ",".join(
-        part for part in value.split(",") if not ((host := normalise_host(part)) and is_generated(host))
-    )
+#: Moved to the pure domain layer (applications drop generated hosts too).
+_drop_generated = domains.without_generated
 
 
 def _url_key(value: str) -> tuple[str, ...]:
@@ -679,11 +785,7 @@ def service_custom_urls(
     """
     out: list[dict[str, str]] = []
     for name, value in service_app_urls(source).items():
-        hosts = [h for h in (normalise_host(part) for part in value.split(",")) if h]
-        if any(
-            not is_generated(h) and not dns_wildcard.under_wildcard(h, source_wildcard)
-            for h in hosts
-        ):
+        if domains.custom_hosts(value, source_wildcard=source_wildcard):
             out.append({"name": name, "url": value})
     return out
 
@@ -694,9 +796,9 @@ def service_restore_body(
     """The body that gives the source back its custom URLs, or ``None``. PURE.
 
     Journaled as ``parked_domains`` before any write for the resource. Nothing
-    parks a service, so a rollback before FINALIZE finds the source unchanged and
-    :func:`restore_service_urls` sends nothing; the body matters once FINALIZE has
-    released the hosts.
+    touches a service's domains before FINALIZE, so a rollback before it finds
+    the source unchanged and :func:`restore_service_urls` sends nothing; the
+    body matters once FINALIZE has released the hosts.
     """
     urls = service_custom_urls(source, source_wildcard=source_wildcard)
     return {"urls": urls} if urls else None
@@ -733,23 +835,19 @@ def service_urls_body(
     return entries, missing
 
 
-def _conflicts(body: object) -> list[dict[str, Any]]:
-    """The ``conflicts`` of a 409 body, tolerating any other shape. PURE."""
-    conflicts = body.get("conflicts") if isinstance(body, dict) else None
-    if not isinstance(conflicts, list):
-        return []
-    return [c for c in conflicts if isinstance(c, dict)]
+def sub_application_uuids(resource: dict[str, Any]) -> set[str]:
+    """The uuids of a service GET's sub-applications. PURE.
 
-
-def only_own_conflicts(conflicts: list[dict[str, Any]], own: Collection[str]) -> bool:
-    """Whether every holder of a conflicting domain is one of ``own``. PURE.
-
-    ``resource_uuid`` is the HOLDING ServiceApplication's (or Application's) uuid,
-    and ``null`` for the instance's own domain (domains.php v4.1.2:142-257,
-    v4.5.0:250-335) — which never counts as own. No conflicts is not "own" either.
+    A service's domain conflict names the holding ServiceApplication, never the
+    service (domains.php v4.1.2:226-232, v4.5.0:304-310), so these are what an
+    own-holder set must contain. ``GET /services/{uuid}`` loads ``applications``
+    (ServicesController v4.1.2:736, v4.5.0:885).
     """
-    holders = [c.get("resource_uuid") for c in conflicts]
-    return bool(holders) and all(isinstance(h, str) and h in own for h in holders)
+    return {
+        str(app["uuid"])
+        for app in resource.get("applications") or []
+        if isinstance(app, dict) and app.get("uuid")
+    }
 
 
 async def finish_service_target(
@@ -758,21 +856,30 @@ async def finish_service_target(
     placement: Placement,
     source: dict[str, Any],
     target_uuid: str,
-) -> int:
+    *,
+    own: Collection[str] = (),
+) -> set[str]:
     """Carry the source's domains, and its network flag, to a created service.
 
     One ``PATCH /services/{target}``, sent only after the engine journaled the
-    uuid. Returns the number of sub-applications whose URL was carried.
+    uuid. Returns the target's sub-application uuids, which the caller adds to
+    its own-holder set.
 
     On a 409 it retries ONCE with ``force_domain_override`` — and only when every
-    holder is one of the source's own sub-applications, which keep their hosts
-    until FINALIZE releases them. Any other holder (another resource of the team,
-    the instance) is refused: forcing would put two routers on one host. Note the
-    check is port-blind against a portless holder from 4.3.15 (the request key
-    keeps its port, the stored fqdn lost it), so a port-bearing URL may never 409
-    at all; FINALIZE releases the source's copy either way.
+    holder is this migration's own (:func:`domains.only_own_holders` over ``own``
+    plus the source's and the target's sub-applications). The source keeps its
+    hosts until FINALIZE releases them. Any other holder (another resource of the
+    team, the instance) is refused, naming each by type and uuid: forcing would
+    put two routers on one host. Note the check is port-blind against a portless
+    holder from 4.3.15 (the request key keeps its port, the stored fqdn lost it),
+    so a port-bearing URL may never 409 at all; FINALIZE releases the source's
+    copy either way.
+
+    Then the target is read back and must hold every custom host: make-before-
+    break needs the target to HOLD a host before the source may let it go.
     """
     target = await api.get_resource("services", target_uuid)
+    target_apps = sub_application_uuids(target)
     names = {
         str(app["name"])
         for app in target.get("applications") or []
@@ -820,50 +927,49 @@ async def finish_service_target(
     if entries:
         body["urls"] = entries
     if not body:
-        return 0
+        return target_apps
     body = filter_body(body, SERVICE_UPDATE)
 
+    holders = {*own, *sub_application_uuids(source), *target_apps, target_uuid}
     try:
         await api.update_resource("services", target_uuid, body)
     except CoolifyApiError as exc:
         if exc.status_code != 409:
             raise
-        conflicts = _conflicts(exc.body)
-        own = {
-            str(app["uuid"])
-            for app in source.get("applications") or []
-            if isinstance(app, dict) and app.get("uuid")
-        }
-        if not only_own_conflicts(conflicts, own):
-            held = "; ".join(str(c.get("message") or c.get("domain")) for c in conflicts)
-            raise CoolifyApiError(
-                f"service {snapshot.name!r}: the target cannot claim its domain(s): "
-                + (held or "Coolify named no holder"),
-                status_code=409,
-                body=exc.body,
-                hint=(
-                    "Another resource of this team — or the Coolify instance itself — "
-                    "holds it. Free it there, then migrate again; this tool never forces a "
-                    "domain away from anything but the source itself. The source was never "
-                    "stopped and keeps serving; the created target will be deleted."
-                ),
-            ) from exc
+        if not domains.only_own_holders(exc.body, holders):
+            raise _holder_refusal(snapshot.name, "service", exc, holders) from exc
         log.info("api.service.urls_forced", name=snapshot.name, target=target_uuid)
         await api.update_resource(
             "services", target_uuid, {**body, "force_domain_override": True}
         )
 
+    wanted: list[str] = []
+    for entry in entries:
+        wanted.extend(domains.custom_hosts(entry["url"], source_wildcard=placement.source_wildcard))
+    if wanted:
+        after = await api.get_resource("services", target_uuid)
+        held = domains.held_hosts(after)
+        lost = [h for h in dict.fromkeys(wanted) if h not in held]
+        if lost:
+            raise UnsupportedResource(
+                f"service {snapshot.name!r}: the target does not hold {lost} after carrying "
+                "its domains",
+                hint=(
+                    "Coolify accepted the URLs but did not keep them. The source was never "
+                    "stopped and keeps every domain; the created target will be deleted."
+                ),
+            )
     log.info("api.service.urls_carried", name=snapshot.name, target=target_uuid, count=len(entries))
-    return len(entries)
+    return target_apps
 
 
 async def restore_service_urls(api: CoolifyClient, uuid: str, body: dict[str, Any]) -> bool:
     """Give a service back the URLs in ``body``, PATCHing only what differs.
 
     Idempotent, and silent when nothing differs — the normal case, since nothing
-    parks a service: a rollback before FINALIZE finds the source as it was. Not
-    writing then matters. Every PATCH re-parses the live source's compose
-    (v4.5.0:1336-1342), and on 4.5 applyServiceUrls rewrites its
+    touches a service's domains before FINALIZE: a rollback before it finds the
+    source as it was. Not writing then matters. Every PATCH re-parses the live
+    source's compose (v4.5.0:1336-1342), and on 4.5 applyServiceUrls rewrites its
     SERVICE_URL_*/SERVICE_FQDN_* rows on the spot (updateCompose, v4.5.0:214).
 
     A ``force_domain_override`` in ``body`` is passed on (the caller's 409 retry).
@@ -897,35 +1003,86 @@ async def restore_service_urls(api: CoolifyClient, uuid: str, body: dict[str, An
     return True
 
 
+# ── releasing the source at FINALIZE ─────────────────────────────────────────
+
+
+async def release_application_domains(
+    api: CoolifyClient, snapshot: ResourceSnapshot, *, source_wildcard: str | None
+) -> bool:
+    """Remove an application source's CUSTOM hosts at FINALIZE. Returns success.
+
+    The target holds them already (claimed at CREATE), so this is the "break"
+    of make-before-break: Coolify's release job for the removed hosts finds the
+    target holding each and only re-references a managed record
+    (ManagedDnsRecordCleanup v4.5.0:322-333) — it never deletes one. Server-bound
+    and generated hosts stay: they collide with nothing on the target, and
+    removing them would let Coolify delete a record of the source's own server.
+
+    A kept or renamed source still holding the custom hosts would be a second
+    router and ACME requester on each the moment anyone restarts it, so this
+    runs under KEEP and RENAME alike. A dockercompose app's ``domains`` field
+    422s; it is released by resubmitting its docker_compose_domains. Never
+    raises: the source is stopped, nothing routes it yet, and the caller reports
+    a failure for the operator to finish by hand.
+    """
+    try:
+        current = await api.get_resource("applications", snapshot.uuid)
+        if snapshot.kind is ResourceKind.APP_GIT_COMPOSE:
+            parsed = _parse_compose_domains(current.get("docker_compose_domains"))
+            released = [
+                {"name": n, "domain": domains.without_custom(d, source_wildcard=source_wildcard)}
+                for n, d in parsed.items()
+            ]
+            if released == [{"name": n, "domain": d} for n, d in parsed.items()]:
+                return True
+            body: dict[str, Any] = {"docker_compose_domains": released}
+        else:
+            original = str(current.get("fqdn") or "")
+            kept = domains.without_custom(original, source_wildcard=source_wildcard)
+            if kept == ",".join(p.strip() for p in original.split(",") if p.strip()):
+                return True
+            body = {"domains": kept}
+        await api.update_resource("applications", snapshot.uuid, body)
+        log.info("api.application.domains_released", uuid=snapshot.uuid)
+        return True
+    except CoolifyApiError as exc:
+        log.warning(
+            "api.application.domains_release_failed",
+            uuid=snapshot.uuid,
+            error=str(exc)[:200],
+            hint="Remove the source's custom domains by hand before restarting it.",
+        )
+        return False
+
+
 async def release_service_urls(
     api: CoolifyClient, uuid: str, *, source_wildcard: str | None
-) -> None:
-    """Blank the source's custom sub-application URLs at FINALIZE. NEVER raises.
+) -> bool:
+    """Blank the source's custom sub-application URLs at FINALIZE. Returns success.
 
     The target serves those hosts now. A kept or renamed source still holding
-    them would put a second router on each the moment anyone restarts it — what
-    parking prevents for applications — so this runs under KEEP as well as
-    RENAME. Blanked, not renamed: a null fqdn is regenerated on the next parse as
-    a generated or source-wildcard host, which collide with nothing, whereas an
-    ``old-<tag>`` name would collide with the next migration of this project
-    (the tag is the project/environment digest, not per run). ``""`` arrives as
-    null (ConvertEmptyStringsToNull), and a blank url sets fqdn=null
-    (ServicesController v4.1.2:118-121, v4.5.0:209-212).
+    them would put a second router on each the moment anyone restarts it, so
+    this runs under KEEP as well as RENAME. Blanked, not renamed: a null fqdn is
+    regenerated on the next parse as a generated or source-wildcard host, which
+    collide with nothing. ``""`` arrives as null (ConvertEmptyStringsToNull), and
+    a blank url sets fqdn=null (ServicesController v4.1.2:118-121,
+    v4.5.0:209-212).
 
     From 4.4 removing a hostname queues ReleaseRemovedDnsHostnamesJob; the live
-    target uses it, so a Coolify-managed record is re-referenced, not deleted
-    (ManagedDnsRecordCleanup v4.5.0:322-333). Not fatal on failure, like
-    :func:`release_fqdn`: the source is stopped, so nothing routes it yet.
+    target holds it, so a Coolify-managed record is re-referenced, not deleted
+    (ManagedDnsRecordCleanup v4.5.0:322-333). Never raises: the source is
+    stopped, so nothing routes it yet, and the caller reports a failure.
     """
     try:
         source = await api.get_resource("services", uuid)
         urls = service_custom_urls(source, source_wildcard=source_wildcard)
         if not urls:
-            return
+            return True
         await api.update_resource(
             "services", uuid, {"urls": [{"name": e["name"], "url": ""} for e in urls]}
         )
         log.info("api.service.urls_released", uuid=uuid, count=len(urls))
+        return True
     except CoolifyApiError as exc:
         log.warning(
             "api.service.urls_release_failed",
@@ -933,6 +1090,18 @@ async def release_service_urls(
             error=str(exc)[:200],
             hint="Clear the source's domains by hand before restarting it.",
         )
+        return False
+
+
+async def release_source_domains(
+    api: CoolifyClient, snapshot: ResourceSnapshot, *, source_wildcard: str | None
+) -> bool:
+    """FINALIZE's release of one source's custom hosts. Returns success, never raises."""
+    if snapshot.collection == "services":
+        return await release_service_urls(api, snapshot.uuid, source_wildcard=source_wildcard)
+    if snapshot.collection == "applications":
+        return await release_application_domains(api, snapshot, source_wildcard=source_wildcard)
+    return True
 
 
 # ── env vars ─────────────────────────────────────────────────────────────────
@@ -1295,33 +1464,3 @@ async def rename(api: CoolifyClient, collection: str, uuid: str, name: str) -> N
     await api.update_resource(collection, uuid, {"name": name})
     log.info("api.renamed", uuid=uuid, name=name)
 
-
-async def release_fqdn(
-    api: CoolifyClient, collection: str, uuid: str, *, kind: ResourceKind | None = None
-) -> None:
-    """Clear the source's domains so the old proxy stops claiming them.
-
-    Without this, a kept-or-renamed source still has its FQDN, so the old host's
-    Traefik keeps the router rule and keeps renewing the certificate — quietly
-    consuming ACME budget for a hostname it no longer serves.
-
-    A dockercompose app is special: its ``domains`` field is rejected (422), so
-    it is released by resubmitting docker_compose_domains with blank domains.
-    """
-    if collection != "applications":
-        return
-    try:
-        if kind is ResourceKind.APP_GIT_COMPOSE:
-            full = await api.get_resource("applications", uuid)
-            blanked = _blank_compose_domains(full.get("docker_compose_domains"))
-            if blanked is None:
-                return
-            body: dict[str, Any] = {"docker_compose_domains": blanked}
-        else:
-            body = {"domains": ""}
-        await api.update_resource(collection, uuid, body)
-        log.info("api.fqdn.released", uuid=uuid)
-    except CoolifyApiError as exc:
-        # Not fatal: the source is stopped, so its labels are gone anyway. Worth
-        # saying out loud rather than swallowing.
-        log.warning("api.fqdn.release_failed", uuid=uuid, error=str(exc)[:200])

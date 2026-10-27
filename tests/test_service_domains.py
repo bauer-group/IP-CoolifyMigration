@@ -1,4 +1,4 @@
-"""Service domains: carried to the target, released at FINALIZE, never parked.
+"""Service domains: claimed by the target, released by the source at FINALIZE.
 
 A service's domains live on its sub-applications (``applications[].fqdn``/``url``),
 which is what the target's proxy labels are generated from. Before this, CREATE
@@ -83,10 +83,26 @@ def _source(**kw: object) -> dict[str, Any]:
     return {**base, **kw}
 
 
-def _target_get(names: tuple[str, ...] = ("web", "api", "admin")) -> httpx.Response:
-    return httpx.Response(
-        200, json={"uuid": "tgt1", "applications": [{"uuid": f"t-{n}", "name": n} for n in names]}
-    )
+def _target_get(
+    names: tuple[str, ...] = ("web", "api", "admin"), *, urls: dict[str, str] | None = None
+) -> httpx.Response:
+    apps = [{"uuid": f"t-{n}", "name": n, "url": (urls or {}).get(n)} for n in names]
+    return httpx.Response(200, json={"uuid": "tgt1", "applications": apps})
+
+
+#: The target once it holds the carried URLs - what the read-back must find.
+CLAIMED = {"web": "https://shop.example.com:8443", "api": f"http://api.{TGT_WC}/v1"}
+
+
+def _target_reads(*, claimed: dict[str, str] | None = CLAIMED) -> Any:
+    """GET /services/tgt1: as created at first, holding the URLs from then on."""
+    calls: list[int] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return _target_get(urls=None if len(calls) == 1 else claimed)
+
+    return handler
 
 
 def _body(route: respx.Route, index: int = 0) -> Any:
@@ -194,22 +210,13 @@ class TestCustomUrls:
         ]
 
 
-class TestOnlyOwnConflicts:
-    OWN = frozenset({"sa-web", "sa-api"})
+class TestSubApplicationUuids:
+    def test_reads_the_uuids_a_conflict_names(self) -> None:
+        assert resources.sub_application_uuids(_source()) == {"sa-web", "sa-api", "sa-admin"}
 
-    def test_every_holder_is_the_source(self) -> None:
-        conflicts = [{"resource_uuid": "sa-web"}, {"resource_uuid": "sa-api"}]
-        assert resources.only_own_conflicts(conflicts, self.OWN)
-
-    def test_a_third_party_holder(self) -> None:
-        conflicts = [{"resource_uuid": "sa-web"}, {"resource_uuid": "someone-else"}]
-        assert not resources.only_own_conflicts(conflicts, self.OWN)
-
-    def test_the_instance_domain_is_never_own(self) -> None:
-        assert not resources.only_own_conflicts([{"resource_uuid": None}], self.OWN)
-
-    def test_no_conflicts_is_not_own(self) -> None:
-        assert not resources.only_own_conflicts([], self.OWN)
+    def test_tolerates_junk(self) -> None:
+        assert resources.sub_application_uuids({"applications": ["x", {"name": "n"}]}) == set()
+        assert resources.sub_application_uuids({}) == set()
 
 
 # ── IO: create, carry, restore, release ──────────────────────────────────────
@@ -232,19 +239,14 @@ class TestCreateService:
         assert len(respx_mock.calls) == 1
 
 
-class TestParkSourceDomainsForServices:
-    async def test_a_service_is_never_parked_but_its_restore_is_returned(
-        self, api: CoolifyClient, respx_mock: respx.Router
-    ) -> None:
-        restore = await resources.park_source_domains(
-            api, _snapshot(), _source(), source_wildcard=SRC_WC, tag="t1"
-        )
+class TestSourceRestoreBodyForServices:
+    def test_a_service_body_holds_its_custom_sub_application_urls(self) -> None:
+        restore = resources.source_restore_body(_snapshot(), _source(), source_wildcard=SRC_WC)
         assert restore == {"urls": [{"name": "web", "url": "https://shop.example.com:8443"}]}
-        assert not respx_mock.calls
 
 
 class TestFinishServiceTarget:
-    async def _finish(self, api: CoolifyClient, source: dict[str, Any] | None = None) -> int:
+    async def _finish(self, api: CoolifyClient, source: dict[str, Any] | None = None) -> set[str]:
         return await resources.finish_service_target(
             api, _snapshot(), _placement(), source or _source(), "tgt1"
         )
@@ -252,12 +254,13 @@ class TestFinishServiceTarget:
     async def test_one_patch_carries_urls_and_the_network_flag(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
-        respx_mock.get(f"{BASE}/services/tgt1").mock(return_value=_target_get())
+        respx_mock.get(f"{BASE}/services/tgt1").mock(side_effect=_target_reads())
         patch = respx_mock.patch(f"{BASE}/services/tgt1").mock(
             return_value=httpx.Response(200, json={"uuid": "tgt1"})
         )
-        count = await self._finish(api, _source(connect_to_docker_network=True))
-        assert count == 2
+        own = await self._finish(api, _source(connect_to_docker_network=True))
+        # The target's sub-applications join the caller's own-holder set.
+        assert own == {"t-web", "t-api", "t-admin"}
         assert patch.call_count == 1
         assert _body(patch) == {
             "connect_to_docker_network": True,
@@ -270,7 +273,7 @@ class TestFinishServiceTarget:
     async def test_never_forces_on_the_first_attempt(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
-        respx_mock.get(f"{BASE}/services/tgt1").mock(return_value=_target_get())
+        respx_mock.get(f"{BASE}/services/tgt1").mock(side_effect=_target_reads())
         patch = respx_mock.patch(f"{BASE}/services/tgt1").mock(
             return_value=httpx.Response(200, json={})
         )
@@ -300,15 +303,15 @@ class TestFinishServiceTarget:
             return_value=httpx.Response(200, json={})
         )
         source = {"applications": [{"uuid": "sa-admin", "name": "admin", "fqdn": SSLIP}]}
-        assert await self._finish(api, source) == 0
+        assert await self._finish(api, source) == {"t-web", "t-api", "t-admin"}
         assert not patch.called
 
     async def test_a_conflict_held_only_by_the_source_is_forced(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
         # The source keeps its hosts until FINALIZE, so the target's claim 409s
-        # against the source's own sub-application — the one holder we may force.
-        respx_mock.get(f"{BASE}/services/tgt1").mock(return_value=_target_get())
+        # against the source's own sub-application — a holder we may force.
+        respx_mock.get(f"{BASE}/services/tgt1").mock(side_effect=_target_reads())
         conflict = {
             "message": "Domain conflicts detected. Use force_domain_override=true to proceed.",
             "conflicts": [
@@ -340,14 +343,20 @@ class TestFinishServiceTarget:
     ) -> None:
         respx_mock.get(f"{BASE}/services/tgt1").mock(return_value=_target_get())
         conflicts = [
-            {"resource_uuid": "sa-web", "message": "in use by service 'shop'"},
-            {**holder, "message": "Domain https://shop.example.com is already in use by X"},
+            {"resource_uuid": "sa-web", "domain": "shop.example.com", "resource_name": "shop"},
+            {**holder, "domain": "shop.example.com", "resource_name": "X"},
         ]
         patch = respx_mock.patch(f"{BASE}/services/tgt1").mock(
             return_value=httpx.Response(409, json={"conflicts": conflicts})
         )
-        with pytest.raises(CoolifyApiError, match="already in use by X") as exc_info:
+        with pytest.raises(CoolifyApiError, match="held elsewhere") as exc_info:
             await self._finish(api)
+        message = exc_info.value.args[0]  # the message itself, not the echoed body
+        # Only the holder that is NOT ours is named — by uuid when it has one, so
+        # an orphan carrying the source's name cannot be mistaken for it.
+        assert "sa-web" not in message
+        uuid = holder["resource_uuid"]
+        assert (f"(uuid {uuid})" if uuid else "the Coolify instance itself") in message
         assert exc_info.value.status_code == 409
         assert "never stopped" in (exc_info.value.hint or "")
         assert patch.call_count == 1
@@ -375,10 +384,33 @@ class TestFinishServiceTarget:
             await self._finish(api)
         assert patch.call_count == 1
 
+    async def test_the_target_must_hold_what_it_claimed(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # Make-before-break: the source may only let go once the target HOLDS it.
+        respx_mock.get(f"{BASE}/services/tgt1").mock(side_effect=_target_reads(claimed={}))
+        respx_mock.patch(f"{BASE}/services/tgt1").mock(return_value=httpx.Response(200, json={}))
+        with pytest.raises(UnsupportedResource, match=r"does not hold \['shop\.example\.com', 'api\."):
+            await self._finish(api)
+
+    async def test_an_orphan_of_ours_is_forced_too(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # The caller's own set: a target this run already made holds the host.
+        respx_mock.get(f"{BASE}/services/tgt1").mock(side_effect=_target_reads())
+        conflict = {"conflicts": [{"resource_uuid": "t-earlier", "domain": "shop.example.com"}]}
+        patch = respx_mock.patch(f"{BASE}/services/tgt1").mock(
+            side_effect=[httpx.Response(409, json=conflict), httpx.Response(200, json={})]
+        )
+        await resources.finish_service_target(
+            api, _snapshot(), _placement(), _source(), "tgt1", own=frozenset({"t-earlier"})
+        )
+        assert patch.call_count == 2
+
     async def test_a_target_without_a_wildcard_keeps_its_generated_url(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
-        respx_mock.get(f"{BASE}/services/tgt1").mock(return_value=_target_get())
+        respx_mock.get(f"{BASE}/services/tgt1").mock(side_effect=_target_reads())
         patch = respx_mock.patch(f"{BASE}/services/tgt1").mock(
             return_value=httpx.Response(200, json={})
         )
@@ -512,7 +544,7 @@ def _mock_create(respx_mock: respx.Router, *, source: dict[str, Any] | None = No
     respx_mock.post(f"{BASE}/services").mock(
         return_value=httpx.Response(201, json={"uuid": "tgt1"})
     )
-    respx_mock.get(f"{BASE}/services/tgt1").mock(return_value=_target_get())
+    respx_mock.get(f"{BASE}/services/tgt1").mock(side_effect=_target_reads())
     respx_mock.get(f"{BASE}/services/svc1/envs").mock(
         return_value=httpx.Response(200, json=[{"key": "A", "value": "1"}])
     )
@@ -571,7 +603,17 @@ class TestCreateTarget:
         _mock_create(respx_mock)
         respx_mock.patch(f"{BASE}/services/tgt1").mock(
             return_value=httpx.Response(
-                409, json={"conflicts": [{"resource_uuid": "x", "message": "in use by app X"}]}
+                409,
+                json={
+                    "conflicts": [
+                        {
+                            "resource_uuid": "x",
+                            "domain": "shop.example.com",
+                            "resource_name": "X",
+                            "resource_type": "application",
+                        }
+                    ]
+                },
             )
         )
         delete = respx_mock.delete(url__startswith=f"{BASE}/services/tgt1").mock(
@@ -581,7 +623,7 @@ class TestCreateTarget:
             return_value=httpx.Response(200, json={})
         )
 
-        with pytest.raises(CoolifyApiError, match="in use by app X"):
+        with pytest.raises(CoolifyApiError, match=r"application 'X' \(uuid x\)"):
             await steps.step_create_target(ctx)
 
         assert delete.called, "the journaled target must be deleted"
@@ -675,3 +717,67 @@ class TestRestoreCompensation:
             ctx, {"target_uuids": {}, "parked_domains": {"svc1": restore}}
         )
         assert [c.request.method for c in respx_mock.calls] == ["GET"]
+
+
+class TestRollbackAfterFinalize:
+    """Findings 1/3/6: the released URLs must be back BEFORE the restart re-parses.
+
+    /restart -> StartService -> parse() rebuilds a blank sub-application fqdn as
+    a generated host and bakes the labels from it (parsers.php v4.5.0:2626-2675);
+    the urls PATCH only writes the database. So the restore must come first, and
+    the target that holds the host goes last.
+    """
+
+    async def test_released_urls_are_restored_before_the_source_restarts(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        from bg_coolify_migrate.engine.compensations import build_compensations
+        from bg_coolify_migrate.engine.executor import Saga
+
+        ctx.plan = _service_plan(finalize_policy=FinalizePolicy.RENAME)
+        restore = {"urls": [{"name": "web", "url": "https://shop.example.com:8443"}]}
+        ctx.journal.append(
+            "step_completed",
+            state="create_target",
+            detail={"target_uuids": {"svc1": "tgt1"}, "parked_domains": {"svc1": restore}},
+        )
+        ctx.journal.append("step_completed", state="quiesce", detail={})
+        ctx.journal.append("step_completed", state="finalize", detail={"policy": "rename"})
+        released = _source()
+        released["applications"][0] = {"uuid": "sa-web", "name": "web", "fqdn": None}
+        state = {"source": released}
+        order: list[str] = []
+
+        def get_source(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=state["source"])
+
+        def patch_source(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.read())
+            if "name" in body:
+                order.append("rename back")
+            else:
+                order.append("restore urls")
+                state["source"] = _source()
+            return httpx.Response(200, json={})
+
+        def mark(label: str) -> Any:
+            def handler(_request: httpx.Request) -> httpx.Response:
+                order.append(label)
+                return httpx.Response(200, json={})
+
+            return handler
+
+        respx_mock.get(f"{BASE}/services/svc1").mock(side_effect=get_source)
+        respx_mock.get(f"{BASE}/services/tgt1").mock(return_value=_target_get(urls=CLAIMED))
+        respx_mock.patch(f"{BASE}/services/svc1").mock(side_effect=patch_source)
+        respx_mock.post(f"{BASE}/services/svc1/restart").mock(side_effect=mark("restart"))
+        respx_mock.delete(url__startswith=f"{BASE}/services/tgt1").mock(
+            side_effect=mark("delete target")
+        )
+
+        result = await Saga(
+            journal=ctx.journal, context=ctx, steps={}, compensations=build_compensations()
+        ).rollback()
+
+        assert order == ["rename back", "restore urls", "restart", "delete target"]
+        assert result.compensations_failed == []

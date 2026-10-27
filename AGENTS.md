@@ -95,6 +95,13 @@ decision, the decision is in the wrong layer.
   is there for a reason documented in the module docstring. Removing one is a
   data-integrity change.
 - **Touching quiesce?** It has no `--force` and must not grow one.
+- **Touching a domain of a source or a target?** Make-before-break, always: a
+  custom hostname must have a live holder of ours at every instant. The target
+  claims it first (scoped `force_domain_override`, `domains.only_own_holders` —
+  the ONE predicate), the source lets go only at FINALIZE as its last mutation,
+  and a rollback restores the source BEFORE it deletes a target holding the host
+  — deleting the last holder is what makes Coolify (4.4+) delete a managed DNS
+  record. Never park, blank or delete first.
 - **Leaving a volume unmounted across a step?** Pin it (`discovery/pins.py`)
   first. Unmounted is what Coolify's `docker volume prune -af` deletes. Never
   flip the server's cleanup setting instead: a crash leaves it flipped, and a
@@ -141,7 +148,7 @@ tags v4.1.2 through v4.5.0 (2026-10-26). Read upstream at a **release tag**, nev
   `/applications/{uuid}/destinations` exists from 4.3.0; its DELETE only
   detaches and never stops. The UI's removal stops first — except on an
   unreachable server, where it detaches anyway. CREATE re-checks the count
-  (`steps._refuse_multi_server`) before parking anything.
+  (`steps._refuse_multi_server`) before creating anything.
 - **Scheduled tasks** exist for applications and services only (no database
   route or column), readable and creatable from v4.1.2 with one six-field array
   (`ScheduledTasksController` v4.1.2:57 = v4.5.0:81). An absent `enabled`
@@ -200,8 +207,9 @@ tags v4.1.2 through v4.5.0 (2026-10-26). Read upstream at a **release tag**, nev
   (`force_domain_override`, in every update array) only over our own targets.
 - **`noindex_domains` (4.3.0+) is dropped with the domains it flags.** The save
   hook's `syncNoindexDomains` keeps flags only for current domains
-  (Application.php v4.3.0:280), so parking erases them; the update applies them
-  after the fqdn (v4.3.0:3115-3120), so the journalled restore body carries them.
+  (Application.php v4.3.0:280), so FINALIZE's release erases them; the update
+  applies them after the fqdn (v4.3.0:3115-3120), so the journalled restore body
+  carries them.
 
 ### Learned the hard way, from a real instance
 
@@ -303,15 +311,17 @@ the release it starts in — read that module before adding a rule.
   and VERIFY would pass.
 - **A domain's explicit port moved into hidden `domain_port_overrides` (4.3.15).**
   The GET shows a portless fqdn; only the generated proxy labels still show the
-  routing. Parking the source's domains erases the override on the source too.
+  routing. Releasing the source's domains at FINALIZE erases the override on the
+  source too, so a rollback after FINALIZE restores the portless value.
   **Compose domains followed in 4.4.0** (`normalizeDockerComposeDomainPorts`,
   v4.4.0:6372, v4.5.0:6535-6551; absent at v4.3.15): the parsed `docker_compose`
   labels are the only witness, and `fidelity.compose_hidden_port_overrides` reads
   them — a port that is not the service's first exposed one is refused.
 - **The parking tag is stable per project/environment** (`domains.parking_tag`,
-  the migration id's digest). A source still on `old-<tag>.` hosts — an earlier
-  run's un-park failed — is refused at plan time: a new run would park the parked
-  host again and journal it as the one to restore.
+  the migration id's digest). Versions up to 2.9 parked a source's custom hosts
+  under `old-<tag>.` at CREATE; a source still on such hosts — an un-park that
+  failed — is refused at plan time: a new run would carry the parked host to
+  the target and journal it as the one to restore.
 - **Env rows saved before 4.5 keep the legacy escaping; every row we create is
   exact** (`uses_legacy_escaping`, hidden, unsettable). The row's `version` field
   tells which is which. Values with `\ " '`, a ` #` tail or quoted literals reach
@@ -346,18 +356,19 @@ the release it starts in — read that module before adding a rule.
   the hidden `domain_port_overrides`; the model appends `url`, which re-composes
   it (ServiceApplication v4.5.0:18,215-242). Generated sslip hosts name the
   SOURCE's uuid and IP and are never carried.
-- **Services are NOT parked.** Every `PATCH /services` re-parses the compose
-  before it applies `urls` (v4.5.0:1338), and on 4.5 `applyServiceUrls` rewrites
-  the SERVICE_URL_*/SERVICE_FQDN_* rows at once (`updateCompose`, v4.5.0:214) — so
-  parking would rewrite a LIVE source and couple every rollback to restoring
-  before `/restart`. Instead the target claims the hosts with
-  `force_domain_override`, and only when every `conflicts[].resource_uuid` of the
-  409 is one of the source's own sub-applications (that field is the holder's
+- **Nothing is parked — neither services nor applications.** Every `PATCH /services`
+  re-parses the compose before it applies `urls` (v4.5.0:1338), and on 4.5
+  `applyServiceUrls` rewrites the SERVICE_URL_*/SERVICE_FQDN_* rows at once
+  (`updateCompose`, v4.5.0:214) — so parking would rewrite a LIVE source. Instead
+  the target claims the hosts with `force_domain_override`, and only when every
+  `conflicts[].resource_uuid` of the 409 is ours: the plan's sources, their
+  sub-applications, this run's targets and theirs (that field is the holder's
   uuid, `null` for the instance's own domain: domains.php v4.5.0:250-335). Any
-  other holder is refused before the stop. FINALIZE releases the source's custom
-  hosts (url `""` -> null) under KEEP as well as RENAME: the park tag is the
-  project/environment digest, not per run, and a kept source holding the target's
-  host is a second router the moment someone restarts it.
+  other holder is refused before the stop, named by type and uuid (an orphaned
+  target carries the source's NAME). The target is read back and must hold every
+  custom host. FINALIZE releases the source's custom hosts (url `""` -> null)
+  under KEEP as well as RENAME, as its last mutation: a kept source holding the
+  target's host is a second router the moment someone restarts it.
 - **The conflict check is port-blind against a portless holder (4.3.15+):** the
   request key keeps its port, the stored fqdn lost it, so a port-bearing URL never
   409s against the same host saved without one. Do not rely on a 409 to detect a
@@ -365,7 +376,8 @@ the release it starts in — read that module before adding a rule.
 - **From 4.4 a removed hostname queues `ReleaseRemovedDnsHostnamesJob`**, which
   deletes a Coolify-managed DNS record no live resource uses (v4.5.0
   ServicesController:125-145). Removing a host from a live source before the
-  target holds it can delete its record; at FINALIZE the target already uses it.
+  target holds it can delete its record; at FINALIZE the target already uses it
+  (next section).
 - **A restore must not write a source that already holds its originals**
   (`restore_service_urls` GETs, compares, PATCHes only the difference): the same
   re-parse and `updateCompose` apply to it.
@@ -464,16 +476,72 @@ the release it starts in — read that module before adding a rule.
   StandalonePostgresql.php:180). Every pin is released BEFORE anything Coolify
   deletes - FINALIZE under DELETE, the target delete in a rollback.
 - **The source unpin is the LAST compensation** (`RELEASE_SOURCE_PINS`, owed
-  from CREATE_TARGET). It waits for the restarted source to mount its volumes,
-  and `/restart` redeploys with proxy labels built at job time - waiting any
-  earlier would hold back the parked-domain restore until the source had
-  deployed under the parked names.
+  from CREATE_TARGET): ..., RESTORE_SOURCE_FQDN, RESTART_SOURCE,
+  DELETE_TARGET_RESOURCE, RELEASE_SOURCE_PINS. It waits for the restarted source
+  to mount its volumes, so nothing may wait behind it; the domain restore runs
+  before the restart (`/restart` bakes the labels at job time).
 - **The plan reads the setting off `GET /servers/{uuid}`**, whose eager-loaded
   `settings` carry `delete_unused_volumes`, `docker_cleanup_frequency`,
   `force_docker_cleanup` and `docker_cleanup_threshold` at every release
   (v4.1.2:ServersController.php:166-171, v4.5.0:218-224). The dedicated
   `GET /servers/{uuid}/docker-cleanup` exists only from 4.3.0. A warning, never
   a refusal; under KEEP/RENAME it says the stopped source is no fallback copy.
+
+### Managed DNS and the domain hand-over (release tags v4.4.0 -> v4.5.0)
+
+Read at the tags only (managed DNS is absent at v4.3.24 and v4.4-rc.1). This is
+why `domain/domains.py` hands every hostname over make-before-break.
+
+- **Coolify manages DNS records for Cloudflare only, from v4.4.0.** Zones come
+  from the team's Cloudflare integration tokens (CloudflareDnsProvider
+  ::zonesForTeam, v4.4.0:73-76, v4.5.0:80-83). Records are created or replaced
+  only from Livewire UI flows (InteractsWithDnsProviders v4.5.0:47 create, :164
+  replace); no API controller, deploy, start or stop calls them. Created records
+  carry ttl 1 and `proxied` false (v4.4.0:156); from 4.4.4 `proxied` follows the
+  token's setting (v4.5.0:190).
+- **The REST API shows nothing of it.** No zone/record route, and the
+  resources' `domain_dns_statuses` is hidden. Only `GET /audit-events`
+  (admin-only, 90 days) names managed hostnames — so safety must never depend
+  on detecting a managed record.
+- **Coolify's only provider write we can trigger is a DELETE.** Removing a
+  hostname from a resource (any domain PATCH: ApplicationsController
+  v4.4.0:3252/3595, v4.5.0:3361/3784) or deleting a resource that references a
+  record (Traits/ReleasesManagedDnsRecords v4.5.0:21-27, afterCommit) queues a
+  release. The release (ManagedDnsRecordCleanup::releaseLocked v4.4.0:229-285,
+  v4.5.0:294-350) keeps the record when another live reference exists, or when
+  any live application, preview or service application HOLDS the exact hostname
+  in `fqdn`/`docker_compose_domains` — it then only re-references it
+  (v4.5.0:322-333; holders :358-398, soft-deleted excluded). Otherwise it
+  DELETES an owned record at Cloudflare (:342), unless its value was changed
+  there (ChangedExternally, CloudflareDnsProvider v4.5.0:343: forgotten, kept).
+  A deleted record is never recreated.
+- **So holding the hostname is what protects a record.** CREATE never writes
+  the source; the target claims the host while the source still holds it;
+  FINALIZE releases the source last (the target holds it); a rollback restores
+  the source first and deletes a host-holding target only once the source holds
+  its hosts again (`compensations._source_lacks_its_hosts`), keeping the target
+  — stopped, harmless — otherwise. Up to 2.9 CREATE parked the source first,
+  racing the release job against the target's create (a record of a LIVE site
+  could be deleted before QUIESCE), and a rollback deleted the target before the
+  restore. Both orders are races, not certainties — never write a test that
+  expects a deletion from them.
+- **Coolify never re-points a record.** Its value is written only on create or
+  a confirmed replace. The UI offers no create/replace for a hostname that
+  already has a managed row ("Managed by Coolify" badge only,
+  dns-provider-management.blade.php v4.4.0:28-29); for a Cloudflare record it
+  does not manage, the target's Domains -> Configure DNS -> "Replace record"
+  re-points it and tracks it as not owned (blade :33-36, InteractsWithDnsProviders
+  v4.5.0:164-201). The DNS cutover is therefore the operator's (or, later, this
+  tool's own Cloudflare API call — not built: phase 2 is a user decision).
+- **The claim is two-phase on every release.** Before v4.5.0 a dockercompose
+  CREATE strips `force_domain_override` before its conflict check reads it
+  (ApplicationsController v4.4.0:1464 strip, :1518 check; fixed
+  v4.5.0:1329-1330), while the UPDATE checks before it strips at every tag
+  (v4.1.2:2522/2591 vs :2657, v4.4.0:3409/3478 vs :3569, v4.5.0:3589/3658 vs
+  :3749). The target is created without the contested hosts, passes its gates,
+  then one PATCH claims them. The update ignores `domains` when the target
+  server's proxy should not run (v4.5.0:3566) and keeps compose entries only for
+  services in the loaded compose (:3667-3682) — hence the read-back.
 
 ## Verify + ship
 
@@ -498,6 +566,7 @@ Conventional Commits, **past-tense** subject (`added`, `fixed`, `updated`), max
 | Is the stack really stopped? | `discovery/quiesce.py` |
 | Which fields may we send? | `api/fields.py` |
 | What can the target NOT reproduce? | `domain/fidelity.py` |
+| Who holds a domain, and when may we force it? | `domain/domains.py` |
 | Are scheduled tasks and backup schedules carried? | `api/schedules.py`, `domain/schedules.py` |
 | Can a locked variable be carried? | `domain/locked_envs.py` |
 | Is the data safe from Coolify's cleanup? | `discovery/pins.py` |

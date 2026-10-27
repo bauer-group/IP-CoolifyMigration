@@ -1,4 +1,4 @@
-"""Service domains against a real Coolify: carried, released, never parked.
+"""Service domains against a real Coolify: claimed, released, never parked.
 
 A service keeps its domains on its sub-applications. The stack here has three,
 one of each kind the tool must tell apart:
@@ -256,8 +256,8 @@ async def test_rollback_leaves_the_source_domains_untouched(
             await asyncio.sleep(5)
         assert await _service_on(api, stack["name"], str(rig["server_b"]["uuid"])) is None
 
-        # Nothing parked the source, so the restart re-parses it onto its real
-        # hosts — no restore-before-restart ordering is needed for services.
+        # Before FINALIZE nothing touches the source's domains, so the restart
+        # re-parses it onto its real hosts (after FINALIZE the restore runs first).
         async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source_host:
             web = await _container(source_host, stack["uuid"], "web")
             routed = await _routed_hosts(source_host, web)

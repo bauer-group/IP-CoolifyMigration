@@ -352,9 +352,16 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
 
     Runs BEFORE quiesce: a failed create then costs zero downtime, and the target
     must exist before volumes can be paired by mount path.
+
+    Domains go make-before-break (domain/domains.py): the SOURCE is never
+    written here. Each target claims its source's custom hosts — an application
+    after its gates, in a second PATCH; a service through its sub-application
+    urls — forcing a conflict only over this migration's own resources, and is
+    read back to prove it holds them. The source keeps every host until
+    FINALIZE.
     """
-    # First, what an interrupted earlier attempt left: its targets and parked
-    # domains, from the journal. A no-op on a fresh run.
+    # First, what an interrupted earlier attempt left: its targets, from the
+    # journal. A no-op on a fresh run.
     await _undo_interrupted_attempt(ctx)
     # Before ANY write of this attempt: re-read the locked values the plan
     # promised. A refusal here leaves nothing to undo. The values stay in this
@@ -374,15 +381,29 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
     )
 
     created: dict[str, str] = {}
+    # Journal key `parked_domains` is historic (CREATE parked up to 2.9): it holds
+    # the bodies that give each source its ORIGINAL domains back after FINALIZE.
     parked: dict[str, dict[str, Any]] = {}
-    # Stable per project/environment, so the planner can recognise hosts an
-    # earlier run parked and never gave back (domains.leftover_parking_refusals).
+    # Stable per project/environment: the service env filter drops hosts an
+    # older run parked (domains.leftover_parking_refusals refuses them at PLAN).
     tag = domains.parking_tag(ctx.plan.project, ctx.plan.environment)
     source_wildcard = placement.source_wildcard
+    raw_version = ctx.journal.undo_info("preflight").get("coolify_version")
+    version = parse_version(raw_version if isinstance(raw_version, str) else None)
     try:
+        sources = {
+            r.snapshot.uuid: await ctx.api.get_resource(r.snapshot.collection, r.snapshot.uuid)
+            for r in ctx.plan.resources
+        }
+        # Whose domain conflicts a claim may override (domains.only_own_holders):
+        # the plan's sources and their sub-applications, then each target made.
+        own: set[str] = set(sources)
+        for full in sources.values():
+            own |= api_resources.sub_application_uuids(full)
+
         for resource in ctx.plan.resources:
             snapshot = resource.snapshot
-            source_full = await ctx.api.get_resource(snapshot.collection, snapshot.uuid)
+            source_full = sources[snapshot.uuid]
             if snapshot.collection == "applications":
                 await _refuse_multi_server(ctx, snapshot, source_full)
 
@@ -391,19 +412,26 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
             # create field exist only on unreleased `main`; on every published release
             # the read 404s and the create 422s.
 
-            # Free the source's custom domains so the target can claim them — Coolify
-            # 409s on a duplicate. The restore body is journalled BEFORE the park.
-            # A service is never parked; only its restore body is kept.
-            await _park_source_domains(
-                ctx, snapshot, source_full, tag=tag, created=created, parked=parked
+            # The way back for FINALIZE's release, journalled before any write for
+            # this resource.
+            restore = api_resources.source_restore_body(
+                snapshot, source_full, source_wildcard=source_wildcard, version=version
             )
+            if restore is not None:
+                parked[snapshot.uuid] = restore
+                ctx.journal.append(
+                    "step_started",
+                    state="create_target",
+                    detail={"target_uuids": dict(created), "parked_domains": dict(parked)},
+                )
 
             target_uuid = await api_resources.create_resource(ctx.api, snapshot, placement, source_full)
             created[snapshot.uuid] = target_uuid
             ctx.target_uuids[snapshot.uuid] = target_uuid
+            own.add(target_uuid)
 
             # Journal each creation IMMEDIATELY: a crash after creating the third of
-            # five resources must still be able to delete all three (and un-park).
+            # five resources must still be able to delete all three.
             ctx.journal.append(
                 "step_started",
                 state="create_target",
@@ -414,8 +442,8 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
             # now the uuid is journaled, and before copy_envs (4.5 derives the
             # target's SERVICE_URL_* rows from them in that PATCH).
             if snapshot.collection == "services":
-                await api_resources.finish_service_target(
-                    ctx.api, snapshot, placement, source_full, target_uuid
+                own |= await api_resources.finish_service_target(
+                    ctx.api, snapshot, placement, source_full, target_uuid, own=frozenset(own)
                 )
 
             await api_resources.copy_envs(
@@ -434,9 +462,9 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                 target_uuid=target_uuid,
                 kind=snapshot.kind,
             )
-            # Cosmetic metadata, and deliberately last: copy_tags never raises, so a
-            # missing tag route (Coolify <4.2) or a rejected name degrades to "no
-            # tags" instead of taking down a target that is otherwise complete.
+            # Cosmetic metadata: copy_tags never raises, so a missing tag route
+            # (Coolify <4.2) or a rejected name degrades to "no tags" instead of
+            # taking down a target that is otherwise complete.
             await api_resources.copy_tags(
                 ctx.api,
                 collection=snapshot.collection,
@@ -466,6 +494,14 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                     consequence="The source was never stopped; the created target will be deleted.",
                 )
 
+            # Phase two of an application's claim, after its gates: a compose
+            # target keeps docker_compose_domains only for services its loaded
+            # compose has, and a forced compose CREATE is ignored before 4.5.
+            if snapshot.collection == "applications":
+                await api_resources.claim_application_domains(
+                    ctx.api, snapshot, placement, source_full, target_uuid, own=frozenset(own)
+                )
+
             # After the gates: a dockercompose app's service names, which a task's
             # `container` must match, exist only once its compose has loaded.
             await api_schedules.copy_scheduled_tasks(
@@ -484,12 +520,11 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
             )
     except Exception as exc:
         # The saga compensates only COMPLETED steps, so a refusal part-way
-        # through CREATE — the compose gate, the service rehearsal, a 422 on
-        # the third of five resources — would strand the targets already made
-        # and leave the source's domains parked in Coolify's DB, where its next
-        # redeploy would serve only old-<tag> hosts. Undo exactly what this
-        # step did, then let the original error speak — unless the undo itself
-        # failed, which must not be reported as a plain failed create.
+        # through CREATE — the compose gate, the service rehearsal, a claim
+        # someone else blocks, a 422 on the third of five resources — would
+        # strand the targets already made. Undo exactly what this step did, then
+        # let the original error speak — unless the undo itself failed, which
+        # must not be reported as a plain failed create.
         problems = await compensations.undo_partial_create(ctx, created, parked)
         if problems:
             raise _undo_incomplete(ctx, problems, cause=exc) from exc
@@ -507,8 +542,8 @@ async def _refuse_multi_server(
     it was made; a server attached in the UI since then would otherwise be
     dropped from the target and left serving next to it. Costs no API call on
     the common path: ``source_full`` is the GET CREATE reads anyway. Runs before
-    park_source_domains, so nothing of THIS resource is parked or created yet;
-    those made earlier in the loop are undone by step_create_target's handler.
+    anything of THIS resource is created; those made earlier in the loop are
+    undone by step_create_target's handler.
     """
     if not fidelity.additional_servers(source_full)[0]:
         return
@@ -522,7 +557,7 @@ async def _refuse_multi_server(
         f"{snapshot.name}: {fidelity.multi_server_refusal(source_full, version=version)}",
         hint=(
             "An additional server was attached after the plan was made. Nothing of "
-            f"{snapshot.name} was parked or created; anything created before it in "
+            f"{snapshot.name} was created; anything created before it in "
             "this run is deleted again. The source was never stopped. Re-plan once "
             "the servers are removed."
         ),
@@ -558,14 +593,14 @@ async def _undo_interrupted_attempt(ctx: MigrationContext) -> None:
     (KeyboardInterrupt and CancelledError are BaseException), and the saga
     compensates only completed steps. But the journal holds everything that
     attempt did — each target and each restore body, written before the write.
-    A resume that ignored it created a second set of targets and parked the
-    already-parked hosts again (``old-<tag>.old-<tag>.<host>``), journalling the
-    PARKED host as the one to restore, so the real domain was then in no record
-    at all.
+    A resume that ignored it created a second set of targets, the first set
+    orphaned and — once it had claimed its source's custom hosts — holding them,
+    so the next claim 409'd on a holder that is no longer ours.
 
-    So: delete those targets, give the source its domains back, then record that
-    this step owns nothing yet, and let the step create afresh. A no-op on a
-    fresh run, whose journal holds no records for CREATE.
+    So: delete those targets (each only while its source holds its hosts), give
+    the source its domains back where a journal of an older version parked them,
+    then record that this step owns nothing yet, and let the step create afresh.
+    A no-op on a fresh run, whose journal holds no records for CREATE.
     """
     earlier = ctx.journal.undo_info(State.CREATE_TARGET.value)
     targets: dict[str, str] = earlier.get("target_uuids") or {}
@@ -587,48 +622,6 @@ async def _undo_interrupted_attempt(ctx: MigrationContext) -> None:
     )
     for source_uuid in targets:
         ctx.target_uuids.pop(source_uuid, None)
-
-
-async def _park_source_domains(
-    ctx: MigrationContext,
-    snapshot: ResourceSnapshot,
-    source: dict[str, Any],
-    *,
-    tag: str,
-    created: dict[str, str],
-    parked: dict[str, dict[str, Any]],
-) -> None:
-    """Park the source's custom domains, journalling the way back FIRST.
-
-    Server-bound domains are remapped onto the target's wildcard and never
-    collide, so only custom hosts are parked, and a service never is
-    (:func:`api_resources.source_domain_parking`).
-
-    The restore body is journalled BEFORE the park PATCH. The client retries a
-    PATCH that timed out (client.py ``_IDEMPOTENT``, ``max_retries=4``), so this
-    only matters once every retry has failed, or the process died mid-request —
-    and then Coolify may have applied a park we never heard back about, which
-    nothing but this record could undo. Restoring a body that was never parked
-    is harmless.
-    """
-    raw_version = ctx.journal.undo_info("preflight").get("coolify_version")
-    parking = api_resources.source_domain_parking(
-        snapshot,
-        source,
-        source_wildcard=ctx.plan.source_server.wildcard_domain or None,
-        tag=tag,
-        version=parse_version(raw_version if isinstance(raw_version, str) else None),
-    )
-    if parking.restore is not None:
-        parked[snapshot.uuid] = parking.restore
-        ctx.journal.append(
-            "step_started",
-            state="create_target",
-            detail={"target_uuids": dict(created), "parked_domains": dict(parked)},
-        )
-    if parking.park is not None:
-        await ctx.api.update_resource(snapshot.collection, snapshot.uuid, parking.park)
-        log.info("api.source_domains.parked", uuid=snapshot.uuid, tag=tag)
 
 
 async def _assert_compose_target_ready(
@@ -1883,9 +1876,9 @@ def _refuse_hosts_bound_to_source(
 async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
     """Refuse to start the target while a domain IT will serve still points at the source.
 
-    Reads the TARGET's domains, not the source's: create_target may have PARKED
-    the source's custom domains to free them, so the source no longer shows them.
-    What matters is what the TARGET will answer on when it starts.
+    Reads the TARGET's domains, not the source's: what matters is what the
+    TARGET will answer on when it starts — server-bound hosts rewritten onto its
+    wildcard, custom hosts it claimed at CREATE.
     """
     hostnames = []
     for resource in ctx.plan.resources:
@@ -2189,7 +2182,16 @@ async def step_healthcheck(ctx: MigrationContext) -> dict[str, Any]:
 
 
 async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
-    """Apply the finalize policy to the SOURCE. The only irreversible step."""
+    """Apply the finalize policy to the SOURCE. The only irreversible step.
+
+    Releasing the source's custom hosts is its LAST source mutation — after the
+    rename, the unpin and the key revoke — and journalled before it happens. It
+    is the "break" of make-before-break (domain/domains.py): the target holds
+    every one of those hosts since CREATE, so Coolify only ever re-references a
+    managed DNS record and never deletes one. KEEP releases them too: a kept
+    source still holding them is a second router and ACME requester the moment
+    anyone restarts it. DELETE releases by deleting.
+    """
     policy = ctx.plan.finalize_policy
     stamp = ctx.migration_id.split("-")[-1]
     actions: list[str] = []
@@ -2215,12 +2217,6 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
 
     for resource in ctx.plan.resources:
         snapshot = resource.snapshot
-        if snapshot.collection == "services" and policy is not FinalizePolicy.DELETE:
-            # The target holds the source's custom hosts now; a kept source too
-            # would be a second router on each once restarted. Never raises.
-            await api_resources.release_service_urls(
-                ctx.api, snapshot.uuid, source_wildcard=ctx.plan.source_server.wildcard_domain or None
-            )
         if policy is FinalizePolicy.KEEP:
             actions.append(f"kept {snapshot.name}")
             continue
@@ -2228,11 +2224,6 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
         if policy is FinalizePolicy.RENAME:
             new_name = f"{snapshot.name}-old-{stamp}"
             await api_resources.rename(ctx.api, snapshot.collection, snapshot.uuid, new_name)
-            # Without releasing the FQDN the old proxy keeps the router rule and
-            # keeps renewing its certificate for a hostname it no longer serves.
-            await api_resources.release_fqdn(
-                ctx.api, snapshot.collection, snapshot.uuid, kind=snapshot.kind
-            )
             actions.append(f"renamed {snapshot.name} -> {new_name}")
             continue
 
@@ -2245,13 +2236,54 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
         left += source.kept
 
     await keys.revoke(source=ctx.source_host, target=ctx.target_host, migration_id=ctx.migration_id)
+
+    domains_released: list[str] = []
+    if policy is not FinalizePolicy.DELETE:
+        domains_released = await _release_source_domains(ctx)
     return {
         "policy": policy.value,
         "actions": actions,
         "original_names": [r.snapshot.name for r in ctx.plan.resources],
         "pins_released": released,
         "pins_left": left,
+        "domains_released": domains_released,
     }
+
+
+async def _release_source_domains(ctx: MigrationContext) -> list[str]:
+    """Let the source go of its custom hosts. Never raises; reports what it could not.
+
+    Journalled first: a crash mid-release leaves the record that the source may
+    have let go, and RESTORE_SOURCE_FQDN reads the source anyway, so a rollback
+    gives back exactly what is missing. A failed release leaves the source
+    holding a host the target serves — stopped, so harmless until someone
+    restarts it — and says so in the run report.
+    """
+    owners = [
+        r.snapshot.uuid
+        for r in ctx.plan.resources
+        if r.snapshot.collection in ("applications", "services")
+    ]
+    if not owners:
+        return []
+    ctx.journal.append("step_started", state="finalize", detail={"releasing_domains": owners})
+    source_wildcard = ctx.plan.source_server.wildcard_domain or None
+    released: list[str] = []
+    for resource in ctx.plan.resources:
+        snapshot = resource.snapshot
+        if snapshot.uuid not in owners:
+            continue
+        if await api_resources.release_source_domains(
+            ctx.api, snapshot, source_wildcard=source_wildcard
+        ):
+            released.append(snapshot.uuid)
+            continue
+        ctx.notices.append(
+            f"{snapshot.name} (the stopped source) still holds its custom domains, which "
+            "the target now serves: remove them from the source in Coolify before anyone "
+            "restarts it, or it requests certificates for them next to the target."
+        )
+    return released
 
 
 async def _unpin_target(ctx: MigrationContext) -> pins.Release:
