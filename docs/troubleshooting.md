@@ -491,9 +491,14 @@ it, with the confirmation `delete` requires. From there the **target is the only
 copy** of the data, and undoing the run would mean stopping the target,
 dropping its volumes and deleting it — so nothing was undone, on purpose.
 
-Check the target in Coolify: it holds the data. If FINALIZE stopped part-way,
-some source resources may still exist; delete them by hand once the target is
-verified. The journal named in the hint shows what FINALIZE recorded.
+Check the target in Coolify: it holds the data. The hint starts with what
+failed. If FINALIZE stopped part-way, some source resources may still exist:
+`coolify-migrate resume <id>` finishes the step — each source deletion is
+journalled the moment Coolify accepts it, so a resume skips what is already
+gone, and a source Coolify answers 404 for counts as deleted. Or delete them by
+hand once the target is verified; if the hint names a pin that holds the
+remaining sources' volumes, `docker rm` it first, or Coolify's delete keeps
+them. The journal named in the hint shows what FINALIZE recorded.
 
 ### "rollback refused: the source no longer holds its data"
 

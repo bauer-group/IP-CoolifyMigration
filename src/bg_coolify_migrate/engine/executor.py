@@ -233,18 +233,22 @@ class Saga:
 
         Raised, not returned as ROLLBACK_FAILED: that outcome tells the operator
         the source was NOT deleted, and here it was. Nothing is marked finished,
-        so the journal stays as it is for whoever adjudicates it.
+        so the journal stays as it is for whoever adjudicates it - and a resume
+        can finish the step. The step's own error leads the hint: it says what
+        went wrong and what is left, and only this error reaches the operator.
         """
         reason = self._refusal(self.journal.details()) if self._refusal else None
         if reason is None:
             return
+        cause = f"What failed: {str(error)[:1500]}\n\n" if error is not None else ""
         self._refuse(
             reason,
             error,
             hint=(
-                "Nothing was undone. Check the target in Coolify - it holds the data. "
-                "If FINALIZE stopped part-way, delete what is left of the source by hand "
-                "once the target is verified."
+                f"{cause}Nothing was undone. Check the target in Coolify - it holds the data. "
+                "If FINALIZE stopped part-way, `coolify-migrate resume <id>` finishes it - "
+                "a source it already deleted is skipped - or delete what is left of the "
+                "source by hand once the target is verified."
             ),
         )
 

@@ -64,6 +64,7 @@ from bg_coolify_migrate.engine.planner import (
     resource_labels,
 )
 from bg_coolify_migrate.errors import (
+    CoolifyApiError,
     DnsGateBlocked,
     MigrationError,
     PreflightError,
@@ -2362,7 +2363,9 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
     released = list(target.released)
     left = list(target.kept)
     pinned: set[str] = set()
-    deleted: list[str] = []
+    # A part-way DELETE cannot be rolled back, only finished: what an earlier
+    # attempt deleted is on disk, and a resume skips it.
+    deleted: list[str] = list(ctx.journal.undo_info(State.FINALIZE.value).get("deleted") or [])
     if policy is FinalizePolicy.DELETE:
         # BEFORE the delete, and fatal: Coolify's `docker volume rm -f` cannot
         # remove a volume a pin references and swallows the refusal for apps and
@@ -2387,12 +2390,8 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
             actions.append(f"renamed {snapshot.name} -> {new_name}")
             continue
 
-        try:
-            await ctx.api.delete_resource(snapshot.collection, snapshot.uuid, delete_volumes=True)
-        except Exception as exc:
-            await _repin_undeleted(ctx, pinned, deleted=deleted, error=exc)
-            raise
-        deleted.append(snapshot.uuid)
+        if snapshot.uuid not in deleted:
+            await _delete_source(ctx, snapshot, pinned, deleted=deleted)
         actions.append(f"deleted {snapshot.name}")
 
     if policy is not FinalizePolicy.DELETE:
@@ -2542,6 +2541,33 @@ async def _refuse_other_references(ctx: MigrationContext) -> set[str]:
             f"`coolify-migrate resume {ctx.migration_id}`. Nothing has been deleted, and "
             "this run's own pins are still in place."
         ),
+    )
+
+
+async def _delete_source(
+    ctx: MigrationContext, snapshot: ResourceSnapshot, pinned: set[str], *, deleted: list[str]
+) -> None:
+    """Delete one source and journal it the moment Coolify has accepted the delete.
+
+    No rollback may run once a DELETE finalize began, so a failure part-way is
+    finished by a resume - and a resume must neither delete a source twice nor
+    trip over one already gone. A 404 is "already gone": the client retries a
+    DELETE that timed out, and the retry of one that landed finds nothing (the
+    models soft-delete), as does a source someone deleted by hand meanwhile.
+    """
+    try:
+        await ctx.api.delete_resource(snapshot.collection, snapshot.uuid, delete_volumes=True)
+    except CoolifyApiError as exc:
+        if exc.status_code != 404:
+            await _repin_undeleted(ctx, pinned, deleted=deleted, error=exc)
+            raise
+        log.info("finalize.source_already_gone", uuid=snapshot.uuid)
+    except Exception as exc:
+        await _repin_undeleted(ctx, pinned, deleted=deleted, error=exc)
+        raise
+    deleted.append(snapshot.uuid)
+    ctx.journal.append(
+        "step_started", state=State.FINALIZE.value, detail={"deleted": list(deleted)}
     )
 
 

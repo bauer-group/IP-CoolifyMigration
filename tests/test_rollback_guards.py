@@ -161,6 +161,96 @@ class TestFinalizeJournalsItsPolicyFirst:
         assert rollback_refusal(ctx.journal.details()) is not None
 
 
+def _at_finalize(tmp_path: Path, api: CoolifyClient, plan: MigrationPlan) -> MigrationContext:
+    """A run whose every state before FINALIZE completed, on stateful fake daemons."""
+    from tests.test_pins_engine import _source, _target
+
+    journal = Journal.create(tmp_path, "g6")
+    for state in State:
+        if state in (State.FINALIZE, State.DONE):
+            continue
+        detail = {"target_uuids": {}} if state is State.CREATE_TARGET else {}
+        journal.append("step_completed", state=state.value, detail=detail)
+    return MigrationContext(
+        api=api,
+        settings=Settings(_env_file=None, state_dir=tmp_path),
+        plan=plan,
+        journal=journal,
+        migration_id="g6",
+        source_host=_source(),  # type: ignore[arg-type]
+        target_host=_target(),  # type: ignore[arg-type]
+    )
+
+
+def _saga(ctx: MigrationContext) -> Saga:
+    from bg_coolify_migrate.engine.compensations import build_compensations
+
+    return Saga(
+        journal=ctx.journal,
+        context=ctx,
+        steps=steps.build_steps(),
+        compensations=build_compensations(),
+    )
+
+
+class TestAPartWayDeleteFinalizeIsFinishedByResume:
+    """Finding 7: a delete that fails for resource k after 1..k-1 went.
+
+    The rollback is refused (the target holds the only copy of 1..k-1), so the
+    one way forward is to finish FINALIZE - which re-deleted 1..k-1, got 404
+    from Coolify's soft-deleted rows, and failed again, every time.
+    """
+
+    async def test_resume_skips_what_was_deleted_and_finishes(
+        self, tmp_path: Path, respx_mock: respx.Router
+    ) -> None:
+        from tests.test_engine_steps import BASE, HOST, _plan
+        from tests.test_pins_engine import _redis
+
+        plan = _plan(
+            finalize_policy=FinalizePolicy.DELETE, resources=(_plan().resources[0], _redis())
+        )
+        first = respx_mock.delete(f"{BASE}/databases/db1").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        second = respx_mock.delete(f"{BASE}/databases/db3").mock(
+            side_effect=[httpx.Response(500), httpx.Response(200, json={})]
+        )
+        target_touched = respx_mock.route(url__regex=r".*/databases/db2.*")
+
+        async with CoolifyClient(HOST, "tok", max_retries=0) as api:
+            ctx = _at_finalize(tmp_path, api, plan)
+            with pytest.raises(RollbackError, match="rollback refused") as exc:
+                await _saga(ctx).run()
+            # The operator reads why, not only that nothing was undone.
+            assert "What failed" in (exc.value.hint or "")
+            assert "resume" in (exc.value.hint or "")
+            assert ctx.journal.undo_info(FINALIZE)["deleted"] == ["db1"]
+
+            result = await _saga(ctx).run()
+
+        assert result.outcome is Outcome.SUCCEEDED
+        assert first.call_count == 1 and second.call_count == 2
+        assert not target_touched.called
+
+    async def test_a_source_already_gone_counts_as_deleted(
+        self, tmp_path: Path, respx_mock: respx.Router
+    ) -> None:
+        # A DELETE that timed out after Coolify took it is retried, and the
+        # retry finds the soft-deleted row gone: 404.
+        from tests.test_engine_steps import BASE, HOST, _plan
+
+        respx_mock.delete(f"{BASE}/databases/db1").mock(
+            return_value=httpx.Response(404, json={"message": "Database not found."})
+        )
+        async with CoolifyClient(HOST, "tok", max_retries=0) as api:
+            ctx = _at_finalize(tmp_path, api, _plan(finalize_policy=FinalizePolicy.DELETE))
+            result = await steps.step_finalize(ctx)
+
+        assert result["actions"] == ["deleted postgres"]
+        assert ctx.journal.undo_info(FINALIZE)["deleted"] == ["db1"]
+
+
 class TestDnsRollbackNote:
     def _note(self, gate: dict[str, Any]) -> str | None:
         return domains.dns_rollback_note(
