@@ -748,23 +748,55 @@ async def create_resource(
 def service_app_urls(source: dict[str, Any]) -> dict[str, str]:
     """``{sub-application name: "url,url"}`` as the source routes them. PURE.
 
-    ``url`` before ``fqdn``: from 4.3.15 a saved domain's explicit port moves into
-    the hidden ``domain_port_overrides`` and ``fqdn`` comes back portless, while
-    the appended ``url`` re-composes it (ServiceApplication v4.5.0:18,215-242).
-    Before 4.3.15 the port is inline in ``fqdn`` and ``url`` is absent. Carrying
-    ``fqdn`` would route the target to the first exposed port instead.
+    Decided per comma part (:func:`_routed_url`), because neither field alone is
+    right on every release in range:
+
+    * from 4.3.15 a saved domain's explicit port moves into the hidden
+      ``domain_port_overrides`` and ``fqdn`` comes back portless, while the
+      appended ``url`` re-composes it (ServiceApplication v4.5.0:18,215-242);
+    * on 4.3.15-4.3.17 that accessor returned the port-STRIPPED canonical for a
+      domain without an override entry — a row saved before 4.3.15 whose port is
+      still inline in ``fqdn`` (the migration moves no data, and the proxy keeps
+      honouring the inline port) — fixed in 4.3.18 (``return $url``);
+    * before 4.3.15 the port is inline in ``fqdn`` and ``url`` is absent.
+
+    Carrying a portless value routes the target to the first exposed port.
     """
     out: dict[str, str] = {}
     for app in source.get("applications") or []:
         if not isinstance(app, dict) or not app.get("name"):
             continue
-        raw = app.get("url") or app.get("fqdn")
-        if not isinstance(raw, str):
-            continue
-        value = ",".join(part.strip() for part in raw.split(",") if part.strip())
+        value = _routed_url(app.get("url"), app.get("fqdn"))
         if value:
             out[str(app["name"])] = value
     return out
+
+
+def _parts_of(raw: object) -> list[str]:
+    return [p.strip() for p in raw.split(",") if p.strip()] if isinstance(raw, str) else []
+
+
+def _explicit_port(part: str) -> int | None:
+    try:
+        return urlsplit(part if "://" in part else f"//{part}").port
+    except ValueError:
+        return None
+
+
+def _routed_url(url: object, fqdn: object) -> str:
+    """One sub-application's routed URL list: per part, ``fqdn``'s when it names a port.
+
+    ``url`` maps ``fqdn``'s parts one to one and in order, so the two are paired
+    by index. Lists that do not pair (one absent, a different count) fall back
+    to ``url``, then ``fqdn``.
+    """
+    url_parts, fqdn_parts = _parts_of(url), _parts_of(fqdn)
+    if url_parts and len(url_parts) == len(fqdn_parts):
+        return ",".join(
+            f if _explicit_port(f) is not None else u
+            for u, f in zip(url_parts, fqdn_parts, strict=True)
+        )
+    return ",".join(url_parts or fqdn_parts)
 
 
 #: Moved to the pure domain layer (applications drop generated hosts too).

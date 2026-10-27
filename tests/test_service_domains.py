@@ -920,3 +920,70 @@ class TestRouteEnvReleaseAndRestore:
         body = {"route_envs": [{"key": "MINIO_SERVER_URL", "url": "https://s3.example.com"}, "x"]}
         assert await resources.restore_service_urls(api, "svc1", body) is False
         assert [c.request.method for c in respx_mock.calls] == ["GET"]
+
+
+# ── finding 2: the port of a legacy URL on 4.3.15-4.3.17 ────────────────────
+
+
+class TestRoutedUrlPerPart:
+    def test_a_legacy_inline_port_beats_a_port_stripped_url(self) -> None:
+        # 4.3.15-4.3.17: saved before 4.3.15, no override entry -> the url
+        # accessor strips the port the proxy still routes to.
+        source = {
+            "applications": [
+                {
+                    "name": "web",
+                    "fqdn": "https://shop.example.com:8443",
+                    "url": "https://shop.example.com",
+                }
+            ]
+        }
+        assert resources.service_app_urls(source) == {"web": "https://shop.example.com:8443"}
+
+    def test_a_hidden_override_comes_from_url(self) -> None:
+        # 4.3.15+ with an override: fqdn portless, url re-composed with the port.
+        assert resources.service_app_urls(_source())["web"] == "https://shop.example.com:8443"
+
+    def test_parts_pair_by_index(self) -> None:
+        source = {
+            "applications": [
+                {
+                    "name": "web",
+                    "fqdn": "https://a.example.com:81,https://b.example.com",
+                    "url": "https://a.example.com,https://b.example.com:82",
+                }
+            ]
+        }
+        assert resources.service_app_urls(source) == {
+            "web": "https://a.example.com:81,https://b.example.com:82"
+        }
+
+    def test_lists_that_do_not_pair_fall_back_to_url(self) -> None:
+        source = {
+            "applications": [
+                {"name": "web", "fqdn": "https://a.example.com:81", "url": "https://a.b,https://c.d"}
+            ]
+        }
+        assert resources.service_app_urls(source) == {"web": "https://a.b,https://c.d"}
+
+    def test_a_malformed_port_is_no_port(self) -> None:
+        source = {
+            "applications": [
+                {"name": "web", "fqdn": "https://a.example.com:99999", "url": "https://a.example.com"}
+            ]
+        }
+        assert resources.service_app_urls(source) == {"web": "https://a.example.com"}
+
+    def test_the_restore_body_keeps_the_legacy_port(self) -> None:
+        source = {
+            "applications": [
+                {
+                    "name": "web",
+                    "fqdn": "https://shop.example.com:8443",
+                    "url": "https://shop.example.com",
+                }
+            ]
+        }
+        assert resources.service_restore_body(source, source_wildcard=SRC_WC) == {
+            "urls": [{"name": "web", "url": "https://shop.example.com:8443"}]
+        }

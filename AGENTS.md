@@ -352,10 +352,16 @@ the release it starts in — read that module before adding a rule.
   `PATCH /services/{target}` `{"urls": [{name, url}]}`, the only write path valid
   on every release (items are exactly `{name, url}`, ServicesController
   v4.1.2:971, v4.5.0:1259; the per-sub-application PATCH exists only from 4.2).
-- **Read `url` before `fqdn`.** From 4.3.15 the port of a saved domain moves into
-  the hidden `domain_port_overrides`; the model appends `url`, which re-composes
-  it (ServiceApplication v4.5.0:18,215-242). Generated sslip hosts name the
-  SOURCE's uuid and IP and are never carried.
+- **Read `url` and `fqdn` per comma part, never one wholesale.** From 4.3.15
+  the port of a saved domain moves into the hidden `domain_port_overrides`; the
+  model appends `url`, which re-composes it (ServiceApplication
+  v4.5.0:18,215-242). But on 4.3.15-4.3.17 that accessor returned the
+  port-STRIPPED canonical for a domain without an override entry — a row saved
+  before 4.3.15 keeps its port inline in `fqdn` (no data migration; the proxy
+  keeps routing to it) — fixed in 4.3.18 (`return $url`). So the `fqdn` part
+  wins when it names a port, the `url` part otherwise
+  (`resources._routed_url`). Generated sslip hosts name the SOURCE's uuid and
+  IP and are never carried.
 - **Nothing is parked — neither services nor applications.** Every `PATCH /services`
   re-parses the compose before it applies `urls` (v4.5.0:1338), and on 4.5
   `applyServiceUrls` rewrites the SERVICE_URL_*/SERVICE_FQDN_* rows at once
