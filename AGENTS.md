@@ -347,6 +347,20 @@ the release it starts in — read that module before adding a rule.
 - **A TARGET host under the SOURCE's wildcard blocks the gate** (invariant 7, not
   a cutover: `--accept-dns` does not apply). It was not remapped and its wildcard
   binds it to the source. Derived `service_env` rows stay report-only.
+- **One URL on two sub-applications rejects the WHOLE `urls` update** (422
+  "conflicting URLs across containers", ServicesController v4.1.2:73-76,
+  v4.5.0:166-169), before any conflict check — so no force retry helps, and the
+  plan refuses it. The comparison lowercases scheme and host from 4.2.0
+  (`normalizeApplicationDomains`); 4.1.x compares raw strings. A trailing slash,
+  http vs https or a port difference only meet the per-item conflict check,
+  which CREATE's own-conflict retry resolves or refuses before the stop — do not
+  widen the plan refusal to them.
+- **Coolify's URL validator accepts `user:password@host`.** The plan refuses
+  such a sub-application URL (naming only the sub-application) so no credential
+  reaches a request, a conflict message, a log line or the journal. Do NOT add a
+  raising URL shape to `journal/store.py::_SECRET_SHAPES` instead: the executor
+  journals `str(exc)` inside its except handler, and a raise there escapes
+  before the rollback runs.
 
 ## Verify + ship
 

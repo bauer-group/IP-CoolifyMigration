@@ -890,6 +890,7 @@ async def build_plan(
                 refusals.extend(fidelity.storage_refusals(api_storages, version=coolify_version))
         else:
             warnings.extend(fidelity.service_warnings(full))
+            refusals.extend(fidelity.service_refusals(full, version=coolify_version))
 
         # Env keys are validated by the TARGET's API at copy time, and Coolify
         # >=4.2 rejects shapes its own older versions happily stored. Catching that

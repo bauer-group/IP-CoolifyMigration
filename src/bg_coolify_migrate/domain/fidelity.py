@@ -37,6 +37,9 @@ from bg_coolify_migrate.domain.versions import Version, at_least, parse_version
 
 # ── where each rule starts ───────────────────────────────────────────────────
 
+#: applyServiceUrls lowercases scheme and host before its duplicate-URL check
+#: (ValidationPatterns::normalizeApplicationDomains); 4.1.x compares raw strings.
+SERVICE_URLS_NORMALISED_SINCE: Version = (4, 2, 0)
 #: An explicit domain port moves into the hidden applications.domain_port_overrides.
 PORT_OVERRIDES_HIDDEN_SINCE: Version = (4, 3, 15)
 #: `host_path` leaves every storage create array (backported to the 4.3 line).
@@ -428,6 +431,97 @@ def service_warnings(source: dict[str, Any]) -> list[str]:
             "redirects until you re-apply them by hand."
         )
     return out
+
+
+def service_refusals(source: dict[str, Any], *, version: Version | None) -> list[str]:
+    """Sub-application URLs the target's ``urls`` update would reject, or must not see.
+
+    Only what WILL fail. Every subtler collision — a trailing slash, http vs
+    https from 4.4, a port-bearing URL against a portless one — either resolves
+    through CREATE's own-conflict retry or surfaces there as a 409/422, which is
+    before the stop.
+    """
+    parts = _service_url_parts(source)
+    out: list[str] = []
+
+    # Coolify's URL validator accepts user:password@host (domains.php
+    # v4.5.0:41-49). Carried, it would ride the urls PATCH, Coolify's conflict
+    # messages, our logs and the journal's restore body: refused before any of
+    # those, naming only the sub-application (invariants 5 and 6).
+    with_credentials = sorted({name for name, url in parts if _has_userinfo(url)})
+    if with_credentials:
+        out.append(
+            f"sub-application(s) {with_credentials} carry a URL with credentials in it "
+            "(user:password@host). It would be sent to Coolify for the target and "
+            "repeated in its errors, and this tool never handles a credential it could "
+            "log. Remove the credentials from the URL on the source (Coolify's basic "
+            "auth does not live there), then migrate."
+        )
+
+    # applyServiceUrls rejects the WHOLE request when one URL is set on two
+    # containers (ServicesController v4.1.2:73-76, v4.5.0:166-169) — before any
+    # conflict check, so no retry helps. From 4.2.0 it compares the URLs with
+    # scheme and host lowercased; 4.1.x compares the trimmed strings.
+    normalised = at_least(version, SERVICE_URLS_NORMALISED_SINCE)
+    owners: dict[str, set[str]] = {}
+    for name, url in parts:
+        if name not in with_credentials:
+            owners.setdefault(_duplicate_key(url, normalised=normalised), set()).add(name)
+    for key, names in sorted(owners.items()):
+        if len(names) > 1:
+            out.append(
+                f"sub-applications {sorted(names)} share the URL {key!r}. Coolify rejects "
+                "the target's whole domain update when one URL is set on two containers, "
+                "so none of this service's domains could be carried. Give each "
+                "sub-application its own URL on the source, then migrate."
+            )
+    return out
+
+
+def _service_url_parts(source: dict[str, Any]) -> list[tuple[str, str]]:
+    """``(sub-application name, url)`` for every URL a sub-application routes. PURE.
+
+    ``url`` before ``fqdn``, like the carry (resources.service_app_urls): from
+    4.3.15 only ``url`` keeps a domain's port.
+    """
+    out: list[tuple[str, str]] = []
+    for app in source.get("applications") or []:
+        if not isinstance(app, dict) or not app.get("name"):
+            continue
+        raw = app.get("url") or app.get("fqdn")
+        if not isinstance(raw, str):
+            continue
+        out.extend((str(app["name"]), p.strip()) for p in raw.split(",") if p.strip())
+    return out
+
+
+def _has_userinfo(url: str) -> bool:
+    try:
+        return "@" in urlsplit(url if "://" in url else f"https://{url}").netloc
+    except ValueError:
+        return "@" in url
+
+
+def _duplicate_key(url: str, *, normalised: bool) -> str:
+    """The form Coolify compares for duplicates. PURE.
+
+    normalizeApplicationDomainUrl (ValidationPatterns v4.5.0:677-727) lowercases
+    the scheme and host and keeps port, path, query and fragment as written.
+    """
+    if not normalised:
+        return url
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if not parts.scheme or not parts.netloc:
+        return url
+    key = f"{parts.scheme.lower()}://{parts.netloc.lower()}{parts.path}"
+    if parts.query:
+        key += f"?{parts.query}"
+    if parts.fragment:
+        key += f"#{parts.fragment}"
+    return key
 
 
 def database_warnings(

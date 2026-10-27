@@ -341,6 +341,19 @@ files**. A rollback can also be run after a successful migration, and then those
 dumps are the only copy of everything written since the cutover. The log line
 `compensate.target_backup_files_kept` names where they are. Delete them yourself
 once you are sure.
+## The plan refuses a service's URLs
+
+- **"sub-applications [...] share the URL ..."** — two containers of the stack
+  are set to the same URL. Coolify rejects the target's whole domain update when
+  that happens (from 4.2 comparing with scheme and host lowercased), so none of
+  the service's domains could be carried. Give each sub-application its own URL
+  on the source, then plan again.
+- **"sub-application(s) [...] carry a URL with credentials in it"** — a domain
+  written as `https://user:password@host`. It would be sent to Coolify and
+  repeated in its error messages, our logs and the journal, so the tool refuses
+  before reading it any further. Remove the credentials from the URL on the
+  source; Coolify's basic auth is configured elsewhere.
+
 ## CREATE refused a service's domains
 
 Both refusals come before the source is stopped: the created target is deleted
