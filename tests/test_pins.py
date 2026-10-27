@@ -71,6 +71,15 @@ class TestCreateCommand:
         with pytest.raises(ValueError):
             pins.create_command(name="p", migration_id=MID, side=pins.SOURCE, volumes=[bad])
 
+    def test_an_idle_pin_says_so_in_a_label(self) -> None:
+        idle = pins.create_command(
+            name="p", migration_id=MID, side=pins.SOURCE, volumes=["v1"], idle=True
+        )
+        argv = shlex.split(idle.split(" && ", 1)[1])
+        labels = [argv[i + 1] for i, a in enumerate(argv) if a == "--label"]
+        assert labels[-1] == f"{pins.LABEL_HOLD}={pins.HOLD_IDLE}"
+        assert pins.LABEL_HOLD not in _cmd()
+
     def test_refuses_no_volumes_and_a_bad_side(self) -> None:
         with pytest.raises(ValueError, match="at least one"):
             pins.create_command(name="p", migration_id=MID, side=pins.SOURCE, volumes=[])
@@ -119,6 +128,17 @@ class TestPredicates:
         held = [pins.Pin("p1", frozenset({"v1", ANON})), pins.Pin("p2", frozenset({"v2"}))]
         assert pins.awaited(held) == {"v1", "v2"}
 
+    def test_an_idle_pins_volumes_are_never_awaited(self) -> None:
+        # Nothing mounted them before the migration; nothing will after it.
+        held = [pins.Pin("p1", frozenset({"v1"})), pins.Pin("p2", frozenset({"v2"}), idle=True)]
+        assert pins.awaited(held) == {"v1"}
+
+    def test_only_a_running_non_pin_is_a_reference(self) -> None:
+        assert pins.is_reference(_c("running", {"coolify.managed": "true"}))
+        for state in ("created", "exited", "restarting", "dead", "removing"):
+            assert not pins.is_reference(_c(state, {"coolify.managed": "true"}))
+        assert not pins.is_reference(_c("created", OURS))
+
 
 class TestEnsure:
     async def test_creates_one_pin_for_all_volumes(self) -> None:
@@ -141,6 +161,18 @@ class TestEnsure:
         names = await pins.ensure(daemon, migration_id=MID, side=pins.SOURCE, volumes=["v1", "v3"])
         assert len(names) == 2
         assert daemon.containers[names[1]].volumes == ["v3"]
+
+    async def test_idle_volumes_get_a_labelled_pin_of_their_own(self) -> None:
+        daemon = FakeDaemon(volumes=("v1", "v2", "v3"))
+        names = await pins.ensure(
+            daemon, migration_id=MID, side=pins.SOURCE, volumes=["v1"], idle=["v1", "v2", "v3"]
+        )
+        assert len(names) == 2
+        mounted, idle = (daemon.containers[n] for n in names)
+        assert mounted.volumes == ["v1"] and pins.LABEL_HOLD not in mounted.labels
+        assert idle.volumes == ["v2", "v3"] and idle.labels[pins.LABEL_HOLD] == pins.HOLD_IDLE
+        listed = {p.name: p.idle for p in await pins.list_pins(daemon, migration_id=MID, side="source")}
+        assert listed == {mounted.name: False, idle.name: True}
 
     async def test_never_creates_a_volume_absent_from_volume_ls(self) -> None:
         # A --mount of a missing volume CREATES it; a pin must never do that.
@@ -299,6 +331,110 @@ class TestReleaseWhenReferenced:
             == pins.Release()
         )
 
+    async def test_a_container_seen_once_does_not_release(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Coolify's rolling update: the restarted container is up during its
+        # health check, then removed when the check fails - and QUIESCE already
+        # removed the old one. Released at that first sighting, the volume was
+        # left unreferenced and unpinned.
+        daemon = FakeDaemon(volumes=("v1",))
+        daemon.add("ours", state="created", labels=OURS, volumes=("v1",))
+        looks: list[float] = []
+
+        async def health_check_fails(seconds: float) -> None:
+            looks.append(seconds)
+            if len(looks) == 1:
+                daemon.add("app-new", state="running", volumes=("v1",))
+            else:
+                daemon.containers.pop("app-new", None)
+
+        monkeypatch.setattr(pins.asyncio, "sleep", health_check_fails)
+        outcome = await pins.release_when_referenced(
+            daemon, migration_id=MID, side=pins.SOURCE, timeout=10, settle=10, interval=5
+        )
+        assert outcome == pins.Release(kept=("ours",), unmounted=("v1",))
+        assert "ours" in daemon.containers
+
+    async def test_releases_once_the_mount_held_across_the_settle_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        daemon = FakeDaemon(volumes=("v1",))
+        daemon.add("ours", state="created", labels=OURS, volumes=("v1",))
+        sleeps: list[float] = []
+
+        async def restarted(seconds: float) -> None:
+            sleeps.append(seconds)
+            daemon.add("db", state="running", volumes=("v1",))
+
+        monkeypatch.setattr(pins.asyncio, "sleep", restarted)
+        outcome = await pins.release_when_referenced(
+            daemon, migration_id=MID, side=pins.SOURCE, timeout=5, settle=10, interval=5
+        )
+        # Seen after the first wait, then held for two more.
+        assert outcome.released == ("ours",) and sleeps == [5, 5, 5]
+
+    async def test_an_idle_pin_is_released_without_waiting_for_a_mount(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A volume nothing mounted before the migration - a stale storage row's,
+        # a profile-gated compose volume - is never mounted by the restarted
+        # source. Awaiting it kept every pin of the migration, for good.
+        daemon = FakeDaemon(volumes=("v1", "stale"))
+        daemon.add("ours", state="created", labels=OURS, volumes=("v1",))
+        daemon.add(
+            "ours-idle",
+            state="created",
+            labels={**OURS, pins.LABEL_HOLD: pins.HOLD_IDLE},
+            volumes=("stale",),
+        )
+        daemon.add("db", state="running", volumes=("v1",))
+        _no_sleep(monkeypatch)
+
+        outcome = await pins.release_when_referenced(
+            daemon, migration_id=MID, side=pins.SOURCE, timeout=0
+        )
+        assert set(outcome.released) == {"ours", "ours-idle"} and not outcome.kept
+
+    async def test_an_idle_pin_goes_even_when_the_others_are_kept(self) -> None:
+        daemon = FakeDaemon(volumes=("v1", "stale"))
+        daemon.add("ours", state="created", labels=OURS, volumes=("v1",))
+        daemon.add(
+            "ours-idle",
+            state="created",
+            labels={**OURS, pins.LABEL_HOLD: pins.HOLD_IDLE},
+            volumes=("stale",),
+        )
+        outcome = await pins.release_when_referenced(
+            daemon, migration_id=MID, side=pins.SOURCE, timeout=0
+        )
+        assert outcome == pins.Release(released=("ours-idle",), kept=("ours",), unmounted=("v1",))
+
+
+class TestReleaseIdle:
+    async def test_keeps_every_awaiting_pin_even_while_mounted(self) -> None:
+        # A container mounting the volume now may be the next one a queued
+        # stop removes: no look counts.
+        daemon = FakeDaemon(volumes=("v1", "stale"))
+        daemon.add("ours", state="created", labels=OURS, volumes=("v1",))
+        daemon.add(
+            "ours-idle",
+            state="created",
+            labels={**OURS, pins.LABEL_HOLD: pins.HOLD_IDLE},
+            volumes=("stale",),
+        )
+        daemon.add("db", state="running", volumes=("v1",))
+        outcome = await pins.release_idle(daemon, migration_id=MID, side=pins.SOURCE)
+        assert outcome == pins.Release(released=("ours-idle",), kept=("ours",), unmounted=("v1",))
+        assert "ours" in daemon.containers
+
+
+def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def forbidden(_seconds: float) -> None:
+        raise AssertionError("waited, but nothing could have changed")
+
+    monkeypatch.setattr(pins.asyncio, "sleep", forbidden)
+
 
 class TestUnreferenced:
     async def test_a_failed_probe_counts_as_unreferenced(self) -> None:
@@ -307,10 +443,17 @@ class TestUnreferenced:
         daemon.on(r"--filter volume=v1", exit_status=1, stderr="daemon unreachable")
         assert await pins.unreferenced(daemon, ["v1"]) == {"v1"}
 
-    async def test_a_stopped_coolify_container_is_a_reference(self) -> None:
-        # Coolify's cleanup keeps stopped application/service/database containers.
+    async def test_a_stopped_coolify_container_is_no_reference(self) -> None:
+        # Before 4.4.4 Coolify's cleanup prunes stopped resource containers
+        # (`label!=` filters are ANDed) right before `docker volume prune -af`
+        # (v4.4.3:CleanupDocker.php:164,173): the container goes, then the data.
         daemon = FakeDaemon(volumes=("v1",))
         daemon.add(
             "postgres-db1", state="exited", labels={"coolify.managed": "true"}, volumes=("v1",)
         )
+        assert await pins.unreferenced(daemon, ["v1"]) == {"v1"}
+
+    async def test_a_running_coolify_container_is_a_reference(self) -> None:
+        daemon = FakeDaemon(volumes=("v1",))
+        daemon.add("postgres-db1", labels={"coolify.managed": "true"}, volumes=("v1",))
         assert await pins.unreferenced(daemon, ["v1"]) == set()

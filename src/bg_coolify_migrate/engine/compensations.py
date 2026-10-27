@@ -31,6 +31,7 @@ from bg_coolify_migrate.engine import keys
 from bg_coolify_migrate.engine.context import MigrationContext, deserialise_volume_pairs
 from bg_coolify_migrate.errors import CoolifyApiError
 from bg_coolify_migrate.journal.store import JournalRecord
+from bg_coolify_migrate.settings.base import Settings
 
 log = structlog.get_logger(__name__)
 
@@ -547,16 +548,38 @@ def _restart_succeeded(records: Iterable[JournalRecord]) -> bool:
     return ok is True
 
 
+#: The shortest settle window: outlasts Coolify's rolling-update health check at
+#: its defaults - a 5 s start period, then 10 checks 5 s apart of up to 5 s
+#: each - after which a restarted container that failed it is removed.
+_MIN_SETTLE = 120.0
+
+
+def settle_window(settings: Settings) -> float:
+    """How long a restarted source must keep its volumes mounted before its pins go.
+
+    The longer of ``stop_timeout`` - the time a stop may take, so a stop still
+    in Coolify's queue when the restart was asked for has landed by then - and
+    Coolify's default health-check window (:data:`_MIN_SETTLE`).
+    """
+    return max(settings.stop_timeout, _MIN_SETTLE)
+
+
 async def undo_release_source_pins(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
     """Unpin the source's volumes - the last act of every rollback.
 
-    Released only once something other than a pin mounts every pinned volume:
-    a volume unpinned before the restarted source mounts it again is exactly
-    what Coolify's ``docker volume prune -af`` deletes. Waited for up to
-    ``deploy_timeout`` only when this rollback restarted the source; otherwise
-    one look - the source is still serving (QUIESCE failed before the stop), or
-    down with no restart coming (QUIESCE failed after it, or the restart
-    failed), and then the pin must stay.
+    Released only on durable evidence: a volume unpinned before the source
+    mounts it again for good is exactly what Coolify's ``docker volume prune
+    -af`` deletes. Idle pins (volumes nothing mounted before the migration) go
+    at once. For the rest it depends on whether this run may have stopped the
+    source (:func:`statemachine.source_was_stopped`):
+
+    * no stop was ever requested - the source still serves: one look;
+    * a stop may have been requested and this rollback's restart was
+      accepted: running containers must mount every pinned volume within
+      ``deploy_timeout`` and keep it mounted across :func:`settle_window`;
+    * a stop may have been requested and the restart was NOT accepted: kept
+      without a look. Coolify queues every stop, so a container seen running
+      now may be the one that stop removes next.
 
     A kept pin is not a compensation failure. The source is no worse off than
     before - better: its data survives the cleanup - so the outcome stays
@@ -566,12 +589,20 @@ async def undo_release_source_pins(ctx: MigrationContext, undo_info: dict[str, A
     """
     stopped = _source_was_stopped(ctx)
     restarted = stopped and _restart_succeeded(ctx.journal.read())
-    outcome = await pins.release_when_referenced(
-        ctx.source_host,
-        migration_id=ctx.migration_id,
-        side=pins.SOURCE,
-        timeout=ctx.settings.deploy_timeout if restarted else 0.0,
-    )
+    if stopped and not restarted:
+        outcome = await pins.release_idle(
+            ctx.source_host, migration_id=ctx.migration_id, side=pins.SOURCE
+        )
+        why = "the source was not restarted, and a stop this run asked for may still land"
+    else:
+        outcome = await pins.release_when_referenced(
+            ctx.source_host,
+            migration_id=ctx.migration_id,
+            side=pins.SOURCE,
+            timeout=ctx.settings.deploy_timeout if restarted else 0.0,
+            settle=settle_window(ctx.settings) if restarted else 0.0,
+        )
+        why = "no running container kept them mounted"
     if not outcome.kept:
         return
 
@@ -606,8 +637,8 @@ async def undo_release_source_pins(ctx: MigrationContext, undo_info: dict[str, A
         remedy = f"Once the source runs: {remove} there."
     ctx.notices.append(
         f"{', '.join(outcome.kept)} still pins the source's volume(s) "
-        f"{', '.join(outcome.unmounted)} on {ctx.plan.source_server.name}: nothing mounts "
-        f"them yet, so without the pin Coolify's Docker cleanup could delete them. {remedy}"
+        f"{', '.join(outcome.unmounted)} on {ctx.plan.source_server.name}: {why}, so "
+        f"without the pin Coolify's Docker cleanup could delete them. {remedy}"
     )
 
 

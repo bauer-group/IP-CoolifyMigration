@@ -49,6 +49,20 @@ them after a crash between the ``docker create`` and the journal write, and can
 never touch another migration's. Removed with ``docker rm`` — never ``-v``, which
 would delete anonymous volumes, never ``-f``, which a container that never runs
 does not need.
+
+Releasing one
+-------------
+Only a RUNNING container is evidence that a volume will stay referenced, and
+only one that keeps running across a settle window. A container seen once can
+vanish right after: Coolify's rolling update removes a new container that fails
+its health check, and a queued stop lands whenever its worker gets to it. A
+stopped Coolify container is no evidence at all — before 4.4.4 the cleanup's
+own ``docker container prune`` removes stopped resource containers just before
+it prunes the volumes (v4.4.3:CleanupDocker.php:164,173).
+
+A volume nothing mounted before the migration is pinned apart, labelled
+``idle``: no restart will ever mount it, so waiting for one would keep the pin
+forever, and releasing it is no more exposure than before the migration.
 """
 
 from __future__ import annotations
@@ -74,9 +88,16 @@ LABEL_ROLE = "bg-coolify-migrate.role"
 ROLE_PIN = "pin"
 LABEL_MIGRATION = "bg-coolify-migrate.migration"
 LABEL_SIDE = "bg-coolify-migrate.side"
+#: Present, as ``idle``, only on a pin for volumes nothing mounted before the
+#: migration. A pin without it waits for a remount — older pins included.
+LABEL_HOLD = "bg-coolify-migrate.hold"
+HOLD_IDLE = "idle"
 
 SOURCE = "source"
 TARGET = "target"
+
+#: The only container state that counts as a reference worth releasing for.
+_REFERENCING = "running"
 
 #: What a pin's name may embed. Docker's own rule for container names.
 _MIGRATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -93,6 +114,8 @@ class Pin:
 
     name: str
     volumes: frozenset[str]
+    idle: bool = False
+    """Holds volumes nothing mounted before the migration: released without a wait."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,12 +150,15 @@ def pin_name(migration_id: str, side: str, volumes: Iterable[str]) -> str:
     return f"bg-coolify-migrate-pin-{migration_id}-{side}-{digest}"
 
 
-def create_command(*, name: str, migration_id: str, side: str, volumes: Iterable[str]) -> str:
+def create_command(
+    *, name: str, migration_id: str, side: str, volumes: Iterable[str], idle: bool = False
+) -> str:
     """One SSH round trip: import the empty image if absent, then create the pin. PURE.
 
     Never ``docker run`` and never ``docker start``: the ``/pin`` command only
     satisfies ``docker create`` and does not exist in the image, so the
-    container could not start even if asked to.
+    container could not start even if asked to. ``idle`` labels a pin for
+    volumes nothing mounted before the migration (:data:`LABEL_HOLD`).
     """
     if not _MIGRATION_ID.fullmatch(migration_id):
         raise ValueError(f"migration id {migration_id!r} cannot be part of a container name")
@@ -151,6 +177,7 @@ def create_command(*, name: str, migration_id: str, side: str, volumes: Iterable
             (LABEL_ROLE, ROLE_PIN),
             (LABEL_MIGRATION, migration_id),
             (LABEL_SIDE, side),
+            *([(LABEL_HOLD, HOLD_IDLE)] if idle else []),
         )
     )
     mounts = " ".join(
@@ -191,12 +218,25 @@ def is_anonymous(volume: str) -> bool:
 def awaited(held: Iterable[Pin]) -> set[str]:
     """The pinned volumes a release must first see mounted by someone else. PURE.
 
-    Every pinned volume except the anonymous ones: a container Coolify recreates
-    gets a NEW anonymous volume, so waiting for the old one would always time
-    out. Taken from the pins themselves rather than from QUIESCE's journalled
-    capture, which a resumed QUIESCE overwrites with an empty one.
+    Every pinned volume except the anonymous ones and those of an idle pin: a
+    container Coolify recreates gets a NEW anonymous volume, so waiting for the
+    old one would always time out, and an idle pin's volumes were mounted by
+    nothing before the migration, so nothing will mount them after it. Taken
+    from the pins themselves rather than from QUIESCE's journalled capture,
+    which a resumed QUIESCE overwrites with an empty one.
     """
-    return {v for pin in held for v in pin.volumes if not is_anonymous(v)}
+    return {v for pin in held if not pin.idle for v in pin.volumes if not is_anonymous(v)}
+
+
+def is_reference(container: docker.Container) -> bool:
+    """Does this container keep a volume referenced for good? PURE.
+
+    Only a running non-pin. A pin is no reference — it may be released at any
+    time — and neither is a stopped container: Coolify removes one at its next
+    stop or rolling update, and before 4.4.4 its cleanup prunes stopped resource
+    containers right before the volumes (v4.4.3:CleanupDocker.php:164,173).
+    """
+    return container.state == _REFERENCING and not is_pin(container)
 
 
 def _labels(migration_id: str, side: str) -> dict[str, str]:
@@ -225,25 +265,36 @@ async def list_pins(host: RemoteHost, *, migration_id: str, side: str) -> list[P
             Pin(
                 name=container.name,
                 volumes=frozenset(m.name for m in mounts if m.type == "volume" and m.name),
+                idle=container.labels.get(LABEL_HOLD) == HOLD_IDLE,
             )
         )
     return out
 
 
 async def ensure(
-    host: RemoteHost, *, migration_id: str, side: str, volumes: Iterable[str]
+    host: RemoteHost,
+    *,
+    migration_id: str,
+    side: str,
+    volumes: Iterable[str],
+    idle: Iterable[str] = (),
 ) -> list[str]:
-    """Pin every one of ``volumes`` that exists. Returns the names of all our pins.
+    """Pin every one of ``volumes`` and ``idle`` that exists. Returns all our pins' names.
+
+    ``idle``: volumes nothing mounted before the migration. They get a pin of
+    their own, labelled so a release does not wait for a remount that never
+    comes (:func:`awaited`). A volume in both is not idle.
 
     Idempotent and additive: volumes an existing pin already holds are skipped,
-    and the rest get ONE new pin. Never replaces a pin, so there is no moment in
-    which a volume is unpinned.
+    and the rest get ONE new pin per kind. Never replaces a pin, so there is no
+    moment in which a volume is unpinned.
 
     A volume absent from ``docker volume ls`` is skipped with a warning, never
     mounted: ``--mount`` of a missing volume CREATES it, and a pin must never
     create a volume.
     """
-    wanted = {v for v in volumes if v}
+    mounted = {v for v in volumes if v}
+    wanted = mounted | {v for v in idle if v}
     if not wanted:
         return []
 
@@ -254,13 +305,21 @@ async def ensure(
 
     held = await list_pins(host, migration_id=migration_id, side=side)
     covered = {v for pin in held for v in pin.volumes}
-    todo = sorted((wanted & present) - covered)
+    todo = (wanted & present) - covered
     names = [pin.name for pin in held]
-    if not todo:
-        return names
+    for group, is_idle in ((todo & mounted, False), (todo - mounted, True)):
+        if group:
+            names.append(await _create(host, migration_id, side, sorted(group), idle=is_idle))
+    return names
 
-    name = pin_name(migration_id, side, todo)
-    command = create_command(name=name, migration_id=migration_id, side=side, volumes=todo)
+
+async def _create(
+    host: RemoteHost, migration_id: str, side: str, volumes: list[str], *, idle: bool
+) -> str:
+    name = pin_name(migration_id, side, volumes)
+    command = create_command(
+        name=name, migration_id=migration_id, side=side, volumes=volumes, idle=idle
+    )
     result = await host.run(command)
     if not result.ok and "no such image" in (result.stderr + result.stdout).lower():
         # Coolify's image prune removed the freshly imported, still-unused image
@@ -269,18 +328,24 @@ async def ensure(
         result = await host.run(command)
     result.check()
 
-    log.info("pins.created", side=side, pin=name, volumes=todo)
-    return [*names, name]
+    log.info("pins.created", side=side, pin=name, volumes=volumes, idle=idle)
+    return name
 
 
-async def release(host: RemoteHost, *, migration_id: str, side: str) -> list[str]:
+async def release(
+    host: RemoteHost, *, migration_id: str, side: str, only: Iterable[str] | None = None
+) -> list[str]:
     """Remove this migration's pins on one side. Returns their names; [] did nothing.
 
-    ``docker rm`` alone: no ``-v`` (removing a pin must never remove a volume)
-    and no ``-f`` (a pin never runs). A pin already gone counts as removed.
+    ``only`` restricts it to the pins of those names. ``docker rm`` alone: no
+    ``-v`` (removing a pin must never remove a volume) and no ``-f`` (a pin
+    never runs). A pin already gone counts as removed.
     """
+    names = None if only is None else set(only)
     removed: list[str] = []
     for container in await _our_pins(host, migration_id=migration_id, side=side):
+        if names is not None and container.name not in names:
+            continue
         result = await host.run(f"docker rm {shlex.quote(container.name)}")
         if not result.ok and "no such container" not in result.stderr.lower():
             result.check()
@@ -291,7 +356,7 @@ async def release(host: RemoteHost, *, migration_id: str, side: str) -> list[str
 
 
 async def unreferenced(host: RemoteHost, volumes: Iterable[str]) -> set[str]:
-    """The volumes no container other than a pin mounts.
+    """The volumes no RUNNING container other than a pin mounts (:func:`is_reference`).
 
     Any pin counts as no reference, ours or another migration's: the question is
     whether the volume survives once OUR pin is gone, and another migration may
@@ -301,7 +366,7 @@ async def unreferenced(host: RemoteHost, volumes: Iterable[str]) -> set[str]:
     out: set[str] = set()
     for volume in sorted(set(volumes)):
         users = await docker.containers_mounting(host, volumes=[volume])
-        if not any(not is_pin(c) for c in users):
+        if not any(is_reference(c) for c in users):
             out.add(volume)
     return out
 
@@ -312,28 +377,49 @@ async def release_when_referenced(
     migration_id: str,
     side: str,
     timeout: float,
+    settle: float = 0.0,
     interval: float = 5.0,
 ) -> Release:
-    """Release our pins once something else mounts every pinned volume.
+    """Release our pins once running containers keep every awaited volume mounted.
 
-    ``timeout=0`` asks once. The pins are kept, with a warning, when a volume
-    is still unmounted at the end: an unmounted volume without its pin is
-    exactly what the cleanup deletes.
+    Idle pins go at once (:func:`awaited`). The rest only when every awaited
+    volume has been mounted by a running container in each look across
+    ``settle`` seconds — a container seen once is no evidence it stays — the
+    first such look coming within ``timeout``. ``timeout=0, settle=0`` asks
+    once. The pins are kept, with a warning, when the evidence never holds: an
+    unmounted volume without its pin is exactly what the cleanup deletes.
     """
     held = await list_pins(host, migration_id=migration_id, side=side)
     if not held:
         return Release()
 
-    need = awaited(held)
+    idle_names = [pin.name for pin in held if pin.idle]
+    idle = (
+        await release(host, migration_id=migration_id, side=side, only=idle_names)
+        if idle_names
+        else []
+    )
+    waiting = [pin for pin in held if not pin.idle]
+    need = awaited(waiting)
     waited = 0.0
-    while True:
+    steady_since: float | None = None
+    while waiting:
         missing = await unreferenced(host, need) if need else set()
-        if not missing:
+        if missing:
+            steady_since = None
+        elif steady_since is None:
+            steady_since = waited
+        # Nothing awaited (anonymous volumes only): nothing to watch settle.
+        if steady_since is not None and (not need or waited - steady_since >= settle):
+            names = [pin.name for pin in waiting]
             return Release(
-                released=tuple(await release(host, migration_id=migration_id, side=side))
+                released=(
+                    *idle,
+                    *await release(host, migration_id=migration_id, side=side, only=names),
+                )
             )
-        if waited >= timeout:
-            kept = tuple(sorted(pin.name for pin in held))
+        if steady_since is None and waited >= timeout:
+            kept = tuple(sorted(pin.name for pin in waiting))
             log.warning(
                 "pins.kept",
                 side=side,
@@ -341,6 +427,30 @@ async def release_when_referenced(
                 unmounted=sorted(missing),
                 hint=f"docker rm {' '.join(kept)} once these volumes are mounted again",
             )
-            return Release(kept=kept, unmounted=tuple(sorted(missing)))
+            return Release(released=tuple(idle), kept=kept, unmounted=tuple(sorted(missing)))
         await asyncio.sleep(interval)
         waited += interval
+    return Release(released=tuple(idle))
+
+
+async def release_idle(host: RemoteHost, *, migration_id: str, side: str) -> Release:
+    """Release only the idle pins; keep every pin awaiting a remount, without a look.
+
+    For when no look could be evidence: a stop may still be queued, and
+    nothing restarted the stack — a container seen running now may be the one
+    that stop removes next. ``unmounted`` names every volume the kept pins
+    await.
+    """
+    held = await list_pins(host, migration_id=migration_id, side=side)
+    idle_names = [pin.name for pin in held if pin.idle]
+    released = (
+        await release(host, migration_id=migration_id, side=side, only=idle_names)
+        if idle_names
+        else []
+    )
+    waiting = [pin for pin in held if not pin.idle]
+    return Release(
+        released=tuple(released),
+        kept=tuple(sorted(pin.name for pin in waiting)),
+        unmounted=tuple(sorted(awaited(waiting))),
+    )

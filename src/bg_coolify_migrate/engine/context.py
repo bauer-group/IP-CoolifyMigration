@@ -88,6 +88,11 @@ class MigrationContext:
     #: volumes must stay unpinned, or Coolify's preview delete fails on them.
     source_pin_volumes: dict[str, list[str]] = field(default_factory=dict)
 
+    #: source resource uuid -> the planned volumes NO container mounted before
+    #: the stop. Pinned apart, as idle (``pins.LABEL_HOLD``): no restart will
+    #: mount them, so a rollback must not wait for one before unpinning them.
+    source_idle_volumes: dict[str, list[str]] = field(default_factory=dict)
+
     #: source resource uuid -> verification reports, one per volume
     verifications: dict[str, list[VerificationReport]] = field(default_factory=dict)
 
