@@ -185,6 +185,18 @@ restart is not: each resource is restarted at most once per stop (journalled
 per resource), because `/restart` is a full stop and start and the source has
 been serving since the first rollback. A restart that failed is retried.
 
+Only a **running** container counts as a reference: before 4.4.4 Coolify's
+cleanup prunes stopped resource containers right before the volumes. A volume
+nothing mounted before the migration — a stale storage row's, say — gets a pin
+of its own, labelled `idle`; no restart will mount it, so a rollback removes
+that pin without waiting, which leaves it exactly as exposed as before.
+
+A **delete** finalize refuses while anything but this migration's own pins
+mounts a source volume — typically a pin an earlier, rolled-back migration of
+the same source had to keep. Coolify's delete would leave such a volume in
+place without a word. If a delete fails part-way, the sources not yet deleted
+are pinned again until a resume finishes the step.
+
 The tool never changes the server's cleanup setting: a crash would leave it
 changed, and a manual run overrides it anyway.
 

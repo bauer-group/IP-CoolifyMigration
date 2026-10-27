@@ -314,7 +314,11 @@ A pin is a stopped container that never ran; it holds no process and writes
 nothing. List a migration's pins with
 `docker ps -a --filter label=bg-coolify-migrate.migration=<id>`. A PREFLIGHT
 warning `preflight.foreign_pin` means another migration's pin mounts this
-stack's volume: harmless, and that migration's finalize or rollback removes it.
+stack's volume: harmless for a keep or rename finalize. With `--finalize delete`
+it is a refusal instead, and so is a FINALIZE that finds one: Coolify's delete
+cannot remove a pinned volume and does not say so, so the source would be
+reported deleted while its data stays. `coolify-migrate unpin <that id>` once
+its source runs, or `docker rm` the pin, then re-run (or resume).
 
 ## Plan warning: "server 'X' has 'Delete unused volumes' on"
 

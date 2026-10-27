@@ -524,13 +524,26 @@ the release it starts in — read that module before adding a rule.
   create.
 - **A pinned volume survives Coolify's delete.** `docker volume rm -f` refuses a
   referenced volume and apps/databases swallow it (v4.5.0:Application.php:575,
-  StandalonePostgresql.php:180). Every pin is released BEFORE anything Coolify
-  deletes - FINALIZE under DELETE, the target delete in a rollback.
+  StandalonePostgresql.php:180). Every pin of OURS is released BEFORE anything
+  Coolify deletes - FINALIZE under DELETE, the target delete in a rollback - and
+  a DELETE refuses (PREFLIGHT, then FINALIZE) while any other container, above
+  all another migration's kept pin, still mounts a source volume.
+- **Only a running container is a reference worth unpinning for**
+  (`pins.is_reference`), and only one that stays across a settle window. A
+  restarted container that fails Coolify's rolling-update health check is
+  removed, a queued stop lands late, and before 4.4.4 the cleanup prunes stopped
+  resource containers right before the volumes (v4.4.3:CleanupDocker.php:164,
+  173). Volumes nothing mounted before the stop get an `idle` pin, released
+  without a wait - awaiting a remount that never comes kept every pin forever.
 - **The source unpin is the LAST compensation** (`RELEASE_SOURCE_PINS`, owed
   from CREATE_TARGET): ..., RESTORE_SOURCE_FQDN, RESTART_SOURCE,
   DELETE_TARGET_RESOURCE, RELEASE_SOURCE_PINS. It waits for the restarted source
-  to mount its volumes, so nothing may wait behind it; the domain restore runs
-  before the restart (`/restart` bakes the labels at job time).
+  to keep its volumes mounted, so nothing may wait behind it; the domain restore
+  runs before the restart (`/restart` bakes the labels at job time). When a stop
+  may have been requested (`statemachine.source_was_stopped`) and the restart
+  was not accepted, it keeps the pins without a look. A kept pin's way out is
+  `coolify-migrate unpin <id>` - never a second `rollback`, which redeploys a
+  source that is serving by then.
 - **`rollback <id>` again replays EVERY compensation** (completed states never
   leave the journal), and several messages ask for it (a KEPT target, a failed
   restart). RESTART_SOURCE is therefore once per stop and per resource
@@ -538,7 +551,7 @@ the release it starts in — read that module before adding a rule.
   restart): `/restart` is `docker rm -f` plus start for a database and a
   redeploy for an image app, and the source is serving since the first one.
   A remedy that has the operator start the source by hand must not lead into a
-  rollback that still owes its restart (the kept-pin notice says `docker rm`).
+  rollback that still owes its restart (the kept-pin notice says `coolify-migrate unpin`).
 - **After FINALIZE(keep/rename) the source is no proven copy.** Its pins are
   gone, its containers were removed at QUIESCE, so a pruning server deletes its
   volumes; an operator may delete it. `rollback_refusal` refuses DELETE as a
