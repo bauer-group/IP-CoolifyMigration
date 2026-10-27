@@ -314,10 +314,16 @@ the release it starts in — read that module before adding a rule.
   The GET shows a portless fqdn; only the generated proxy labels still show the
   routing. Releasing the source's domains at FINALIZE erases the override on the
   source too, so a rollback after FINALIZE restores the portless value.
-  **Compose domains followed in 4.4.0** (`normalizeDockerComposeDomainPorts`,
-  v4.4.0:6372, v4.5.0:6535-6551; absent at v4.3.15): the parsed `docker_compose`
-  labels are the only witness, and `fidelity.compose_hidden_port_overrides` reads
-  them — a port that is not the service's first exposed one is refused.
+  **Compose domains followed on the 4.3 line, not in 4.4.0**: a UI save from
+  v4.3.15 (Livewire Application/Domains.php:1995-2011), an API save from v4.3.18
+  (`normalizeDockerComposeDomainPorts`, ApplicationsController v4.3.18:1459/3379,
+  v4.4.0:6372, v4.5.0:6535-6551). Tags are not linear — v4.3.24 shipped after
+  v4.4.0 — so gate on the release that introduced a thing, never on "4.4". The
+  parsed `docker_compose` labels are the only witness, and
+  `fidelity.compose_hidden_port_overrides` reads them; where a portless domain
+  falls back moved twice (`ports_exposes` on 4.3.15, the service's first port of
+  any protocol on 4.3.16-4.3.17, its first tcp port from 4.3.18), so the check
+  takes the version. A port that is not that fallback is refused.
 - **The parking tag is stable per project/environment** (`domains.parking_tag`,
   the migration id's digest). Versions up to 2.9 parked a source's custom hosts
   under `old-<tag>.` at CREATE; a source still on such hosts — an un-park that

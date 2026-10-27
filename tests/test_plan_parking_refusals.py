@@ -5,8 +5,9 @@ Two shapes the rollback cannot repair, so the plan refuses them up front:
 * a source still on ``old-<tag>.`` hosts from an earlier run of this project —
   the tag is stable, so a new run would park the parked host again and journal
   it as the one to restore;
-* a compose app (Coolify >= 4.4) whose domain routes to a port only the hidden
-  ``domain_port_overrides`` knows — parking erases it on the source too.
+* a compose app (Coolify >= 4.3.15) whose domain routes to a port only the
+  hidden ``domain_port_overrides`` knows — the release at FINALIZE erases it on
+  the source too.
 """
 
 from __future__ import annotations
@@ -215,18 +216,66 @@ class TestComposeHiddenPortOverrides:
 
 
 class TestComposePortRules:
-    def test_refused_from_4_4(self) -> None:
+    # A UI save hides the port from 4.3.15, an API save from 4.3.18 — on the 4.3
+    # line (4.3.24 shipped after 4.4.0) as much as in 4.4+.
+    @pytest.mark.parametrize("version", [(4, 3, 15), (4, 3, 18), (4, 3, 24), (4, 4, 0), None])
+    def test_refused_from_4_3_15(self, version: tuple[int, ...] | None) -> None:
         [line] = [
             r
-            for r in fidelity.application_refusals(_compose_source(), version=(4, 4, 0))
+            for r in fidelity.application_refusals(_compose_source(), version=version)
             if "compose service domains" in r
         ]
         assert "web -> [3000]" in line
-        assert "rollback" in line
+        assert "rollback" in line and "parking" not in line
 
-    def test_not_refused_before_4_4(self) -> None:
-        refusals = fidelity.application_refusals(_compose_source(), version=(4, 3, 24))
+    def test_not_refused_before_4_3_15(self) -> None:
+        refusals = fidelity.application_refusals(_compose_source(), version=(4, 3, 14))
         assert not [r for r in refusals if "compose service domains" in r]
+        warnings = fidelity.application_warnings(_compose_source(compose=""), version=(4, 3, 14))
+        assert not any("could not be read" in w for w in warnings)
+
+    def test_an_unreadable_compose_warns_from_4_3_15(self) -> None:
+        warnings = fidelity.application_warnings(_compose_source(compose=""), version=(4, 3, 15))
+        assert any("could not be read" in w for w in warnings)
+
+
+class TestComposeFallbackByRelease:
+    """Where a portless compose domain routes changed twice on the 4.3 line."""
+
+    def _source(self, expose: list[Any], ports_exposes: str) -> dict[str, Any]:
+        source = _compose_source(expose=expose)
+        source["ports_exposes"] = ports_exposes
+        return source
+
+    def test_4_3_15_routes_to_ports_exposes(self) -> None:
+        # The label routes to 3000 = ports_exposes[0]: no override, nothing hidden.
+        source = self._source(["80"], "3000")
+        assert fidelity.compose_hidden_port_overrides(source, version=(4, 3, 15)) == {}
+        assert fidelity.compose_hidden_port_overrides(source, version=(4, 3, 18)) == {
+            "web": [3000]
+        }
+
+    def test_4_3_16_takes_any_protocol_then_ports_exposes(self) -> None:
+        udp_first = self._source(["3000/udp"], "80")
+        assert fidelity.compose_hidden_port_overrides(udp_first, version=(4, 3, 16)) == {}
+        assert fidelity.compose_hidden_port_overrides(udp_first, version=(4, 3, 18)) == {
+            "web": [3000]
+        }
+        label = "traefik.http.services.https-0-a1-web.loadbalancer.server.port=3000"
+        no_port = _compose_source(
+            compose=json.dumps({"services": {"web": {"image": "x", "labels": [label]}}})
+        )
+        no_port["ports_exposes"] = "3000"
+        assert fidelity.compose_hidden_port_overrides(no_port, version=(4, 3, 17)) == {}
+        assert fidelity.compose_hidden_port_overrides(no_port, version=(4, 3, 18)) == {
+            "web": [3000]
+        }
+
+    def test_4_3_18_takes_the_first_tcp_port_only(self) -> None:
+        source = self._source(["53/udp", "80"], "3000")
+        assert fidelity.compose_hidden_port_overrides(source, version=(4, 3, 18)) == {
+            "web": [3000]
+        }
 
     def test_an_unreadable_compose_warns_instead(self) -> None:
         source = _compose_source(compose="")

@@ -346,7 +346,7 @@ on the source in Coolify, redeploy the source, then plan again.
 
 ## "compose service domains route to port(s) their domain does not name"
 
-Coolify >= 4.4 moves the `:port` of a compose domain into a hidden column that
+Coolify >= 4.3.15 moves the `:port` of a compose domain into a hidden column that
 no API read returns, and routes the domain there. The target would route it to
 the service's first exposed port instead, and releasing the source's domains at
 finalize would erase the port on the source as well — a rollback after finalize

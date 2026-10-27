@@ -45,8 +45,15 @@ from bg_coolify_migrate.domain.versions import Version, at_least
 SERVICE_URLS_NORMALISED_SINCE: Version = (4, 2, 0)
 #: An explicit domain port moves into the hidden applications.domain_port_overrides.
 PORT_OVERRIDES_HIDDEN_SINCE: Version = (4, 3, 15)
-#: ...and a compose service's domain port too (normalizeDockerComposeDomainPorts).
-COMPOSE_PORT_OVERRIDES_HIDDEN_SINCE: Version = (4, 4, 0)
+#: ...and a compose service's domain port too: a UI save from 4.3.15 (Livewire
+#: Application/Domains.php v4.3.15:1995-2011), an API save from 4.3.18
+#: (normalizeDockerComposeDomainPorts), on the 4.3 line and in 4.4.0+ alike.
+COMPOSE_PORT_OVERRIDES_HIDDEN_SINCE: Version = (4, 3, 15)
+#: A portless compose domain falls back to its SERVICE's first port, then to
+#: ports_exposes (parsers.php v4.3.16:1361); 4.3.15 routed it to ports_exposes.
+COMPOSE_SERVICE_PORT_FALLBACK_SINCE: Version = (4, 3, 16)
+#: ...the service's first TCP port only, and nothing else (parsers.php v4.3.18:1357).
+COMPOSE_TCP_PORT_FALLBACK_SINCE: Version = (4, 3, 18)
 #: `host_path` leaves every storage create array (backported to the 4.3 line).
 HOST_PATH_REMOVED_SINCE: Version = (4, 3, 22)
 #: ManualWebhookSecret: a new secret must be >= 16 characters.
@@ -158,14 +165,15 @@ def application_refusals(source: dict[str, Any], *, version: Version | None) -> 
                 f"the source routes a domain to port(s) {hidden}, but ports_exposes "
                 f"starts with {exposed}. Since 4.3.15 Coolify keeps a domain's explicit "
                 "port in a hidden column no API read returns, so the target would route "
-                f"every domain to {exposed} — and parking the source's domains would "
-                "erase that port on the source as well, beyond what a rollback restores. "
+                f"every domain to {exposed} — and releasing the source's custom domains at "
+                "finalize would erase that port on the source as well, beyond what a "
+                "rollback restores. "
                 "If every domain uses one port, put it first in ports_exposes on the "
                 "source; otherwise migrate this application by hand."
             )
 
     if at_least(version, COMPOSE_PORT_OVERRIDES_HIDDEN_SINCE):
-        out.extend(_compose_port_refusals(source))
+        out.extend(_compose_port_refusals(source, version=version))
 
     return out
 
@@ -308,7 +316,7 @@ def application_warnings(source: dict[str, Any], *, version: Version | None) -> 
     if source.get("is_maintenance_enabled") is True:
         out.append(_MAINTENANCE_WARNING)
     if at_least(version, COMPOSE_PORT_OVERRIDES_HIDDEN_SINCE) and (
-        compose_hidden_port_overrides(source) is None
+        compose_hidden_port_overrides(source, version=version) is None
     ):
         out.append(_COMPOSE_PORTS_UNCHECKED_WARNING)
     if at_least(version, RUN_OPTIONS_PARSER_SINCE) and (
@@ -392,26 +400,34 @@ def hidden_port_overrides(source: dict[str, Any]) -> list[int]:
 
 _COMPOSE_PORTS_UNCHECKED_WARNING = (
     "the parsed compose (docker_compose) could not be read, so it is unknown whether "
-    "a compose domain routes to an explicit port. Since 4.4 Coolify keeps such a port "
-    "in a hidden column no API read returns: the target would route the domain to the "
-    "service's first exposed port, and parking the source's domains would erase the "
-    "port on the source beyond what a rollback restores. Check the domains' ports in "
-    "Coolify before migrating."
+    "a compose domain routes to an explicit port. Since 4.3.15 Coolify keeps such a "
+    "port in a hidden column no API read returns: the target would route the domain to "
+    "the service's first exposed port, and releasing the source's custom domains at "
+    "finalize would erase the port on the source beyond what a rollback restores. Check "
+    "the domains' ports in Coolify before migrating."
 )
 
 
-def compose_hidden_port_overrides(source: dict[str, Any]) -> dict[str, list[int]] | None:
+def compose_hidden_port_overrides(
+    source: dict[str, Any], *, version: Version | None = None
+) -> dict[str, list[int]] | None:
     """Per compose service: ports its domain routes to that a portless domain cannot.
 
-    From 4.4.0 a ``docker_compose_domains`` save strips each domain's ``:port`` into
-    the hidden ``domain_port_overrides`` (normalizeDockerComposeDomainPorts,
-    ApplicationsController v4.4.0:6372, v4.5.0:6535-6551; absent at v4.3.15), and the
-    parser routes by that override, falling back to the service's first tcp
-    ``expose``/``ports`` entry (parsers.php v4.5.0:2158-2161, docker.php :883-906,
-    :1015-1017). The GET shows only the portless domain. Parking replaces the
-    domain list, and ``DomainPortOverrides::normalize`` drops overrides for domains
-    that are gone (v4.5.0 app/Support/DomainPortOverrides.php:27-75) — so neither
-    the target nor a rollback's restore can bring the port back.
+    A ``docker_compose_domains`` save strips each domain's ``:port`` into the
+    hidden ``domain_port_overrides`` — in the UI from 4.3.15 (Livewire
+    Application/Domains.php v4.3.15:1995-2011), through the API from 4.3.18
+    (normalizeDockerComposeDomainPorts, ApplicationsController v4.3.18:1459/3379,
+    v4.4.0:6372, v4.5.0:6535-6551) — and the parser routes by that override,
+    falling back for a portless domain to (``version``; unknown reads as newest):
+    the application's first ``ports_exposes`` on 4.3.15 (parsers.php
+    v4.3.15:1361), the service's first ``expose``/``ports`` entry of any protocol
+    and then ``ports_exposes`` on 4.3.16-4.3.17 (v4.3.16:1361), the service's
+    first tcp entry from 4.3.18 (v4.3.18:1357, v4.5.0:2158-2161, docker.php
+    :883-906, :1015-1017). The GET shows only the portless domain. FINALIZE's
+    release replaces the domain list, and ``DomainPortOverrides::normalize``
+    drops overrides for domains that are gone (v4.5.0
+    app/Support/DomainPortOverrides.php:27-75) — so neither the target nor a
+    rollback's restore can bring the port back.
 
     The routing survives only in the generated labels of the parsed compose
     (``docker_compose``, visible with read:sensitive, v4.5.0:122-126). Coolify's
@@ -445,7 +461,7 @@ def compose_hidden_port_overrides(source: dict[str, Any]) -> dict[str, list[int]
         routed = {int(p) for p in generated.findall(labels)} | {
             int(p) for p in _CADDY_PORT.findall(labels)
         }
-        fallback = _first_compose_port(body)
+        fallback = _compose_fallback_port(source, body, version=version)
         explicit: set[int] = set()
         for url in domain.split(","):
             try:
@@ -459,18 +475,32 @@ def compose_hidden_port_overrides(source: dict[str, Any]) -> dict[str, list[int]
     return out
 
 
-def _compose_port_refusals(source: dict[str, Any]) -> list[str]:
-    hidden = compose_hidden_port_overrides(source)
+def _compose_fallback_port(
+    source: dict[str, Any], service: dict[str, Any], *, version: Version | None
+) -> int | None:
+    """Where the compose parser routes a portless domain on this release."""
+    exposed = 80 if _settings(source).get("is_static") else _first_port(source.get("ports_exposes"))
+    if not at_least(version, COMPOSE_SERVICE_PORT_FALLBACK_SINCE):
+        return exposed
+    if not at_least(version, COMPOSE_TCP_PORT_FALLBACK_SINCE):
+        first = _first_compose_port(service, tcp_only=False)
+        return first if first is not None else exposed
+    return _first_compose_port(service)
+
+
+def _compose_port_refusals(source: dict[str, Any], *, version: Version | None) -> list[str]:
+    hidden = compose_hidden_port_overrides(source, version=version)
     if not hidden:
         return []
     detail = "; ".join(f"{name} -> {ports}" for name, ports in sorted(hidden.items()))
     return [
         f"compose service domains route to port(s) their domain does not name ({detail}). "
-        "Since 4.4 Coolify keeps such a port in a hidden column no API read returns, so "
-        "the target would route each domain to its service's first exposed port — and "
-        "parking the source's domains would erase the port on the source as well, beyond "
-        "what a rollback restores. Make that port the service's first `expose:` entry in "
-        "the compose (in git), redeploy the source, then migrate; or migrate it by hand."
+        "Since 4.3.15 Coolify keeps such a port in a hidden column no API read returns, "
+        "so the target would route each domain to its service's first exposed port — and "
+        "releasing the source's custom domains at finalize would erase the port on the "
+        "source as well, beyond what a rollback restores. Make that port the service's "
+        "first `expose:` entry in the compose (in git), redeploy the source, then migrate; "
+        "or migrate it by hand."
     ]
 
 
@@ -498,17 +528,20 @@ def _compose_label_text(labels: object) -> str:
     return ""
 
 
-def _first_compose_port(service: dict[str, Any]) -> int | None:
-    """firstDockerComposeServicePort (docker.php v4.5.0:883-906): first tcp target."""
+def _first_compose_port(service: dict[str, Any], *, tcp_only: bool = True) -> int | None:
+    """firstDockerComposeServicePort (docker.php v4.5.0:883-906): first tcp target.
+
+    ``tcp_only=False`` is its 4.3.16-4.3.17 form, which took any protocol.
+    """
     entries = list(service.get("expose") or []) + list(service.get("ports") or [])
     for entry in entries:
         if isinstance(entry, dict):
-            if str(entry.get("protocol") or "tcp") != "tcp":
+            if tcp_only and str(entry.get("protocol") or "tcp") != "tcp":
                 continue
             port = str(entry.get("target") or "")
         else:
             text = str(entry)
-            if "/" in text and text.rsplit("/", 1)[1] != "tcp":
+            if tcp_only and "/" in text and text.rsplit("/", 1)[1] != "tcp":
                 continue
             port = text.split("/", 1)[0].rsplit(":", 1)[-1]
         if port.isdigit() and 1 <= int(port) <= 65535:
