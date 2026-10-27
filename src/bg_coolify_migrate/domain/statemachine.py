@@ -97,6 +97,9 @@ class Compensation(StrEnum):
     REVOKE_EPHEMERAL_KEY = "revoke_ephemeral_key"
     RESTORE_SOURCE_NAME = "restore_source_name"
     RESTORE_SOURCE_FQDN = "restore_source_fqdn"
+    """Give the source its own domains back — ``fqdn`` or ``docker_compose_domains``,
+    whichever CREATE parked and FINALIZE(rename) blanked. The value keeps its old
+    name so journals written before it covered compose domains still read."""
     RELEASE_SOURCE_PINS = "release_source_pins"
     """Remove the containers that keep Coolify's Docker cleanup off the stopped
     source's volumes (``discovery/pins.py``) — once the source mounts them again."""
@@ -129,21 +132,44 @@ ORDER: tuple[State, ...] = (
 #: A state absent from this map completed without side effects (PREFLIGHT, PLAN,
 #: DISCOVER, VERIFY and DNS_GATE only read).
 #:
+#: The domain restore is owed to CREATE_TARGET, not FINALIZE: CREATE is what parks
+#: the source's domains, and its journal records the bodies that undo it — so a
+#: run that fails anywhere after CREATE gives them back, not only one that got as
+#: far as FINALIZE. ``_PRECEDENCE`` moves it forward, to just before the restart.
+#:
 #: RELEASE_SOURCE_PINS hangs off CREATE_TARGET although QUIESCE makes the pins,
 #: for two reasons. It must be owed even when QUIESCE fails AFTER the stop —
 #: QUIESCE is then never completed — and CREATE_TARGET always is by then. And
-#: CREATE_TARGET's tuple is the last a rollback runs, so the unpin waits for the
-#: restarted source only after the target delete has given the source back its
-#: parked domains. Waiting any earlier would hold that restore back until the
-#: restart's deploy had built its proxy labels from the PARKED names (the
-#: restart redeploys; the restore is a PATCH that does not). Pins are found by
-#: label, so it is a no-op when none exist.
+#: CREATE_TARGET's tuple is the last a rollback runs, so the unpin comes after
+#: both the source restart and the target delete: it waits for the restarted
+#: source to mount its volumes again, and running the delete behind that wait
+#: would only hold the target's resources longer. Pins are found by label, so
+#: it is a no-op when none exist.
 _COMPENSATION: dict[State, tuple[Compensation, ...]] = {
-    State.CREATE_TARGET: (Compensation.DELETE_TARGET_RESOURCE, Compensation.RELEASE_SOURCE_PINS),
+    State.CREATE_TARGET: (
+        Compensation.DELETE_TARGET_RESOURCE,
+        Compensation.RESTORE_SOURCE_FQDN,
+        Compensation.RELEASE_SOURCE_PINS,
+    ),
     State.QUIESCE: (Compensation.RESTART_SOURCE,),
     State.COPY: (Compensation.DROP_TARGET_VOLUMES, Compensation.REVOKE_EPHEMERAL_KEY),
     State.START_TARGET: (Compensation.STOP_TARGET,),
-    State.FINALIZE: (Compensation.RESTORE_SOURCE_NAME, Compensation.RESTORE_SOURCE_FQDN),
+    State.FINALIZE: (Compensation.RESTORE_SOURCE_NAME,),
+}
+
+#: ``{first: then}`` — when both are due, ``first`` runs immediately before
+#: ``then``, whatever reverse completion order says.
+#:
+#: The source's domains must be back BEFORE the deploy that restarts it. A domain
+#: PATCH only writes the database (ApplicationsController v4.1.2:2660-2680,
+#: v4.5.0:3752-3793) and regenerates the stored labels; ``/restart`` queues a
+#: deploy that bakes the stored labels into the new container
+#: (ApplicationDeploymentJob v4.1.2:3099-3113, v4.5.0:4118-4132). Reverse order
+#: alone runs RESTART (owed to QUIESCE) before anything owed to CREATE, so the
+#: source came back serving only its parked ``old-<tag>.`` hosts, and its custom
+#: domain 404'd until someone redeployed it by hand.
+_PRECEDENCE: dict[Compensation, Compensation] = {
+    Compensation.RESTORE_SOURCE_FQDN: Compensation.RESTART_SOURCE,
 }
 
 #: States after which the source is no longer running. Used to decide whether a
@@ -204,6 +230,7 @@ def rollback_plan_for(
     *,
     order: Sequence[str],
     compensation_map: Mapping[str, tuple[Compensation, ...]],
+    precedence: Mapping[str, str] | None = None,
 ) -> tuple[RollbackStep, ...]:
     """Compensations for a set of completed states, in reverse completion order.
 
@@ -213,6 +240,11 @@ def rollback_plan_for(
     volumes are dropped, and its volumes must be dropped before the resource is
     deleted, or we leak volumes that nothing references.
 
+    ``precedence`` then moves individual steps forward — ``{first: then}`` puts
+    ``first`` immediately before ``then`` when both are planned and ``first``
+    would otherwise come later. Nothing else moves, and a step keeps its
+    ``because_of``, so it still receives its own state's journalled undo info.
+
     Deliberately tolerant of duplicates and of unordered input — a journal
     replayed after a crash may contain either.
 
@@ -220,6 +252,7 @@ def rollback_plan_for(
         completed: State values that finished successfully.
         order: The machine's execution order.
         compensation_map: State value -> its undo actions.
+        precedence: Compensation value -> the compensation it must precede.
 
     Returns:
         Steps to execute in order. Empty if nothing had side effects.
@@ -232,6 +265,12 @@ def rollback_plan_for(
             continue
         for comp in compensation_map[key]:
             steps.append(RollbackStep(compensation=comp, because_of=key))
+    for first, then in (precedence or {}).items():
+        names = [str(s.compensation) for s in steps]
+        if str(first) in names and str(then) in names:
+            i, j = names.index(str(first)), names.index(str(then))
+            if i > j:
+                steps.insert(j, steps.pop(i))
     return tuple(steps)
 
 
@@ -241,6 +280,7 @@ def rollback_plan(completed: Sequence[State]) -> tuple[RollbackStep, ...]:
         [s.value for s in completed],
         order=[s.value for s in ORDER],
         compensation_map={k.value: v for k, v in _COMPENSATION.items()},
+        precedence={k.value: v.value for k, v in _PRECEDENCE.items()},
     )
 
 

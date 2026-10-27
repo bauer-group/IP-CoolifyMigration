@@ -28,7 +28,6 @@ loss:
 from __future__ import annotations
 
 import base64
-import json
 from collections.abc import Collection
 from typing import Any
 from urllib.parse import urlsplit
@@ -56,10 +55,12 @@ from bg_coolify_migrate.dns.extract import (
     is_service_url_key,
     normalise_host,
 )
+from bg_coolify_migrate.domain import domains
 from bg_coolify_migrate.domain.kinds import ResourceKind, create_route
 from bg_coolify_migrate.domain.locked_envs import Secrets
 from bg_coolify_migrate.domain.naming import VolumeEndpoint, resource_config_dir
 from bg_coolify_migrate.domain.plan import ResourceSnapshot
+from bg_coolify_migrate.domain.versions import Version
 from bg_coolify_migrate.errors import CoolifyApiError, UnsupportedResource
 
 log = structlog.get_logger(__name__)
@@ -372,29 +373,10 @@ def _with_host(url: str, host: str) -> str:
     return f"{parts.scheme or 'https'}://{host}{port}{parts.path.rstrip('/')}"
 
 
-def _parse_compose_domains(raw: object) -> dict[str, str]:
-    """Reduce docker_compose_domains to ``{service: "url,url"}``. PURE.
-
-    Coolify STORES and GETs this as a dict ``{service: {"domain": "url,url"}}``
-    (a JSON string), though the create route wants a different shape (see
-    :func:`_compose_domains_body`). Tolerant of a raw string or an already-decoded
-    dict, and of junk — a bad value yields ``{}``, not a crash.
-    """
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw) if isinstance(raw, str) else raw
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return {}
-    if not isinstance(parsed, dict):
-        return {}
-    out: dict[str, str] = {}
-    for name, cfg in parsed.items():
-        if isinstance(cfg, dict):
-            out[str(name)] = str(cfg.get("domain") or "")
-        elif isinstance(cfg, str):
-            out[str(name)] = cfg
-    return out
+#: Moved to the pure domain layer with the rest of the parking logic; the old
+#: private names stay so callers (and their tests) keep working.
+_parse_compose_domains = domains.compose_domains
+_park_hosts = domains.park_hosts
 
 
 def _compose_domains_body(
@@ -434,29 +416,28 @@ def _blank_compose_domains(raw: object) -> list[dict[str, str]] | None:
     return [{"name": name, "domain": ""} for name in parsed]
 
 
-def _park_hosts(domain_str: object, *, source_wildcard: str | None, tag: str) -> str:
-    """Rename the CUSTOM hosts in a comma-separated domain string. PURE.
+def source_domain_parking(
+    snapshot: ResourceSnapshot,
+    source: dict[str, Any],
+    *,
+    source_wildcard: str | None,
+    tag: str,
+    version: Version | None = None,
+) -> domains.DomainParking:
+    """The park and restore bodies for one source resource. PURE.
 
-    A custom host (``speakup.bauer-group.com``) is the same on source and target,
-    so creating the target 409s while the source still holds it. Prefixing an
-    ``old-<tag>.`` marker frees the real host for the target; the source keeps
-    serving the real one until quiesce (we do not redeploy it). Server-bound hosts
-    are remapped onto the target's wildcard and never collide, so they pass
-    through untouched.
+    Services are never parked — only their restore body is kept
+    (:func:`service_restore_body`): the target claims a service's custom hosts
+    with a scoped force instead (:func:`finish_service_target`). Everything else
+    is decided by :func:`domains.domain_parking`.
     """
-    if not domain_str:
-        return ""
-    out: list[str] = []
-    for part in str(domain_str).split(","):
-        stripped = part.strip()
-        if not stripped:
-            continue
-        host = normalise_host(stripped)
-        if host and not dns_wildcard.under_wildcard(host, source_wildcard):
-            out.append(f"https://old-{tag}.{host}")
-        else:
-            out.append(stripped)
-    return ",".join(out)
+    if snapshot.collection == "services":
+        return domains.DomainParking(
+            restore=service_restore_body(source, source_wildcard=source_wildcard), park=None
+        )
+    return domains.domain_parking(
+        snapshot, source, source_wildcard=source_wildcard, tag=tag, version=version
+    )
 
 
 async def park_source_domains(
@@ -475,40 +456,18 @@ async def park_source_domains(
     the running source is not redeployed, so it keeps serving the real domain
     until quiesce).
 
-    ALWAYS returns the body that restores the source's ORIGINAL domains, even when
-    nothing is parked: finalize blanks the source's domains on success, and the
-    rollback needs the originals to swing the URL back onto the old stack. Returns
-    ``None`` only when the source has no domains at all.
+    A thin shell over :func:`source_domain_parking`, which decides both bodies.
+    CREATE does not use this wrapper: it journals the restore body BEFORE the
+    park PATCH, which a single call that does both cannot offer.
 
-    Services are never parked — only their restore body is returned (see
-    :func:`service_restore_body`).
+    Returns the body that restores the source's ORIGINAL domains, or ``None``
+    when the source has none.
     """
-    if snapshot.collection == "services":
-        return service_restore_body(source, source_wildcard=source_wildcard)
-    if snapshot.kind is ResourceKind.APP_GIT_COMPOSE:
-        parsed = _parse_compose_domains(source.get("docker_compose_domains"))
-        if not parsed:
-            return None
-        original = [{"name": name, "domain": domain} for name, domain in parsed.items()]
-        parked = [
-            {"name": name, "domain": _park_hosts(domain, source_wildcard=source_wildcard, tag=tag)}
-            for name, domain in parsed.items()
-        ]
-        if parked != original:
-            await api.update_resource(
-                snapshot.collection, snapshot.uuid, {"docker_compose_domains": parked}
-            )
-            log.info("api.source_domains.parked", uuid=snapshot.uuid, tag=tag)
-        return {"docker_compose_domains": original}
-
-    original_fqdn = str(source.get("fqdn") or "")
-    if not original_fqdn:
-        return None
-    parked_fqdn = _park_hosts(original_fqdn, source_wildcard=source_wildcard, tag=tag)
-    if parked_fqdn != original_fqdn:
-        await api.update_resource(snapshot.collection, snapshot.uuid, {"domains": parked_fqdn})
+    parking = source_domain_parking(snapshot, source, source_wildcard=source_wildcard, tag=tag)
+    if parking.park is not None:
+        await api.update_resource(snapshot.collection, snapshot.uuid, parking.park)
         log.info("api.source_domains.parked", uuid=snapshot.uuid, tag=tag)
-    return {"domains": original_fqdn}
+    return parking.restore
 
 
 def _unrewritable_server_bound(

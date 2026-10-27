@@ -640,15 +640,25 @@ class TestRestoreCompensation:
         respx_mock.get(f"{BASE}/services/svc1").mock(
             return_value=httpx.Response(200, json=released)
         )
+        # The holder is the target's own sub-application: forced (and only then).
+        respx_mock.get(f"{BASE}/services/svcT").mock(
+            return_value=httpx.Response(200, json={"applications": [{"uuid": "sa-webT"}]})
+        )
         patch = respx_mock.patch(f"{BASE}/services/svc1").mock(
             side_effect=[
-                httpx.Response(409, json={"message": "Domain conflicts detected."}),
+                httpx.Response(
+                    409,
+                    json={
+                        "message": "Domain conflicts detected.",
+                        "conflicts": [{"domain": "shop.example.com", "resource_uuid": "sa-webT"}],
+                    },
+                ),
                 httpx.Response(200, json={}),
             ]
         )
         restore = {"urls": [{"name": "web", "url": "https://shop.example.com:8443"}]}
-        await compensations.undo_create_target(
-            ctx, {"target_uuids": {}, "parked_domains": {"svc1": restore}}
+        await compensations.undo_restore_source_fqdn(
+            ctx, {"target_uuids": {"svc1": "svcT"}, "parked_domains": {"svc1": restore}}
         )
         assert patch.call_count == 2
         assert "force_domain_override" not in _body(patch, 0)
@@ -661,7 +671,7 @@ class TestRestoreCompensation:
             return_value=httpx.Response(200, json=_source())
         )
         restore = {"urls": [{"name": "web", "url": "https://shop.example.com:8443"}]}
-        await compensations.undo_create_target(
+        await compensations.undo_restore_source_fqdn(
             ctx, {"target_uuids": {}, "parked_domains": {"svc1": restore}}
         )
         assert [c.request.method for c in respx_mock.calls] == ["GET"]

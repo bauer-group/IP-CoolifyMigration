@@ -140,7 +140,12 @@ typo away from silently copying nothing.
   holder.
 - `test_rollback.py` — injects a fault after the volumes are copied and asserts
   the world is put back: target deleted from server-b, source still running on
-  server-a with its data intact. This is what caught finding 15.
+  server-a with its data intact. This is what caught finding 15. Its two
+  application tests (the rig's first: the fixture errors at setup if an nginx
+  app cannot deploy at all) roll back a source on a custom domain — once mid-run,
+  once after a `rename` finalize — and assert the RESTARTED container routes
+  `Host(<domain>)` and carries no parked `old-<tag>.` host. They confirm on
+  4.5.0 what the respx call-order test locks: domains restored before restart.
 - `test_cleanup_guard.py` — runs **Coolify's own Docker cleanup** with the volume
   prune forced on (`POST /servers/{uuid}/docker-cleanup/run`, 4.3.0+) on both
   servers at the widest window — source stopped, target filled, nothing mounts

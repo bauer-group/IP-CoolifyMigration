@@ -94,19 +94,23 @@ class TestRollbackPlan:
     def test_read_only_progress_means_nothing_to_undo(self) -> None:
         assert rollback_plan([State.INIT, State.PREFLIGHT, State.PLAN]) == ()
 
-    def test_failure_after_create_target_deletes_it(self) -> None:
+    def test_failure_after_create_target_deletes_it_and_unparks_the_source(self) -> None:
         plan = rollback_plan([State.INIT, State.PREFLIGHT, State.PLAN, State.CREATE_TARGET])
-        # RELEASE_SOURCE_PINS is owed from CREATE_TARGET on; with no pins yet it
-        # finds none by label and does nothing.
+        # Delete first: from 4.3.11 the soft-delete releases the target's domains
+        # at once, so the restore needs no override. RELEASE_SOURCE_PINS is owed
+        # from CREATE_TARGET on; with no pins yet it finds none and does nothing.
         assert [s.compensation for s in plan] == [
             Compensation.DELETE_TARGET_RESOURCE,
+            Compensation.RESTORE_SOURCE_FQDN,
             Compensation.RELEASE_SOURCE_PINS,
         ]
 
-    def test_failure_after_quiesce_restarts_source_then_deletes_target(self) -> None:
+    def test_failure_after_quiesce_restores_domains_restarts_then_deletes(self) -> None:
         plan = rollback_plan([State.CREATE_TARGET, State.QUIESCE])
-        # Reverse order: undo QUIESCE (restart source) before undoing CREATE_TARGET.
+        # The domains go back BEFORE the restart: the restart's deploy bakes the
+        # stored labels into the container. Otherwise reverse order.
         assert [s.compensation for s in plan] == [
+            Compensation.RESTORE_SOURCE_FQDN,
             Compensation.RESTART_SOURCE,
             Compensation.DELETE_TARGET_RESOURCE,
             Compensation.RELEASE_SOURCE_PINS,
@@ -117,17 +121,17 @@ class TestRollbackPlan:
         assert [s.compensation for s in plan] == [
             Compensation.DROP_TARGET_VOLUMES,
             Compensation.REVOKE_EPHEMERAL_KEY,
+            Compensation.RESTORE_SOURCE_FQDN,
             Compensation.RESTART_SOURCE,
             Compensation.DELETE_TARGET_RESOURCE,
             Compensation.RELEASE_SOURCE_PINS,
         ]
 
     def test_source_pins_are_released_last(self) -> None:
-        """After the restart AND after the target delete restores parked domains.
+        """After the restart AND after the target delete.
 
-        Waiting for the restarted source to re-mount its volumes any earlier
-        would hold the domain restore back until the restart's deploy had built
-        its proxy labels from the parked names.
+        The unpin waits for the restarted source to re-mount its volumes; the
+        domain restore must not wait behind it, and runs before the restart.
         """
         for completed in (
             [State.CREATE_TARGET, State.QUIESCE],
@@ -168,6 +172,8 @@ class TestRollbackPlan:
         by_comp = {s.compensation: s.because_of for s in plan}
         assert by_comp[Compensation.RESTART_SOURCE] == State.QUIESCE
         assert by_comp[Compensation.DELETE_TARGET_RESOURCE] == State.CREATE_TARGET
+        # Moved forward by precedence, but still CREATE's: it reads CREATE's journal.
+        assert by_comp[Compensation.RESTORE_SOURCE_FQDN] == State.CREATE_TARGET
 
     def test_full_run_rollback_restores_source_identity(self) -> None:
         plan = rollback_plan(list(ORDER))

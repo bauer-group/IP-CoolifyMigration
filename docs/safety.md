@@ -232,16 +232,26 @@ Every state that mutates anything has a compensating action, journalled to disk
 with enough information to run after a total crash of your machine.
 
 ```text
-CREATE_TARGET  -> delete the target; then, last of all, unpin the source's volumes
+CREATE_TARGET  -> delete the target; give the source its own domains back;
+                  then, last of all, unpin the source's volumes
 QUIESCE        -> restart the source
 COPY           -> drop the target's volumes, revoke the ephemeral key
 START_TARGET   -> stop the target
-FINALIZE       -> restore the source's name and FQDN
+FINALIZE       -> restore the source's name
 ```
 
 Compensations run in reverse: the target must be stopped before its volumes are
 dropped, and its volumes dropped before the resource is deleted, or we leak
 volumes nothing references.
+
+One step is moved forward: **the source's domains are restored before the
+source is restarted.** CREATE parks the source's custom domains (`old-<tag>.`)
+so the target can claim them, and FINALIZE(rename) blanks them. A domain change
+in Coolify only writes its database; the proxy labels are baked into the
+container at deploy time, and the restart is a deploy. Restarting first brought
+the source back answering only on its parked hosts. The restore overrides a
+domain conflict (`force_domain_override`) only when every holder Coolify names
+is a target this migration created — never a third party's resource.
 
 **Rollback is cheap because the source is never destroyed until FINALIZE.** That
 is the one thing Geczy's script gets right, and it is the backbone of the whole
@@ -249,7 +259,8 @@ safety story.
 
 If a compensation itself fails, the remaining ones still run — a failure to
 delete the target must not also prevent restarting the source — and the run exits
-`8` naming what is broken and where the journal is. We never compensate a
+`8` naming what is broken and where the journal is. A domain restore that fails
+names the source and the exact domains to set back. We never compensate a
 compensation.
 
 ## Accepted risks

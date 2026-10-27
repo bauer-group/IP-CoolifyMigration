@@ -590,11 +590,12 @@ class TestReleaseSourcePins:
 async def test_rollback_unpins_source_after_domain_restore(
     ctx: MigrationContext, respx_mock: respx.Router
 ) -> None:
-    """The unpin's wait must not hold back the parked-domain restore.
+    """The domains go back before the restart; the unpin comes after everything.
 
     /restart redeploys and builds its proxy labels from the application row at
-    job time; the domain restore is a PATCH. Waiting for the remount inside
-    RESTART_SOURCE would make the restart always deploy under the PARKED names.
+    job time; the domain restore is a PATCH, so it must land first. The unpin
+    waits for the restarted source to remount its volumes, so it runs last —
+    after the restart and the target delete.
     """
     source = _src(ctx)
     source.add("src-pin", state="created", labels=_labels(pins.SOURCE), volumes=(VOL,))
@@ -634,7 +635,7 @@ async def test_rollback_unpins_source_after_domain_restore(
     ).rollback()
 
     assert result.outcome is Outcome.ROLLED_BACK
-    assert order == ["restart", "delete", "restore", "unpin"]
+    assert order == ["restore", "restart", "delete", "unpin"]
 
 
 async def test_a_kept_pin_reaches_the_report_and_the_outcome_stays_rolled_back(

@@ -371,7 +371,7 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
     created: dict[str, str] = {}
     parked: dict[str, dict[str, Any]] = {}
     tag = ctx.migration_id.split("-")[-1]
-    source_wildcard = ctx.plan.source_server.wildcard_domain or None
+    source_wildcard = placement.source_wildcard
     try:
         for resource in ctx.plan.resources:
             snapshot = resource.snapshot
@@ -385,20 +385,11 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
             # the read 404s and the create 422s.
 
             # Free the source's custom domains so the target can claim them — Coolify
-            # 409s on a duplicate. Journal the restore body BEFORE creating, so a
-            # failed create still un-parks them on rollback. Server-bound domains are
-            # remapped onto the target's wildcard and never collide, so park leaves
-            # them alone. A service is never parked; only its restore body is kept.
-            restore_body = await api_resources.park_source_domains(
-                ctx.api, snapshot, source_full, source_wildcard=source_wildcard, tag=tag
+            # 409s on a duplicate. The restore body is journalled BEFORE the park.
+            # A service is never parked; only its restore body is kept.
+            await _park_source_domains(
+                ctx, snapshot, source_full, tag=tag, created=created, parked=parked
             )
-            if restore_body is not None:
-                parked[snapshot.uuid] = restore_body
-                ctx.journal.append(
-                    "step_started",
-                    state="create_target",
-                    detail={"target_uuids": dict(created), "parked_domains": dict(parked)},
-                )
 
             target_uuid = await api_resources.create_resource(ctx.api, snapshot, placement, source_full)
             created[snapshot.uuid] = target_uuid
@@ -491,12 +482,8 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
         # and leave the source's domains parked in Coolify's DB, where its next
         # redeploy would serve only old-<tag> hosts. Undo exactly what this
         # step did, then let the original error speak.
-        try:
-            await compensations.undo_create_target(
-                ctx, {"target_uuids": dict(created), "parked_domains": dict(parked)}
-            )
-        except Exception as undo_exc:  # never mask the original failure
-            log.error("create.undo_failed", error=str(undo_exc)[:200])
+        for problem in await compensations.undo_partial_create(ctx, created, parked):
+            log.error("create.undo_failed", error=problem[:200])
         raise
 
     return {"target_uuids": created}
@@ -531,6 +518,48 @@ async def _refuse_multi_server(
             "the servers are removed."
         ),
     )
+
+
+async def _park_source_domains(
+    ctx: MigrationContext,
+    snapshot: ResourceSnapshot,
+    source: dict[str, Any],
+    *,
+    tag: str,
+    created: dict[str, str],
+    parked: dict[str, dict[str, Any]],
+) -> None:
+    """Park the source's custom domains, journalling the way back FIRST.
+
+    Server-bound domains are remapped onto the target's wildcard and never
+    collide, so only custom hosts are parked, and a service never is
+    (:func:`api_resources.source_domain_parking`).
+
+    The restore body is journalled BEFORE the park PATCH. The client retries a
+    PATCH that timed out (client.py ``_IDEMPOTENT``, ``max_retries=4``), so this
+    only matters once every retry has failed, or the process died mid-request —
+    and then Coolify may have applied a park we never heard back about, which
+    nothing but this record could undo. Restoring a body that was never parked
+    is harmless.
+    """
+    raw_version = ctx.journal.undo_info("preflight").get("coolify_version")
+    parking = api_resources.source_domain_parking(
+        snapshot,
+        source,
+        source_wildcard=ctx.plan.source_server.wildcard_domain or None,
+        tag=tag,
+        version=parse_version(raw_version if isinstance(raw_version, str) else None),
+    )
+    if parking.restore is not None:
+        parked[snapshot.uuid] = parking.restore
+        ctx.journal.append(
+            "step_started",
+            state="create_target",
+            detail={"target_uuids": dict(created), "parked_domains": dict(parked)},
+        )
+    if parking.park is not None:
+        await ctx.api.update_resource(snapshot.collection, snapshot.uuid, parking.park)
+        log.info("api.source_domains.parked", uuid=snapshot.uuid, tag=tag)
 
 
 async def _assert_compose_target_ready(

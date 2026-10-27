@@ -31,6 +31,7 @@ from typing import Any, Protocol
 import structlog
 
 from bg_coolify_migrate.domain.statemachine import _COMPENSATION as F1_COMPENSATION
+from bg_coolify_migrate.domain.statemachine import _PRECEDENCE as F1_PRECEDENCE
 from bg_coolify_migrate.domain.statemachine import (
     ORDER,
     Compensation,
@@ -122,6 +123,7 @@ class Saga:
         on_state: Callable[[Any], Awaitable[None]] | None = None,
         order: Sequence[Any] | None = None,
         compensation_map: Mapping[Any, tuple[Compensation, ...]] | None = None,
+        precedence: Mapping[Any, Any] | None = None,
     ) -> None:
         self.journal = journal
         self.context = context
@@ -131,6 +133,11 @@ class Saga:
         self._order: list[Any] = list(order) if order is not None else list(ORDER)
         raw_map = compensation_map if compensation_map is not None else F1_COMPENSATION
         self._compensation_map = {str(k): v for k, v in raw_map.items()}
+        # F1's precedence only with F1's map: a machine that brings its own map
+        # (F2) has its own compensations, and F1's rules mean nothing there.
+        f1 = compensation_map is None
+        raw_precedence = precedence if precedence is not None else (F1_PRECEDENCE if f1 else {})
+        self._precedence = {str(k): str(v) for k, v in raw_precedence.items()}
         self._keys = [str(s) for s in self._order]
         self._terminal = self._keys[-1]
         self._completed: list[str] = []
@@ -204,6 +211,7 @@ class Saga:
             self._completed,
             order=self._keys,
             compensation_map=self._compensation_map,
+            precedence=self._precedence,
         )
         if not plan:
             self.journal.append("rolled_back", detail={"steps": 0})

@@ -12,13 +12,14 @@ is recorded and the run reports honestly at the end.
 from __future__ import annotations
 
 import functools
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any
 
 import structlog
 
 from bg_coolify_migrate.api import resources as api_resources
 from bg_coolify_migrate.discovery import docker, pins
+from bg_coolify_migrate.domain import domains
 from bg_coolify_migrate.domain.statemachine import Compensation, State
 from bg_coolify_migrate.engine import keys
 from bg_coolify_migrate.engine.context import MigrationContext
@@ -29,16 +30,15 @@ log = structlog.get_logger(__name__)
 
 
 async def undo_create_target(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
-    """Delete the resources we created and restore the source's original domains.
+    """Delete the resources we created.
 
     ``delete_volumes=True`` is correct here and only here: these are volumes WE
     created on the target minutes ago. The source's volumes are never touched by
     a rollback.
 
-    ORDER matters: the target is deleted FIRST so it releases any domain it holds,
-    and only THEN is the source's original domain restored — otherwise reclaiming
-    a custom domain the target still holds would 409. Both parts are best-effort so
-    a stuck target delete cannot also strand the source without its URL.
+    Deletes only. Giving the source its domains back is RESTORE_SOURCE_FQDN, a
+    compensation of its own, so the planner can run it BEFORE the source is
+    restarted — see ``statemachine._PRECEDENCE``.
     """
     target_uuids: dict[str, str] = undo_info.get("target_uuids") or {}
     delete_failures: list[str] = await _release_target_side(ctx)
@@ -68,14 +68,55 @@ async def undo_create_target(ctx: MigrationContext, undo_info: dict[str, Any]) -
                 ),
             )
 
-    # The target is gone (or noted as stuck) — now swing the source's domains back.
-    # create_target parked the custom ones and finalize blanked them on success;
-    # this puts the originals back so the old stack regains its URL.
-    parked: dict[str, dict[str, Any]] = undo_info.get("parked_domains") or {}
-    for source_uuid, restore_body in parked.items():
+    if delete_failures:
+        # Surfaced so the rollback reports honestly.
+        raise RuntimeError("could not delete target(s): " + ", ".join(delete_failures))
+
+
+async def undo_restore_source_fqdn(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
+    """Give the source back the domains CREATE parked and FINALIZE(rename) blanked.
+
+    Owed to CREATE_TARGET, so ``undo_info`` is CREATE's merged journal records —
+    the restore bodies (``parked_domains``) and the targets made, which are the
+    only holders a 409 may be overridden for. Both survive a crash.
+    """
+    await restore_source_domains(
+        ctx,
+        undo_info.get("parked_domains") or {},
+        targets=undo_info.get("target_uuids") or {},
+    )
+
+
+async def restore_source_domains(
+    ctx: MigrationContext,
+    parked: Mapping[str, dict[str, Any]],
+    *,
+    targets: Mapping[str, str],
+    holders: frozenset[str] | None = None,
+) -> None:
+    """PATCH every journalled restore body back onto its source. Loud on failure.
+
+    Every resource is attempted, and the failures are raised together at the
+    end: one source that will not take its domains back must not stop the next
+    one from getting its own. The error names each source and the exact domains
+    to set back FIRST, because the executor keeps only the first 300 characters.
+
+    This used to log and carry on, so a rollback reported ROLLED_BACK while the
+    source sat on its parked hosts — the same dead custom domain as before the
+    rollback, minus any sign of it.
+
+    ``holders`` — the uuids a 409 may be overridden for — defaults to the targets
+    plus their service sub-applications, read now. Pass it when the targets are
+    about to be deleted first (:func:`undo_partial_create`).
+    """
+    if not parked:
+        return
+    own = holders if holders is not None else await own_domain_holders(ctx, targets)
+    failures: list[str] = []
+    for source_uuid, body in parked.items():
         try:
             collection = ctx.collection_of(source_uuid)
-            await _restore_source_domains(ctx, collection, source_uuid, restore_body)
+            await _restore_one(ctx, collection, source_uuid, body, own=own)
             log.info("compensate.source_domains_restored", uuid=source_uuid)
         except Exception as exc:
             log.error(
@@ -83,10 +124,16 @@ async def undo_create_target(ctx: MigrationContext, undo_info: dict[str, Any]) -
                 uuid=source_uuid,
                 error=str(exc)[:200],
             )
-
-    if delete_failures:
-        # Surfaced so the rollback reports honestly; the source restore still ran.
-        raise RuntimeError("could not delete target(s): " + ", ".join(delete_failures))
+            failures.append(
+                f"{_source_name(ctx, source_uuid)} -> {domains.restore_summary(body)} ({_why(exc)})"
+            )
+    if failures:
+        raise RuntimeError(
+            "domains NOT restored: "
+            + "; ".join(failures)
+            + " - set them back on the source in Coolify and restart it; until then it "
+            "answers only on its parked or blank hosts"
+        )
 
 
 async def _release_target_side(ctx: MigrationContext) -> list[str]:
@@ -118,21 +165,30 @@ async def _release_target_side(ctx: MigrationContext) -> list[str]:
     return failures
 
 
-async def _restore_source_domains(
-    ctx: MigrationContext, collection: str, source_uuid: str, restore_body: dict[str, Any]
+class _HeldElsewhere(RuntimeError):
+    """A 409 names a holder this migration did not create, so it is not forced."""
+
+
+async def _restore_one(
+    ctx: MigrationContext,
+    collection: str,
+    source_uuid: str,
+    body: dict[str, Any],
+    *,
+    own: frozenset[str],
 ) -> None:
-    """Give the source back its own domains, surviving the parking 409.
+    """Restore one source, overriding a conflict only with our OWN resources.
 
-    Coolify's domain-uniqueness check 409s ("Domain conflicts detected. Use
-    force_domain_override=true") when a resource asks for a domain another still
-    holds — and the target we just deleted can linger in that check for a beat
-    (the delete is async). The plain restore then failed and the source kept
-    serving under its parked ``old-<tag>`` name (covalida, 2026-07-23:
-    staging.covalida.com was left parked while the source was back up).
+    The PATCH saves before it answers (fill + save, ApplicationsController
+    v4.5.0:3766-3780), so a ``/restart`` that follows reads the restored row.
 
-    So on a 409 we retry ONCE with ``force_domain_override``. In a rollback that
-    is unconditionally correct: the domain is the source's own, and the only
-    thing that could still be holding it is the target being torn down.
+    A 409 that names only this migration's targets is retried ONCE with
+    ``force_domain_override`` — in the update ``$allowedFields`` at every tag
+    from v4.1.2 (applications :2368, services :962) to v4.5.0 (:3363, :1250). A
+    target that still exists holds the custom domain, and so, before v4.3.11,
+    does one whose DELETE is still queued (covalida, 2026-07-23: the plain
+    restore 409'd and the source kept its parked name). Any other holder is
+    the operator's to resolve.
     """
     # service-domains: a service restore GETs, compares and PATCHes only what
     # differs (api_resources.restore_service_urls) — never re-writing a live
@@ -143,12 +199,91 @@ async def _restore_source_domains(
     else:
         send = functools.partial(ctx.api.update_resource, collection, source_uuid)
     try:
-        await send(restore_body)
+        await send(body)
     except CoolifyApiError as exc:
         if exc.status_code != 409:
             raise
-        log.warning("compensate.source_domains_conflict_forcing", uuid=source_uuid)
-        await send({**restore_body, "force_domain_override": True})
+        holders = domains.conflict_holders(exc.body)
+        if not domains.may_force_domain_restore(exc.body, own):
+            raise _HeldElsewhere(
+                "HTTP 409: held by "
+                + (", ".join(holders) or "a holder Coolify did not name")
+                + ", which this migration did not create - not forcing"
+            ) from exc
+        log.warning("compensate.source_domains_conflict_forcing", uuid=source_uuid, holders=holders)
+        await send({**body, "force_domain_override": True})
+
+
+async def own_domain_holders(ctx: MigrationContext, targets: Mapping[str, str]) -> frozenset[str]:
+    """Every uuid a 409 may name for a resource this migration created.
+
+    The targets themselves, plus the sub-application uuids of target SERVICES:
+    a service's domains live on its service_applications, and a conflict names
+    that row (domains.php v4.1.2:226-232, v4.5.0:304-310). ``GET /services/{uuid}``
+    loads ``applications`` (ServicesController v4.1.2:736, v4.5.0:885).
+
+    Best-effort: a target that is already gone, or will not answer, contributes
+    only its own uuid — at worst a restore is not forced and fails loudly.
+    """
+    own = set(targets.values())
+    for source_uuid, target_uuid in targets.items():
+        try:
+            if ctx.collection_of(source_uuid) != "services":
+                continue
+            full = await ctx.api.get_resource("services", target_uuid)
+        except Exception as exc:
+            log.debug("compensate.holders_unavailable", uuid=target_uuid, error=str(exc)[:120])
+            continue
+        for app in full.get("applications") or []:
+            if isinstance(app, dict) and app.get("uuid"):
+                own.add(str(app["uuid"]))
+    return frozenset(own)
+
+
+async def undo_partial_create(
+    ctx: MigrationContext,
+    targets: Mapping[str, str],
+    parked: Mapping[str, dict[str, Any]],
+) -> list[str]:
+    """Undo what an unfinished CREATE did. Returns what could NOT be undone.
+
+    Delete the targets first, then give the source its domains back. From
+    v4.3.11 a DELETE soft-deletes before it answers (ApplicationsController
+    v4.3.11:2563, ServicesController :1023), which drops the target out of the
+    conflict check at once; before that the restore meets the queued target in
+    a 409, which the scoped force covers. The holders are read BEFORE the delete,
+    while a target service's sub-applications can still be listed.
+
+    No restart: CREATE runs before QUIESCE, so the source was never stopped.
+    """
+    holders = await own_domain_holders(ctx, targets) if parked else frozenset(targets.values())
+    problems: list[str] = []
+    try:
+        await undo_create_target(ctx, {"target_uuids": dict(targets)})
+    except Exception as exc:
+        problems.append(str(exc))
+    try:
+        await restore_source_domains(ctx, parked, targets=targets, holders=holders)
+    except Exception as exc:
+        problems.append(str(exc))
+    return problems
+
+
+def _source_name(ctx: MigrationContext, source_uuid: str) -> str:
+    for resource in ctx.plan.resources:
+        if resource.snapshot.uuid == source_uuid:
+            return resource.snapshot.name
+    return source_uuid
+
+
+def _why(exc: Exception) -> str:
+    """A short, secret-free reason. Coolify's message, never the request body."""
+    if isinstance(exc, CoolifyApiError):
+        message = exc.body.get("message") if isinstance(exc.body, dict) else None
+        status = f"HTTP {exc.status_code}" if exc.status_code else "API error"
+        return f"{status}: {message}" if message else status
+    lines = str(exc).splitlines()
+    return lines[0][:160] if lines else type(exc).__name__
 
 
 async def undo_quiesce(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
@@ -246,18 +381,6 @@ async def undo_restore_source_name(ctx: MigrationContext, undo_info: dict[str, A
         except Exception as exc:
             log.error("compensate.rename_failed", name=resource.snapshot.name, error=str(exc)[:200])
             raise
-
-
-async def undo_restore_source_fqdn(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
-    """No-op: the source's domains are restored by ``undo_create_target``.
-
-    That compensation recorded the originals at create and runs LAST — after the
-    target it deletes has released the domain — so it can reclaim a custom domain
-    without a 409. Doing it here (a finalize compensation, which runs while the
-    target still exists) would conflict, so this stays a no-op and is kept only so
-    the state machine's compensation map remains complete.
-    """
-    return
 
 
 def _source_was_stopped(ctx: MigrationContext) -> bool:

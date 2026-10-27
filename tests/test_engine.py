@@ -113,7 +113,9 @@ class TestFailureRollsBack:
         assert result.outcome is Outcome.ROLLED_BACK
         assert isinstance(result.error, TransferError)
         # CREATE_TARGET and QUIESCE completed; COPY failed before completing.
+        # The source's domains go back before the restart that deploys it.
         assert rec.compensations == [
+            Compensation.RESTORE_SOURCE_FQDN,
             Compensation.RESTART_SOURCE,
             Compensation.DELETE_TARGET_RESOURCE,
             Compensation.RELEASE_SOURCE_PINS,
@@ -183,6 +185,9 @@ class TestFailureRollsBack:
         )
         await saga.run()
         assert rec.undo_seen[Compensation.DELETE_TARGET_RESOURCE] == {"target_uuid": "new-uuid-123"}
+        # Ran before RESTART by precedence, yet still reads CREATE's journal —
+        # and DELETE, which ran after it, is not handed its bookkeeping.
+        assert rec.undo_seen[Compensation.RESTORE_SOURCE_FQDN] == {"target_uuid": "new-uuid-123"}
 
 
 class TestGatesAreNotFailures:

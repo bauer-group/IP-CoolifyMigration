@@ -268,10 +268,14 @@ class Journal:
         Merged rather than last-wins because a state can record several facts
         (target uuid at start, volume names as they are created) and a
         compensation needs all of them.
+
+        ``rollback_step`` records are the rollback's own bookkeeping, not facts
+        about the step, and are left out: a state can owe two compensations, and
+        the second must see what the step recorded, not what the first undid.
         """
         merged: dict[str, Any] = {}
         for record in self.read():
-            if record.state == state:
+            if record.state == state and record.event != "rollback_step":
                 merged.update(record.detail)
         return merged
 

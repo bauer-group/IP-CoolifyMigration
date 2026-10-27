@@ -376,6 +376,21 @@ confirmed finalize. Inspect with:
 coolify-migrate status <id>
 ```
 
+### `domains NOT restored: shop -> https://shop.example.com (...)`
+
+The rollback could not give the source its own domains back. Everything else
+still ran — a stopped source was restarted — so it is up, but it answers only on
+its parked `old-<tag>.` hosts (or, after a finalize with `rename`, on none).
+
+Set exactly the listed domains back on the source in Coolify, then **Restart**
+it: Coolify writes a domain change to its database only and bakes the proxy
+labels into the container at deploy time, so the restart is what makes the
+domain live again.
+
+`held by <name>/<uuid>, which this migration did not create - not forcing` means
+another resource claims the same domain. We override a conflict only with this
+migration's own targets; anything else is yours to decide.
+
 ## Scheduled tasks
 
 An application's or service's scheduled tasks are recreated on the target during
@@ -457,6 +472,7 @@ files**. A rollback can also be run after a successful migration, and then those
 dumps are the only copy of everything written since the cutover. The log line
 `compensate.target_backup_files_kept` names where they are. Delete them yourself
 once you are sure.
+
 ## The plan refuses a service's URLs
 
 - **"sub-applications [...] share the URL ..."** — two containers of the stack

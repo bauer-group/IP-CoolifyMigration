@@ -22,16 +22,19 @@ that FINALIZE never ran (so the source was never renamed or deleted).
 
 from __future__ import annotations
 
+import uuid as uuidlib
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
+import pytest_asyncio
 
 from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.domain.plan import TransferMode
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy, Outcome
 from bg_coolify_migrate.engine import steps
 from bg_coolify_migrate.engine.planner import build_plan, server_uuid_of
-from bg_coolify_migrate.engine.runner import run_migration
+from bg_coolify_migrate.engine.runner import make_migration_id, rollback_migration, run_migration
 from bg_coolify_migrate.errors import VerificationError
 from bg_coolify_migrate.settings.base import Settings
 
@@ -119,11 +122,241 @@ def _own_backup(rows: list[dict[str, Any]], backup_uuid: str) -> dict[str, Any]:
     return {k: v for k, v in row.items() if k not in volatile}
 
 
-async def _resource_on(api: CoolifyClient, name: str, server_uuid: str) -> str | None:
-    for db in await api.get("/databases") or []:
-        if not isinstance(db, dict) or db.get("name") != name:
+async def _resource_on(
+    api: CoolifyClient, name: str, server_uuid: str, *, collection: str = "databases"
+) -> str | None:
+    for row in await api.get(f"/{collection}") or []:
+        if not isinstance(row, dict) or row.get("name") != name:
             continue
-        full = await api.get_resource("databases", str(db["uuid"]))
+        full = await api.get_resource(collection, str(row["uuid"]))
         if server_uuid_of(full) == server_uuid:
-            return str(db["uuid"])
+            return str(row["uuid"])
     return None
+
+
+# ── the source's domain survives a rollback ──────────────────────────────────
+#
+# CREATE parks the source's custom domain (old-<tag>.<host>) so the target can
+# claim it. A domain PATCH only writes Coolify's database; the proxy labels are
+# baked into the container at deploy time, and the rollback's /restart IS a
+# deploy. Restarting before the restore brought the source back answering only
+# on its parked host. The unit respx test (test_rollback_domains_engine.py) is
+# the regression lock on call ORDER; this confirms on 4.5.0 that the order gives
+# the restarted container the right labels.
+#
+# Labels can be asserted with no proxy actually serving: rig servers are created
+# through the API, whose proxy type defaults to TRAEFIK, so isProxyShouldRun()
+# holds and Host() labels are generated (Server.php v4.5.0:2080-2088,
+# ServersController :610).
+
+#: nginx:1.27-alpine by its index digest (Docker Hub, pushed 2025-04-16). Coolify
+#: stores a 64-hex tag as `name@sha256` + hash (DockerImageParser, v4.5.0
+#: ApplicationsController:2383-2406), so the image cannot move under the test.
+NGINX_DIGEST = "65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10"
+
+
+async def _running_app_container(host: Any, app_uuid: str, *, not_named: str = "") -> str | None:
+    result = await host.run(
+        f"docker ps --filter name={app_uuid} --filter status=running --format '{{{{.Names}}}}'"
+    )
+    names = [n for n in result.stdout.split() if n and n != not_named]
+    return names[0] if names else None
+
+
+async def _labels(host: Any, container: str) -> dict[str, str]:
+    import json
+
+    result = await host.run(f"docker inspect -f '{{{{json .Config.Labels}}}}' {container}")
+    result.check()
+    return dict(json.loads(result.stdout.strip() or "{}"))
+
+
+@pytest_asyncio.fixture
+async def domained_app(
+    api: CoolifyClient, settings: Settings, rig: dict[str, Any]
+) -> AsyncIterator[dict[str, Any]]:
+    """An nginx dockerimage app on server-a, on a custom domain, deployed.
+
+    Also the rig's smoke test for APPLICATIONS: every other e2e test migrates a
+    database or a service, so this is the first application the rig deploys.
+    If it never comes up, the fixture errors at setup, and the rollback verdict
+    below is not read against a rig that cannot run applications at all.
+    """
+    import asyncio
+    import contextlib
+
+    suffix = uuidlib.uuid4().hex[:8]
+    project = await api.post("/projects", {"name": f"rbd-{suffix}", "description": "bgcm rollback"})
+    project_uuid = str(project["uuid"])
+    app_name = f"web-{suffix}"
+    host_name = f"rb-{suffix}.example.com"
+    try:
+        app = await api.post(
+            "/applications/dockerimage",
+            {
+                "name": app_name,
+                "project_uuid": project_uuid,
+                "environment_name": "production",
+                "server_uuid": rig["server_a"]["uuid"],
+                "docker_registry_image_name": "nginx",
+                "docker_registry_image_tag": NGINX_DIGEST,
+                "ports_exposes": "80",
+                "domains": f"http://{host_name}",
+                "instant_deploy": True,
+            },
+        )
+        app_uuid = str(app["uuid"])
+        container = None
+        async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source:
+            for _ in range(60):
+                container = await _running_app_container(source, app_uuid)
+                if container:
+                    break
+                await asyncio.sleep(4)
+        if container is None:
+            pytest.fail(
+                "smoke: a dockerimage application never came up on server-a - the rig "
+                "cannot run applications, so no application test here means anything"
+            )
+        yield {
+            "project": f"rbd-{suffix}",
+            "app_name": app_name,
+            "app_uuid": app_uuid,
+            "host": host_name,
+            "container": container,
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            for row in await api.get("/applications") or []:
+                if isinstance(row, dict) and suffix in str(row.get("name", "")):
+                    with contextlib.suppress(Exception):
+                        await api.delete_resource(
+                            "applications", str(row["uuid"]), delete_volumes=True
+                        )
+        with contextlib.suppress(Exception):
+            await api.delete(f"/projects/{project_uuid}")
+
+
+async def _assert_source_serves_its_domain(
+    api: CoolifyClient,
+    settings: Settings,
+    rig: dict[str, Any],
+    app: dict[str, Any],
+    *,
+    tag: str,
+) -> None:
+    """A NEW running source container carries Host(<custom>) and no parked host."""
+    import asyncio
+
+    full = await api.get_resource("applications", app["app_uuid"])
+    assert full.get("fqdn") == f"http://{app['host']}", f"fqdn not restored: {full.get('fqdn')!r}"
+
+    labels: dict[str, str] = {}
+    async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source:
+        # QUIESCE removed the original container, so a running one under another
+        # name is the rollback's restart.
+        for _ in range(60):
+            container = await _running_app_container(
+                source, app["app_uuid"], not_named=app["container"]
+            )
+            if container:
+                labels = await _labels(source, container)
+                break
+            await asyncio.sleep(4)
+    assert labels, "the source never came back after the rollback"
+    values = list(labels.values())
+    assert any(f"Host(`{app['host']}`)" in v for v in values), (
+        f"the restarted source has no router for {app['host']}: {values}"
+    )
+    assert not any(f"old-{tag}." in v for v in values), (
+        "the restarted source still carries its PARKED host - the restart ran "
+        "before the domain restore"
+    )
+
+
+async def _assert_target_gone(api: CoolifyClient, rig: dict[str, Any], name: str) -> None:
+    import asyncio
+
+    target = None
+    for _ in range(24):
+        target = await _resource_on(
+            api, name, str(rig["server_b"]["uuid"]), collection="applications"
+        )
+        if target is None:
+            return
+        await asyncio.sleep(5)
+    raise AssertionError(f"rollback left target {target} on server-b")
+
+
+async def test_rollback_brings_the_source_back_on_its_own_domain(
+    api: CoolifyClient,
+    settings: Settings,
+    rig: dict[str, Any],
+    domained_app: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fault after QUIESCE: the restarted source must route its custom domain."""
+
+    async def _boom(_ctx: object) -> dict[str, Any]:
+        raise VerificationError("injected fault: pretend verification found a mismatch")
+
+    monkeypatch.setattr(steps, "step_verify", _boom)
+
+    async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source_host:
+        plan = await build_plan(
+            api,
+            source_host,
+            project=domained_app["project"],
+            environment="production",
+            target_server="e2e-server-b",
+            finalize_policy=FinalizePolicy.RENAME,
+            transfer_mode=TransferMode.DIRECT,
+        )
+
+    result = await run_migration(api, settings, plan)
+    assert result.outcome is Outcome.ROLLED_BACK, f"expected rollback, got {result}"
+
+    tag = make_migration_id(plan.project, plan.environment).split("-")[-1]
+    await _assert_source_serves_its_domain(api, settings, rig, domained_app, tag=tag)
+    await _assert_target_gone(api, rig, domained_app["app_name"])
+
+
+async def test_rollback_after_rename_restores_domains(
+    api: CoolifyClient,
+    settings: Settings,
+    rig: dict[str, Any],
+    domained_app: dict[str, Any],
+) -> None:
+    """Run to DONE with RENAME, then roll back: name AND blanked domains come back.
+
+    FINALIZE(rename) blanks the source's domains (release_fqdn sends
+    ``{"domains": ""}``, which 4.5 accepts and stores as null), so this is also
+    the first live run of that PATCH. RENAME only — a rollback after DELETE is
+    refused, because the target is then the only copy.
+    """
+    async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source_host:
+        plan = await build_plan(
+            api,
+            source_host,
+            project=domained_app["project"],
+            environment="production",
+            target_server="e2e-server-b",
+            finalize_policy=FinalizePolicy.RENAME,
+            transfer_mode=TransferMode.DIRECT,
+        )
+
+    mid = make_migration_id(plan.project, plan.environment)
+    # example.com never resolves to the source; accept_dns lets the gate pass.
+    result = await run_migration(api, settings, plan, migration_id=mid, accept_dns=True)
+    assert result.outcome is Outcome.SUCCEEDED, f"expected DONE, got {result}"
+    renamed = await api.get_resource("applications", domained_app["app_uuid"])
+    assert renamed.get("name") != domained_app["app_name"]
+    assert not renamed.get("fqdn"), "FINALIZE(rename) should have released the domains"
+
+    back = await rollback_migration(api, settings, plan, mid)
+    assert back.outcome is Outcome.ROLLED_BACK, f"expected rollback, got {back}"
+
+    source = await api.get_resource("applications", domained_app["app_uuid"])
+    assert source.get("name") == domained_app["app_name"]
+    await _assert_source_serves_its_domain(api, settings, rig, domained_app, tag=mid.split("-")[-1])
+    await _assert_target_gone(api, rig, domained_app["app_name"])

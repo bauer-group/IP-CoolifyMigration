@@ -183,6 +183,25 @@ tags v4.1.2 through v4.5.0 (2026-10-26). Read upstream at a **release tag**, nev
   send `DELETE .../backups/{b}?delete_s3=true`: `rollback` also runs after a
   SUCCEEDED run (it has no is_finished guard), and then those dumps are the last
   copy of post-cutover data.
+- **A domain PATCH only writes the database; the labels are baked at deploy.**
+  `PATCH /applications/{uuid}` with `domains`/`docker_compose_domains` saves
+  (and, read-only labels being the default, regenerates `custom_labels`) but
+  deploys nothing without `instant_deploy` (v4.1.2:2660-2680, v4.5.0:3752-3793).
+  Every deploy — `/restart` included — writes the stored labels into the new
+  container (ApplicationDeploymentJob v4.1.2:3099-3113, v4.5.0:4118-4132). So a
+  domain change must land BEFORE the deploy that should carry it: the rollback
+  restores the source's domains, then restarts it (`statemachine._PRECEDENCE`).
+- **The domain-conflict check is team-wide and excludes only the updated uuid.**
+  Applications, service applications and the instance fqdn all count
+  (domains.php v4.1.2:142-184, v4.5.0:250-316). The 409 names every holder in
+  `conflicts[].resource_uuid` — a service's ServiceApplication uuid, null for the
+  instance. DELETE dispatches a job on v4.1.2-v4.3.10 (the row holds its domains
+  until it runs) and soft-deletes synchronously from v4.3.11. The restore forces
+  (`force_domain_override`, in every update array) only over our own targets.
+- **`noindex_domains` (4.3.0+) is dropped with the domains it flags.** The save
+  hook's `syncNoindexDomains` keeps flags only for current domains
+  (Application.php v4.3.0:280), so parking erases them; the update applies them
+  after the fqdn (v4.3.0:3115-3120), so the journalled restore body carries them.
 
 ### Learned the hard way, from a real instance
 
