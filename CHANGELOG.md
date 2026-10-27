@@ -1,6 +1,140 @@
 # CHANGELOG
 
 
+## v2.10.0 (2026-10-27)
+
+### Bug Fixes
+
+- **api**: Dropped build_pack from image app creates
+  ([`a0f04b5`](https://github.com/bauer-group/IP-CoolifyMigration/commit/a0f04b5d11da32f926aa1c408be4441e76cc524a))
+
+- **dns**: Blocked hosts resolving elsewhere
+  ([`889f67a`](https://github.com/bauer-group/IP-CoolifyMigration/commit/889f67ab4ca023d04b08854ae298e577fdae2e5a))
+
+- **dns**: Gated services on the hosts they serve
+  ([`e2a3ea3`](https://github.com/bauer-group/IP-CoolifyMigration/commit/e2a3ea369f8859ffbf8d66dcc518683d5692744e))
+
+- **engine**: Compensated an interrupted create
+  ([`be6acdc`](https://github.com/bauer-group/IP-CoolifyMigration/commit/be6acdc91e819414fbea877d153a63fc0ccd6eb8))
+
+- **engine**: Finished a part-way delete on resume
+  ([`70dbb90`](https://github.com/bauer-group/IP-CoolifyMigration/commit/70dbb90e88b5c6f9fc07f7f6b5a5fe24f708c8e7))
+
+- **engine**: Forced claims over deleted targets
+  ([`befbd76`](https://github.com/bauer-group/IP-CoolifyMigration/commit/befbd763a3d85252a2b38c7083d28ff2f7c8cae0))
+
+- **engine**: Handed domains over make-before-break
+  ([`0375cba`](https://github.com/bauer-group/IP-CoolifyMigration/commit/0375cbaa461249c323a5a1ed45fcb59df4c6ab83))
+
+- **engine**: Hardened locked variable recovery
+  ([`5517576`](https://github.com/bauer-group/IP-CoolifyMigration/commit/5517576dffbd1f221148382ecc3c6fbfabb4b60d))
+
+- **engine**: Kept pins until sources hold volumes
+  ([`5f53070`](https://github.com/bauer-group/IP-CoolifyMigration/commit/5f5307052ca613676dbd7f55343b2f53273a7143))
+
+- **engine**: Kept the port of legacy service urls
+  ([`e0a8b6a`](https://github.com/bauer-group/IP-CoolifyMigration/commit/e0a8b6afc769e754465b4a9f90c0b02e14e7d04d))
+
+- **engine**: Matched carried tasks by uuid
+  ([`dbc0fcb`](https://github.com/bauer-group/IP-CoolifyMigration/commit/dbc0fcb96963c61cd9c16baa494e671dc22215ee))
+
+- **engine**: Noted kept pins on a failed restart
+  ([`0aa647e`](https://github.com/bauer-group/IP-CoolifyMigration/commit/0aa647edca3b385f399fc966596ae59d48e98f47))
+
+- **engine**: Pinned volumes against docker cleanup
+  ([`4681069`](https://github.com/bauer-group/IP-CoolifyMigration/commit/46810695497d07ac406a2392cbfc4dbd40967058))
+
+- **engine**: Re-read targets before the release
+  ([`977d7dd`](https://github.com/bauer-group/IP-CoolifyMigration/commit/977d7ddc289bbbd977fe9f84fad7c1bb7421cd15))
+
+- **engine**: Refused rollback over a lost source
+  ([`2f54a7b`](https://github.com/bauer-group/IP-CoolifyMigration/commit/2f54a7b33c1c22a2dd585dc044b022012b32408e))
+
+- **engine**: Refused rollback past delete finalize
+  ([`416f177`](https://github.com/bauer-group/IP-CoolifyMigration/commit/416f177a43cf70ab5e9ad0b81c08ad554d1a9ef1))
+
+- **engine**: Rehydrated volume pairs on resume
+  ([`43fc522`](https://github.com/bauer-group/IP-CoolifyMigration/commit/43fc5226037aaa2185577a8f7e3d2bf09ce93125))
+
+- **engine**: Restarted each source once per stop
+  ([`fb64129`](https://github.com/bauer-group/IP-CoolifyMigration/commit/fb6412997ca143ad75262a5cc05401333806ba11))
+
+- **engine**: Restarted source after failed quiesce
+  ([`23ccf9b`](https://github.com/bauer-group/IP-CoolifyMigration/commit/23ccf9b88244a06a2c120f71d2fe6fadda06c5af))
+
+- **engine**: Restored domains before the restart
+  ([`331bb6e`](https://github.com/bauer-group/IP-CoolifyMigration/commit/331bb6e28e73e51c281dd111fbc6c4dac1e38346))
+
+- **engine**: Scoped route keys to their images
+  ([`df2a1cc`](https://github.com/bauer-group/IP-CoolifyMigration/commit/df2a1ccbbe9008395738dd03bfa199c65bf12a8d))
+
+- **fidelity**: Checked compose ports from 4.3.15
+  ([`dbb8c78`](https://github.com/bauer-group/IP-CoolifyMigration/commit/dbb8c788227df089879d1c8e46fb14f46664d317))
+
+- **fidelity**: Refused multi-server applications
+  ([`ab91bc5`](https://github.com/bauer-group/IP-CoolifyMigration/commit/ab91bc57524682822a5525d96c4eb486f70cf39d))
+
+- **fidelity**: Warned when database TLS is lost
+  ([`6ae5efa`](https://github.com/bauer-group/IP-CoolifyMigration/commit/6ae5efa139fc89d2f35313a4a5c7ed02d91d2f70))
+
+- **observability**: Hid frame locals in crash logs
+  ([`3375068`](https://github.com/bauer-group/IP-CoolifyMigration/commit/3375068fd4f9e13d2200d07add0e40b382a9bd62))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`d38e369`](https://github.com/bauer-group/IP-CoolifyMigration/commit/d38e36938d6164918a09fba1abbf016aae1bc08e))
+
+- **safety**: Described when volume pins go
+  ([`aa536c7`](https://github.com/bauer-group/IP-CoolifyMigration/commit/aa536c731d0fdd04aa41e0df10f1818b9fb4cece))
+
+### Features
+
+- **cli**: Added unpin for pins a rollback kept
+  ([`acd44cd`](https://github.com/bauer-group/IP-CoolifyMigration/commit/acd44cd496cda9f6ee1f47ef7876368b317e6c28))
+
+- **engine**: Carried database backup schedules
+  ([`92c2df5`](https://github.com/bauer-group/IP-CoolifyMigration/commit/92c2df52e73a40ecbd0462241ff5b06d3ce93841))
+
+- **engine**: Carried scheduled tasks to target
+  ([`05c0b10`](https://github.com/bauer-group/IP-CoolifyMigration/commit/05c0b10dc0456faebff787f65cec9828e64b7f25))
+
+- **engine**: Carried service domains to targets
+  ([`3d24339`](https://github.com/bauer-group/IP-CoolifyMigration/commit/3d24339a6cc7fd8a21699929db293bb19a10ce01))
+
+- **engine**: Recovered locked variables
+  ([`af3640c`](https://github.com/bauer-group/IP-CoolifyMigration/commit/af3640c0a46520f8c041616da7bcdd8b04c98ff1))
+
+- **plan**: Noted unreadable volume backups
+  ([`259de27`](https://github.com/bauer-group/IP-CoolifyMigration/commit/259de27922822a43d5f93d238ae0716605129d69))
+
+- **plan**: Refused parked hosts and hidden ports
+  ([`69e85eb`](https://github.com/bauer-group/IP-CoolifyMigration/commit/69e85eb3dd94cbfb1628be32620d6cdb78ec96a4))
+
+- **plan**: Refused unusable service urls
+  ([`b6fc8e9`](https://github.com/bauer-group/IP-CoolifyMigration/commit/b6fc8e9546877b9d28d49f24843c73fc76c720c6))
+
+- **plan**: Warned of cloudflare-hosted domains
+  ([`82426e4`](https://github.com/bauer-group/IP-CoolifyMigration/commit/82426e4add784e9ae3d8d6964529cfbe63f2e580))
+
+- **plan**: Warned of servers that prune volumes
+  ([`454aacc`](https://github.com/bauer-group/IP-CoolifyMigration/commit/454aacce3ef981e264a0b134cc53c0d44810acee))
+
+### Testing
+
+- **e2e**: Covered locked variable recovery
+  ([`0286035`](https://github.com/bauer-group/IP-CoolifyMigration/commit/028603558f5612e2fe0aebb18613b4526bc6bbbd))
+
+- **e2e**: Covered the domain hand-over
+  ([`3e0596b`](https://github.com/bauer-group/IP-CoolifyMigration/commit/3e0596ba5822703b873c53f2709554273c7985e7))
+
+- **e2e**: Retried psql while postgres restarts
+  ([`2037114`](https://github.com/bauer-group/IP-CoolifyMigration/commit/20371144302c11cdcc44d44e740963ad8bf376a5))
+
+- **e2e**: Retried seeds while engines initialise
+  ([`480a66d`](https://github.com/bauer-group/IP-CoolifyMigration/commit/480a66da715813133e7cd9e0853f6b51e891d004))
+
+
 ## v2.9.0 (2026-10-26)
 
 ### Bug Fixes
