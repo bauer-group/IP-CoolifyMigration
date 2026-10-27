@@ -264,10 +264,12 @@ the release it starts in — read that module before adding a rule.
   migration dropped them. `test_controller_arrays_are_adjudicated` reads the
   enforcement arrays FORWARD now; a field accepted but not documented still fails.
 - **A locked (`is_shown_once`) variable's value is in no API read** — even for a
-  root token (applications/services since 4.2, databases since 4.4). The target
-  is created without it; a locked generated credential (`SERVICE_PASSWORD_*`,
-  Redis `REDIS_PASSWORD`) would leave the target holding a different secret
-  than the copied data, so the plan refuses those.
+  root token (applications/services since 4.2, databases since 4.4) — with ONE
+  exception, below. `domain/locked_envs.py` reads it back from the file Coolify
+  wrote on the source server instead (next section); only what that cannot read
+  is created without, and a locked generated credential (`SERVICE_PASSWORD_*` of
+  a service or a dockercompose app, Redis `REDIS_PASSWORD`) that stays unread is
+  refused, because the target would hold a different secret than the copied data.
 - **`host_path` left every storage create array in 4.3.22** (backported). Dropping
   it instead of refusing would mount an empty volume over the mirrored bind data,
   and VERIFY would pass.
@@ -362,6 +364,48 @@ the release it starts in — read that module before adding a rule.
   journals `str(exc)` inside its except handler, and a raise there escapes
   before the rollback runs.
 
+### Locked variables are read back from the source server (release tags)
+
+`domain/locked_envs.py` + `discovery/envfiles.py`; read both before touching it.
+
+- **Coolify writes every locked value to a file on the resource's server** and
+  the stop deletes none of them: `/data/coolify/applications/{uuid}/.env`
+  (runtime rows only — never build-only or NIXPACKS_/RAILPACK_ rows),
+  `/data/coolify/services/{uuid}/.env` (every row), and the `environment:` list of
+  `/data/coolify/databases/{uuid}/docker-compose.yml`. Never the container's
+  environment: compose has already expanded `${SERVICE_FQDN_X}` to the SOURCE host
+  there, and QUIESCE removes the containers.
+- **Each line is `KEY=ENC(resolved)`** — exact escaping for rows stamped 4.5+,
+  the legacy form otherwise. We decode, RE-ENCODE and require the line back byte
+  for byte, so a wrong guess or a secret-manager line is "unrecoverable", never a
+  different value (`test_round_trip_property_exact_or_nothing`). Indistinguishable
+  secret-manager lines are carried as their resolved value — documented, accepted.
+- **The file is what Coolify LAST WROTE, so it is checked first.** Every unlocked
+  row in it must encode exactly as the API's `real_value` predicts (legacy rows:
+  `real_value` IS the written form, v4.5.0 EnvironmentVariable.php:265-283);
+  a mismatch means "redeploy/restart the source, then plan again".
+- **A preview deploy overwrites the application's .env** (configuration_dir does
+  not depend on the PR, v4.5.0 ADJ.php:282). `COOLIFY_CONTAINER_NAME=…-pr-N` or
+  `SERVICE_NAME_*=…-pr-N` gives it away; recovery refuses that file.
+- **The app .env and a database compose are written with `tee`, non-atomically**
+  (ADJ.php:2063, StartPostgresql.php:213): read twice in one SSH command, and only
+  two identical reads count.
+- **The exception: a Redis `internal_db_url` carries the locked REDIS_PASSWORD.**
+  It is appended and made visible to sensitive callers, and embeds
+  `rawurlencode(connectionPassword())` (v4.5.0 StandaloneRedis.php:309-318,
+  DatabasesController.php:213-234; same at 4.4.0). It is the primary source,
+  cross-checked with the compose. Never log it or put it in a snapshot — `db_url`
+  is a redaction fragment.
+- **`is_shared` is strict only from 4.4.0** (`isSharedReference`); 4.1.2-4.3.x
+  call any `{{x.y}}`-wrapped value shared. Shared locked rows are never recovered
+  (the file holds the resolved value, not the reference).
+- **A value-less bulk entry nulls the row on applications only**; services and
+  databases `updateOrCreate` and keep the old value. Never send one either way.
+  The application created hook copies a new row into an UNLOCKED preview twin,
+  so a carried locked value is followed by a locked preview entry.
+- **Values live only in `Secrets`** (repr: key names), never in a ResourcePlan,
+  plan.json, the journal or a log line; CREATE re-reads before its first write.
+
 ## Verify + ship
 
 ```bash
@@ -386,3 +430,4 @@ Conventional Commits, **past-tense** subject (`added`, `fixed`, `updated`), max
 | Which fields may we send? | `api/fields.py` |
 | What can the target NOT reproduce? | `domain/fidelity.py` |
 | Are scheduled tasks and backup schedules carried? | `api/schedules.py`, `domain/schedules.py` |
+| Can a locked variable be carried? | `domain/locked_envs.py` |

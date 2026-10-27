@@ -46,7 +46,7 @@ from bg_coolify_migrate.domain.naming import (
 from bg_coolify_migrate.domain.plan import ResourcePlan, ResourceSnapshot
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.domain.versions import parse_version
-from bg_coolify_migrate.engine import compensations, keys
+from bg_coolify_migrate.engine import compensations, env_recovery, keys
 from bg_coolify_migrate.engine.context import MigrationContext, serialise_mounts
 from bg_coolify_migrate.engine.planner import (
     build_manifest,
@@ -339,6 +339,9 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
     Runs BEFORE quiesce: a failed create then costs zero downtime, and the target
     must exist before volumes can be paired by mount path.
     """
+    # Before ANY write: re-read the locked values the plan promised. A refusal
+    # here leaves nothing to undo. The values stay in this frame (env_recovery).
+    recovered = await env_recovery.recover_for_create(ctx.api, ctx.source_host, ctx.plan.resources)
     project_uuid = await api_resources.ensure_project(ctx.api, ctx.plan.project)
     await api_resources.ensure_environment(ctx.api, project_uuid, ctx.plan.environment)
     destination = await api_resources.resolve_destination(ctx.api, ctx.plan.target_server.uuid)
@@ -411,6 +414,7 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                 target_uuid=target_uuid,
                 source_wildcard=source_wildcard,
                 tag=tag,
+                recovered=recovered.get(snapshot.uuid),
             )
             await api_resources.copy_storages(
                 ctx.api,

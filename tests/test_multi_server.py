@@ -234,6 +234,10 @@ def _mock_multi_server_app(respx_mock: respx.Router) -> tuple[respx.Route, respx
             },
         )
     )
+    # Nothing locked, so CREATE's locked-variable pre-pass reads no file.
+    respx_mock.get(f"{BASE}/applications/app1/envs").mock(
+        return_value=httpx.Response(200, json=[])
+    )
     create = respx_mock.post(url__startswith=f"{BASE}/applications").mock(
         return_value=httpx.Response(201, json={"uuid": "tgt1"})
     )

@@ -25,15 +25,17 @@ from __future__ import annotations
 
 import base64
 import binascii
-import json
 import re
 import shlex
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
 from bg_coolify_migrate.domain import compose as compose_mod
+from bg_coolify_migrate.domain import locked_envs
 from bg_coolify_migrate.domain.kinds import DatabaseEngine
-from bg_coolify_migrate.domain.versions import Version, at_least, parse_version
+from bg_coolify_migrate.domain.locked_envs import is_locked
+from bg_coolify_migrate.domain.versions import Version, at_least
 
 # ── where each rule starts ───────────────────────────────────────────────────
 
@@ -57,7 +59,8 @@ REDIS_PASSWORD_QUOTING_SINCE: Version = (4, 4, 0)
 #: http_basic_auth_password gains max:72 on create.
 BASIC_AUTH_MAX_LENGTH_SINCE: Version = (4, 5, 0)
 #: New env rows use exact escaping; rows saved before keep the legacy escaping.
-EXACT_ENV_ESCAPING_SINCE: Version = (4, 5, 0)
+#: Defined beside the encoders in domain/locked_envs.py, which this module uses.
+EXACT_ENV_ESCAPING_SINCE: Version = locked_envs.EXACT_ENV_ESCAPING_SINCE
 #: Both compose parsers refuse `scale` / `deploy.replicas` above 1.
 COMPOSE_SCALE_CHECK_SINCE: Version = (4, 5, 0)
 #: convertDockerRunToCompose maps flags it used to ignore.
@@ -83,7 +86,7 @@ _BASIC_AUTH_MAX_LENGTH = 72
 _HEALTH_CHECK_COMMAND = re.compile(r"[a-zA-Z0-9 \-_./:=@,+]{1,1000}")
 
 #: app/Support/RemoteSecretReferences.php::PATTERN (v4.4.0+).
-_VAULT_REFERENCE = re.compile(r"\{\{\s*vault\.([A-Za-z0-9_]+)\s*\}\}")
+_VAULT_REFERENCE = locked_envs.VAULT_REFERENCE
 
 _REDIS_FAMILY = frozenset({DatabaseEngine.REDIS, DatabaseEngine.KEYDB, DatabaseEngine.DRAGONFLY})
 
@@ -904,22 +907,33 @@ _GENERATED_SERVICE_SECRET = re.compile(r"^SERVICE_(PASSWORD|USER|BASE64|REALBASE
 _CREDENTIAL_KEY = re.compile(r"PASSWORD|PASSWD|SECRET|TOKEN|PRIVATE", re.IGNORECASE)
 
 
-def _locked(env: dict[str, Any]) -> bool:
-    return bool(env.get("key")) and bool(env.get("is_shown_once")) and env.get("value") is None
-
-
-def _target_regenerates(key: str, *, collection: str, engine: DatabaseEngine | None) -> bool:
+def target_regenerates(
+    key: str, *, collection: str, engine: DatabaseEngine | None, compose_app: bool = False
+) -> bool:
     """A locked key the target will hold a DIFFERENT value for, not merely lack.
 
     A new service generates its own SERVICE_PASSWORD_* / SERVICE_USER_* (and the
-    bulk upsert that would overwrite them skips a value it cannot read); a Redis
-    takes its server password from REDIS_PASSWORD and gets a random one. NOT
+    bulk upsert that would overwrite them skips a value it cannot read). So does
+    a dockercompose APPLICATION: applicationParser firstOrCreates the same magic
+    rows (v4.1.2 parsers.php:630, v4.3.10:668, v4.5.0:1436-1444). A Redis takes
+    its server password from REDIS_PASSWORD and gets a random one. NOT
     KeyDB/Dragonfly: their create makes no REDIS_PASSWORD row, so a target
     without the locked one falls back to the carried keydb/dragonfly_password.
     """
-    if collection == "services":
+    if collection == "services" or (collection == "applications" and compose_app):
         return bool(_GENERATED_SERVICE_SECRET.match(key))
     return engine is DatabaseEngine.REDIS and key == "REDIS_PASSWORD"
+
+
+def _locked_production(envs: list[dict[str, Any]]) -> list[str]:
+    """Keys of locked production rows still without a value (recovered ones have one)."""
+    return sorted(str(e["key"]) for e in envs if is_locked(e) and not e.get("is_preview"))
+
+
+def _with_reasons(keys: list[str], unrecovered: Mapping[str, str] | None) -> str:
+    """``['A', 'B'] (A: why; B: why)`` — key names and reasons, never a value."""
+    reasons = "; ".join(f"{k}: {unrecovered[k]}" for k in keys if unrecovered and k in unrecovered)
+    return f"{keys} ({reasons})" if reasons else f"{keys}"
 
 
 def env_refusals(
@@ -928,8 +942,15 @@ def env_refusals(
     collection: str,
     engine: DatabaseEngine | None,
     version: Version | None,
+    compose_app: bool = False,
+    unrecovered: Mapping[str, str] | None = None,
 ) -> list[str]:
-    """Environment variables whose copy would fail the target after the stop."""
+    """Environment variables whose copy would fail the target after the stop.
+
+    ``envs`` is the source's list with every locked value that could be read back
+    filled in (locked_envs.merged_view); ``unrecovered`` says why the rest could
+    not be, per key.
+    """
     out: list[str] = []
 
     if at_least(version, SECRET_MANAGER_SINCE):
@@ -950,18 +971,18 @@ def env_refusals(
                 "references, or migrate this resource by hand."
             )
 
-    regenerated = sorted(
-        str(e["key"])
-        for e in envs
-        if _locked(e) and _target_regenerates(str(e["key"]), collection=collection, engine=engine)
-    )
+    regenerated = [
+        k
+        for k in _locked_production(envs)
+        if target_regenerates(k, collection=collection, engine=engine, compose_app=compose_app)
+    ]
     if regenerated:
         out.append(
-            f"locked (is_shown_once) variable(s) {regenerated} cannot be read through any "
-            "API, so the target would run with its OWN freshly generated value while the "
-            "copied data was initialised with the source's — every client would fail to "
-            "authenticate. Delete and re-add them unlocked with the same value (the "
-            "running container's environment shows it), then migrate."
+            f"locked (is_shown_once) variable(s) {_with_reasons(regenerated, unrecovered)} "
+            "could not be read back from the source server, so the target would run with "
+            "its OWN freshly generated value while the copied data was initialised with the "
+            "source's — every client would fail to authenticate. Fix the cause above, or "
+            "delete and re-add them unlocked with the same value, then migrate."
         )
     return out
 
@@ -973,23 +994,46 @@ def env_warnings(
     engine: DatabaseEngine | None,
     compose: str | None,
     version: Version | None,
+    compose_app: bool = False,
+    unrecovered: Mapping[str, str] | None = None,
+    builds: bool = False,
 ) -> list[str]:
-    """Environment variables the target will get differently. Keys only, never values."""
+    """Environment variables the target will get differently. Keys only, never values.
+
+    ``envs`` and ``unrecovered`` as for :func:`env_refusals`; ``builds`` says the
+    target rebuilds this application from source (START_TARGET, after the stop).
+    """
     out: list[str] = []
 
-    locked = sorted(
-        str(e["key"])
-        for e in envs
-        if _locked(e)
-        and not _target_regenerates(str(e["key"]), collection=collection, engine=engine)
-    )
+    locked = [
+        k
+        for k in _locked_production(envs)
+        if not target_regenerates(k, collection=collection, engine=engine, compose_app=compose_app)
+    ]
     if locked:
         credentials = [k for k in locked if _CREDENTIAL_KEY.search(k)]
         out.append(
-            f"locked (is_shown_once) variable(s) {locked} cannot be read through any API, "
-            "so the target is created WITHOUT them. Set them on the target by hand "
-            "before switching traffic over."
+            f"locked (is_shown_once) variable(s) {_with_reasons(locked, unrecovered)} could "
+            "not be read back from the source server, so the target is created WITHOUT "
+            "them. Set them on the target by hand before switching traffic over."
             + (f" {credentials} look like credentials." if credentials else "")
+        )
+        build_only = [
+            k for k in locked if unrecovered and unrecovered.get(k) == locked_envs.BUILD_TIME_ONLY
+        ]
+        if builds and build_only:
+            out.append(
+                f"{build_only} are build-time variables of an application the target "
+                "rebuilds from source. That build runs AFTER the source is stopped and "
+                "without them: a build that needs them fails, and the run rolls back. "
+                "Unlock them on the source, or make sure the build does not need them."
+            )
+    previews = sorted(str(e["key"]) for e in envs if is_locked(e) and e.get("is_preview"))
+    if previews:
+        out.append(
+            f"locked preview variable(s) {previews} are not carried "
+            f"({locked_envs.PREVIEW_ONLY}): the target's pull-request deployments run "
+            "without them until you set them by hand."
         )
 
     if at_least(version, SECRET_MANAGER_SINCE):
@@ -1054,16 +1098,8 @@ def env_warnings(
     return out
 
 
-def _saved_before_exact_escaping(env: dict[str, Any]) -> bool:
-    """Whether a row keeps the legacy escaping. PURE.
-
-    `uses_legacy_escaping` itself is in $hidden, but the creating hook stamps every
-    row's `version` with the Coolify version that saved it, and that IS returned.
-    The 4.5.0 migration set the flag on every row that existed then; no code path
-    clears it short of delete-and-re-add. A row without a version predates it.
-    """
-    stamped = parse_version(str(env["version"])) if env.get("version") else None
-    return stamped is None or stamped < EXACT_ENV_ESCAPING_SINCE
+#: Whether a row keeps the legacy escaping — read off its `version` stamp.
+_saved_before_exact_escaping = locked_envs.saved_before_exact_escaping
 
 
 #: bootstrap/helpers/docker.php::escapeEnvVariables (v4.5.0:1991) — the characters
@@ -1097,12 +1133,8 @@ def legacy_escaping_changes_value(
     return bool(_LEGACY_ESCAPED & set(value)) or (app_or_service and " #" in value)
 
 
-def _is_json(value: str) -> bool:
-    try:
-        json.loads(value)
-    except ValueError:
-        return False
-    return True
+#: PHP json_validate: strict JSON, NaN/Infinity rejected (Python's json takes them).
+_is_json = locked_envs.is_json
 
 
 #: StartRedis::requirePassArgument (v4.5.0:334-341, flag since v4.4.0): a legacy row

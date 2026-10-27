@@ -57,6 +57,7 @@ from bg_coolify_migrate.dns.extract import (
     normalise_host,
 )
 from bg_coolify_migrate.domain.kinds import ResourceKind, create_route
+from bg_coolify_migrate.domain.locked_envs import Secrets
 from bg_coolify_migrate.domain.naming import VolumeEndpoint, resource_config_dir
 from bg_coolify_migrate.domain.plan import ResourceSnapshot
 from bg_coolify_migrate.errors import CoolifyApiError, UnsupportedResource
@@ -980,10 +981,12 @@ async def release_service_urls(
 
 def build_env_entries(
     source_envs: list[dict[str, Any]],
+    recovered: Secrets | None = None,
     *,
     collection: str | None = None,
     source_wildcard: str | None = None,
     tag: str | None = None,
+    lock_preview_twins: bool = False,
 ) -> list[dict[str, Any]]:
     """Prepare env vars for the target. PURE.
 
@@ -993,19 +996,39 @@ def build_env_entries(
     would bake the old hostname in permanently. The raw ``value`` keeps the magic
     intact so Coolify re-resolves it for the new resource.
 
-    Entries whose ``value`` key is absent are dropped with no attempt to guess:
-    that state means the token lacked ``read:sensitive`` and the caller should
-    never have got this far (the client asserts scope at startup).
+    Entries whose ``value`` key is absent are LOCKED rows (is_shown_once; the
+    controllers makeHidden the value) — or the token lacked ``read:sensitive``,
+    which the client asserts at startup. They are dropped with no attempt to
+    guess, unless ``recovered`` holds the production row's value read back from
+    the source server (domain/locked_envs.py): then it is sent with
+    ``is_shown_once`` still true. A locked PREVIEW row is never filled — no
+    production deploy writes its value anywhere. An entry without a value is
+    never sent: on applications it would null the row (v4.5.0
+    ApplicationsController.php:4291).
+
+    ``lock_preview_twins`` (applications only): creating a production row makes
+    Coolify copy it into an UNLOCKED preview twin (EnvironmentVariable created
+    hook, v4.5.0:118-148, is_shown_once not copied). Where no preview row of the
+    source will overwrite that twin, a locked preview entry with the same value
+    follows, so the bulk's preview branch (:4249-4272) locks the twin instead of
+    exposing the secret through every read. Never for services/databases: their
+    bulk upserts by key alone, and an is_preview entry would REPLACE the row.
 
     For a service (``collection="services"``) a row that names where the stack
     lives is also dropped when it names the SOURCE: see
     :func:`_names_the_source`.
     """
     entries: list[dict[str, Any]] = []
+    previews_sent: set[str] = set()
+    filled: list[dict[str, Any]] = []
     for env in source_envs:
-        if "value" not in env:
+        if "value" in env:
+            entry = filter_body(env, ENV_FIELDS)
+        elif recovered is not None and not env.get("is_preview") and env.get("key") in recovered:
+            entry = filter_body({**env, "value": recovered.get(str(env["key"]))}, ENV_FIELDS)
+            filled.append(entry)
+        else:
             continue
-        entry = filter_body(env, ENV_FIELDS)
         if not entry.get("key"):
             continue
         if collection == "services" and _names_the_source(
@@ -1013,6 +1036,14 @@ def build_env_entries(
         ):
             continue
         entries.append(entry)
+        if entry.get("is_preview"):
+            previews_sent.add(str(entry["key"]))
+    if lock_preview_twins:
+        entries.extend(
+            {**entry, "is_preview": True, "is_shown_once": True}
+            for entry in filled
+            if entry.get("key") and str(entry["key"]) not in previews_sent
+        )
     return entries
 
 
@@ -1061,6 +1092,7 @@ async def copy_envs(
     target_uuid: str,
     source_wildcard: str | None = None,
     tag: str | None = None,
+    recovered: Secrets | None = None,
 ) -> int:
     """Copy environment variables source -> target. Returns the count.
 
@@ -1069,17 +1101,28 @@ async def copy_envs(
     upsert matches by ``key`` and therefore overwrites them with the source's —
     which is essential: the mirrored data belongs to the source's credentials.
     A service's URL rows that name the source are the exception, and are left
-    to the target (:func:`build_env_entries`).
+    to the target (:func:`build_env_entries`). ``recovered`` carries the locked
+    values CREATE read back; logged by count.
     """
     source_envs = await api.get_envs(collection, source_uuid)
     entries = build_env_entries(
-        source_envs, collection=collection, source_wildcard=source_wildcard, tag=tag
+        source_envs,
+        recovered,
+        collection=collection,
+        source_wildcard=source_wildcard,
+        tag=tag,
+        lock_preview_twins=collection == "applications",
     )
     if not entries:
         log.info("api.envs.none", source=source_uuid)
         return 0
     await api.set_envs_bulk(collection, target_uuid, entries)
-    log.info("api.envs.copied", count=len(entries), target=target_uuid)
+    log.info(
+        "api.envs.copied",
+        count=len(entries),
+        target=target_uuid,
+        locked_carried=len(recovered) if recovered is not None else 0,
+    )
     return len(entries)
 
 

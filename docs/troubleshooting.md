@@ -22,6 +22,66 @@ This reads exactly like a token or permission problem and is neither — your to
 is fine, the instance switch just has not been flipped. It is off by default and
 has to be enabled once.
 
+## Locked (`is_shown_once`) variables
+
+Coolify returns a locked variable's value through **no** API read, not even to a
+root token. The tool reads it back instead from the file Coolify itself wrote on
+the source server — `/data/coolify/applications/{uuid}/.env`,
+`/data/coolify/services/{uuid}/.env`, or the `environment:` list of
+`/data/coolify/databases/{uuid}/docker-compose.yml` — and sets it on the target,
+**still locked**. A Redis `REDIS_PASSWORD` comes from the database's connection
+URL in the API, so it needs no file at all.
+
+The plan says what it will carry:
+
+> locked (is_shown_once) variable(s) ['API_SECRET'] will be read from
+> /data/coolify/services/abc/.env on the source server and set on the target,
+> still locked. They carry the value Coolify last wrote on the source server …
+
+*The value Coolify last wrote* is exact: the tool decodes the line, re-encodes
+it the way Coolify does and accepts it only if the line comes back byte for byte.
+It never guesses. Two consequences worth knowing:
+
+* A `{{project.X}}`-style reference **inside** a value arrives resolved.
+* A secret-manager value (`{{vault.X}}`) is written to the file resolved. Where
+  its line is indistinguishable from a plain value's, the resolved secret is
+  carried — Coolify's secret-manager link is visible through no API.
+
+### "… could not be read back from the source server (reason)"
+
+A **refusal** when the target would generate its own value for the key — a
+service's or a dockercompose application's `SERVICE_PASSWORD_*` /
+`SERVICE_USER_*`, a Redis `REDIS_PASSWORD` — because the copied data was
+initialised with the source's. A **warning** otherwise: the target is created
+without the key; set it by hand. The reason says what to do:
+
+| Reason | What to do |
+| --- | --- |
+| `… is missing or unreadable on the source server (exit N)` | The resource was never deployed/started since the variable was locked, or the SSH user is not root (there is no sudo support). Deploy or restart the source once, or connect as root. |
+| `the source's last deployment was pull request #N` | A preview deploy overwrote the application's `.env`. Redeploy production once, then plan again. |
+| `… does not match the resource's current configuration` | A variable changed (API or UI) without a redeploy/restart, so the file is stale. Redeploy or restart the source once, then plan again. |
+| `… changed while it was read` | Coolify was rewriting the file. Plan again. |
+| `build-time only: Coolify never writes it to the server` | Build-only variables live only in the throwaway build container. Unlock the variable, or set it on the target. |
+| `a {{...}} shared-variable reference` | The file holds the resolved value, not the reference. Unlock it on the source, or set it on the target. |
+| `… cannot be delimited exactly` / `… is ambiguous` / `… is not in the encoding Coolify uses …` | A multi-line value saved before Coolify 4.5, or a secret-manager value. Delete and re-add the variable unlocked (or save it again on 4.5 and redeploy), then migrate. |
+| `the source database's API connection URL and … disagree` | The Redis password in the database record and the running compose differ. Restart the source database once. |
+
+A locked **build-time** variable of an application the target rebuilds gets an
+extra warning: the target's build runs after the source is stopped, without the
+variable, so a build that needs it fails and the run rolls back.
+
+### "the recovered value of KEY names the source server's wildcard domain or IP"
+
+The value is carried unchanged. If it should point at the target (a callback
+URL, a database host), update it on the target after the cutover.
+
+### "can no longer be read back from the source server" at CREATE_TARGET (exit 2)
+
+CREATE reads every locked value again before it writes anything. A key the plan
+promised to carry — or a credential the target would regenerate — that cannot be
+read any more refuses the run. **Nothing has been changed**: fix the reason it
+names (usually a redeploy of the source since the plan), then run again.
+
 ## The DNS gate blocked me (exit 3)
 
 Working as designed. It is a resumable stop, not a failure — the target is created

@@ -454,11 +454,22 @@ class TestLockedVariables:
         assert "SERVICE_PASSWORD_POSTGRES" in out[0]
 
     def test_a_locked_redis_password_refuses(self) -> None:
-        envs = [_env("REDIS_PASSWORD", None, is_shown_once=True)]
+        envs = [_env("REDIS_PASSWORD", _ABSENT, is_shown_once=True)]
         out = fidelity.env_refusals(
             envs, collection="databases", engine=DatabaseEngine.REDIS, version=V45
         )
         assert len(out) == 1
+
+    def test_a_null_value_is_a_null_row_not_a_hidden_one(self) -> None:
+        """The hide is makeHidden: the key is ABSENT. A present null is just null.
+
+        On 4.1.x every locked value is still returned, and a genuinely null row
+        must not send the planner reading files for a value that does not exist.
+        """
+        envs = [_env("REDIS_PASSWORD", None, is_shown_once=True)]
+        assert fidelity.env_refusals(
+            envs, collection="databases", engine=DatabaseEngine.REDIS, version=V45
+        ) == []
 
     def test_a_locked_redis_password_on_keydb_only_warns(self) -> None:
         """REVIEW: a KeyDB target falls back to the carried keydb_password.

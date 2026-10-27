@@ -64,6 +64,7 @@ from bg_coolify_migrate.domain.plan import (
 )
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.domain.versions import parse_version
+from bg_coolify_migrate.engine import env_recovery
 from bg_coolify_migrate.engine.schedules import plan_schedules
 from bg_coolify_migrate.errors import (
     EmptyEnvironment,
@@ -904,20 +905,22 @@ async def build_plan(
         except Exception as exc:  # diagnostics only, never fatal
             log.debug("planner.envs_unavailable", uuid=snapshot.uuid, error=str(exc)[:120])
         warnings.extend(env_key_warnings(envs))
-        refusals.extend(
-            fidelity.env_refusals(
-                envs, collection=collection, engine=snapshot.engine, version=coolify_version
-            )
+        # Locked values are read back from the file Coolify wrote on the source
+        # server; the fidelity env rules then judge what is left. Values stay
+        # inside review_envs — the plan gets lines and key names only.
+        origin = server_ref(source_server) if source_server else None
+        review = await env_recovery.review_envs(
+            source_host,
+            snapshot=snapshot,
+            full=full,
+            envs=envs,
+            version=coolify_version,
+            compose=snapshot.docker_compose_raw if compose_backed else None,
+            source_ip=origin.ip if origin else None,
+            source_wildcard=source_wildcard or (origin.wildcard_domain if origin else None),
         )
-        warnings.extend(
-            fidelity.env_warnings(
-                envs,
-                collection=collection,
-                engine=snapshot.engine,
-                compose=snapshot.docker_compose_raw if compose_backed else None,
-                version=coolify_version,
-            )
-        )
+        refusals.extend(review.refusals)
+        warnings.extend(review.warnings)
         # Schedules (domain/schedules.py): carried at CREATE, reported here.
         more_warnings, more_refusals = await plan_schedules(
             api,
@@ -938,6 +941,7 @@ async def build_plan(
                 drift=drift,
                 warnings=tuple(warnings),
                 refusals=tuple(refusals),
+                recover_env_keys=review.recover_env_keys,
             )
         )
 

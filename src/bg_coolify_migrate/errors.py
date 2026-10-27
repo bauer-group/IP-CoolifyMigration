@@ -47,6 +47,15 @@ class EmptyEnvironment(PreflightError):
     """
 
 
+class EnvRecoveryError(PreflightError):
+    """A locked variable the plan promised to carry cannot be read back any more.
+
+    Raised by CREATE_TARGET before its first write, so nothing has been changed
+    and there is nothing to roll back. Carries key names and reasons only —
+    never a value, because str(exc) is journaled.
+    """
+
+
 class DnsGateBlocked(MigrationError):
     """A live FQDN still resolves to the source, so the target must not start.
 

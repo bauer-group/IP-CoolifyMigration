@@ -184,6 +184,11 @@ class ResourcePlan(BaseModel):
     """What the target provably cannot reproduce — a create that will 422, a
     deploy that will fail after the stop, data that would be left behind. Decided
     by domain/fidelity.py from the captured GETs."""
+    recover_env_keys: tuple[str, ...] = ()
+    """Locked variables the plan read back from the source server and promised to
+    carry (domain/locked_envs.py). KEY NAMES ONLY — this model is saved as
+    plan.json. CREATE re-reads them and refuses, before any write, if one of
+    them can no longer be read."""
 
     @property
     def hard_blocking_reasons(self) -> tuple[str, ...]:
