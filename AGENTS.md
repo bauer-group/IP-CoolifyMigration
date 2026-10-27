@@ -331,6 +331,22 @@ the release it starts in — read that module before adding a rule.
 - **A restore must not write a source that already holds its originals**
   (`restore_service_urls` GETs, compares, PATCHes only the difference): the same
   re-parse and `updateCompose` apply to it.
+- **SPECIFIC_SERVICES images are routed from plain env rows, not from fqdn.**
+  minio, logto, garage (and silo from 4.5) go through
+  `generateServiceSpecificFqdns` (parsers.php v4.1.2:2527-2528, v4.5.0:3386-3389;
+  docker.php v4.5.0:660-760): `MINIO_SERVER_URL`, `LOGTO_ENDPOINT`,
+  `GARAGE_S3_API_URL` and friends (`dns/extract.py::ROUTE_ENV_KEYS`). The gate
+  reads those, each sub-application's domain and a custom compose's own Host()
+  labels — never the derived SERVICE_URL_*/SERVICE_FQDN_* rows.
+- **`updateCompose` and the parser rebuild only DIRECTLY declared
+  SERVICE_URL_*/SERVICE_FQDN_* rows.** A row that is only referenced (`${...}`) is
+  `firstOrCreate`d and keeps whatever was copied into it for good (services.php
+  v4.5.0:392-418). So `copy_envs` drops a service's URL row (and route key) only
+  when it names the source — a generated host, a host under the source wildcard,
+  or `old-<tag>.` — and copies an operator's custom value verbatim.
+- **A TARGET host under the SOURCE's wildcard blocks the gate** (invariant 7, not
+  a cutover: `--accept-dns` does not apply). It was not remapped and its wildcard
+  binds it to the source. Derived `service_env` rows stay report-only.
 
 ## Verify + ship
 

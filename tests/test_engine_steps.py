@@ -1367,8 +1367,10 @@ class TestDnsGate:
         self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # A URL under the source server's wildcard is rewritten onto the target,
-        # not cut over: it must not be resolved (it points at the source forever)
-        # and must never block.
+        # not cut over: it must not be resolved (it points at the source forever).
+        # Only a derived SERVICE_FQDN_* row may still show one, and that row is
+        # reported, never gated. The same host in what the target ROUTES (its
+        # fqdn) blocks instead: tests/test_service_domains_gate.py.
         ctx.plan = _plan(
             source_server=ServerRef(
                 uuid="s1",
@@ -1385,12 +1387,19 @@ class TestDnsGate:
         )
         ctx.target_uuids["db1"] = "db1"
         respx_mock.get(f"{BASE}/databases/db1").mock(
+            return_value=httpx.Response(200, json={"uuid": "db1"})
+        )
+        respx_mock.get(f"{BASE}/databases/db1/envs").mock(
             return_value=httpx.Response(
                 200,
-                json={"uuid": "db1", "fqdn": "https://pdf-tool.app.0046-20.cloud.bauer-group.com"},
+                json=[
+                    {
+                        "key": "SERVICE_FQDN_PDF",
+                        "value": "https://pdf-tool.app.0046-20.cloud.bauer-group.com",
+                    }
+                ],
             )
         )
-        respx_mock.get(f"{BASE}/databases/db1/envs").mock(return_value=httpx.Response(200, json=[]))
 
         async def fake_resolve(hostnames, config=None):  # type: ignore[no-untyped-def]
             # Server-bound hosts are excluded before resolution.

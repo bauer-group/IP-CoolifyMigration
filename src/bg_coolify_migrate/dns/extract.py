@@ -8,7 +8,12 @@ gate passes while a live domain still points at the old server:
 
 1. ``applications.fqdn`` — comma-separated, may carry paths and schemes.
 2. ``applications.docker_compose_domains`` — JSON, per compose service.
-3. ``SERVICE_FQDN_*`` / ``SERVICE_URL_*`` magic env vars on services.
+3. For services, ``service_applications.fqdn`` (``url`` in a GET) per
+   sub-application — the authority the proxy labels are generated from
+   (parsers.php v4.5.0:3389). The ``SERVICE_FQDN_*`` / ``SERVICE_URL_*`` env
+   rows are derived from it and can hold copied hosts until the next parse, so a
+   service's gate does not read them. A SPECIFIC_SERVICES image (minio, logto,
+   garage, silo) is routed from plain env keys instead (:data:`ROUTE_ENV_KEYS`).
 4. Raw Traefik router rules in ``custom_labels`` and inside compose labels:
    ``traefik.http.routers.x.rule=Host(`a.example.com`)``. These are hidden from
    the API without ``read:sensitive``, which is one more reason the tool demands
@@ -42,6 +47,23 @@ _GENERATED_SUFFIXES = (".sslip.io", ".nip.io", ".traefik.me", ".localhost")
 
 _SERVICE_FQDN_RE = re.compile(r"^SERVICE_(?:FQDN|URL)_", re.IGNORECASE)
 
+#: Env keys a SPECIFIC_SERVICES sub-application is ROUTED from, in place of its
+#: fqdn: the parser calls generateServiceSpecificFqdns for those images
+#: (parsers.php v4.1.2:2527-2528, v4.5.0:3386-3389; docker.php v4.5.0:660-760),
+#: and the list is constants.php SPECIFIC_SERVICES (silo, from 4.5.0, reads the
+#: minio keys). Plain rows, copied verbatim — so they must be gated.
+ROUTE_ENV_KEYS = frozenset(
+    {
+        "MINIO_SERVER_URL",
+        "MINIO_BROWSER_REDIRECT_URL",
+        "LOGTO_ENDPOINT",
+        "LOGTO_ADMIN_ENDPOINT",
+        "GARAGE_S3_API_URL",
+        "GARAGE_WEB_URL",
+        "GARAGE_ADMIN_URL",
+    }
+)
+
 
 class HostnameOrigin(StrEnum):
     """Where a hostname was found. Kept for the report, so an operator can see
@@ -50,6 +72,8 @@ class HostnameOrigin(StrEnum):
     FQDN = "fqdn"
     COMPOSE_DOMAINS = "docker_compose_domains"
     SERVICE_ENV = "service_env"
+    SERVICE_APPLICATION = "service_application"
+    SERVICE_ROUTE_ENV = "service_route_env"
     TRAEFIK_LABEL = "traefik_label"
     CADDY_LABEL = "caddy_label"
 
@@ -179,6 +203,49 @@ def from_env(entries: list[dict[str, object]]) -> list[Hostname]:
     return out
 
 
+def is_service_url_key(key: str) -> bool:
+    """A ``SERVICE_FQDN_*`` / ``SERVICE_URL_*`` magic variable."""
+    return bool(_SERVICE_FQDN_RE.match(key))
+
+
+def from_service_applications(apps: object) -> list[Hostname]:
+    """Hosts of a service's sub-applications (``GET /services/{uuid}``).
+
+    ``url`` before ``fqdn``: from 4.3.15 only ``url`` carries a domain's port.
+    Tolerant of junk — anything but a list of dicts yields nothing.
+    """
+    if not isinstance(apps, list):
+        return []
+    out: list[Hostname] = []
+    for app in apps:
+        if not isinstance(app, dict):
+            continue
+        raw = app.get("url") or app.get("fqdn")
+        if not isinstance(raw, str):
+            continue
+        for part in raw.split(","):
+            host = _mk(part, HostnameOrigin.SERVICE_APPLICATION)
+            if host:
+                out.append(host)
+    return out
+
+
+def from_service_route_env(entries: list[dict[str, object]]) -> list[Hostname]:
+    """Hosts a SPECIFIC_SERVICES image is routed from (:data:`ROUTE_ENV_KEYS`)."""
+    out: list[Hostname] = []
+    for entry in entries:
+        if str(entry.get("key", "")) not in ROUTE_ENV_KEYS:
+            continue
+        value = entry.get("value") or entry.get("real_value")
+        if not isinstance(value, str):
+            continue
+        for part in value.split(","):
+            host = _mk(part, HostnameOrigin.SERVICE_ROUTE_ENV)
+            if host:
+                out.append(host)
+    return out
+
+
 def from_traefik_rule(rule: str) -> list[Hostname]:
     """Extract hostnames from a Traefik router rule.
 
@@ -242,6 +309,28 @@ def collect(
             if "rule" in line.lower() and "host" in line.lower():
                 found.extend(from_traefik_rule(line))
 
+    seen: dict[str, Hostname] = {}
+    for host in found:
+        seen.setdefault(host.host, host)
+    return sorted(seen.values(), key=lambda h: h.host)
+
+
+def collect_service(
+    *,
+    applications: object,
+    envs: list[dict[str, object]] | None = None,
+    compose: str | None = None,
+) -> list[Hostname]:
+    """Every hostname a SERVICE will be routed on, deduplicated like :func:`collect`.
+
+    Its sub-applications' domains, the route keys of a SPECIFIC_SERVICES image,
+    and Host() rules written into a custom compose's own labels — but never the
+    SERVICE_FQDN_*/SERVICE_URL_* rows, which are derived and may hold hosts the
+    target will not serve until its next parse.
+    """
+    found = from_service_applications(applications)
+    found.extend(from_service_route_env(envs or []))
+    found.extend(collect(extra_labels=compose))
     seen: dict[str, Hostname] = {}
     for host in found:
         seen.setdefault(host.host, host)

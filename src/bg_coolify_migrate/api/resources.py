@@ -50,7 +50,12 @@ from bg_coolify_migrate.api.fields import (
     missing_required,
 )
 from bg_coolify_migrate.dns import wildcard as dns_wildcard
-from bg_coolify_migrate.dns.extract import is_generated, normalise_host
+from bg_coolify_migrate.dns.extract import (
+    ROUTE_ENV_KEYS,
+    is_generated,
+    is_service_url_key,
+    normalise_host,
+)
 from bg_coolify_migrate.domain.kinds import ResourceKind, create_route
 from bg_coolify_migrate.domain.naming import VolumeEndpoint, resource_config_dir
 from bg_coolify_migrate.domain.plan import ResourceSnapshot
@@ -973,7 +978,13 @@ async def release_service_urls(
 # ── env vars ─────────────────────────────────────────────────────────────────
 
 
-def build_env_entries(source_envs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_env_entries(
+    source_envs: list[dict[str, Any]],
+    *,
+    collection: str | None = None,
+    source_wildcard: str | None = None,
+    tag: str | None = None,
+) -> list[dict[str, Any]]:
     """Prepare env vars for the target. PURE.
 
     Copies ``value``, NOT ``real_value``. ``real_value`` is an accessor that
@@ -985,19 +996,71 @@ def build_env_entries(source_envs: list[dict[str, Any]]) -> list[dict[str, Any]]
     Entries whose ``value`` key is absent are dropped with no attempt to guess:
     that state means the token lacked ``read:sensitive`` and the caller should
     never have got this far (the client asserts scope at startup).
+
+    For a service (``collection="services"``) a row that names where the stack
+    lives is also dropped when it names the SOURCE: see
+    :func:`_names_the_source`.
     """
     entries: list[dict[str, Any]] = []
     for env in source_envs:
         if "value" not in env:
             continue
         entry = filter_body(env, ENV_FIELDS)
-        if entry.get("key"):
-            entries.append(entry)
+        if not entry.get("key"):
+            continue
+        if collection == "services" and _names_the_source(
+            entry, source_wildcard=source_wildcard, tag=tag
+        ):
+            continue
+        entries.append(entry)
     return entries
 
 
+def _names_the_source(
+    entry: dict[str, Any], *, source_wildcard: str | None, tag: str | None
+) -> bool:
+    """Whether a service's URL row would plant a SOURCE host in the target. PURE.
+
+    Only ``SERVICE_FQDN_*`` / ``SERVICE_URL_*`` and the SPECIFIC_SERVICES route
+    keys (:data:`~bg_coolify_migrate.dns.extract.ROUTE_ENV_KEYS`). Their values
+    are RESOLVED hosts, not placeholders. A directly declared one is rebuilt
+    from the sub-application's fqdn on every parse (parsers.php v4.5.0:2626-2723),
+    but one that is only referenced is firstOrCreate'd (v4.5.0:2733-2821) and
+    updateCompose skips it (services.php v4.5.0:392-418), and a route key is read
+    as written (docker.php v4.5.0:660-760) — so a copied value stays.
+
+    A row is dropped — the target keeps its own generated value — when any host
+    in it is Coolify-generated (it names the source's IP), under the source's
+    wildcard (bound to the source), or parked ``old-<tag>.``. Anything else is an
+    operator's choice, an OAuth callback base say, and is copied verbatim.
+    """
+    key = str(entry.get("key") or "")
+    if not (is_service_url_key(key) or key in ROUTE_ENV_KEYS):
+        return False
+    value = entry.get("value")
+    if not isinstance(value, str):
+        return False
+    for part in value.split(","):
+        host = normalise_host(part)
+        if host is None:
+            continue
+        if (
+            is_generated(host)
+            or dns_wildcard.under_wildcard(host, source_wildcard)
+            or (tag and host.startswith(f"old-{tag}."))
+        ):
+            return True
+    return False
+
+
 async def copy_envs(
-    api: CoolifyClient, *, collection: str, source_uuid: str, target_uuid: str
+    api: CoolifyClient,
+    *,
+    collection: str,
+    source_uuid: str,
+    target_uuid: str,
+    source_wildcard: str | None = None,
+    tag: str | None = None,
 ) -> int:
     """Copy environment variables source -> target. Returns the count.
 
@@ -1005,9 +1068,13 @@ async def copy_envs(
     service, so the target arrives with its OWN generated secrets. The bulk
     upsert matches by ``key`` and therefore overwrites them with the source's —
     which is essential: the mirrored data belongs to the source's credentials.
+    A service's URL rows that name the source are the exception, and are left
+    to the target (:func:`build_env_entries`).
     """
     source_envs = await api.get_envs(collection, source_uuid)
-    entries = build_env_entries(source_envs)
+    entries = build_env_entries(
+        source_envs, collection=collection, source_wildcard=source_wildcard, tag=tag
+    )
     if not entries:
         log.info("api.envs.none", source=source_uuid)
         return 0

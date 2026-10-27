@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from bg_coolify_migrate.dns.extract import Hostname
+from bg_coolify_migrate.dns.extract import Hostname, HostnameOrigin
 from bg_coolify_migrate.dns.wildcard import under_wildcard
 
 
@@ -232,6 +232,27 @@ def build_report(
         source_ips=tuple(sorted(source_ips)),
         target_ips=tuple(sorted(target_ips)),
     )
+
+
+def bound_to_source(
+    hostnames: list[Hostname], *, source_wildcard: str | None, target_wildcard: str | None
+) -> list[Hostname]:
+    """TARGET hosts still under the SOURCE server's wildcard. PURE.
+
+    Each was never remapped: its wildcard record binds it to the source, so the
+    target would serve — and request a certificate for — a hostname that can only
+    ever resolve to the old server. Invariant 7, not a judgement and not a
+    cutover: no DNS change fixes it. A host also under the TARGET's wildcard is
+    exempt (both servers share it). ``service_env`` rows are exempt as well: they
+    are derived copies, report-only as before, never what the proxy routes.
+    """
+    return [
+        h
+        for h in hostnames
+        if h.origin is not HostnameOrigin.SERVICE_ENV
+        and under_wildcard(h.host, source_wildcard)
+        and not under_wildcard(h.host, target_wildcard)
+    ]
 
 
 def explain_why_blocking_matters() -> str:

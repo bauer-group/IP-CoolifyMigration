@@ -129,6 +129,15 @@ typo away from silently copying nothing.
   Pins that the live GET carries `additional_servers_count` and the server rows
   the refusal names, that the plan blocks and the run creates nothing on
   server-b, and that detaching the server lifts the refusal.
+- `test_service_domains.py` — a three-container service whose sub-applications
+  hold a custom domain with a port, a server-bound URL and Coolify's own sslip
+  URL. The target must route the first two (the port included: on 4.5 it lives
+  in a hidden override only the GET's `url` shows) and generate its own for the
+  third, and the renamed source must let its custom host go. A rollback must
+  leave the source's hosts exactly as they were, and a domain held by a third
+  resource must refuse CREATE before the source is stopped — with a PORTLESS
+  URL, because from 4.3.15 a port-bearing one never 409s against a portless
+  holder.
 - `test_rollback.py` — injects a fault after the volumes are copied and asserts
   the world is put back: target deleted from server-b, source still running on
   server-a with its data intact. This is what caught finding 15.

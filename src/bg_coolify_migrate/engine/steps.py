@@ -26,7 +26,12 @@ from bg_coolify_migrate.discovery import docker, quiesce
 from bg_coolify_migrate.dns import extract as dns_extract
 from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.dns import wildcard as dns_wildcard
-from bg_coolify_migrate.dns.gate import Resolution, build_report, explain_why_blocking_matters
+from bg_coolify_migrate.dns.gate import (
+    Resolution,
+    bound_to_source,
+    build_report,
+    explain_why_blocking_matters,
+)
 from bg_coolify_migrate.domain import fidelity
 from bg_coolify_migrate.domain.kinds import GitAuth, ResourceKind
 from bg_coolify_migrate.domain.manifest import DockerMount
@@ -404,6 +409,8 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                 collection=snapshot.collection,
                 source_uuid=snapshot.uuid,
                 target_uuid=target_uuid,
+                source_wildcard=source_wildcard,
+                tag=tag,
             )
             await api_resources.copy_storages(
                 ctx.api,
@@ -1559,6 +1566,36 @@ async def _server_addresses(host: str) -> frozenset[str]:
     return frozenset(resolution.addresses) or frozenset({host})
 
 
+def _refuse_hosts_bound_to_source(
+    ctx: MigrationContext, hostnames: list[dns_extract.Hostname]
+) -> None:
+    """Block a target that would serve a host under the SOURCE's wildcard.
+
+    Not a cutover, so --accept-dns does not apply: the wildcard record binds the
+    host to the source for good, and the target's ACME challenge can never pass.
+    """
+    bound = bound_to_source(
+        hostnames,
+        source_wildcard=ctx.plan.source_server.wildcard_domain or None,
+        target_wildcard=ctx.plan.target_server.wildcard_domain or None,
+    )
+    if not bound:
+        return
+    raise DnsGateBlocked(
+        "the target would serve hostname(s) bound to the SOURCE server's wildcard: "
+        + ", ".join(h.host for h in bound),
+        hint=(
+            f"Their wildcard record points at {ctx.plan.source_server.name} and always "
+            "will, so no DNS change moves them, and the target could never obtain a "
+            "certificate for them. They were not rewritten onto the target's wildcard "
+            "— check that it is configured (or pass --target-wildcard).\n"
+            "Change the target's domain in Coolify to a host under the target's "
+            "wildcard or a custom domain, then run `coolify-migrate resume <id>`. "
+            "--accept-dns does not apply here."
+        ),
+    )
+
+
 async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
     """Refuse to start the target while a domain IT will serve still points at the source.
 
@@ -1571,6 +1608,22 @@ async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
         target_uuid = ctx.target_uuids[resource.snapshot.uuid]
         full = await ctx.api.get_resource(resource.snapshot.collection, target_uuid)
         envs = await ctx.api.get_envs(resource.snapshot.collection, target_uuid)
+        if resource.snapshot.collection == "services":
+            # What its proxy is configured from: sub-application domains, the
+            # route keys of a minio/logto/garage image, a custom compose's own
+            # Host() labels — not the derived SERVICE_* rows (dns/extract.py).
+            compose = full.get("docker_compose_raw")
+            hostnames.extend(
+                dns_extract.collect_service(
+                    applications=full.get("applications"),
+                    envs=envs,
+                    compose=compose
+                    if resource.snapshot.kind is ResourceKind.SERVICE_COMPOSE
+                    and isinstance(compose, str)
+                    else None,
+                )
+            )
+            continue
         hostnames.extend(
             dns_extract.collect(
                 fqdn=full.get("fqdn"),
@@ -1585,6 +1638,7 @@ async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
     )
     if not real:
         return {"hostnames": 0, "verdict": "no real hostnames"}
+    _refuse_hosts_bound_to_source(ctx, real)
 
     # Coolify's server `ip` is often a hostname; resolve both sides to addresses so
     # a domain's A record is compared to an address, not a name.

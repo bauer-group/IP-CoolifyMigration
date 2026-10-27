@@ -364,6 +364,31 @@ class TestFinishServiceTarget:
         assert exc_info.value.status_code == 422
         assert patch.call_count == 1
 
+    async def test_a_409_naming_no_holder_is_not_forced(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.get(f"{BASE}/services/tgt1").mock(return_value=_target_get())
+        patch = respx_mock.patch(f"{BASE}/services/tgt1").mock(
+            return_value=httpx.Response(409, json={"message": "Domain conflicts detected."})
+        )
+        with pytest.raises(CoolifyApiError, match="named no holder"):
+            await self._finish(api)
+        assert patch.call_count == 1
+
+    async def test_a_target_without_a_wildcard_keeps_its_generated_url(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.get(f"{BASE}/services/tgt1").mock(return_value=_target_get())
+        patch = respx_mock.patch(f"{BASE}/services/tgt1").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        placement = _placement()
+        placement.target_wildcard = None
+        await resources.finish_service_target(api, _snapshot(), placement, _source(), "tgt1")
+        # api's server-bound URL cannot be placed: not sent, so the target's own
+        # parse-generated URL stays (and a warning names the host).
+        assert [e["name"] for e in _body(patch)["urls"]] == ["web"]
+
 
 class TestRestoreServiceUrls:
     async def test_a_source_that_holds_its_originals_is_not_written(

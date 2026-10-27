@@ -28,10 +28,11 @@ Working as designed. It is a resumable stop, not a failure — the target is cre
 and its data is verified. The gate checks the domains the **target** will serve
 (the source's may have been parked to free a custom domain for the target) and
 compares them against the servers' **resolved** addresses (Coolify's `ip` is often
-a hostname). It only ever fires for a **custom domain** (`shop.example.com`) that
-still points at the source. Server-bound URLs under a server's wildcard
+a hostname). It fires for a **custom domain** (`shop.example.com`) that still
+points at the source. Server-bound URLs under a server's wildcard
 (`pdf-tool.app.0046-20…`) are rewritten onto the target's wildcard automatically
-and never gate — see *Domains & DNS* in the CLI reference.
+and never gate — see *Domains & DNS* in the CLI reference — unless one was NOT
+rewritten and the target would serve it on the source's wildcard (below).
 
 ```bash
 # Apply the printed cutover checklist to your DNS, wait out the TTL, then:
@@ -47,6 +48,19 @@ budget, so even a correct cutover an hour later cannot get a certificate.
 If you accept that risk — you want to finalize now and repoint DNS in parallel,
 knowing propagation lags by the record's TTL — confirm interactively or pass
 `--accept-dns` (on `run` or `resume`). The gate then warns instead of blocking.
+
+### "the target would serve hostname(s) bound to the SOURCE server's wildcard"
+
+A host the target is configured to route still sits under the **source**
+server's wildcard: it was not rewritten onto the target's, usually because the
+target has no wildcard configured. The wildcard's DNS record binds it to the
+source for good, so no DNS change moves it and the target could never obtain a
+certificate for it. This is not a cutover, so `--accept-dns` does not apply.
+Change the target's domain in Coolify to a host under the target's wildcard (or
+a custom domain), then `coolify-migrate resume <id>`. For a service, the gate
+reads each sub-application's domain, the routing variables of a minio, logto,
+garage or silo image (`MINIO_SERVER_URL` and friends) and Host() labels written
+into a custom compose — not the derived `SERVICE_URL_*` variables.
 
 ### "resolves to neither source nor target"
 
