@@ -41,6 +41,11 @@ _IDEMPOTENT = frozenset({"GET", "HEAD", "PUT", "PATCH", "DELETE"})
 
 _RETRY_STATUS = frozenset({429, 502, 503, 504})
 
+#: The only status that proves a request was NOT processed: the throttle rejects
+#: it before the controller runs. A 502/503/504 from the proxy can arrive after
+#: Coolify committed the row, so a create that must not double retries only this.
+_THROTTLED = frozenset({429})
+
 
 class CoolifyClient:
     """Async client for one Coolify instance.
@@ -103,11 +108,13 @@ class CoolifyClient:
         *,
         json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        retry_statuses: frozenset[int] = _RETRY_STATUS,
     ) -> httpx.Response:
         """Perform the request with retries; return the response undecoded.
 
         Exists because ``/version`` answers in plain text while everything else
-        answers in JSON.
+        answers in JSON. ``retry_statuses`` narrows which statuses are retried,
+        for a create whose double would be harmful (see :data:`_THROTTLED`).
         """
         attempt = 0
         while True:
@@ -125,7 +132,7 @@ class CoolifyClient:
             except httpx.HTTPError as exc:
                 raise CoolifyApiError(f"{method} {path} failed: {exc}") from exc
 
-            if response.status_code in _RETRY_STATUS and attempt <= self._max_retries:
+            if response.status_code in retry_statuses and attempt <= self._max_retries:
                 retry_after = _parse_retry_after(response)
                 await self._backoff(attempt, reason=str(response.status_code), floor=retry_after)
                 continue
@@ -142,9 +149,12 @@ class CoolifyClient:
         *,
         json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        retry_statuses: frozenset[int] = _RETRY_STATUS,
     ) -> Any:
         """Perform the request and decode its JSON body."""
-        response = await self._raw(method, path, json=json, params=params)
+        response = await self._raw(
+            method, path, json=json, params=params, retry_statuses=retry_statuses
+        )
         if not response.content:
             return None
         try:
@@ -403,6 +413,47 @@ class CoolifyClient:
         error after Coolify committed the row can double it — the caller re-reads
         the target and counts (``api.schedules.copy_scheduled_tasks``)."""
         return await self.post(f"/{collection}/{uuid}/scheduled-tasks", body)
+
+    async def get_backups(self, uuid: str) -> list[dict[str, Any]]:
+        """A standalone database's backup schedules, each execution reduced.
+
+        Three things to know about this route (identical v4.1.2:167 .. v4.5.0:447):
+
+        * It filters on ``database_id`` ONLY, not ``database_type``, so a database
+          of another engine with the same hidden numeric id adds ITS schedules
+          here. Callers filter by type (``domain.schedules.own_backup_schedules``).
+        * It eager-loads EVERY execution of every schedule — an unbounded list,
+          pruned only by retention. The planner's read is fail-soft for that.
+        * Before 4.5 an execution's ``message`` is the raw dump output, unredacted.
+          It is dropped HERE, at the boundary, so nothing downstream can log it;
+          only ``status``, ``filename`` and ``created_at`` survive.
+        """
+        rows = _as_list(await self.get(f"/databases/{uuid}/backups"))
+        for row in rows:
+            row["executions"] = [
+                {k: e.get(k) for k in ("status", "filename", "created_at")}
+                for e in row.get("executions") or []
+                if isinstance(e, dict)
+            ]
+        return rows
+
+    async def create_backup(self, uuid: str, body: dict[str, Any]) -> str:
+        """Create one backup schedule; returns its uuid.
+
+        Retried on 429 only. Every other POST here is retried on 502/503/504 too,
+        and a proxy error after Coolify saved the row turns one schedule into two:
+        double dumps, double S3 usage. A 429 is the throttle refusing before the
+        controller ran, so it alone is safe to repeat.
+        """
+        created = await self._request(
+            "POST", f"/databases/{uuid}/backups", json=body, retry_statuses=_THROTTLED
+        )
+        backup_uuid = created.get("uuid") if isinstance(created, dict) else None
+        if not backup_uuid:
+            raise CoolifyApiError(
+                f"creating a backup schedule on database {uuid} returned no uuid", body=created
+            )
+        return str(backup_uuid)
 
     # ── writes ───────────────────────────────────────────────────────────────
 

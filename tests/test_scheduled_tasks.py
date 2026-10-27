@@ -801,6 +801,7 @@ async def _plan(
     *,
     snapshot: dict[str, Any] | None = None,
     source_timezone: str | None = None,
+    full: dict[str, Any] | None = None,
 ) -> Any:
     from bg_coolify_migrate.domain.kinds import BuildPack
     from bg_coolify_migrate.domain.manifest import VolumeManifest
@@ -823,7 +824,7 @@ async def _plan(
         return [(shape["collection"], {"uuid": "a1", "name": "api"})]
 
     async def fake_snapshot(_api: Any, host: Any, **kw: Any) -> Any:
-        return ResourceSnapshot(uuid="a1", name="api", **shape), [], {}
+        return ResourceSnapshot(uuid="a1", name="api", **shape), [], full or {}
 
     async def fake_resolve_server(_api: Any, resource: Any) -> dict[str, Any]:
         settings: dict[str, Any] = {}

@@ -22,12 +22,9 @@ that FINALIZE never ran (so the source was never renamed or deleted).
 
 from __future__ import annotations
 
-import uuid as uuidlib
-from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
-import pytest_asyncio
 
 from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.domain.plan import TransferMode
@@ -38,71 +35,14 @@ from bg_coolify_migrate.engine.runner import run_migration
 from bg_coolify_migrate.errors import VerificationError
 from bg_coolify_migrate.settings.base import Settings
 
+from .conftest import PG_FINGERPRINT as FINGERPRINT
 from .conftest import db_exec, ssh_to, wait_until_healthy
 
 pytestmark = [pytest.mark.e2e, pytest.mark.asyncio]
 
-FINGERPRINT = (
-    "psql -U shop -d shopdb -tA -c "
-    "\"SELECT count(*)||':'||sum(cents)||':'||md5(string_agg(customer,'|' ORDER BY id)) "
-    'FROM orders"'
-)
-
-
-@pytest_asyncio.fixture
-async def seeded_pg(
-    api: CoolifyClient, settings: Settings, rig: dict[str, Any]
-) -> AsyncIterator[dict[str, Any]]:
-    suffix = uuidlib.uuid4().hex[:8]
-    project = await api.post("/projects", {"name": f"rb-{suffix}", "description": "bgcm rollback"})
-    project_uuid = str(project["uuid"])
-    db_name = f"pg-{suffix}"
-    try:
-        db = await api.post(
-            "/databases/postgresql",
-            {
-                "name": db_name,
-                "project_uuid": project_uuid,
-                "environment_name": "production",
-                "server_uuid": rig["server_a"]["uuid"],
-                "image": "postgres:16-alpine",
-                "postgres_user": "shop",
-                "postgres_password": "secret",
-                "postgres_db": "shopdb",
-                "instant_deploy": True,
-            },
-        )
-        db_uuid = str(db["uuid"])
-        async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source:
-            await wait_until_healthy(source, db_uuid)
-            await db_exec(
-                source,
-                db_uuid,
-                "psql -U shop -d shopdb -tA -v ON_ERROR_STOP=1",
-                stdin="CREATE TABLE orders(id serial primary key, customer text, cents int);"
-                "INSERT INTO orders(customer,cents) VALUES ('Grüße GmbH',129900),('Ötztal AG',4200);",
-            )
-            fingerprint = await db_exec(source, db_uuid, FINGERPRINT)
-        assert fingerprint.startswith("2:134100:")
-        yield {
-            "project": f"rb-{suffix}",
-            "project_uuid": project_uuid,
-            "db_name": db_name,
-            "db_uuid": db_uuid,
-            "fingerprint": fingerprint,
-        }
-    finally:
-        import contextlib
-
-        with contextlib.suppress(Exception):
-            for db in await api.get("/databases") or []:
-                if isinstance(db, dict) and suffix in str(db.get("name", "")):
-                    with contextlib.suppress(Exception):
-                        await api.delete_resource(
-                            "databases", str(db["uuid"]), delete_volumes=True
-                        )
-        with contextlib.suppress(Exception):
-            await api.delete(f"/projects/{project_uuid}")
+#: A schedule on the source: the rollback deletes the target's copy with the
+#: target, and must never touch the source's own row.
+BACKUP = {"frequency": "0 4 * * *", "enabled": True, "save_s3": False, "timeout": 900}
 
 
 async def test_rollback_restores_the_world(
@@ -120,6 +60,9 @@ async def test_rollback_restores_the_world(
     # build_steps() resolves step_verify from the module namespace at call time,
     # so patching it here reaches the saga run_migration is about to build.
     monkeypatch.setattr(steps, "step_verify", _boom)
+
+    backup_uuid = await api.create_backup(seeded_pg["db_uuid"], BACKUP)
+    before = _own_backup(await api.get_backups(seeded_pg["db_uuid"]), backup_uuid)
 
     async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source_host:
         plan = await build_plan(
@@ -161,6 +104,19 @@ async def test_rollback_restores_the_world(
         f"source data changed across the rollback\n"
         f"  before: {seeded_pg['fingerprint']}\n  after:  {arrived}"
     )
+
+    # 4. The source's backup schedule is exactly as it was: same row, same values.
+    #    The target's copy went with the target (DeleteResourceJob deletes the rows).
+    after = _own_backup(await api.get_backups(seeded_pg["db_uuid"]), backup_uuid)
+    assert after == before, f"the rollback touched the source's schedule\n  {before}\n  {after}"
+
+
+def _own_backup(rows: list[dict[str, Any]], backup_uuid: str) -> dict[str, Any]:
+    """One schedule's configuration, without what a run changes (history, timestamps)."""
+    row = next((r for r in rows if r.get("uuid") == backup_uuid), None)
+    assert row is not None, f"backup schedule {backup_uuid} is gone"
+    volatile = {"executions", "updated_at", "last_execution_at"}
+    return {k: v for k, v in row.items() if k not in volatile}
 
 
 async def _resource_on(api: CoolifyClient, name: str, server_uuid: str) -> str | None:

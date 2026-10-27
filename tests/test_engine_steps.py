@@ -865,6 +865,9 @@ class TestCreateTarget:
             return_value=httpx.Response(201, json={"uuid": "db2"})
         )
         respx_mock.get(f"{BASE}/databases/db1/envs").mock(return_value=httpx.Response(200, json=[]))
+        respx_mock.get(f"{BASE}/databases/db1/backups").mock(
+            return_value=httpx.Response(200, json=[])
+        )
 
         result = await steps.step_create_target(ctx)
         assert result["target_uuids"] == {"db1": "db2"}
@@ -1180,6 +1183,9 @@ class TestCreateTarget:
             return_value=httpx.Response(200, json={"uuid": "db1", "postgres_password": "s3cret"})
         )
         respx_mock.get(f"{BASE}/databases/db1/envs").mock(return_value=httpx.Response(200, json=[]))
+        respx_mock.get(f"{BASE}/databases/db1/backups").mock(
+            return_value=httpx.Response(200, json=[])
+        )
         route = respx_mock.post(f"{BASE}/databases/postgresql").mock(
             return_value=httpx.Response(201, json={"uuid": "db2"})
         )
@@ -1215,6 +1221,9 @@ class TestCreateTarget:
             return_value=httpx.Response(200, json={"uuid": "db1", "postgres_password": "s3cret"})
         )
         respx_mock.get(f"{BASE}/databases/db1/envs").mock(return_value=httpx.Response(200, json=[]))
+        respx_mock.get(f"{BASE}/databases/db1/backups").mock(
+            return_value=httpx.Response(200, json=[])
+        )
         create = respx_mock.post(f"{BASE}/databases/postgresql").mock(
             return_value=httpx.Response(201, json={"uuid": "db2"})
         )

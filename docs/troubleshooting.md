@@ -286,6 +286,48 @@ A create timed out at a proxy (502/504) after Coolify had already saved it, and
 the retry saved it a second time. CREATE refuses a doubled cron, deletes the
 target and leaves the source running. Re-run the migration.
 
+## Database backup schedules
+
+A standalone database's backup schedules are recreated on the target during
+CREATE, with their frequency, retention, timeout and enabled state. The target
+makes no dumps before it is started: Coolify skips a database that is not
+running. These cases come up as plan warnings, never as blocks:
+
+- **"… upload to S3 … created LOCAL-ONLY"**: below Coolify 4.5 the API does not
+  say which S3 storage a schedule uses. Select it in the target database's
+  **Backups** tab after the move, or off-site backups stop.
+- **"the source has N backup run(s) on record"**: history is not migrated. The
+  old dumps stay on the source server under the directory named in the warning,
+  and in S3 if they were uploaded. Nothing deletes them, and no retention prunes
+  them once the source is stopped. Remove them by hand when you no longer need
+  them.
+- **"keep no local dumps on the source (disable_local_backup)"**: no API can set
+  that, so the target keeps local dumps. Switch it off on the target if disk
+  matters.
+- **"service database(s) … can have backup schedules"**: no Coolify API exposes a
+  service database's schedules. Check each one's Backups tab on the source and
+  recreate them on the target by hand.
+- **"… not carried: Coolify has no backup for redis"** (also KeyDB, Dragonfly):
+  those schedules never produced a backup on the source either.
+
+**Volume backups** (Coolify 4.3+, a volume's **Backups** setting) are not carried.
+The API can create them but cannot read them, so the plan cannot see them. If you
+use them, set them up on the target again.
+
+### "the target database holds N backup schedule(s) where M were created"
+
+The target did not hold what CREATE made: a schedule saved twice, or one not
+reported back. A doubled schedule dumps twice per run, so CREATE deletes the
+target and leaves the source running. Re-run the migration.
+
+### Rolled back, and the target had already made backups
+
+A rollback deletes the target database and its schedules, but **not its dump
+files**. A rollback can also be run after a successful migration, and then those
+dumps are the only copy of everything written since the cutover. The log line
+`compensate.target_backup_files_kept` names where they are. Delete them yourself
+once you are sure.
+
 ## `422 This field is not allowed`
 
 Our request whitelist has drifted from upstream Coolify. Coolify names the

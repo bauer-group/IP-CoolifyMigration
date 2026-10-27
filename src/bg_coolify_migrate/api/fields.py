@@ -494,6 +494,38 @@ SCHEDULED_TASK_REQUIRED: frozenset[str] = frozenset({"name", "command", "frequen
 #: cannot hold one through any API.
 SCHEDULED_TASK_COLLECTIONS: frozenset[str] = frozenset({"applications", "services"})
 
+# ── Database backup schedules ────────────────────────────────────────────────
+# POST /v1/databases/{uuid}/backups (DatabasesController::create_backup), whose
+# `$backupConfigFields` rejects anything else per field. Base list v4.1.2:704;
+# missing_backup_notification_days joins in v4.3.18 and v4.4.0 together with its
+# COLUMN, so a GET row carries the key exactly where create accepts it and
+# filter_body (which copies only keys the row has) gates it by itself.
+# `backup_now` is accepted outside the list and NEVER sent: it dumps at once.
+
+BACKUP_CREATE: frozenset[str] = frozenset(
+    {
+        "save_s3",
+        "enabled",
+        "dump_all",
+        "frequency",
+        "databases_to_backup",
+        "database_backup_retention_amount_locally",
+        "database_backup_retention_days_locally",
+        "database_backup_retention_max_storage_locally",
+        "database_backup_retention_amount_s3",
+        "database_backup_retention_days_s3",
+        "database_backup_retention_max_storage_s3",
+        "timeout",
+        "missing_backup_notification_days",
+    }
+)
+#: Accepted too, but never copied off a GET: build_backup_body sets them from the
+#: destinations a 4.5 row discloses. `s3_storage_uuids` exists from v4.5.0 only.
+BACKUP_S3_FIELDS: frozenset[str] = frozenset({"s3_storage_uuid", "s3_storage_uuids"})
+#: Returned by every GET, in no create or update array on any release: the API
+#: cannot set them, so the plan reports disable_local_backup instead.
+BACKUP_UNSETTABLE: frozenset[str] = frozenset({"disable_local_backup", "description"})
+
 # ── Environment variables ────────────────────────────────────────────────────
 # Identical for single create and bulk. Bulk body is {"data": [...]} — the key is
 # literally `data`. Unlike create endpoints, bulk SILENTLY DROPS unknown keys

@@ -3,34 +3,41 @@
 PURE module: no IO.
 
 Coolify hangs schedules off a resource that are part of no resource GET and no
-create body: scheduled tasks (applications and services). Every migration before
-this module recreated the stack without them — the nightly cleanup or report cron
-silently stopped on the target, and nothing said so.
+create body: scheduled tasks (applications and services) and backup schedules
+(standalone databases). Every migration before this module recreated the stack
+without them — the nightly cleanup cron and the database's dumps silently stopped
+on the target, and nothing said so.
 
 They are carried at CREATE_TARGET by ``api/schedules.py``. What makes copying
 them with the source's ``enabled`` safe before START is upstream's own guard, not
-ours: the scheduler skips any task whose resource's status column does not
-contain 'running' (ScheduledJobManager v4.1.2:394-405, v4.5.0:670-681), and a
-target created with instant_deploy=false reads 'exited' (the column default)
-until START_TARGET. That status skip is THE guard — the UI's "execute now" and
-``artisan`` RunScheduledJobsManually dispatch the job without it, but neither is
-anything this tool calls.
+ours. A target created with instant_deploy=false reads 'exited' (the column
+default) until START_TARGET, and:
+
+* the scheduler skips any task whose resource's status does not contain
+  'running' (ScheduledJobManager v4.1.2:394-405, v4.5.0:670-681). That skip is
+  THE guard — the UI's "execute now" and ``artisan`` RunScheduledJobsManually
+  dispatch the job without it, but neither is anything this tool calls;
+* DatabaseBackupJob returns, writing nothing, for a database whose status does
+  not start with 'running' (v4.1.2:122-131, v4.5.0:147-151).
 
 This module decides what the copy cannot reproduce. Refusals are creates that
 WILL 422; warnings are behaviour the operator has to judge (AGENTS.md). Every
 rule is silent on a stock setup, so a warning here is never furniture.
 
-No line produced here ever contains a task's ``command``: Coolify itself treats
-it as sensitive from 4.4 (hidden without can_read_sensitive), and it carries
-credentials often enough — a curl header, a DSN. Names only (invariant 5).
+No line produced here ever contains a task's ``command`` or a backup execution's
+``message``: Coolify itself treats the first as sensitive from 4.4 and redacts
+the second only from 4.5, and both carry credentials often enough. Names,
+frequencies and paths only (invariant 5).
 """
 
 from __future__ import annotations
 
+import posixpath
 from collections import Counter
 from collections.abc import Iterable
 from typing import Any
 
+from bg_coolify_migrate.domain.kinds import DatabaseEngine
 from bg_coolify_migrate.domain.versions import Version, at_least
 
 # ── where each rule starts ───────────────────────────────────────────────────
@@ -164,7 +171,212 @@ def copy_count_mismatches(sent: Iterable[str], found: Iterable[str]) -> dict[str
     The client retries a POST on 429/502/503/504, and a proxy error that arrives
     after Coolify committed the row turns one create into two. Nothing upstream
     deduplicates (the tables have no uniqueness constraint), so the only proof of
-    "exactly once" is to count what the target holds afterwards.
+    "exactly once" is to count what the target holds afterwards — kept even where
+    a create is retried on 429 alone, because it is the proof, not the cause.
     """
     want, got = Counter(sent), Counter(found)
     return {n: (want[n], got[n]) for n in sorted(set(want) | set(got)) if want[n] != got[n]}
+
+
+# ── database backup schedules ────────────────────────────────────────────────
+
+#: The morph class each engine's schedules are stored under. There is no morph
+#: map (none in app/ at v4.1.2 or v4.5.0), so ``database_type`` is the FQCN
+#: create writes with getMorphClass() (DatabasesController v4.1.2:835, v4.5.0:1188).
+_BACKUP_OWNER: dict[DatabaseEngine, str] = {
+    DatabaseEngine.POSTGRESQL: "App\\Models\\StandalonePostgresql",
+    DatabaseEngine.MYSQL: "App\\Models\\StandaloneMysql",
+    DatabaseEngine.MARIADB: "App\\Models\\StandaloneMariadb",
+    DatabaseEngine.MONGODB: "App\\Models\\StandaloneMongodb",
+    DatabaseEngine.REDIS: "App\\Models\\StandaloneRedis",
+    DatabaseEngine.KEYDB: "App\\Models\\StandaloneKeydb",
+    DatabaseEngine.DRAGONFLY: "App\\Models\\StandaloneDragonfly",
+    DatabaseEngine.CLICKHOUSE: "App\\Models\\StandaloneClickhouse",
+}
+#: Other owners that share the numeric-id space, so their rows can appear in a
+#: database's GET. Dropped silently: they belong to a different database.
+_OTHER_BACKUP_OWNERS = frozenset({"App\\Models\\ServiceDatabase", "App\\Models\\StandaloneSqlite"})
+
+#: isBackupSolutionAvailable() is false for these from v4.2.0 (create 422s,
+#: DatabasesController v4.2.0:853, v4.5.0:1116); on 4.1.x the job threw
+#: 'Unsupported database type'. A schedule on one never produced a backup.
+_NO_BACKUP_ENGINES = frozenset(
+    {DatabaseEngine.REDIS, DatabaseEngine.KEYDB, DatabaseEngine.DRAGONFLY}
+)
+
+#: Where DatabaseBackupJob puts local dumps: {team-slug}-{team_id}/{db-slug}-{uuid}/
+#: below this (v4.5.0:288-290), so source and target never share a directory.
+_BACKUP_ROOT = "/data/coolify/backups/databases/"
+
+
+def own_backup_schedules(
+    rows: list[dict[str, Any]], engine: DatabaseEngine | None
+) -> list[dict[str, Any]]:
+    """The rows that really belong to this database. PURE.
+
+    GET /databases/{uuid}/backups filters on ``database_id`` only, never on
+    ``database_type`` (v4.1.2:167, v4.5.0:447), and every engine has its own id
+    sequence — so a MySQL with the same hidden numeric id as this Postgres hands
+    its schedules to this Postgres's GET. Copying them would create the MySQL's
+    schedules on the Postgres target.
+    """
+    if engine is None:
+        return []
+    owner = _BACKUP_OWNER[engine]
+    return [r for r in rows if r.get("database_type") == owner]
+
+
+def is_backupless(engine: DatabaseEngine | None) -> bool:
+    """Whether Coolify has no backup for this engine, so schedules are never carried."""
+    return engine in _NO_BACKUP_ENGINES
+
+
+def backup_s3_destinations(row: dict[str, Any]) -> tuple[str, ...] | None:
+    """Where a schedule uploads, primary first — or ``None`` when undisclosed. PURE.
+
+    Only v4.5.0 names a schedule's S3 storages by uuid (``s3_storage_uuids``,
+    always present on 4.5 rows; v4.5.0:200-211). Before that a row carries the
+    hidden numeric ``s3_storage_id`` alone, and no API maps it to a uuid:
+    /s3-storages hides ``id`` (from 4.3.0, absent before) and hands a root token
+    the key and secret, which this tool will not read.
+    """
+    if "s3_storage_uuids" not in row:
+        return None
+    raw = row.get("s3_storage_uuids") or []
+    uuids = [str(u) for u in raw if u] if isinstance(raw, list) else []
+    primary = row.get("s3_storage_uuid")
+    if primary and str(primary) in uuids:
+        uuids.insert(0, uuids.pop(uuids.index(str(primary))))
+    return tuple(dict.fromkeys(uuids))
+
+
+def _frequencies(rows: list[dict[str, Any]]) -> list[str]:
+    return [str(r.get("frequency") or "?") for r in rows]
+
+
+def backup_warnings(
+    rows: list[dict[str, Any]],
+    *,
+    engine: DatabaseEngine | None,
+    source_timezone: str | None,
+    target_timezone: str | None,
+) -> list[str]:
+    """What a database's backup schedules will not do on the target as on the source.
+
+    ``rows`` is the raw GET. Schedules are named by their frequency — a backup
+    schedule has no name — and never by anything an execution recorded.
+    """
+    out: list[str] = []
+    known = set(_BACKUP_OWNER.values()) | _OTHER_BACKUP_OWNERS
+    if unknown := sorted({str(r.get("database_type")) for r in rows} - known):
+        count = sum(1 for r in rows if str(r.get("database_type")) in unknown)
+        out.append(
+            f"{count} backup schedule(s) of an unrecognised database type {unknown} are not "
+            "carried. Check the source database's Backups tab and recreate any that "
+            "belong to it on the target."
+        )
+
+    own = own_backup_schedules(rows, engine)
+    if is_backupless(engine):
+        if own:
+            out.append(
+                f"{len(own)} backup schedule(s) are not carried: Coolify has no backup for "
+                f"{engine}, its API refuses one on create from 4.2.0, and the schedule never "
+                "produced a backup on the source either."
+            )
+        return out
+
+    s3 = [r for r in own if r.get("save_s3")]
+    if undisclosed := _frequencies([r for r in s3 if backup_s3_destinations(r) is None]):
+        out.append(
+            f"backup schedule(s) {undisclosed} upload to S3, but this Coolify (< 4.5) names "
+            "a schedule's S3 storage only by a hidden numeric id that no API maps to a "
+            "uuid. The target's copy is created LOCAL-ONLY: select the S3 storage in the "
+            "target database's Backups tab, or off-site backups stop after the move."
+        )
+    if dangling := _frequencies([r for r in s3 if backup_s3_destinations(r) == ()]):
+        out.append(
+            f"backup schedule(s) {dangling} are set to upload to S3, but their S3 storage "
+            "no longer exists. The target's copy is created local-only."
+        )
+    if no_local := _frequencies([r for r in own if r.get("disable_local_backup") is True]):
+        out.append(
+            f"backup schedule(s) {no_local} keep no local dumps on the source "
+            "(disable_local_backup), a setting no API can set. The target keeps local "
+            "dumps on the target server's disk, under the schedule's local retention; "
+            "switch it off in the target's Backups tab if disk matters."
+        )
+
+    armed = _frequencies([r for r in own if r.get("enabled") is not False])
+    if armed and source_timezone and target_timezone and source_timezone != target_timezone:
+        out.append(
+            f"backup schedule(s) {armed} fire on the server's clock: {source_timezone} on "
+            f"the source server, {target_timezone} on the target. The same frequency "
+            "dumps at a different wall-clock time after the move."
+        )
+
+    runs = [e for r in own for e in r.get("executions") or [] if isinstance(e, dict)]
+    if runs:
+        out.append(
+            f"the source has {len(runs)} backup run(s) on record. They are not migrated, "
+            "and the target starts a fresh history. The dumps stay where they are, on "
+            f"the source server under {_dump_directory(runs)} (and in S3 if uploaded). "
+            "Once the source stops running, no retention prunes them and no finalize "
+            "policy removes them."
+        )
+    return out
+
+
+def _dump_directory(runs: list[dict[str, Any]]) -> str:
+    """The directory of the newest recorded dump, else the root all dumps live under."""
+    dated = sorted(
+        (str(e.get("created_at") or ""), str(e["filename"]))
+        for e in runs
+        if isinstance(e.get("filename"), str) and e["filename"].startswith("/")
+    )
+    if not dated:
+        return _BACKUP_ROOT
+    return posixpath.dirname(dated[-1][1]) + "/"
+
+
+#: ServiceDatabase::isBackupSolutionAvailable, identical v4.1.2:185-193 and
+#: v4.5.0:192-200: the image before ':' names one of these (databaseType() maps
+#: timescale and pgvector to postgresql), or a custom_type is set.
+_SERVICE_BACKUP_IMAGES = (
+    "mysql",
+    "postgres",
+    "postgis",
+    "mariadb",
+    "mongo",
+    "timescale",
+    "pgvector",
+)
+
+
+def service_backup_warnings(service: dict[str, Any]) -> list[str]:
+    """A service's databases that can hold backup schedules nobody can read.
+
+    Unconditional on purpose: the /databases/{uuid}/backups routes resolve only
+    standalone databases, and GET /services/{uuid} loads its databases without
+    schedules (v4.1.2:736, v4.5.0:880), so no API says whether one exists.
+    """
+    capable = sorted(
+        str(db.get("name") or "?")
+        for db in service.get("databases") or []
+        if isinstance(db, dict) and _service_database_backs_up(db)
+    )
+    if not capable:
+        return []
+    return [
+        f"service database(s) {capable} can have backup schedules, and no Coolify API "
+        "exposes a service database's schedules on any release, so they are neither "
+        "read nor recreated. Check each one's Backups tab on the source and recreate "
+        "its schedules on the target."
+    ]
+
+
+def _service_database_backs_up(db: dict[str, Any]) -> bool:
+    if db.get("custom_type"):
+        return True
+    image = str(db.get("image") or "").split(":", 1)[0]
+    return any(marker in image for marker in _SERVICE_BACKUP_IMAGES)

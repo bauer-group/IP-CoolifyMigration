@@ -5,19 +5,22 @@ IO shell. What carries and what the plan reports is decided in
 and creates them on the target.
 
 Runs inside CREATE_TARGET, before QUIESCE, and is FATAL — unlike copy_tags. A
-lost cleanup or report cron is a functional regression nobody notices until the
-day it is needed, while failing here costs zero downtime: the in-step undo
-deletes the target, and its schedules go with it (Application::forceDeleting
-and DeleteService delete its tasks, v4.5.0:Application.php:417-426,
-DeleteService.php:133-135).
+lost cleanup cron or a database that silently stopped being backed up is a
+regression nobody notices until the day it is needed, while failing here costs
+zero downtime: the in-step undo deletes the target, and its schedules go with it
+(Application::forceDeleting and DeleteService delete its tasks,
+v4.5.0:Application.php:417-426, DeleteService.php:133-135; DeleteResourceJob
+deletes a database's schedule rows, v4.1.2:94, v4.5.0:167).
 
 The source's ``enabled`` is carried as it is. Creating disabled and arming at
 START was considered and rejected: it is one more write after the source is down,
 a journal field and a compensation — protecting nothing, because the target reads
-status 'exited' until START and the scheduler skips it (see domain/schedules.py).
+status 'exited' until START and upstream skips it (see domain/schedules.py).
 
-NEVER log a task's ``command``. It carries credentials often enough, and the
-redaction processor is key-based and does not know the word. Names and counts only.
+NEVER log a task's ``command`` or a backup execution's ``message``. Both carry
+credentials often enough, and the redaction processor is key-based and knows
+neither word. Names, frequencies and counts only. No S3 credential is ever read:
+storages are shared on the one control plane and named by uuid.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ import structlog
 
 from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.api.fields import (
+    BACKUP_CREATE,
     SCHEDULED_TASK_COLLECTIONS,
     SCHEDULED_TASK_CREATE,
     SCHEDULED_TASK_REQUIRED,
@@ -35,8 +39,14 @@ from bg_coolify_migrate.api.fields import (
     missing_required,
 )
 from bg_coolify_migrate.domain import compose as compose_mod
-from bg_coolify_migrate.domain.kinds import ResourceKind
-from bg_coolify_migrate.domain.schedules import copy_count_mismatches, task_container_mismatches
+from bg_coolify_migrate.domain.kinds import DatabaseEngine, ResourceKind
+from bg_coolify_migrate.domain.schedules import (
+    backup_s3_destinations,
+    copy_count_mismatches,
+    is_backupless,
+    own_backup_schedules,
+    task_container_mismatches,
+)
 from bg_coolify_migrate.errors import CoolifyApiError, InsufficientTokenScope, MigrationError
 
 log = structlog.get_logger(__name__)
@@ -210,3 +220,95 @@ async def _target_container_names(
             return None
         return set(compose_mod.services(compose_mod.parse(raw)))
     return None
+
+
+# ── database backup schedules ────────────────────────────────────────────────
+
+#: Retention acts only on values > 0, so a negative one — which the UI's
+#: BackupEdit stores (v4.1.2:46-58, v4.5.0:61-74) and the API's min:0 refuses —
+#: behaves exactly like 0, "keep all" (bootstrap/helpers/databases.php
+#: v4.1.2:302-319, v4.5.0:344-369). Sent as 0: the same behaviour, accepted.
+_RETENTION_FIELDS = (
+    "database_backup_retention_amount_locally",
+    "database_backup_retention_days_locally",
+    "database_backup_retention_max_storage_locally",
+    "database_backup_retention_amount_s3",
+    "database_backup_retention_days_s3",
+    "database_backup_retention_max_storage_s3",
+)
+
+
+def build_backup_body(row: dict[str, Any]) -> dict[str, Any]:
+    """The create body for one source backup schedule. PURE.
+
+    Values only, through BACKUP_CREATE; never ``backup_now`` (it dumps at once,
+    and needs ``deploy`` from 4.5). The S3 destinations are set from what the row
+    DISCLOSES (4.5+), primary first, even with save_s3 off — that keeps the
+    storage the operator preselected. A row that uploads to S3 without
+    disclosing where (before 4.5, or a storage since deleted) is created with
+    save_s3 off: sending it on would 422 the whole schedule, and the plan has
+    already said "local-only" out loud.
+    """
+    body = filter_body(row, BACKUP_CREATE)
+    for field in _RETENTION_FIELDS:
+        value = body.get(field)
+        if isinstance(value, int | float) and not isinstance(value, bool) and value < 0:
+            body[field] = 0
+    if destinations := backup_s3_destinations(row):
+        body["s3_storage_uuids"] = list(destinations)
+        body["s3_storage_uuid"] = destinations[0]
+    elif body.get("save_s3"):
+        body["save_s3"] = False
+    return body
+
+
+async def copy_backup_schedules(
+    api: CoolifyClient,
+    *,
+    collection: str,
+    source_uuid: str,
+    target_uuid: str,
+    engine: DatabaseEngine | None,
+) -> int:
+    """Recreate a standalone database's backup schedules on the target. Returns the count.
+
+    Only this database's own rows (the GET mixes in other engines' rows with the
+    same numeric id), and none for an engine Coolify cannot back up. After the
+    POSTs the target is re-read and its own rows counted against the uuids the
+    creates returned, so a doubled schedule fails CREATE instead of dumping twice.
+
+    Nothing to undo beyond the target delete: DeleteResourceJob removes the rows.
+    Their dump FILES are deliberately left — see compensations.undo_create_target.
+    """
+    if collection != "databases" or is_backupless(engine):
+        return 0
+    rows = own_backup_schedules(await api.get_backups(source_uuid), engine)
+    if not rows:
+        return 0
+
+    bodies = [build_backup_body(r) for r in rows]
+    for row, body in zip(rows, bodies, strict=True):
+        if row.get("save_s3") and not body.get("save_s3"):
+            # The plan said so when it saw it; a schedule added since has not been
+            # announced anywhere else.
+            log.warning(
+                "api.backups.s3_dropped",
+                frequency=row.get("frequency"),
+                target=target_uuid,
+                hint="its S3 storage is not disclosed by this Coolify; created local-only",
+            )
+    created = [await api.create_backup(target_uuid, body) for body in bodies]
+
+    present = own_backup_schedules(await api.get_backups(target_uuid), engine)
+    if copy_count_mismatches(created, [str(r.get("uuid")) for r in present]):
+        raise CoolifyApiError(
+            f"the target database holds {len(present)} backup schedule(s) where "
+            f"{len(created)} were created",
+            hint=(
+                "A schedule was saved twice, or one the target did not report back. A "
+                "doubled schedule dumps twice per run. The source was never stopped; "
+                "the created target will be deleted — re-run the migration."
+            ),
+        )
+    log.info("api.backups.copied", count=len(created), target=target_uuid)
+    return len(created)

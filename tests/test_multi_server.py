@@ -281,6 +281,9 @@ class TestCreateRecheck:
         )
         respx_mock.get(f"{BASE}/databases/db1/envs").mock(return_value=httpx.Response(200, json=[]))
         respx_mock.get(f"{BASE}/databases/db1/tags").mock(return_value=httpx.Response(200, json=[]))
+        respx_mock.get(f"{BASE}/databases/db1/backups").mock(
+            return_value=httpx.Response(200, json=[])
+        )
         delete = respx_mock.delete(url__startswith=f"{BASE}/databases/db2").mock(
             return_value=httpx.Response(200, json={"message": "queued"})
         )

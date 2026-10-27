@@ -921,6 +921,7 @@ async def build_plan(
         more_warnings, more_refusals = await plan_schedules(
             api,
             snapshot,
+            source=full,
             source_server=source_server,
             target_server=target,
             version=coolify_version,

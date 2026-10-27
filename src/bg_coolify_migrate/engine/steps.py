@@ -445,6 +445,13 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                 target_uuid=target_uuid,
                 kind=snapshot.kind,
             )
+            await api_schedules.copy_backup_schedules(
+                ctx.api,
+                collection=snapshot.collection,
+                source_uuid=snapshot.uuid,
+                target_uuid=target_uuid,
+                engine=snapshot.engine,
+            )
     except Exception:
         # The saga compensates only COMPLETED steps, so a refusal part-way
         # through CREATE — the compose gate, the service rehearsal, a 422 on

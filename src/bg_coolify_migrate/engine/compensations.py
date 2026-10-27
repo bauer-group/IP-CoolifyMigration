@@ -50,6 +50,19 @@ async def undo_create_target(ctx: MigrationContext, undo_info: dict[str, Any]) -
         except Exception as exc:
             delete_failures.append(target_uuid)
             log.error("compensate.target_delete_failed", uuid=target_uuid, error=str(exc)[:200])
+        if collection == "databases":
+            # Deliberately NOT deleted with the schedules: a rollback can follow a
+            # SUCCEEDED run, and then these dumps are the last copy of everything
+            # written since the cutover. An orphaned dump is recoverable.
+            log.info(
+                "compensate.target_backup_files_kept",
+                uuid=target_uuid,
+                hint=(
+                    "any backup dumps of this target stay under /data/coolify/backups/"
+                    f"databases/<team>/<name>-{target_uuid}/ on the target server, and "
+                    "under its S3 prefix if uploaded"
+                ),
+            )
 
     # The target is gone (or noted as stuck) — now swing the source's domains back.
     # create_target parked the custom ones and finalize blanked them on success;

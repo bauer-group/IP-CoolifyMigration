@@ -155,6 +155,30 @@ tags v4.1.2 through v4.5.0 (2026-10-26). Read upstream at a **release tag**, nev
   from the CURRENT catalog or git HEAD, so CREATE checks each task's container
   against the target. A POST retried on 502/504 can save a task twice, so CREATE
   re-reads and counts. Deleting the target deletes its tasks (model hooks).
+- **Database backup schedules** (`/databases/{uuid}/backups`, every release)
+  create through `$backupConfigFields` (v4.1.2:704, v4.5.0:1057).
+  `missing_backup_notification_days` arrives with its column (4.3.18/4.4.0) and
+  `s3_storage_uuids` in 4.5.0, so key presence gates both. The GET filters on
+  `database_id` ONLY: another engine's rows with the same hidden id come back
+  too, so filter on `database_type` (the model FQCN; there is no morph map). It
+  also eager-loads every execution, whose `message` is raw dump output before
+  4.5; `client.get_backups` drops it at the boundary. Only 4.5 names a
+  schedule's S3 storages by uuid. Before that it is a hidden id no API maps, so
+  the target's copy is created local-only and the plan says so. Redis, KeyDB
+  and Dragonfly have no backup (create 422s from 4.2.0). DatabaseBackupJob skips
+  a database whose status does not start with 'running', so a carried schedule
+  is inert before START. `create_backup` retries 429 only: a re-POST after a
+  proxy 502 would double the schedule.
+- **No API reads two kinds of backup schedule.** A SERVICE database's schedules
+  are not exposed (the backup routes resolve standalone databases only), so the
+  plan warns for every backup-capable service database. Volume-backup schedules
+  (4.3.0+, PUT/run/DELETE on `.../storages/{uuid}/backups`, no GET) are
+  documented, not warned per resource.
+- **Rollback deletes a target's backup ROWS, never its dump FILES.**
+  DeleteResourceJob removes the rows (v4.5.0:167) and leaves the dumps. Never
+  send `DELETE .../backups/{b}?delete_s3=true`: `rollback` also runs after a
+  SUCCEEDED run (it has no is_finished guard), and then those dumps are the last
+  copy of post-cutover data.
 
 ### Learned the hard way, from a real instance
 
@@ -294,4 +318,4 @@ Conventional Commits, **past-tense** subject (`added`, `fixed`, `updated`), max
 | Is the stack really stopped? | `discovery/quiesce.py` |
 | Which fields may we send? | `api/fields.py` |
 | What can the target NOT reproduce? | `domain/fidelity.py` |
-| Are scheduled tasks carried? | `api/schedules.py`, `domain/schedules.py` |
+| Are scheduled tasks and backup schedules carried? | `api/schedules.py`, `domain/schedules.py` |

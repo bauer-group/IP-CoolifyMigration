@@ -192,6 +192,75 @@ def tinker(code: str) -> str:
     return result.stdout
 
 
+#: Counts, sums and hashes the seeded rows, so "the data arrived" is one string compare.
+PG_FINGERPRINT = (
+    "psql -U shop -d shopdb -tA -c "
+    "\"SELECT count(*)||':'||sum(cents)||':'||md5(string_agg(customer,'|' ORDER BY id)) "
+    'FROM orders"'
+)
+
+
+@pytest_asyncio.fixture
+async def seeded_pg(
+    api: CoolifyClient, settings: Settings, rig: dict[str, Any]
+) -> AsyncIterator[dict[str, Any]]:
+    """A deployed, seeded standalone Postgres on server-a, deleted afterwards.
+
+    Shared by the rollback and the backup-schedule tests. The cleanup matches the
+    run's unique suffix, so it also removes the migrated copy on server-b and a
+    source that FINALIZE renamed.
+    """
+    import contextlib
+    import uuid as uuidlib
+
+    suffix = uuidlib.uuid4().hex[:8]
+    project = await api.post("/projects", {"name": f"rb-{suffix}", "description": "bgcm e2e"})
+    project_uuid = str(project["uuid"])
+    db_name = f"pg-{suffix}"
+    try:
+        db = await api.post(
+            "/databases/postgresql",
+            {
+                "name": db_name,
+                "project_uuid": project_uuid,
+                "environment_name": "production",
+                "server_uuid": rig["server_a"]["uuid"],
+                "image": "postgres:16-alpine",
+                "postgres_user": "shop",
+                "postgres_password": "secret",
+                "postgres_db": "shopdb",
+                "instant_deploy": True,
+            },
+        )
+        db_uuid = str(db["uuid"])
+        async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source:
+            await wait_until_healthy(source, db_uuid)
+            await db_exec(
+                source,
+                db_uuid,
+                "psql -U shop -d shopdb -tA -v ON_ERROR_STOP=1",
+                stdin="CREATE TABLE orders(id serial primary key, customer text, cents int);"
+                "INSERT INTO orders(customer,cents) VALUES ('Grüße GmbH',129900),('Ötztal AG',4200);",
+            )
+            fingerprint = await db_exec(source, db_uuid, PG_FINGERPRINT)
+        assert fingerprint.startswith("2:134100:")
+        yield {
+            "project": f"rb-{suffix}",
+            "project_uuid": project_uuid,
+            "db_name": db_name,
+            "db_uuid": db_uuid,
+            "fingerprint": fingerprint,
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            for db in await api.get("/databases") or []:
+                if isinstance(db, dict) and suffix in str(db.get("name", "")):
+                    with contextlib.suppress(Exception):
+                        await api.delete_resource("databases", str(db["uuid"]), delete_volumes=True)
+        with contextlib.suppress(Exception):
+            await api.delete(f"/projects/{project_uuid}")
+
+
 async def db_exec(host: RemoteHost, container: str, argv: str, *, stdin: str | None = None) -> str:
     """Run a command inside a database container on a rig server, checked.
 
