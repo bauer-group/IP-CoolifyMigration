@@ -173,4 +173,6 @@ typo away from silently copying nothing.
   its volume prune cannot pass the test. **Not parallel-safe**: it prunes every
   unused volume on both daemons, so run it alone or serially. Coolify's image
   prune also removes the stopped source's postgres image, so the rollback's
-  restart re-pulls it.
+  restart re-pulls it. A third test runs to DONE under `rename`, lets the
+  cleanup prune the kept source's volume (its pins went at FINALIZE), and
+  asserts `rollback <id>` is REFUSED with the target and its data untouched.

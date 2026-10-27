@@ -26,7 +26,7 @@ import asyncio
 import contextlib
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
@@ -37,7 +37,7 @@ from rich.text import Text
 
 from bg_coolify_migrate import __version__
 from bg_coolify_migrate.domain.plan import MigrationPlan, TransferMode
-from bg_coolify_migrate.domain.statemachine import FinalizePolicy
+from bg_coolify_migrate.domain.statemachine import FinalizePolicy, State
 from bg_coolify_migrate.domain.versions import parse_version
 from bg_coolify_migrate.errors import EmptyEnvironment, MigrationError, PreflightError
 from bg_coolify_migrate.observability.logging_setup import setup_logging
@@ -1254,6 +1254,29 @@ def rollback(
     raise typer.Exit(code)
 
 
+def _rollback_prompt(
+    migration_id: str, plan: MigrationPlan, details: Mapping[str, Mapping[str, Any]]
+) -> str:
+    """What the confirmation says a rollback will do. ``details``: the journal's, per state.
+
+    Once the target was started it serves - from DNS_GATE on, through FINALIZE
+    and after DONE - so the rollback throws away everything written to it since:
+    the source comes back on its data as of the stop.
+    """
+    text = (
+        f"Rolling back [bold]{escape(migration_id)}[/bold] will delete the target "
+        f"resources created on [host]{escape(plan.target_server.name)}[/host] "
+        f"and restart [host]{escape(plan.source_server.name)}[/host]."
+    )
+    if State.START_TARGET.value in details:
+        text += (
+            "\n[warn]The target was started and may have served since: everything written "
+            "to it since the cutover is DISCARDED - the source comes back with its data as "
+            "of the stop.[/warn]"
+        )
+    return text
+
+
 async def _rollback(
     settings: Settings, migration_id: str, assume_yes: bool, trust_host_key: bool = False
 ) -> int:
@@ -1261,6 +1284,7 @@ async def _rollback(
 
     from bg_coolify_migrate.api.client import CoolifyClient
     from bg_coolify_migrate.engine.runner import load_plan, rollback_migration
+    from bg_coolify_migrate.journal.store import Journal
     from bg_coolify_migrate.ui import run_report
 
     console = get_console()
@@ -1271,11 +1295,8 @@ async def _rollback(
         if not is_interactive():
             console.print("[err]error:[/err] refusing to roll back unattended without --yes")
             return 2
-        console.print(
-            f"Rolling back [bold]{escape(migration_id)}[/bold] will delete the target "
-            f"resources created on [host]{escape(migration_plan.target_server.name)}[/host] "
-            f"and restart [host]{escape(migration_plan.source_server.name)}[/host]."
-        )
+        journal = Journal.open(settings.resolved_state_dir(), migration_id)
+        console.print(_rollback_prompt(migration_id, migration_plan, journal.details()))
         if not await _off_loop(questionary.confirm("Proceed?", default=False).ask):
             return 0
 

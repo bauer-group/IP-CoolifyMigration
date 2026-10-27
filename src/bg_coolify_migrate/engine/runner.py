@@ -19,7 +19,7 @@ from bg_coolify_migrate.dns.gate import is_definitive
 from bg_coolify_migrate.domain.domains import dns_rollback_note, parking_tag
 from bg_coolify_migrate.domain.plan import MigrationPlan, ServerRef, TransferMode
 from bg_coolify_migrate.domain.statemachine import Outcome, State
-from bg_coolify_migrate.engine.compensations import build_compensations
+from bg_coolify_migrate.engine.compensations import build_compensations, source_data_refusal
 from bg_coolify_migrate.engine.context import (
     MigrationContext,
     deserialise_mounts,
@@ -206,6 +206,7 @@ async def _execute(
             context=ctx,
             steps=build_steps(),
             compensations=build_compensations(),
+            guard=source_data_refusal,
             on_state=on_state,
         )
         result = await saga.run(start_from=start_from)
@@ -437,6 +438,7 @@ async def rollback_migration(
             context=ctx,
             steps={},
             compensations=build_compensations(),
+            guard=source_data_refusal,
         )
         result = await saga.rollback()
         result.notices.extend(ctx.notices)

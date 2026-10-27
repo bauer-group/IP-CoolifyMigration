@@ -131,6 +131,7 @@ class Saga:
         precedence: Mapping[Any, Any] | None = None,
         owed: Callable[..., Sequence[str]] | None = None,
         refusal: Callable[[Mapping[str, Mapping[str, Any]]], str | None] | None = None,
+        guard: Callable[[Any], Awaitable[str | None]] | None = None,
     ) -> None:
         self.journal = journal
         self.context = context
@@ -150,6 +151,9 @@ class Saga:
         self._owed_rule = owed if owed is not None else (owed_states if f1 else None)
         # When no rollback may run at all (domain rule).
         self._refusal = refusal if refusal is not None else (rollback_refusal if f1 else None)
+        # The same question where only looking answers it (IO, injected by the
+        # caller): called with the context before any compensation runs.
+        self._guard = guard
         self._keys = [str(s) for s in self._order]
         self._terminal = self._keys[-1]
         self._completed: list[str] = []
@@ -234,15 +238,47 @@ class Saga:
         reason = self._refusal(self.journal.details()) if self._refusal else None
         if reason is None:
             return
-        self.journal.append("rollback_refused", detail={"reason": reason[:500]})
-        log.error("saga.rollback_refused", reason=reason[:200])
-        raise RollbackError(
-            f"rollback refused: {reason}",
+        self._refuse(
+            reason,
+            error,
             hint=(
                 "Nothing was undone. Check the target in Coolify - it holds the data. "
                 "If FINALIZE stopped part-way, delete what is left of the source by hand "
-                f"once the target is verified.\nJournal: {self.journal.path}"
+                "once the target is verified."
             ),
+        )
+
+    async def _refuse_if_unsafe(self, error: MigrationError | None) -> None:
+        """Raise instead of rolling back when the guard finds the rollback would destroy data.
+
+        A guard that cannot answer refuses too: the compensations it protects
+        stop and delete the target, and on a guess that is the one move that
+        cannot be taken back.
+        """
+        if self._guard is None:
+            return
+        try:
+            reason = await self._guard(self.context)
+        except Exception as exc:
+            reason = f"whether the source still holds its data could not be checked ({exc})"
+        if reason is None:
+            return
+        self._refuse(
+            reason,
+            error,
+            hint=(
+                "Nothing was undone: the target keeps running and holds the data, including "
+                "everything written to it since the cutover. Keep it. Run the rollback again "
+                "only once the source's data is back (restore it from a backup), or treat "
+                "the target as the migrated stack and clean up the source by hand."
+            ),
+        )
+
+    def _refuse(self, reason: str, error: MigrationError | None, *, hint: str) -> None:
+        self.journal.append("rollback_refused", detail={"reason": reason[:500]})
+        log.error("saga.rollback_refused", reason=reason[:200])
+        raise RollbackError(
+            f"rollback refused: {reason}", hint=f"{hint}\nJournal: {self.journal.path}"
         ) from error
 
     def _owed(self, *, explicit: bool) -> list[str]:
@@ -263,6 +299,7 @@ class Saga:
         self, failed_at: Any, error: MigrationError | None, *, explicit: bool = False
     ) -> RunResult:
         self._refuse_if_irreversible(error)
+        await self._refuse_if_unsafe(error)
         plan = rollback_plan_for(
             self._owed(explicit=explicit),
             order=self._keys,

@@ -495,6 +495,21 @@ Check the target in Coolify: it holds the data. If FINALIZE stopped part-way,
 some source resources may still exist; delete them by hand once the target is
 verified. The journal named in the hint shows what FINALIZE recorded.
 
+### "rollback refused: the source no longer holds its data"
+
+The migration finished (or got into FINALIZE) with `keep` or `rename`, and the
+source has since lost what a rollback would restart it on: a resource was
+deleted in Coolify, or a copied volume is gone from the source server —
+usually Coolify's Docker cleanup with *Delete unused volumes* on, which the plan
+warned about (FINALIZE released the source's pins). A rollback would stop the
+target, drop its volumes, delete it and restart the source on **empty**
+volumes, so nothing was undone: the target holds the only copy, including
+everything written since the cutover. Keep it. Run the rollback again only once
+the source's data is back (from a backup); otherwise the target is the migrated
+stack, and the source is yours to clean up. `could not be read` / `could not be
+checked` means the look itself failed (API or SSH): fix that and run the
+rollback again.
+
 ### "point DNS for … back to …"
 
 Not an error — a step a rollback cannot take for you. The DNS gate had already

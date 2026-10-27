@@ -513,6 +513,17 @@ the release it starts in — read that module before adding a rule.
   redeploy for an image app, and the source is serving since the first one.
   A remedy that has the operator start the source by hand must not lead into a
   rollback that still owes its restart (the kept-pin notice says `docker rm`).
+- **After FINALIZE(keep/rename) the source is no proven copy.** Its pins are
+  gone, its containers were removed at QUIESCE, so a pruning server deletes its
+  volumes; an operator may delete it. `rollback_refusal` refuses DELETE as a
+  policy; for keep/rename the saga's `guard`
+  (`compensations.source_data_refusal`, gated by
+  `statemachine.source_copy_unproven`) LOOKS before any compensation: every
+  source resource GETs, every copied volume is in `docker volume ls`, else
+  refuse — STOP_TARGET and DROP_TARGET_VOLUMES run before RESTART_SOURCE, and
+  compose recreates a missing volume EMPTY. Present volumes are re-pinned there,
+  so no cleanup lands between the look and the restart. A guard that cannot
+  answer refuses.
 - **The plan reads the setting off `GET /servers/{uuid}`**, whose eager-loaded
   `settings` carry `delete_unused_volumes`, `docker_cleanup_frequency`,
   `force_docker_cleanup` and `docker_cleanup_threshold` at every release

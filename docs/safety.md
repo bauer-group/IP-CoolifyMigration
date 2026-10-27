@@ -296,6 +296,17 @@ safety story. It is also why a rollback is **refused** once a FINALIZE with
 remaining compensation aims at the target. FINALIZE journals its policy before
 it touches anything, so the refusal holds even when it died part-way.
 
+After a `keep` or `rename` finalize the source still exists, but nothing
+protects its data any more: its pins are released, and on a server that prunes
+unused volumes the next cleanup deletes them; a kept source can also be deleted
+by hand. So a rollback that follows first **looks**: every source resource must
+still exist in Coolify and every volume the migration copied must still be on
+the source server. If anything is missing it is refused, nothing undone — the
+target holds the only copy. If all is there, the volumes are pinned again
+before anything else runs, so no cleanup can take them before the restart
+mounts them. A rollback after the target was started always discards what was
+written to the target since; the confirmation prompt says so.
+
 A rollback cannot move DNS. It re-resolves every custom host at its end: a host
 now pointing at the target (found by the gate, accepted, or changed by hand) is
 listed to point back at the source, and one whose record vanished since the plan

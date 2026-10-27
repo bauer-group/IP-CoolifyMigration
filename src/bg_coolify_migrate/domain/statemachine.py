@@ -347,6 +347,9 @@ def rollback_refusal(markers: Mapping[str, Mapping[str, Any]]) -> str | None:
     DELETE_TARGET_RESOURCE(delete_volumes=True) would destroy that copy too.
     ``step_finalize`` journals its policy before it touches anything, so this
     holds for a finished, a failed and a crashed FINALIZE alike.
+
+    ``keep`` and ``rename`` leave the source in place, but not necessarily its
+    data: :func:`source_copy_unproven` has the engine look before anything runs.
     """
     finalize = markers.get(State.FINALIZE.value) or {}
     if finalize.get("policy") == FinalizePolicy.DELETE.value:
@@ -356,6 +359,23 @@ def rollback_refusal(markers: Mapping[str, Mapping[str, Any]]) -> str | None:
             "would delete that copy too"
         )
     return None
+
+
+def source_copy_unproven(markers: Mapping[str, Mapping[str, Any]]) -> bool:
+    """Must a rollback first prove the SOURCE still holds its data? PURE.
+
+    True once FINALIZE began with ``keep`` or ``rename`` (it journals its policy
+    before it touches anything). From then on nothing keeps the stopped source's
+    volumes: FINALIZE released its pins, Coolify's stop had already removed its
+    containers, so on a server that prunes unused volumes the next cleanup
+    deletes them — and an operator may delete the kept source by hand. A
+    rollback that then stops and drops the target, and restarts the source on
+    fresh empty volumes, destroys the only copy and reports ROLLED_BACK. Unlike
+    ``delete`` this is a question of fact, not of policy, so it is answered by
+    looking (``compensations.source_data_refusal``), not refused outright.
+    """
+    finalize = markers.get(State.FINALIZE.value) or {}
+    return finalize.get("policy") in (FinalizePolicy.KEEP.value, FinalizePolicy.RENAME.value)
 
 
 def requires_source_restart(completed: Sequence[State]) -> bool:

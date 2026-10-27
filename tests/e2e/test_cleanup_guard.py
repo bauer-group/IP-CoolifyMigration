@@ -38,8 +38,8 @@ from bg_coolify_migrate.domain.plan import TransferMode
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy, Outcome, State
 from bg_coolify_migrate.engine import steps
 from bg_coolify_migrate.engine.planner import build_plan, server_uuid_of
-from bg_coolify_migrate.engine.runner import make_migration_id, run_migration
-from bg_coolify_migrate.errors import VerificationError
+from bg_coolify_migrate.engine.runner import make_migration_id, rollback_migration, run_migration
+from bg_coolify_migrate.errors import RollbackError, VerificationError
 from bg_coolify_migrate.settings.base import Settings
 
 from .conftest import db_exec, ssh_to, wait_until_healthy
@@ -278,3 +278,38 @@ async def test_rollback_after_cleanup_restores_the_source(
                 break
             await asyncio.sleep(5)
     assert not set(target_volumes) & set(listed.split()), "the rollback left target volumes"
+
+
+async def test_a_rollback_after_done_onto_a_pruned_source_is_refused(
+    api: CoolifyClient, settings: Settings, rig: dict[str, Any], seeded_pg: dict[str, Any]
+) -> None:
+    """RENAME to DONE, Coolify's cleanup prunes the kept source, then `rollback <id>`.
+
+    FINALIZE released the source's pins, and nothing else references its
+    volume: the plan warns that the kept source is no fallback copy on a
+    pruning server. A rollback must then refuse before it touches the target -
+    stopping and dropping it, and restarting the source on an empty volume,
+    would destroy the only copy and report ROLLED_BACK.
+    """
+    a, b = str(rig["server_a"]["uuid"]), str(rig["server_b"]["uuid"])
+    plan = await _plan(api, settings, rig, seeded_pg["project"])
+    mid = make_migration_id(plan.project, plan.environment)
+    result = await run_migration(api, settings, plan, migration_id=mid)
+    assert result.outcome is Outcome.SUCCEEDED, f"migration did not succeed: {result}"
+
+    await _coolify_cleanup(api, settings, a, canary=f"bgcm-canary-{mid}-a")
+    async with ssh_to(api, a, settings) as source_host:
+        listed = (await source_host.run("docker volume ls --format '{{.Name}}'")).stdout
+    assert not any(seeded_pg["db_uuid"] in name for name in listed.split()), (
+        "the cleanup kept the source's volume - nothing left to refuse over"
+    )
+
+    with pytest.raises(RollbackError, match="no longer holds its data"):
+        await rollback_migration(api, settings, plan, mid)
+
+    target_uuid = await _database_on(api, seeded_pg["db_name"], b)
+    assert target_uuid, "the refused rollback deleted the target"
+    async with ssh_to(api, b, settings) as target_host:
+        await wait_until_healthy(target_host, target_uuid)
+        kept = await db_exec(target_host, target_uuid, FINGERPRINT)
+    assert kept == seeded_pg["fingerprint"], "the refused rollback touched the target's data"

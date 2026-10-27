@@ -24,10 +24,11 @@ from bg_coolify_migrate.domain.statemachine import (
     STOP_REQUESTED,
     Compensation,
     State,
+    source_copy_unproven,
     source_was_stopped,
 )
 from bg_coolify_migrate.engine import keys
-from bg_coolify_migrate.engine.context import MigrationContext
+from bg_coolify_migrate.engine.context import MigrationContext, deserialise_volume_pairs
 from bg_coolify_migrate.errors import CoolifyApiError
 from bg_coolify_migrate.journal.store import JournalRecord
 
@@ -607,6 +608,72 @@ async def undo_release_source_pins(ctx: MigrationContext, undo_info: dict[str, A
         f"{', '.join(outcome.kept)} still pins the source's volume(s) "
         f"{', '.join(outcome.unmounted)} on {ctx.plan.source_server.name}: nothing mounts "
         f"them yet, so without the pin Coolify's Docker cleanup could delete them. {remedy}"
+    )
+
+
+async def source_data_refusal(ctx: MigrationContext) -> str | None:
+    """Why no rollback may run because the source lost its data, or ``None``. The saga's guard.
+
+    Asked only once FINALIZE began with keep or rename
+    (:func:`statemachine.source_copy_unproven`): before that the source's
+    volumes are pinned and nobody deletes the source. After it, every
+    compensation that follows aims at the TARGET — STOP_TARGET, then
+    DROP_TARGET_VOLUMES, then the delete — and RESTART_SOURCE brings the source
+    up on whatever volumes exist then; docker compose creates a missing one
+    EMPTY (StartPostgresql v4.5.0:252-255, ``external: false``), so postgres
+    runs initdb and the rollback reports ROLLED_BACK over an empty database.
+
+    So it looks first: every source resource must still exist in Coolify, and
+    every source volume the migration copied (DISCOVER's journal) on the source
+    server. Then those volumes are pinned again (``discovery/pins.py``) before
+    anything runs, so Coolify's cleanup cannot take them between this look and
+    the restart; RELEASE_SOURCE_PINS, the last compensation, removes the pin
+    once the restarted source mounts them.
+    """
+    if not source_copy_unproven(ctx.journal.details()):
+        return None
+    lost: list[str] = []
+    for resource in ctx.plan.resources:
+        snapshot = resource.snapshot
+        try:
+            await ctx.api.get_resource(snapshot.collection, snapshot.uuid)
+        except CoolifyApiError as exc:
+            if exc.status_code != 404:
+                return f"the source {snapshot.name} could not be read ({_why(exc)})"
+            lost.append(f"{snapshot.name} (no longer in Coolify)")
+    volumes = _copied_source_volumes(ctx)
+    if volumes:
+        present = {v.name for v in await docker.list_volumes(ctx.source_host)}
+        lost.extend(f"volume {name}" for name in sorted(set(volumes) - present))
+    if lost:
+        return (
+            f"the source no longer holds its data on {ctx.plan.source_server.name}: "
+            + ", ".join(lost)
+            + " - a server that deletes unused volumes pruned them after FINALIZE released "
+            "their pins, or the kept source was deleted by hand. The target then holds the "
+            "only copy, and a rollback would drop it and restart the source on empty volumes"
+        )
+    if volumes:
+        await pins.ensure(
+            ctx.source_host, migration_id=ctx.migration_id, side=pins.SOURCE, volumes=volumes
+        )
+    return None
+
+
+def _copied_source_volumes(ctx: MigrationContext) -> list[str]:
+    """The source volume names DISCOVER paired — or, without its record, the plan's."""
+    pairs = deserialise_volume_pairs(
+        ctx.journal.undo_info(State.DISCOVER.value).get("volume_pairs")
+    )
+    if pairs:
+        return sorted({p.source.name for found in pairs.values() for p in found})
+    return sorted(
+        {
+            item.source_name
+            for resource in ctx.plan.resources
+            for item in resource.manifest.to_migrate
+            if item.source_name
+        }
     )
 
 
