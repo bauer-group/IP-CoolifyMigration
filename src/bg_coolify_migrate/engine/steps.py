@@ -373,7 +373,7 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
     """
     # First, what an interrupted earlier attempt left: its targets, from the
     # journal. A no-op on a fresh run.
-    await _undo_interrupted_attempt(ctx)
+    undone = await _undo_interrupted_attempt(ctx)
     # Before ANY write of this attempt: re-read the locked values the plan
     # promised. A refusal here leaves nothing to undo. The values stay in this
     # frame (env_recovery).
@@ -407,8 +407,11 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
             for r in ctx.plan.resources
         }
         # Whose domain conflicts a claim may override (domains.only_own_holders):
-        # the plan's sources and their sub-applications, then each target made.
-        own: set[str] = set(sources)
+        # the plan's sources and their sub-applications, then each target made —
+        # and an interrupted attempt's targets, just deleted. Until 4.3.11 a
+        # DELETE only queues the job, and the row holds its hosts until the job
+        # has finished its SSH cleanup, so this attempt's claim meets them.
+        own: set[str] = set(sources) | undone
         for full in sources.values():
             own |= api_resources.sub_application_uuids(full)
 
@@ -657,8 +660,16 @@ def _undo_incomplete(
     )
 
 
-async def _undo_interrupted_attempt(ctx: MigrationContext) -> None:
+async def _undo_interrupted_attempt(ctx: MigrationContext) -> frozenset[str]:
     """Undo what an INTERRUPTED earlier attempt of this step left, before starting over.
+
+    Returns the uuids that attempt's resources may still hold domains under —
+    each target and its sub-applications, read before the delete — for the new
+    attempt's own-holder set. On 4.1.2-4.3.10 ``DELETE`` only queues
+    DeleteResourceJob (ApplicationsController/ServicesController
+    ``delete_by_uuid``), whose database rows go only after its SSH cleanup; the
+    new claim's 409 then names them, and a holder outside the set was refused
+    as "held elsewhere". From 4.3.11 the row is soft-deleted first.
 
     A crash, SIGKILL or Ctrl-C inside CREATE never reaches the in-step undo
     (KeyboardInterrupt and CancelledError are BaseException), and the saga
@@ -677,9 +688,11 @@ async def _undo_interrupted_attempt(ctx: MigrationContext) -> None:
     targets: dict[str, str] = earlier.get("target_uuids") or {}
     parked: dict[str, dict[str, Any]] = earlier.get("parked_domains") or {}
     if not targets and not parked:
-        return
+        return frozenset()
     log.warning("create.undoing_interrupted_attempt", targets=len(targets), parked=len(parked))
-    problems = await compensations.undo_partial_create(ctx, targets, parked)
+    # Read BEFORE the delete: a deleted service's sub-applications cannot be listed.
+    holders = await compensations.own_domain_holders(ctx, targets)
+    problems = await compensations.undo_partial_create(ctx, targets, parked, holders=holders)
     if problems:
         raise _undo_incomplete(
             ctx,
@@ -693,6 +706,7 @@ async def _undo_interrupted_attempt(ctx: MigrationContext) -> None:
     )
     for source_uuid in targets:
         ctx.target_uuids.pop(source_uuid, None)
+    return holders
 
 
 async def _assert_compose_target_ready(

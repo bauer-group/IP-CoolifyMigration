@@ -316,6 +316,8 @@ async def undo_partial_create(
     ctx: MigrationContext,
     targets: Mapping[str, str],
     parked: Mapping[str, dict[str, Any]],
+    *,
+    holders: frozenset[str] | None = None,
 ) -> list[str]:
     """Undo what an unfinished CREATE did. Returns what could NOT be undone.
 
@@ -323,11 +325,15 @@ async def undo_partial_create(
     nothing to send — kept for journals of runs that parked (up to 2.9). The
     targets are deleted first, each only while its source holds its hosts
     (:func:`undo_create_target`). The holders are read BEFORE the delete, while
-    a target service's sub-applications can still be listed.
+    a target service's sub-applications can still be listed — or passed in by
+    a caller that read them already.
 
     No restart: CREATE runs before QUIESCE, so the source was never stopped.
     """
-    holders = await own_domain_holders(ctx, targets) if parked else frozenset(targets.values())
+    if holders is None:
+        holders = (
+            await own_domain_holders(ctx, targets) if parked else frozenset(targets.values())
+        )
     problems: list[str] = []
     try:
         await undo_create_target(

@@ -339,6 +339,11 @@ the release it starts in — read that module before adding a rule.
   services pair by compose volume key (`{uuid}_{key}`), like compose apps.
 - **DELETE needs `write` AND `deploy` from 4.5** (rollback deletes targets);
   the token docs say root, or `read:sensitive` + `write` + `deploy`.
+- **Before 4.3.11 a DELETE only queues DeleteResourceJob** (`delete_by_uuid`,
+  v4.1.2-v4.3.10): the row — and every host it holds — lives on until the job's
+  SSH cleanup is done, so a claim seconds later 409s on it. From 4.3.11 the row
+  is soft-deleted first. Hence a resumed CREATE counts the targets it just
+  deleted as its own (`steps._undo_interrupted_attempt` returns them).
 - **Standalone database TLS (`enable_ssl`, `ssl_mode`) is readable in every GET
   and carried by no create/update field and no dedicated route** (v4.1.2-v4.5.0);
   only `POST /databases/{uuid}/clone` (v4.3.0+) copies it, as a whole-row

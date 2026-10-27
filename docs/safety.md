@@ -316,7 +316,8 @@ A crash mid-step is covered too. CREATE journals each target and each restore
 body before it writes them, so `coolify-migrate rollback <id>` also undoes the
 step a run was *inside* when it died, not only the ones it finished; `resume`
 first undoes an interrupted CREATE, then creates afresh — never a second set of
-targets. QUIESCE journals that it asked for a
+targets; the fresh targets may take their domains from the deleted ones, which
+Coolify before 4.3.11 still lists until its delete job has finished. QUIESCE journals that it asked for a
 stop *before* asking: from then on the source is restarted on rollback even if
 QUIESCE never completed (a SIGKILLed data holder, a stop gate that timed out),
 and a crash before that request leaves a running source alone.

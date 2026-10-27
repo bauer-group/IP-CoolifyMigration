@@ -401,6 +401,46 @@ class TestResumeAfterACrash:
         assert info["target_uuids"] == {"app1": "appNew"}
         assert info["parked_domains"] == {"app1": {"domains": SHOP}}
 
+    async def test_the_claim_forces_over_the_deleted_target_coolify_still_lists(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        # Until 4.3.11 DELETE only queues the job, and the old target's row holds
+        # the host until the job's SSH cleanup is done: the new claim's 409 names
+        # it. It is ours — refusing it as "held elsewhere" failed the resume.
+        _interrupted(ctx, target="appOld")
+        ctx.target_uuids["app1"] = "appOld"
+        bodies: list[dict[str, Any]] = []
+        conflict = {
+            "conflicts": [
+                {"resource_uuid": uuid, "domain": "shop.example.com", "resource_name": "shop",
+                 "resource_type": "application"}
+                for uuid in ("app1", "appOld")
+            ]
+        }
+
+        def patch(request: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(request.read()))
+            if len(bodies) == 1:
+                return httpx.Response(409, json=conflict)
+            return httpx.Response(200, json={})
+
+        _mock_create(respx_mock, create=[httpx.Response(201, json={"uuid": "appNew"})])
+        respx_mock.get(f"{BASE}/applications/app1/envs").mock(
+            return_value=httpx.Response(200, json=[])
+        )
+        respx_mock.patch(f"{BASE}/applications/appNew").mock(side_effect=patch)
+        respx_mock.get(f"{BASE}/applications/appNew").mock(
+            return_value=httpx.Response(200, json={"uuid": "appNew", "fqdn": SHOP})
+        )
+        respx_mock.delete(f"{BASE}/applications/appOld").mock(
+            return_value=httpx.Response(200, json={"message": "deletion request queued"})
+        )
+
+        result = await steps.step_create_target(ctx)
+
+        assert bodies == [{"domains": SHOP}, {"domains": SHOP, "force_domain_override": True}]
+        assert result == {"target_uuids": {"app1": "appNew"}}
+
     async def test_a_resume_whose_undo_fails_creates_nothing(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
