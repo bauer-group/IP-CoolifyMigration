@@ -376,6 +376,21 @@ confirmed finalize. Inspect with:
 coolify-migrate status <id>
 ```
 
+### "creating the target failed, and undoing it did not complete"
+
+CREATE failed before anything was stopped, then could not fully undo itself —
+a target is left on the new server, or the source's domains are still parked.
+The source never stopped and is still serving. Fix what the message names (often
+the same outage that failed the create), then let the tool finish the undo:
+
+```bash
+coolify-migrate rollback <id>
+```
+
+`resume` refuses this journal on purpose; `rollback` retries exactly the
+unfinished undo, and running it again is safe — a target already gone counts as
+deleted.
+
 ### `domains NOT restored: shop -> https://shop.example.com (...)`
 
 The rollback could not give the source its own domains back. Everything else

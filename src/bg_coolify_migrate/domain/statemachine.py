@@ -284,6 +284,36 @@ def rollback_plan(completed: Sequence[State]) -> tuple[RollbackStep, ...]:
     )
 
 
+def owed_states(
+    completed: Sequence[str],
+    *,
+    in_flight: str | None = None,
+    undo_incomplete: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """The F1 states whose compensations a rollback owes.
+
+    Completed states, always. The explicit ``rollback`` command also passes:
+
+    * ``in_flight`` — the state a crashed run was inside. Its step journals what
+      it did as it goes (CREATE records each target and each restore body before
+      the write), so its compensations find exactly that partial work and are
+      no-ops where there is none. Planning from completions alone left a crash
+      mid-CREATE with its targets and parked domains in place, reported as
+      ROLLED_BACK.
+    * ``undo_incomplete`` — states whose in-step undo failed part-way, so the
+      command can finish what the step could not.
+
+    QUIESCE is never owed merely for being in flight or flagged: a crash before
+    the stop request leaves the source running, and restarting it then would be
+    an outage this tool caused.
+    """
+    owed = dict.fromkeys(str(s) for s in completed)
+    for state in (in_flight, *undo_incomplete):
+        if state and str(state) != State.QUIESCE.value:
+            owed.setdefault(str(state))
+    return tuple(owed)
+
+
 def requires_source_restart(completed: Sequence[State]) -> bool:
     """True if a rollback must restart the source because we stopped it."""
     return _STOPS_SOURCE in set(completed)

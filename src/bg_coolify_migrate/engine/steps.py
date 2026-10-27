@@ -61,6 +61,7 @@ from bg_coolify_migrate.errors import (
     PreflightError,
     QuiesceError,
     RebuildDriftBlocked,
+    RollbackError,
     TransferError,
     VerificationError,
 )
@@ -352,8 +353,12 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
     Runs BEFORE quiesce: a failed create then costs zero downtime, and the target
     must exist before volumes can be paired by mount path.
     """
-    # Before ANY write: re-read the locked values the plan promised. A refusal
-    # here leaves nothing to undo. The values stay in this frame (env_recovery).
+    # First, what an interrupted earlier attempt left: its targets and parked
+    # domains, from the journal. A no-op on a fresh run.
+    await _undo_interrupted_attempt(ctx)
+    # Before ANY write of this attempt: re-read the locked values the plan
+    # promised. A refusal here leaves nothing to undo. The values stay in this
+    # frame (env_recovery).
     recovered = await env_recovery.recover_for_create(ctx.api, ctx.source_host, ctx.plan.resources)
     project_uuid = await api_resources.ensure_project(ctx.api, ctx.plan.project)
     await api_resources.ensure_environment(ctx.api, project_uuid, ctx.plan.environment)
@@ -475,15 +480,17 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                 target_uuid=target_uuid,
                 engine=snapshot.engine,
             )
-    except Exception:
+    except Exception as exc:
         # The saga compensates only COMPLETED steps, so a refusal part-way
         # through CREATE — the compose gate, the service rehearsal, a 422 on
         # the third of five resources — would strand the targets already made
         # and leave the source's domains parked in Coolify's DB, where its next
         # redeploy would serve only old-<tag> hosts. Undo exactly what this
-        # step did, then let the original error speak.
-        for problem in await compensations.undo_partial_create(ctx, created, parked):
-            log.error("create.undo_failed", error=problem[:200])
+        # step did, then let the original error speak — unless the undo itself
+        # failed, which must not be reported as a plain failed create.
+        problems = await compensations.undo_partial_create(ctx, created, parked)
+        if problems:
+            raise _undo_incomplete(ctx, problems, cause=exc) from exc
         raise
 
     return {"target_uuids": created}
@@ -518,6 +525,66 @@ async def _refuse_multi_server(
             "the servers are removed."
         ),
     )
+
+
+def _undo_incomplete(
+    ctx: MigrationContext, problems: list[str], *, cause: Exception
+) -> RollbackError:
+    """Flag CREATE's undo as unfinished, so ``rollback <id>`` can finish it.
+
+    The run ends ROLLBACK_FAILED (exit 8), and its journal is then finished, so
+    resume refuses it — the explicit rollback, which owes ``undo_incomplete``
+    states, is the way to retry. The source was never stopped.
+    """
+    ctx.journal.append("step_started", state="create_target", detail={"undo_incomplete": True})
+    return RollbackError(
+        "creating the target failed, and undoing it did not complete: " + "; ".join(problems),
+        hint=(
+            "The source was never stopped and is still serving.\n"
+            f"The create failed with: {cause}\n"
+            f"Fix what is named above, then finish the undo: "
+            f"coolify-migrate rollback {ctx.migration_id}\n"
+            f"Journal: {ctx.journal.path}"
+        ),
+    )
+
+
+async def _undo_interrupted_attempt(ctx: MigrationContext) -> None:
+    """Undo what an INTERRUPTED earlier attempt of this step left, before starting over.
+
+    A crash, SIGKILL or Ctrl-C inside CREATE never reaches the in-step undo
+    (KeyboardInterrupt and CancelledError are BaseException), and the saga
+    compensates only completed steps. But the journal holds everything that
+    attempt did — each target and each restore body, written before the write.
+    A resume that ignored it created a second set of targets and parked the
+    already-parked hosts again (``old-<tag>.old-<tag>.<host>``), journalling the
+    PARKED host as the one to restore, so the real domain was then in no record
+    at all.
+
+    So: delete those targets, give the source its domains back, then record that
+    this step owns nothing yet, and let the step create afresh. A no-op on a
+    fresh run, whose journal holds no records for CREATE.
+    """
+    earlier = ctx.journal.undo_info(State.CREATE_TARGET.value)
+    targets: dict[str, str] = earlier.get("target_uuids") or {}
+    parked: dict[str, dict[str, Any]] = earlier.get("parked_domains") or {}
+    if not targets and not parked:
+        return
+    log.warning("create.undoing_interrupted_attempt", targets=len(targets), parked=len(parked))
+    problems = await compensations.undo_partial_create(ctx, targets, parked)
+    if problems:
+        raise _undo_incomplete(
+            ctx,
+            problems,
+            cause=RuntimeError("an earlier attempt of this step was interrupted"),
+        )
+    ctx.journal.append(
+        "step_started",
+        state=State.CREATE_TARGET.value,
+        detail={"target_uuids": {}, "parked_domains": {}, "undo_incomplete": False},
+    )
+    for source_uuid in targets:
+        ctx.target_uuids.pop(source_uuid, None)
 
 
 async def _park_source_domains(

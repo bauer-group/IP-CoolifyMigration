@@ -257,6 +257,13 @@ is a target this migration created — never a third party's resource.
 is the one thing Geczy's script gets right, and it is the backbone of the whole
 safety story.
 
+A crash mid-step is covered too. CREATE journals each target and each restore
+body before it writes them, so `coolify-migrate rollback <id>` also undoes the
+step a run was *inside* when it died, not only the ones it finished; `resume`
+first undoes an interrupted CREATE, then creates afresh — never a second set of
+targets, never a parked host parked again. QUIESCE is the exception: a crash
+before its stop request left the source running, so it is not restarted.
+
 If a compensation itself fails, the remaining ones still run — a failure to
 delete the target must not also prevent restarting the source — and the run exits
 `8` naming what is broken and where the journal is. A domain restore that fails

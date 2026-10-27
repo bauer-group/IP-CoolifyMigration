@@ -256,6 +256,37 @@ class Journal:
             if r.event == "step_completed" and r.state is not None
         ]
 
+    def in_flight_state(self) -> str | None:
+        """The state a run was INSIDE when it stopped, or ``None``.
+
+        The last ``step_started`` that never reached ``step_completed``,
+        ``step_failed`` or ``blocked``. A crash, SIGKILL or Ctrl-C mid-step leaves
+        exactly this — the step's own records of what it had done, and no ending —
+        and ``completed_states`` alone never sees it, so a rollback planned from
+        completions would leave that partial work behind.
+        """
+        current: str | None = None
+        for record in self.read():
+            if record.event == "step_started" and record.state is not None:
+                current = record.state
+            elif record.event in ("step_completed", "step_failed", "blocked") and (
+                record.state == current
+            ):
+                current = None
+        return current
+
+    def undo_incomplete_states(self) -> list[str]:
+        """States whose own in-step undo did not finish (``undo_incomplete``).
+
+        The latest record wins, so a later successful undo that writes
+        ``undo_incomplete: False`` clears the flag.
+        """
+        flags: dict[str, bool] = {}
+        for record in self.read():
+            if record.state is not None and "undo_incomplete" in record.detail:
+                flags[record.state] = bool(record.detail["undo_incomplete"])
+        return [state for state, flagged in flags.items() if flagged]
+
     def last_event(self) -> JournalRecord | None:
         last: JournalRecord | None = None
         for record in self.read():

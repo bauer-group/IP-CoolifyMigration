@@ -52,6 +52,12 @@ async def undo_create_target(ctx: MigrationContext, undo_info: dict[str, Any]) -
             await ctx.api.delete_resource(collection, target_uuid, delete_volumes=True)
             log.info("compensate.target_deleted", uuid=target_uuid)
         except Exception as exc:
+            if isinstance(exc, CoolifyApiError) and exc.status_code == 404:
+                # Already gone: a re-run rollback, an in-step undo that got this
+                # far before, or a retried DELETE whose first attempt landed.
+                # Counting it as a failure meant a rollback could never converge.
+                log.info("compensate.target_already_gone", uuid=target_uuid)
+                continue
             delete_failures.append(target_uuid)
             log.error("compensate.target_delete_failed", uuid=target_uuid, error=str(exc)[:200])
         if collection == "databases":

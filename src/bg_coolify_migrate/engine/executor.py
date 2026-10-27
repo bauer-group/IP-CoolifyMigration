@@ -36,6 +36,7 @@ from bg_coolify_migrate.domain.statemachine import (
     ORDER,
     Compensation,
     Outcome,
+    owed_states,
     rollback_plan_for,
 )
 from bg_coolify_migrate.errors import (
@@ -124,6 +125,7 @@ class Saga:
         order: Sequence[Any] | None = None,
         compensation_map: Mapping[Any, tuple[Compensation, ...]] | None = None,
         precedence: Mapping[Any, Any] | None = None,
+        owed: Callable[..., Sequence[str]] | None = None,
     ) -> None:
         self.journal = journal
         self.context = context
@@ -138,6 +140,9 @@ class Saga:
         f1 = compensation_map is None
         raw_precedence = precedence if precedence is not None else (F1_PRECEDENCE if f1 else {})
         self._precedence = {str(k): str(v) for k, v in raw_precedence.items()}
+        # Which states a rollback owes beyond the completed ones (domain rule).
+        # None: completions only, which is all F2 has ever planned from.
+        self._owed_rule = owed if owed is not None else (owed_states if f1 else None)
         self._keys = [str(s) for s in self._order]
         self._terminal = self._keys[-1]
         self._completed: list[str] = []
@@ -202,17 +207,46 @@ class Saga:
         return RunResult(outcome=Outcome.SUCCEEDED, reached=self._order[-1])
 
     async def rollback(self) -> RunResult:
-        """Roll back a previously-failed or blocked run."""
-        self._completed = _states_from_journal(self.journal, set(self._keys))
-        return await self._rollback(self._order[0], None)
+        """Roll back a previously-failed, blocked or interrupted run.
 
-    async def _rollback(self, failed_at: Any, error: MigrationError | None) -> RunResult:
-        plan = rollback_plan_for(
+        Unlike the rollback a failing run performs on itself, this one also owes
+        the state a crashed run was inside and any step whose own undo did not
+        finish — see ``statemachine.owed_states``. Nothing else can clean those
+        up: resume refuses a finished journal, and the run never completed them.
+        """
+        self._completed = _states_from_journal(self.journal, set(self._keys))
+        return await self._rollback(self._order[0], None, explicit=True)
+
+    def _owed(self, *, explicit: bool) -> list[str]:
+        if self._owed_rule is None:
+            return list(self._completed)
+        known = set(self._keys)
+        in_flight = self.journal.in_flight_state() if explicit else None
+        incomplete = self.journal.undo_incomplete_states() if explicit else []
+        owed = self._owed_rule(
             self._completed,
+            in_flight=in_flight if in_flight in known else None,
+            undo_incomplete=[s for s in incomplete if s in known],
+        )
+        return [str(s) for s in owed]
+
+    async def _rollback(
+        self, failed_at: Any, error: MigrationError | None, *, explicit: bool = False
+    ) -> RunResult:
+        plan = rollback_plan_for(
+            self._owed(explicit=explicit),
             order=self._keys,
             compensation_map=self._compensation_map,
             precedence=self._precedence,
         )
+        if not plan and isinstance(error, RollbackError):
+            # A step undid its own partial work, and that undo failed (CREATE
+            # does this). Nothing completed, so nothing is planned — but a target
+            # or a parked domain may be left behind, which is not "FAILED,
+            # nothing changed". The step journalled undo_incomplete, so the
+            # explicit rollback command can finish the job.
+            self.journal.append("rolled_back", detail={"steps": 0, "ok": False})
+            return RunResult(outcome=Outcome.ROLLBACK_FAILED, reached=failed_at, error=error)
         if not plan:
             self.journal.append("rolled_back", detail={"steps": 0})
             return RunResult(

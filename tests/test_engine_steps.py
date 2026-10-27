@@ -926,6 +926,11 @@ class TestCreateTarget:
         respx_mock.get(f"{BASE}/applications/tgt1").mock(
             return_value=httpx.Response(200, json={"uuid": "tgt1", "docker_compose_raw": None})
         )
+        # The in-step undo deletes the target; a failed undo would (rightly) turn
+        # this into a RollbackError instead of the refusal under test.
+        respx_mock.delete(url__startswith=f"{BASE}/applications/tgt1").mock(
+            return_value=httpx.Response(200, json={"message": "queued"})
+        )
 
         with pytest.raises(TransferError, match="never loaded its compose") as exc_info:
             await steps.step_create_target(ctx)
