@@ -308,6 +308,17 @@ the important one — it means ownership changed, which is exactly what stops a
 database from starting, and exactly what a content-only checksum would have
 missed.
 
+## "DISCOVER paired volumes for X, but this run holds no pairs" (exit 6)
+
+COPY or VERIFY found DISCOVER's volume pairs in the journal but not in the
+running process. Proceeding would have copied or verified nothing and still
+reported success, so the run stops and rolls back: the source is restarted and
+the target deleted.
+
+A resume rebuilds the pairs from the journal, so this should not happen. If it
+does, please report it with the journal (`coolify-migrate status <id>`), then
+start a fresh run.
+
 ## Rollback failed (exit 8)
 
 A compensating action could not run, so the system is in a state only you can

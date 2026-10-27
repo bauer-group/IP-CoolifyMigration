@@ -44,10 +44,10 @@ from bg_coolify_migrate.domain.naming import (
     pair_by_name_suffix,
 )
 from bg_coolify_migrate.domain.plan import ResourcePlan, ResourceSnapshot
-from bg_coolify_migrate.domain.statemachine import FinalizePolicy
+from bg_coolify_migrate.domain.statemachine import FinalizePolicy, State
 from bg_coolify_migrate.domain.versions import parse_version
 from bg_coolify_migrate.engine import compensations, env_recovery, keys
-from bg_coolify_migrate.engine.context import MigrationContext, serialise_mounts
+from bg_coolify_migrate.engine.context import MigrationContext, is_volume_row, serialise_mounts
 from bg_coolify_migrate.engine.planner import (
     build_manifest,
     inspect_all_mounts,
@@ -1392,8 +1392,56 @@ def _transfer_endpoint(ctx: MigrationContext) -> tuple[str, int, str | None]:
     return ctx.plan.target_server.ip, ctx.plan.target_server.port, identity
 
 
+def _pairs_not_loaded(recorded: object, loaded: dict[str, list[VolumePair]]) -> list[str]:
+    """Resource uuids DISCOVER paired volumes for, but this run holds none for. PURE.
+
+    Bind-mount rows do not count: DISCOVER journals them beside the pairs, and
+    they never become a :class:`VolumePair`.
+    """
+    if not isinstance(recorded, dict):
+        return []
+    return sorted(
+        str(uuid)
+        for uuid, rows in recorded.items()
+        if isinstance(rows, list)
+        and any(is_volume_row(row) for row in rows)
+        and not loaded.get(str(uuid))
+    )
+
+
+def _assert_pairs_loaded(ctx: MigrationContext, *, step: str) -> None:
+    """Refuse a COPY or VERIFY that would do nothing because the pairs went missing.
+
+    Both steps iterate ``ctx.volume_pairs`` and take an empty one as "nothing
+    to move" — correct for a stateless stack, and indistinguishable from a
+    context that lost them. A resumed run did lose them until the runner learnt
+    to rehydrate them from the journal: COPY copied nothing, VERIFY verified
+    nothing, and the target started on empty volumes. The journal is the one
+    witness that can tell the two apart, so ask it.
+    """
+    if State.DISCOVER.value not in ctx.journal.completed_states():
+        return
+    missing = _pairs_not_loaded(
+        ctx.journal.undo_info(State.DISCOVER.value).get("volume_pairs"), ctx.volume_pairs
+    )
+    if not missing:
+        return
+    names = {r.snapshot.uuid: r.snapshot.name for r in ctx.plan.resources}
+    raise TransferError(
+        f"{step}: DISCOVER paired volumes for {', '.join(names.get(u, u) for u in missing)}, "
+        "but this run holds no pairs for them",
+        hint=(
+            "Proceeding would copy or verify nothing and still report success. The "
+            "journal recorded the pairs; this process did not load them - please "
+            "report it.\n"
+            "The source will be restarted and the target deleted."
+        ),
+    )
+
+
 async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
     """Mirror every volume, byte for byte, in parallel where it is safe."""
+    _assert_pairs_loaded(ctx, step="copy")
     # A stateless / rebuilt resource has no volume pairs. Skip the ephemeral-key
     # setup and the restart re-check entirely: there is nothing to copy, and doing
     # the work anyway only adds a way for a no-data migration to fail spuriously.
@@ -1511,6 +1559,7 @@ async def _copy_one(ctx: MigrationContext, source_path: str, target_path: str) -
 
 async def step_verify(ctx: MigrationContext) -> dict[str, Any]:
     """Content AND metadata, both sides. A content-only check cannot see a chown."""
+    _assert_pairs_loaded(ctx, step="verify")
     total_diffs = 0
     verified: list[str] = []
 
@@ -1949,8 +1998,6 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
 
 
 def build_steps() -> dict[Any, Any]:
-    from bg_coolify_migrate.domain.statemachine import State
-
     return {
         State.INIT: step_init,
         State.PREFLIGHT: step_preflight,

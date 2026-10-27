@@ -12,11 +12,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.domain.manifest import DockerMount
-from bg_coolify_migrate.domain.naming import VolumePair
+from bg_coolify_migrate.domain.naming import VolumeEndpoint, VolumePair
 from bg_coolify_migrate.domain.plan import MigrationPlan
 from bg_coolify_migrate.journal.store import Journal
 from bg_coolify_migrate.settings.base import Settings
@@ -157,4 +157,60 @@ def deserialise_mounts(raw: object) -> dict[str, list[DockerMount]]:
                 f"journal: pre_stop_mounts[{uuid!r}] is {type(items).__name__}, not a list"
             )
         out[str(uuid)] = [DockerMount.model_validate(item) for item in items]
+    return out
+
+
+def is_volume_row(row: object) -> TypeGuard[dict[str, Any]]:
+    """Is this journalled DISCOVER row a docker volume pair? PURE.
+
+    DISCOVER journals two shapes under ``volume_pairs``: real pairs, whose
+    ``source`` is a volume NAME, and bind mounts, mirrored path-to-path, whose
+    ``source`` is an absolute host path. Only the first become a
+    :class:`VolumePair`; COPY and VERIFY iterate nothing else.
+    """
+    if not isinstance(row, dict):
+        return False
+    source = row.get("source")
+    return isinstance(source, str) and bool(source) and not source.startswith("/")
+
+
+def deserialise_volume_pairs(raw: object) -> dict[str, list[VolumePair]]:
+    """DISCOVER's journalled pairs, rebuilt for a resumed run. PURE.
+
+    The context dies with the process; this record does not. A resume after a
+    crash inside COPY or VERIFY skips the completed DISCOVER, so without it
+    ``ctx.volume_pairs`` is empty and both steps iterate nothing: COPY copies
+    nothing, VERIFY verifies nothing, START runs on empty target volumes, and a
+    DELETE finalize then removes the only intact copy. Each step's "nothing to
+    do" is a legitimate answer for a stateless stack, so neither can tell.
+
+    Same contract as :func:`deserialise_mounts`: absent gives {}, corrupt
+    raises, because a dropped row reads as "this volume needs no copy". The
+    target endpoint gets the source's mount path: DISCOVER records one, and a
+    pair's paths derive from the volume NAMES alone (:attr:`VolumePair.target_path`).
+    """
+    if not isinstance(raw, dict):
+        return {}
+
+    out: dict[str, list[VolumePair]] = {}
+    for uuid, rows in raw.items():
+        if not isinstance(rows, list):
+            raise ValueError(
+                f"journal: volume_pairs[{uuid!r}] is {type(rows).__name__}, not a list"
+            )
+        pairs: list[VolumePair] = []
+        for row in rows:
+            if not is_volume_row(row):
+                continue  # a bind mount: mirrored path-to-path, never a volume pair
+            target = row.get("target")
+            if not isinstance(target, str) or not target:
+                raise ValueError(f"journal: volume_pairs[{uuid!r}] has a row without a target")
+            mount_path = str(row.get("mount_path") or "")
+            pairs.append(
+                VolumePair(
+                    source=VolumeEndpoint(name=row["source"], mount_path=mount_path),
+                    target=VolumeEndpoint(name=target, mount_path=mount_path),
+                )
+            )
+        out[str(uuid)] = pairs
     return out

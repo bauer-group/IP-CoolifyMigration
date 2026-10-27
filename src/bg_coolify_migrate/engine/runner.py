@@ -18,7 +18,11 @@ from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.domain.plan import MigrationPlan, ServerRef, TransferMode
 from bg_coolify_migrate.domain.statemachine import State
 from bg_coolify_migrate.engine.compensations import build_compensations
-from bg_coolify_migrate.engine.context import MigrationContext, deserialise_mounts
+from bg_coolify_migrate.engine.context import (
+    MigrationContext,
+    deserialise_mounts,
+    deserialise_volume_pairs,
+)
 from bg_coolify_migrate.engine.executor import RunResult, Saga
 from bg_coolify_migrate.engine.steps import build_steps
 from bg_coolify_migrate.errors import MigrationError
@@ -308,6 +312,11 @@ async def resume_migration(
         # removed by the stop, so the journal is the only copy left.
         ctx.pre_stop_mounts.update(
             deserialise_mounts(journal.undo_info(State.QUIESCE.value).get("pre_stop_mounts"))
+        )
+        # Without this a resume past DISCOVER copies and verifies nothing: both
+        # steps iterate ctx.volume_pairs, and DISCOVER is skipped as completed.
+        ctx.volume_pairs.update(
+            deserialise_volume_pairs(journal.undo_info(State.DISCOVER.value).get("volume_pairs"))
         )
 
         result = await _execute(ctx, start_from=State.INIT, on_state=on_state)
