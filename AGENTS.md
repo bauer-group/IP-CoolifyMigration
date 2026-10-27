@@ -505,6 +505,14 @@ the release it starts in — read that module before adding a rule.
   DELETE_TARGET_RESOURCE, RELEASE_SOURCE_PINS. It waits for the restarted source
   to mount its volumes, so nothing may wait behind it; the domain restore runs
   before the restart (`/restart` bakes the labels at job time).
+- **`rollback <id>` again replays EVERY compensation** (completed states never
+  leave the journal), and several messages ask for it (a KEPT target, a failed
+  restart). RESTART_SOURCE is therefore once per stop and per resource
+  (`compensations._restarted_since_stop`, a `restarted` uuid journalled per
+  restart): `/restart` is `docker rm -f` plus start for a database and a
+  redeploy for an image app, and the source is serving since the first one.
+  A remedy that has the operator start the source by hand must not lead into a
+  rollback that still owes its restart (the kept-pin notice says `docker rm`).
 - **The plan reads the setting off `GET /servers/{uuid}`**, whose eager-loaded
   `settings` carry `delete_unused_volumes`, `docker_cleanup_frequency`,
   `force_docker_cleanup` and `docker_cleanup_threshold` at every release

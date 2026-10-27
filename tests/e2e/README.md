@@ -160,6 +160,9 @@ typo away from silently copying nothing.
   once after a `rename` finalize — and assert the RESTARTED container routes
   `Host(<domain>)` and carries no `old-<tag>.` host. They confirm on
   4.5.0 what the respx call-order test locks: domains restored before restart.
+  A second `rollback <id>` after the mid-run one must leave the serving source
+  container alone: it replays every compensation but never a restart already
+  done.
 - `test_cleanup_guard.py` — runs **Coolify's own Docker cleanup** with the volume
   prune forced on (`POST /servers/{uuid}/docker-cleanup/run`, 4.3.0+) on both
   servers at the widest window — source stopped, target filled, nothing mounts

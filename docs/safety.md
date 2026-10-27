@@ -172,7 +172,13 @@ A pin is released when Coolify's own containers reference the data again:
 - **Source, rollback**, as the very last step, once the restarted source mounts
   its volumes again. If it does not within `DEPLOY_TIMEOUT`, or the source was
   never restarted, the pin stays and the report says so: once the source runs,
-  `coolify-migrate rollback <id>` again removes it.
+  `docker rm <pin>` there removes it.
+
+A rollback can be run again — the report asks for it when a target had to be
+kept or a restart failed — and every compensation is then replayed. The source
+restart is not: each resource is restarted at most once per stop (journalled
+per resource), because `/restart` is a full stop and start and the source has
+been serving since the first rollback. A restart that failed is retried.
 
 The tool never changes the server's cleanup setting: a crash would leave it
 changed, and a manual run overrides it anyway.

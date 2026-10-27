@@ -278,6 +278,34 @@ class TestRollbackOrderAgainstTheApi:
         assert "rollback m1" in failed[Compensation.DELETE_TARGET_RESOURCE]
         assert Compensation.RESTART_SOURCE in result.compensations_run
 
+    async def test_the_rerun_the_kept_target_asks_for_does_not_restart_the_source_again(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        # The KEPT message sends the operator to `rollback <id>` again. Every
+        # compensation is replayed then; a second /restart of the source that is
+        # serving since the first rollback was a second outage.
+        _journal_create(ctx)
+        ctx.journal.append("step_completed", state="quiesce", detail={})
+        calls = Calls()
+        row = SourceRow(calls, fqdn="")
+        _source(respx_mock, calls, row, httpx.Response(422, json={"message": "Validation failed."}))
+        restart = respx_mock.post(f"{BASE}/applications/app1/restart").mock(
+            side_effect=calls.mark("restart")
+        )
+        delete = respx_mock.delete(f"{BASE}/applications/appT").mock(
+            side_effect=calls.mark("delete")
+        )
+
+        first = await _rollback(ctx)
+        assert first.outcome is Outcome.ROLLBACK_FAILED and not delete.called
+        row.state["fqdn"] = SHOP  # the operator gives the source its domain back
+
+        second = await _rollback(ctx)
+
+        assert second.outcome is Outcome.ROLLED_BACK
+        assert restart.call_count == 1
+        assert delete.called
+
     async def test_rollback_after_finalize_rename_restores_released_domains_before_restart(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
@@ -859,3 +887,51 @@ class TestFinalizeReleasesLast:
 
         assert result["domains_released"] == []
         assert [c.request.method for c in respx_mock.calls] == ["DELETE"]
+
+
+class TestRestartOncePerStop:
+    """A rollback replayed by `rollback <id>` never restarts a serving source again."""
+
+    async def test_a_restart_that_landed_is_not_repeated_and_one_that_failed_is(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        ctx.plan = _plan(_snapshot("app1"), _snapshot("app2", name="api"))
+        ctx.journal.append("step_started", state="quiesce", detail={"stop_requested": True})
+        first = respx_mock.post(f"{BASE}/applications/app1/restart").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        second = respx_mock.post(f"{BASE}/applications/app2/restart").mock(
+            side_effect=[httpx.Response(500), httpx.Response(200, json={})]
+        )
+
+        with pytest.raises(RuntimeError, match=r"could not restart: api") as exc:
+            await compensations.undo_quiesce(ctx, {})
+        assert "retries only these" in str(exc.value)
+        await compensations.undo_quiesce(ctx, {})
+
+        assert first.call_count == 1
+        assert second.call_count == 2
+        await compensations.undo_quiesce(ctx, {})
+        assert (first.call_count, second.call_count) == (1, 2)
+
+    async def test_a_new_stop_request_owes_a_new_restart(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        restart = respx_mock.post(f"{BASE}/applications/app1/restart").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        ctx.journal.append("step_started", state="quiesce", detail={"stop_requested": True})
+        await compensations.undo_quiesce(ctx, {})
+        ctx.journal.append("step_started", state="quiesce", detail={"stop_requested": True})
+        await compensations.undo_quiesce(ctx, {})
+        assert restart.call_count == 2
+
+    async def test_the_bookkeeping_is_no_fact_about_quiesce(self, ctx: MigrationContext) -> None:
+        # rollback_step records stay out of the step's merged detail
+        # (Journal.undo_info), so QUIESCE's markers read as before.
+        ctx.journal.append(
+            "rollback_step",
+            state="quiesce",
+            detail={"compensation": "restart_source", "restarted": "app1"},
+        )
+        assert ctx.journal.undo_info("quiesce") == {}

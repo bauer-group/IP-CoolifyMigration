@@ -291,9 +291,11 @@ A run or a rollback ended with a pin it deliberately did not remove:
 - **after a rollback**, the restarted source did not mount its volumes within
   `DEPLOY_TIMEOUT` — or its restart failed. Removing the pin then would let
   Coolify's next cleanup delete the
-  source's data on a server with *Delete unused volumes* on. Get the source
-  running, then `coolify-migrate rollback <id>` again: it removes the pin once
-  the volumes are mounted.
+  source's data on a server with *Delete unused volumes* on. If the restart
+  failed, `coolify-migrate rollback <id>` again retries it and then removes the
+  pin. If you start the source yourself, remove the pin with `docker rm <pin>`
+  once it runs instead — a rollback would restart it once more. A source that a
+  rollback already restarted is never restarted again by a second one.
 - **after a finalize**, a copied target volume is mounted by no target
   container. Check the resource's storages in Coolify; once something mounts the
   volume, `docker rm <pin>` on the target removes the pin.

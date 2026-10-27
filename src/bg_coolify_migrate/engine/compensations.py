@@ -20,7 +20,12 @@ import structlog
 from bg_coolify_migrate.api import resources as api_resources
 from bg_coolify_migrate.discovery import docker, pins
 from bg_coolify_migrate.domain import domains
-from bg_coolify_migrate.domain.statemachine import Compensation, State, source_was_stopped
+from bg_coolify_migrate.domain.statemachine import (
+    STOP_REQUESTED,
+    Compensation,
+    State,
+    source_was_stopped,
+)
 from bg_coolify_migrate.engine import keys
 from bg_coolify_migrate.engine.context import MigrationContext
 from bg_coolify_migrate.errors import CoolifyApiError
@@ -94,7 +99,8 @@ async def undo_create_target(ctx: MigrationContext, undo_info: dict[str, Any]) -
             + "; ".join(kept)
             + f" - give the source its domains back, then `coolify-migrate rollback "
             f"{ctx.migration_id}` deletes them (deleting the last holder would let "
-            "Coolify delete a DNS record it manages)"
+            "Coolify delete a DNS record it manages; a source this rollback restarted "
+            "is not restarted again)"
         )
     if delete_failures:
         # Surfaced so the rollback reports honestly.
@@ -369,9 +375,21 @@ async def undo_quiesce(ctx: MigrationContext, undo_info: dict[str, Any]) -> None
     """Restart the source. The single most important compensation.
 
     Everything else is cleanup; this is the one that ends the outage.
+
+    Once per stop, per resource: a resource an earlier rollback of this journal
+    already restarted (:func:`_restarted_since_stop`) is serving again, and
+    ``/restart`` is a full stop and start — ``docker rm -f`` for a database, a
+    redeploy for an image-built app. Every compensation is replayed when the
+    operator runs ``rollback <id>`` again (a KEPT target, a kept pin, a failed
+    restore), so without this the tool's own remedy took production down twice.
+    A restart that failed is not recorded and is tried again.
     """
+    already = _restarted_since_stop(ctx.journal.read())
     failures: list[str] = []
     for resource in ctx.plan.resources:
+        if resource.snapshot.uuid in already:
+            log.info("compensate.source_already_restarted", name=resource.snapshot.name)
+            continue
         try:
             # restart, NOT start. QUIESCE removed the container (docker rm -f),
             # but Coolify's status column lags and can still read "running", and
@@ -381,6 +399,14 @@ async def undo_quiesce(ctx: MigrationContext, undo_info: dict[str, Any]) -> None
             # never rolled back, so it never hit this.
             await ctx.api.restart(resource.snapshot.collection, resource.snapshot.uuid)
             log.info("compensate.source_restarted", name=resource.snapshot.name)
+            ctx.journal.append(
+                "rollback_step",
+                state=State.QUIESCE.value,
+                detail={
+                    "compensation": Compensation.RESTART_SOURCE.value,
+                    "restarted": resource.snapshot.uuid,
+                },
+            )
         except Exception as exc:
             failures.append(f"{resource.snapshot.name}: {exc}")
             log.error(
@@ -394,8 +420,33 @@ async def undo_quiesce(ctx: MigrationContext, undo_info: dict[str, Any]) -> None
         raise RuntimeError(
             "could not restart: "
             + "; ".join(failures)
-            + " (its volume pins against Coolify's Docker cleanup stay until it runs again)"
+            + " (its volume pins against Coolify's Docker cleanup stay until it runs again; "
+            f"`coolify-migrate rollback {ctx.migration_id}` retries only these)"
         )
+
+
+def _restarted_since_stop(records: Iterable[JournalRecord]) -> set[str]:
+    """The source uuids a rollback restarted after this run's last stop request. PURE.
+
+    QUIESCE journals ``stop_requested`` before it asks Coolify to stop anything,
+    so a restart recorded after it ended that stop; one recorded before it
+    belongs to a stop since superseded.
+    """
+    restarted: set[str] = set()
+    for record in records:
+        if (
+            record.event == "step_started"
+            and record.state == State.QUIESCE.value
+            and record.detail.get(STOP_REQUESTED) is True
+        ):
+            restarted.clear()
+        elif (
+            record.event == "rollback_step"
+            and record.detail.get("compensation") == Compensation.RESTART_SOURCE.value
+            and isinstance(uuid := record.detail.get("restarted"), str)
+        ):
+            restarted.add(uuid)
+    return restarted
 
 
 async def undo_copy(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
@@ -508,10 +559,12 @@ async def undo_release_source_pins(ctx: MigrationContext, undo_info: dict[str, A
 
     A kept pin is not a compensation failure. The source is no worse off than
     before - better: its data survives the cleanup - so the outcome stays
-    ROLLED_BACK and the run report names the pin. ``rollback <id>`` again, once
-    the source runs, removes it.
+    ROLLED_BACK and the run report names the pin, with the one remedy that does
+    not restart a serving source: ``docker rm`` once it runs. ``rollback <id>``
+    again is offered only where it has a restart left to do, or none to repeat.
     """
-    restarted = _source_was_stopped(ctx) and _restart_succeeded(ctx.journal.read())
+    stopped = _source_was_stopped(ctx)
+    restarted = stopped and _restart_succeeded(ctx.journal.read())
     outcome = await pins.release_when_referenced(
         ctx.source_host,
         migration_id=ctx.migration_id,
@@ -536,12 +589,24 @@ async def undo_release_source_pins(ctx: MigrationContext, undo_info: dict[str, A
         unmounted=list(outcome.unmounted),
         restarted=restarted,
     )
+    remove = f"docker rm {' '.join(outcome.kept)}"
+    if restarted:
+        remedy = (
+            f"Once the source mounts them again: {remove} there (or coolify-migrate "
+            f"rollback {ctx.migration_id}, which does not restart it again)."
+        )
+    elif stopped:
+        remedy = (
+            f"The source is not running: coolify-migrate rollback {ctx.migration_id} "
+            "restarts it and then removes the pin. If you start it yourself instead, "
+            f"{remove} there once it runs - not the rollback, which would restart it again."
+        )
+    else:
+        remedy = f"Once the source runs: {remove} there."
     ctx.notices.append(
         f"{', '.join(outcome.kept)} still pins the source's volume(s) "
         f"{', '.join(outcome.unmounted)} on {ctx.plan.source_server.name}: nothing mounts "
-        "them yet, so without the pin Coolify's Docker cleanup could delete them. Once the "
-        f"source runs again: coolify-migrate rollback {ctx.migration_id} "
-        f"(or docker rm {' '.join(outcome.kept)} there)."
+        f"them yet, so without the pin Coolify's Docker cleanup could delete them. {remedy}"
     )
 
 

@@ -529,7 +529,10 @@ class TestReleaseSourcePins:
         await compensations.undo_release_source_pins(ctx, {})
 
         assert "src-pin" in source.containers
-        assert "src-pin" in ctx.notices[0] and f"rollback {MID}" in ctx.notices[0]
+        # Nothing stopped it and no restart is owed: a rollback has nothing to do
+        # for it, so the notice names the one thing that removes the pin.
+        assert "docker rm src-pin" in ctx.notices[0]
+        assert "coolify-migrate rollback" not in ctx.notices[0]
         kept = [
             r.detail
             for r in ctx.journal.read()

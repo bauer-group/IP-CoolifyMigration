@@ -39,6 +39,7 @@ from bg_coolify_migrate.engine import steps
 from bg_coolify_migrate.engine.planner import build_plan, server_uuid_of
 from bg_coolify_migrate.engine.runner import make_migration_id, rollback_migration, run_migration
 from bg_coolify_migrate.errors import VerificationError
+from bg_coolify_migrate.journal.store import Journal
 from bg_coolify_migrate.settings.base import Settings
 
 from .conftest import PG_FINGERPRINT as FINGERPRINT
@@ -330,6 +331,67 @@ async def test_rollback_brings_the_source_back_on_its_own_domain(
     tag = parking_tag(plan.project, plan.environment)
     await _assert_source_serves_its_domain(api, settings, rig, domained_app, tag=tag)
     await _assert_target_gone(api, rig, domained_app["app_name"])
+
+
+async def test_a_second_rollback_does_not_restart_the_source_again(
+    api: CoolifyClient,
+    settings: Settings,
+    rig: dict[str, Any],
+    domained_app: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`rollback <id>` again replays every compensation - but never a done restart.
+
+    The report asks for a second rollback when a target had to be kept or a pin
+    stayed. The source is serving since the first one, and /restart is a
+    redeploy for an image app: a second one was an outage the tool caused.
+    """
+
+    async def _boom(_ctx: object) -> dict[str, Any]:
+        raise VerificationError("injected fault: pretend verification found a mismatch")
+
+    monkeypatch.setattr(steps, "step_verify", _boom)
+
+    async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source_host:
+        plan = await build_plan(
+            api,
+            source_host,
+            project=domained_app["project"],
+            environment="production",
+            target_server="e2e-server-b",
+            finalize_policy=FinalizePolicy.RENAME,
+            transfer_mode=TransferMode.DIRECT,
+        )
+    mid = make_migration_id(plan.project, plan.environment)
+    first = await run_migration(api, settings, plan, migration_id=mid)
+    assert first.outcome is Outcome.ROLLED_BACK, f"expected rollback, got {first}"
+    tag = parking_tag(plan.project, plan.environment)
+    await _assert_source_serves_its_domain(api, settings, rig, domained_app, tag=tag)
+    async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source:
+        serving = await _running_app_container(
+            source, domained_app["app_uuid"], not_named=domained_app["container"]
+        )
+    assert serving, "no source container after the first rollback"
+
+    again = await rollback_migration(api, settings, plan, mid)
+    assert again.outcome is Outcome.ROLLED_BACK, f"the second rollback failed: {again}"
+
+    # A queued redeploy would have replaced the container well within this.
+    await asyncio.sleep(45)
+    async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source:
+        replacement = await _running_app_container(
+            source, domained_app["app_uuid"], not_named=serving
+        )
+        still = await _running_app_container(source, domained_app["app_uuid"])
+    assert replacement is None and still == serving, (
+        f"the second rollback redeployed the serving source: {serving} -> {replacement}"
+    )
+    restarts = [
+        r
+        for r in Journal.open(settings.resolved_state_dir(), mid).read()
+        if r.event == "rollback_step" and r.detail.get("restarted")
+    ]
+    assert len(restarts) == 1, restarts
 
 
 async def test_rollback_after_rename_restores_domains(
