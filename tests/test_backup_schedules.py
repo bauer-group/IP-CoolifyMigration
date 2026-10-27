@@ -33,7 +33,17 @@ from bg_coolify_migrate.api.fields import (
 )
 from bg_coolify_migrate.api.schedules import build_backup_body, copy_backup_schedules
 from bg_coolify_migrate.domain import schedules
+from bg_coolify_migrate.domain.compose import MountClass
 from bg_coolify_migrate.domain.kinds import DatabaseEngine, ResourceKind
+from bg_coolify_migrate.domain.manifest import Decision, VolumeItem, VolumeManifest
+from bg_coolify_migrate.domain.plan import (
+    MigrationPlan,
+    ResourcePlan,
+    ResourceSnapshot,
+    ServerRef,
+    Strategy,
+)
+from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.engine import compensations, steps
 from bg_coolify_migrate.engine.context import MigrationContext
 from bg_coolify_migrate.errors import CoolifyApiError
@@ -658,18 +668,34 @@ class TestUndoCreateTarget:
     async def test_deletes_the_database_but_never_its_dump_files(
         self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """No backup DELETE is ever sent: delete_s3 would destroy post-cutover dumps.
+        """No backup request is ever sent: delete_s3 would destroy post-cutover dumps.
 
-        Only the resource DELETE is mocked, so any other request fails the test.
+        The backup routes are mocked to ANSWER and asserted never called. Leaving
+        them unmocked proves nothing: undo_create_target is fail-soft, so respx's
+        AllMockedAssertionError for a wrapped request is logged away and the test
+        stays green while every dump is deleted against a real Coolify.
         """
         recorder = _Recorder()
         monkeypatch.setattr(compensations, "log", recorder)
+
+        def answer(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, json=[_row(uuid="n1")])
+            return httpx.Response(200, json={"message": "Backup configuration deleted."})
+
+        backups = respx_mock.route(url__regex=r".*/databases/db2/backups.*").mock(
+            side_effect=answer
+        )
         delete = respx_mock.delete(url__regex=r".*/databases/db2(\?.*)?$").mock(
             return_value=httpx.Response(200, json={"message": "queued"})
         )
 
         await compensations.undo_create_target(ctx, {"target_uuids": {"db1": "db2"}})
 
+        assert not backups.called, "no backup schedule or dump may be read or deleted"
+        assert [(c.request.method, c.request.url.path) for c in respx_mock.calls] == [
+            ("DELETE", "/api/v1/databases/db2")
+        ]
         assert delete.call_count == 1
         [kept] = recorder.named("compensate.target_backup_files_kept")
         assert kept["uuid"] == "db2"
@@ -749,6 +775,99 @@ class TestPlan:
         )
         assert any("service database(s) ['postgresql']" in w for w in plan.resources[0].warnings)
         assert api.backup_reads == [], "the backup route resolves standalone databases only"
+
+
+# ── volume backups: unreadable, and destroyed by a DELETE finalize ──────────
+
+
+def _volume_plan(
+    *, possible: bool = True, policy: FinalizePolicy = FinalizePolicy.RENAME
+) -> MigrationPlan:
+    """A postgres with a named volume and an api without one."""
+    volume = VolumeItem(
+        mount_class=MountClass.NAMED,
+        decision=Decision.MIGRATE,
+        reason="named volume",
+        source_name="db1-data",
+        source_path="/var/lib/docker/volumes/db1-data/_data",
+        mount_path="/var/lib/postgresql/data",
+    )
+
+    def resource(name: str, *items: VolumeItem) -> ResourcePlan:
+        return ResourcePlan(
+            snapshot=ResourceSnapshot(
+                uuid=name, name=name, collection="databases", kind=ResourceKind.DATABASE
+            ),
+            strategy=Strategy.COPY_DATA,
+            manifest=VolumeManifest(items=items),
+        )
+
+    return MigrationPlan(
+        project="shop",
+        environment="production",
+        source_server=ServerRef(uuid="s1", name="old", ip="10.0.0.1"),
+        target_server=ServerRef(uuid="s2", name="new", ip="10.0.0.2"),
+        resources=(resource("postgres", volume), resource("api")),
+        finalize_policy=policy,
+        volume_backups_possible=possible,
+    )
+
+
+class TestVolumeBackupNotes:
+    """No API reads a volume-backup schedule (4.3.0+), and a resource delete
+    destroys its archives, local and S3. Before this the plan said nothing."""
+
+    def test_names_every_resource_with_a_volume(self) -> None:
+        [note] = _volume_plan().warnings
+        assert "['postgres']" in note and "'api'" not in note
+        assert "neither seen nor carried" in note
+
+    def test_a_delete_finalize_says_coolify_deletes_their_archives(self) -> None:
+        notes = _volume_plan(policy=FinalizePolicy.DELETE).warnings
+        assert len(notes) == 2
+        assert "--finalize delete" in notes[1] and "S3" in notes[1]
+        assert "['postgres']" in notes[1]
+
+    def test_follows_a_policy_swapped_after_planning(self) -> None:
+        # cli.py swaps finalize_policy onto the built plan with model_copy.
+        plan = _volume_plan()
+        swapped = plan.model_copy(update={"finalize_policy": FinalizePolicy.DELETE})
+        assert len(plan.warnings) == 1 and len(swapped.warnings) == 2
+
+    def test_silent_where_volume_backups_do_not_exist(self) -> None:
+        plan = _volume_plan(possible=False, policy=FinalizePolicy.DELETE)
+        assert plan.warnings == ()
+        assert plan.volume_backup_resources == ()
+
+    def test_nothing_with_a_volume_says_nothing(self) -> None:
+        assert schedules.volume_backup_notes([], deletes_source=True) == []
+
+    @pytest.mark.parametrize(
+        ("version", "possible"),
+        [((4, 2, 9), False), ((4, 3, 0), True), ((4, 5, 0), True), (None, True)],
+    )
+    def test_exists_from_4_3_and_an_unknown_version_counts(
+        self, version: tuple[int, ...] | None, possible: bool
+    ) -> None:
+        assert schedules.may_hold_volume_backups(version) is possible
+
+    def test_a_plan_saved_before_the_flag_still_loads(self) -> None:
+        saved = (
+            '{"project": "shop", "environment": "production",'
+            ' "source_server": {"uuid": "s1", "name": "old", "ip": "10.0.0.1"},'
+            ' "target_server": {"uuid": "s2", "name": "new", "ip": "10.0.0.2"}}'
+        )
+        assert MigrationPlan.model_validate_json(saved).volume_backups_possible is False
+
+    @pytest.mark.parametrize(
+        ("version", "possible"),
+        [("4.2.9", False), ("4.3.0", True), ("4.5.0", True), ("unknown", True)],
+    )
+    async def test_the_planner_sets_it_from_the_instance_version(
+        self, monkeypatch: pytest.MonkeyPatch, version: str, possible: bool
+    ) -> None:
+        plan = await _plan(monkeypatch, _TaskPlanApi(tasks=[], version=version))
+        assert plan.volume_backups_possible is possible
 
 
 # ── canary ───────────────────────────────────────────────────────────────────

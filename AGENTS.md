@@ -186,13 +186,18 @@ tags v4.1.2 through v4.5.0 (2026-10-26). Read upstream at a **release tag**, nev
 - **No API reads two kinds of backup schedule.** A SERVICE database's schedules
   are not exposed (the backup routes resolve standalone databases only), so the
   plan warns for every backup-capable service database. Volume-backup schedules
-  (4.3.0+, PUT/run/DELETE on `.../storages/{uuid}/backups`, no GET) are
-  documented, not warned per resource.
+  (4.3.0+, PUT/run/DELETE on `.../storages/{uuid}/backups`, no GET) get one plan
+  note naming every resource with a volume, gated on 4.3.0
+  (`MigrationPlan.volume_backups_possible`).
 - **Rollback deletes a target's backup ROWS, never its dump FILES.**
   DeleteResourceJob removes the rows (v4.5.0:167) and leaves the dumps. Never
   send `DELETE .../backups/{b}?delete_s3=true`: `rollback` also runs after a
   SUCCEEDED run (it has no is_finished guard), and then those dumps are the last
-  copy of post-cutover data.
+  copy of post-cutover data. That holds for DATABASE dumps only: the same job
+  deletes every VOLUME-backup archive, local and S3, of the resource it deletes
+  (`deleteScheduledVolumeBackups`, v4.3.0:49,123-137, v4.5.0:125,188-209). So
+  FINALIZE DELETE destroys the source's volume-backup history; the plan says so
+  under a DELETE policy and the typed confirmation repeats it.
 - **A domain PATCH only writes the database; the labels are baked at deploy.**
   `PATCH /applications/{uuid}` with `domains`/`docker_compose_domains` saves
   (and, read-only labels being the default, regenerates `custom_labels`) but

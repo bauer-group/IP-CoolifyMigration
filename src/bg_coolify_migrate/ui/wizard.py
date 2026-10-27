@@ -16,6 +16,7 @@ import questionary
 from rich.console import Group, RenderableType
 from rich.markup import escape
 
+from bg_coolify_migrate.domain import schedules
 from bg_coolify_migrate.domain.plan import MigrationPlan
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.ui import report as report_mod
@@ -258,6 +259,8 @@ def confirm_destructive(plan: MigrationPlan) -> bool:
         f"volumes on [host]{escape(plan.source_server.name)}[/host] after the target is "
         "verified.\nThis is the only irreversible step. Everything else can be rolled back.",
     )
+    if names := plan.volume_backup_resources:
+        console.print(f"[warn]{escape(schedules.volume_backup_delete_caveat(names))}[/warn]")
     typed = _ask(
         questionary.text(
             f"Type the project name ({plan.project}) to confirm:",

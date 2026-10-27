@@ -654,8 +654,15 @@ running. These cases come up as plan warnings, never as blocks:
   those schedules never produced a backup on the source either.
 
 **Volume backups** (Coolify 4.3+, a volume's **Backups** setting) are not carried.
-The API can create them but cannot read them, so the plan cannot see them. If you
-use them, set them up on the target again.
+The API can create them but cannot read them, so the plan cannot see them; it
+names every resource with a volume instead ("… can have their own backup
+schedules"). If you use them, set them up on the target again.
+
+With `--finalize delete` it is worse than "not carried": deleting the source
+makes Coolify delete every archive its volume backups made, on the server and in
+S3. The plan and the typed confirmation both say so. Download any archive you
+still need before the run, or finalize with `rename`. Database dumps are not
+affected; a delete leaves them where they are.
 
 ### "the target database holds N backup schedule(s) where M were created"
 

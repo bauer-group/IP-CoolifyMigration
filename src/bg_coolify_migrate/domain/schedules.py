@@ -384,3 +384,54 @@ def _service_database_backs_up(db: dict[str, Any]) -> bool:
         return True
     image = str(db.get("image") or "").split(":", 1)[0]
     return any(marker in image for marker in _SERVICE_BACKUP_IMAGES)
+
+
+# ── volume backups ───────────────────────────────────────────────────────────
+
+#: A volume's own backup schedule (ScheduledVolumeBackup, local and S3) exists
+#: from v4.3.0, on application, database and service storages. Its only routes
+#: are PUT, POST run and DELETE on ``.../storages/{storage_uuid}/backups`` — no
+#: GET on any release, and no storages GET loads one — so no plan can see it.
+VOLUME_BACKUPS_SINCE: Version = (4, 3, 0)
+
+
+def may_hold_volume_backups(version: Version | None) -> bool:
+    """Whether this instance can hold volume-backup schedules nobody can read."""
+    return at_least(version, VOLUME_BACKUPS_SINCE)
+
+
+def volume_backup_notes(resources: Iterable[str], *, deletes_source: bool) -> list[str]:
+    """What the move does to the volume backups of ``resources``. PURE.
+
+    ``resources`` are the plan's resources with a volume, on an instance that
+    :func:`may_hold_volume_backups`. Unconditional per plan, like
+    :func:`service_backup_warnings`: no API says whether a schedule exists.
+    """
+    names = sorted(set(resources))
+    if not names:
+        return []
+    out = [
+        f"volume(s) of {names} can have their own backup schedules (Coolify 4.3+, a "
+        "volume's Backups setting). No Coolify API reads them, so they are neither seen "
+        "nor carried. Check each volume's Backups on the source and set them up again "
+        "on the target."
+    ]
+    if deletes_source:
+        out.append(volume_backup_delete_caveat(names))
+    return out
+
+
+def volume_backup_delete_caveat(resources: Iterable[str]) -> str:
+    """The cost of ``--finalize delete`` to those volume backups. PURE.
+
+    Deleting a resource runs DeleteScheduledVolumeBackup for every schedule on
+    its storages, with local and S3 archive deletion on (DeleteResourceJob,
+    v4.3.0:49,123-137 .. v4.5.0:125,188-209) — unlike a database's dumps, which a
+    delete leaves where they are.
+    """
+    return (
+        f"--finalize delete also makes Coolify delete every archive the volume backups "
+        f"of {sorted(set(resources))} made, on the source server and in S3. The target "
+        "starts without them. Keep a copy of any archive you need before finalizing, "
+        "or finalize with rename."
+    )

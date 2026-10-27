@@ -19,6 +19,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from bg_coolify_migrate.domain import schedules
 from bg_coolify_migrate.domain.drift import RebuildDriftReport
 from bg_coolify_migrate.domain.kinds import BuildPack, DatabaseEngine, GitAuth, ResourceKind
 from bg_coolify_migrate.domain.manifest import VolumeManifest
@@ -299,10 +300,22 @@ class MigrationPlan(BaseModel):
     """Every custom host of the plan's sources as DNS answered at plan time
     (:class:`HostBaseline`). Empty for an old plan.json, which then simply has
     no VANISHED verdicts."""
+    volume_backups_possible: bool = False
+    """The instance can hold volume-backup schedules (4.3.0+, or an unknown
+    version), which no API reads (domain/schedules.py). A flag rather than a
+    note: what a DELETE finalize does to them depends on ``finalize_policy``,
+    which is swapped onto a built plan."""
 
     @property
     def is_resource_scoped(self) -> bool:
         return bool(self.selected_resources)
+
+    @property
+    def volume_backup_resources(self) -> tuple[str, ...]:
+        """The resources whose volumes may carry unreadable volume-backup schedules."""
+        if not self.volume_backups_possible:
+            return ()
+        return tuple(r.snapshot.name for r in self.resources if r.manifest.items)
 
     @property
     def total_bytes(self) -> int:
@@ -320,6 +333,12 @@ class MigrationPlan(BaseModel):
     def warnings(self) -> tuple[str, ...]:
         out: list[str] = list(self.notes)
         out.extend(_volume_prune_notes(self))
+        out.extend(
+            schedules.volume_backup_notes(
+                self.volume_backup_resources,
+                deletes_source=self.finalize_policy is FinalizePolicy.DELETE,
+            )
+        )
         for r in self.resources:
             out.extend(f"{r.snapshot.name}: {w}" for w in r.warnings)
             out.extend(f"{r.snapshot.name}: {w}" for w in r.manifest.warnings)

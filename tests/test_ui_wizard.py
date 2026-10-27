@@ -7,9 +7,11 @@ thing this tool does.
 
 from __future__ import annotations
 
+import io
 from typing import Any
 
 import pytest
+from rich.console import Console
 
 from bg_coolify_migrate.domain.compose import MountClass
 from bg_coolify_migrate.domain.kinds import ResourceKind
@@ -23,6 +25,7 @@ from bg_coolify_migrate.domain.plan import (
 )
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.ui import wizard
+from bg_coolify_migrate.ui.console import THEME
 from bg_coolify_migrate.ui.wizard import (
     Cancelled,
     choose_environment,
@@ -275,3 +278,35 @@ class TestConfirmDestructive:
     def test_empty_aborts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch(monkeypatch, "text", "")
         assert confirm_destructive(_plan(policy=FinalizePolicy.DELETE)) is False
+
+    @pytest.mark.parametrize("possible", [True, False])
+    def test_says_coolify_deletes_the_volume_backup_archives(
+        self, monkeypatch: pytest.MonkeyPatch, possible: bool
+    ) -> None:
+        """From 4.3 a resource delete takes its volume-backup archives, S3 included."""
+        out = io.StringIO()
+        console = Console(theme=THEME, file=out, width=400)
+        monkeypatch.setattr(wizard, "get_console", lambda **_kw: console)
+        _patch(monkeypatch, "text", "shop")
+        with_volume = VolumeManifest(
+            items=(
+                VolumeItem(
+                    mount_class=MountClass.NAMED,
+                    decision=Decision.MIGRATE,
+                    reason="named volume",
+                    source_path="/var/lib/docker/volumes/db1-data/_data",
+                    mount_path="/data",
+                ),
+            )
+        )
+        base = _plan(policy=FinalizePolicy.DELETE)
+        plan = base.model_copy(
+            update={
+                "volume_backups_possible": possible,
+                "resources": (base.resources[0].model_copy(update={"manifest": with_volume}),),
+            }
+        )
+
+        assert confirm_destructive(plan) is True
+        said = " ".join(out.getvalue().split())
+        assert ("volume backups of ['postgres']" in said and "in S3" in said) is possible

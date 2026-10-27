@@ -66,6 +66,7 @@ from bg_coolify_migrate.domain.plan import (
     TransferMode,
     select_strategy,
 )
+from bg_coolify_migrate.domain.schedules import may_hold_volume_backups
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.domain.versions import parse_version
 from bg_coolify_migrate.engine import env_recovery
@@ -992,6 +993,7 @@ async def build_plan(
         source_server=source_ref,
         target_server=target_ref,
         notes=tuple(notes),
+        volume_backups_possible=may_hold_volume_backups(coolify_version),
         resources=tuple(plans),
         finalize_policy=finalize_policy,
         transfer_mode=transfer_mode,
