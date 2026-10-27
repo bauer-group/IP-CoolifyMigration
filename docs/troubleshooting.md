@@ -246,6 +246,46 @@ confirmed finalize. Inspect with:
 coolify-migrate status <id>
 ```
 
+## Scheduled tasks
+
+An application's or service's scheduled tasks are recreated on the target during
+CREATE, with each task's enabled/disabled state kept. They cannot run before the
+target is started: Coolify's scheduler skips a resource that is not running. The
+source keeps its own tasks, and they cannot run while the source is stopped
+either. If you ever restart the old stack next to the target, both run every cron.
+
+### "scheduled task(s) … run with a timeout above 36000s"
+
+A refusal. Coolify 4.4+ refuses a timeout above 36000 seconds on create. Only a task
+created through the API before 4.4 can have one. Lower it on the source (the UI's
+own limit is 36000), then plan again.
+
+### "scheduled task … its command is not readable" (exit 10)
+
+From 4.4, Coolify returns a task's command only to a token that can read sensitive
+data. Fix the token as in the first section above. Nothing was stopped.
+
+### "… name their container by its full name" / "… fire on the server's clock"
+
+Warnings, not blocks. A full container name contains the source's uuid and stops
+matching once the target runs more than one container: set the task's container
+to the compose service name (`web`, not `web-<uuid>`). A different
+`server_timezone` on the target server means the same cron fires at a different
+local time.
+
+### `api.scheduled_tasks.container_missing` in the run log
+
+The target is created from the instance's current service template, or from git
+HEAD for a compose app, and that compose no longer has a service with this task's
+container name. The task was still created. Point its container at one of the
+`available` names on the target.
+
+### "the target's scheduled tasks do not match what was created"
+
+A create timed out at a proxy (502/504) after Coolify had already saved it, and
+the retry saved it a second time. CREATE refuses a doubled cron, deletes the
+target and leaves the source running. Re-run the migration.
+
 ## `422 This field is not allowed`
 
 Our request whitelist has drifted from upstream Coolify. Coolify names the

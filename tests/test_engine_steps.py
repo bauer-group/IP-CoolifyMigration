@@ -165,6 +165,10 @@ def _mock_compose_create_routes(respx_mock: respx.Router) -> None:
         return_value=httpx.Response(201, json={"uuid": "tgt1"})
     )
     respx_mock.get(f"{BASE}/applications/app1/envs").mock(return_value=httpx.Response(200, json=[]))
+    # No scheduled tasks — the common case. CREATE reads them for every app.
+    respx_mock.get(f"{BASE}/applications/app1/scheduled-tasks").mock(
+        return_value=httpx.Response(200, json=[])
+    )
 
 
 def _source_host(*, probe: str = "REACH") -> FakeHost:
@@ -1031,6 +1035,9 @@ class TestCreateTarget:
         respx_mock.post(f"{BASE}/services").mock(return_value=httpx.Response(201, json={"uuid": "tgt1"}))
         respx_mock.get(f"{BASE}/services/svc1/envs").mock(return_value=httpx.Response(200, json=[]))
         respx_mock.get(f"{BASE}/services/svc1/tags").mock(return_value=httpx.Response(200, json=[]))
+        respx_mock.get(f"{BASE}/services/svc1/scheduled-tasks").mock(
+            return_value=httpx.Response(200, json=[])
+        )
         respx_mock.get(f"{BASE}/services/svc1/storages").mock(
             return_value=httpx.Response(
                 200,

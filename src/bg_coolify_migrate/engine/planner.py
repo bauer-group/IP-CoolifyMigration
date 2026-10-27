@@ -64,6 +64,7 @@ from bg_coolify_migrate.domain.plan import (
 )
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.domain.versions import parse_version
+from bg_coolify_migrate.engine.schedules import plan_schedules
 from bg_coolify_migrate.errors import (
     EmptyEnvironment,
     MigrationError,
@@ -916,6 +917,16 @@ async def build_plan(
                 version=coolify_version,
             )
         )
+        # Schedules (domain/schedules.py): carried at CREATE, reported here.
+        more_warnings, more_refusals = await plan_schedules(
+            api,
+            snapshot,
+            source_server=source_server,
+            target_server=target,
+            version=coolify_version,
+        )
+        warnings.extend(more_warnings)
+        refusals.extend(more_refusals)
 
         plans.append(
             ResourcePlan(

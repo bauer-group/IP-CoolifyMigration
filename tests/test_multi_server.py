@@ -326,6 +326,9 @@ class TestCreateRecheck:
         respx_mock.post(f"{BASE}/applications/dockerimage").mock(
             return_value=httpx.Response(201, json={"uuid": "tgt1"})
         )
+        respx_mock.get(f"{BASE}/applications/app1/scheduled-tasks").mock(
+            return_value=httpx.Response(200, json=[])
+        )
         respx_mock.get(f"{BASE}/applications/app1/envs").mock(
             return_value=httpx.Response(200, json=[])
         )

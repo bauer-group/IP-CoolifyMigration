@@ -12,9 +12,16 @@ database tests never touch:
   Coolify's stop it does not. This is exactly what the pre-stop mount capture
   exists to rescue.
 
-The stack here is a single Postgres service with a named data volume. We seed it,
-migrate it, and read the rows back from server-b's daemon — the same ground truth
-as the engine suite, but through the /services code path rather than /databases.
+The stack here is a Postgres service with a named data volume, plus a stateless
+sidecar. We seed it, migrate it, and read the rows back from server-b's daemon —
+the same ground truth as the engine suite, but through the /services code path
+rather than /databases.
+
+The same run carries the service's scheduled tasks (one deploy-and-migrate is
+minutes; a second for tasks alone would double the suite). The sidecar is there
+for them: with ONE running container ScheduledTaskJob ignores a task's
+``container`` entirely, so only a second container makes the heartbeat below
+prove that ``store`` resolves to ``store-{target uuid}`` on server-b.
 """
 
 from __future__ import annotations
@@ -29,7 +36,7 @@ import pytest_asyncio
 
 from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.domain.plan import TransferMode
-from bg_coolify_migrate.domain.statemachine import FinalizePolicy, Outcome
+from bg_coolify_migrate.domain.statemachine import FinalizePolicy, Outcome, State
 from bg_coolify_migrate.engine.planner import build_plan
 from bg_coolify_migrate.settings.base import Settings
 
@@ -57,9 +64,57 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
+  sidecar:
+    image: busybox:1.36
+    command: ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done"]
 volumes:
   shopdata:
 """
+
+#: Seeded on the source after the deploy. `paused` is the regression that
+#: matters most — upstream defaults an absent `enabled` to TRUE — and
+#: nightly-vacuum's 600 a non-default timeout that has to survive.
+TASKS: list[dict[str, Any]] = [
+    {
+        "name": "nightly-vacuum",
+        "command": "psql -U shop -d shopdb -c 'VACUUM'",
+        "frequency": "0 3 * * *",
+        "container": "store",
+        "timeout": 600,
+        "enabled": True,
+    },
+    {
+        "name": "heartbeat",
+        "command": "date",
+        "frequency": "* * * * *",
+        "container": "store",
+        "enabled": True,
+    },
+    {
+        "name": "paused",
+        "command": "true",
+        "frequency": "daily",
+        "container": "store",
+        "enabled": False,
+    },
+]
+
+
+def _task_projection(tasks: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
+    """What must be equal on both sides. A sorted LIST, not a set: a set would hide
+    a task doubled by a retried create — exactly the regression to catch."""
+    return sorted(
+        (
+            t.get("name"),
+            t.get("command"),
+            t.get("frequency"),
+            t.get("container"),
+            t.get("timeout"),
+            t.get("enabled"),
+        )
+        for t in tasks
+    )
+
 
 FINGERPRINT = (
     "psql -U shop -d shopdb -tA -c "
@@ -130,12 +185,19 @@ async def compose_stack(
             fingerprint = await db_exec(source, container, FINGERPRINT)
 
         assert fingerprint.startswith("2:134100:"), f"seed did not take: {fingerprint!r}"
+
+        for task in TASKS:
+            await api.create_scheduled_task("services", service_uuid, task)
+        tasks = _task_projection(await api.get_scheduled_tasks("services", service_uuid))
+        assert len(tasks) == len(TASKS), f"seeding the tasks did not take: {tasks}"
+
         yield {
             "project": project_name,
             "project_uuid": project_uuid,
             "service_name": service_name,
             "service_uuid": service_uuid,
             "fingerprint": fingerprint,
+            "tasks": tasks,
         }
     finally:
         import contextlib
@@ -169,13 +231,29 @@ async def test_compose_service_data_survives_migration(
 
     from bg_coolify_migrate.engine.runner import run_migration
 
-    result = await run_migration(api, settings, plan)
+    # Recorded, not asserted, inside the hook: it runs inside the saga, and an
+    # assertion there would abort the run instead of failing the test.
+    ran_before_start: dict[str, Any] = {}
+
+    async def before_start(state: State) -> None:
+        if state is not State.START_TARGET:
+            return
+        target = await _target_service(api, compose_stack["service_name"], server_b)
+        for task in await api.get_scheduled_tasks("services", str(target)):
+            executions = await api.get(
+                f"/services/{target}/scheduled-tasks/{task['uuid']}/executions"
+            )
+            if executions:
+                ran_before_start[str(task["name"])] = executions
+
+    server_b = str(rig["server_b"]["uuid"])
+    result = await run_migration(api, settings, plan, on_state=before_start)
     assert result.outcome is Outcome.SUCCEEDED, f"compose migration did not succeed: {result}"
 
-    target_uuid = await _target_service(api, compose_stack["service_name"], str(rig["server_b"]["uuid"]))
+    target_uuid = await _target_service(api, compose_stack["service_name"], server_b)
     assert target_uuid, "no service with the original name landed on server-b"
 
-    async with ssh_to(api, str(rig["server_b"]["uuid"]), settings) as target_host:
+    async with ssh_to(api, server_b, settings) as target_host:
         container = await _store_container(target_host, target_uuid)
         await wait_until_healthy(target_host, container)
         arrived = await db_exec(target_host, container, FINGERPRINT)
@@ -184,6 +262,51 @@ async def test_compose_service_data_survives_migration(
         f"compose data did not survive the move\n"
         f"  source: {compose_stack['fingerprint']}\n  target: {arrived}"
     )
+
+    # ── scheduled tasks ──────────────────────────────────────────────────────
+    # Nothing may run on a target that was never started. A skipped occurrence
+    # writes no execution row, so this can pass vacuously but never falsely.
+    assert not ran_before_start, f"tasks ran on the target before START: {ran_before_start}"
+
+    target_tasks = await api.get_scheduled_tasks("services", target_uuid)
+    assert _task_projection(target_tasks) == compose_stack["tasks"], (
+        "the target's scheduled tasks differ from the source's\n"
+        f"  source: {compose_stack['tasks']}\n"
+        f"  target: {_task_projection(target_tasks)}"
+    )
+    source_tasks = await api.get_scheduled_tasks("services", compose_stack["service_uuid"])
+    assert _task_projection(source_tasks) == compose_stack["tasks"], "the source's tasks changed"
+
+    # The heartbeat fires every minute. With `store` AND `sidecar` running, its
+    # first success proves `container: store` resolves to store-{target uuid}.
+    # Bounded: it waits on the rig's scheduler and on the status column turning
+    # 'running', neither of which this tool controls.
+    heartbeat = next(t for t in target_tasks if t["name"] == "heartbeat")
+    statuses = await _await_task_run(api, target_uuid, str(heartbeat["uuid"]), timeout=240)
+    assert "success" in statuses, (
+        f"the carried heartbeat never succeeded on server-b (executions: {statuses}). "
+        "'No valid container' means its container did not resolve; no executions at all "
+        "means the rig's scheduler or status checks are not running."
+    )
+
+
+async def _await_task_run(
+    api: CoolifyClient, service_uuid: str, task_uuid: str, *, timeout: float
+) -> list[str]:
+    """Poll a task's executions until one succeeds; return every status seen."""
+    import asyncio
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    statuses: list[str] = []
+    while asyncio.get_running_loop().time() < deadline:
+        executions = await api.get(
+            f"/services/{service_uuid}/scheduled-tasks/{task_uuid}/executions"
+        )
+        statuses = [str(e.get("status")) for e in executions or [] if isinstance(e, dict)]
+        if "success" in statuses:
+            break
+        await asyncio.sleep(10)
+    return statuses
 
 
 async def _target_service(api: CoolifyClient, name: str, target_server: str) -> str | None:

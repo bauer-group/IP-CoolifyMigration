@@ -384,6 +384,26 @@ class CoolifyClient:
         """
         return await self.post(f"/{collection}/{uuid}/tags", {"tag_names": names})
 
+    # ── schedules ────────────────────────────────────────────────────────────
+
+    async def get_scheduled_tasks(self, collection: str, uuid: str) -> list[dict[str, Any]]:
+        """An application's or service's scheduled tasks, as a flat array.
+
+        A plain GET, not :meth:`_get_optional`: the route exists on every release
+        this tool supports (v4.1.2 onward). From 4.4.0 ``command`` is REMOVED from
+        each task unless the request can read sensitive data — the same attribute
+        :meth:`assert_can_read_sensitive` observes — so a missing key means an
+        unreadable command, never an empty one. ``command`` can carry tokens (a
+        curl header, a DSN); nothing that holds a task may log it.
+        """
+        return _as_list(await self.get(f"/{collection}/{uuid}/scheduled-tasks"))
+
+    async def create_scheduled_task(self, collection: str, uuid: str, body: dict[str, Any]) -> Any:
+        """Create one task. Retried on 429/502/503/504 like every POST, so a proxy
+        error after Coolify committed the row can double it — the caller re-reads
+        the target and counts (``api.schedules.copy_scheduled_tasks``)."""
+        return await self.post(f"/{collection}/{uuid}/scheduled-tasks", body)
+
     # ── writes ───────────────────────────────────────────────────────────────
 
     async def set_envs_bulk(self, collection: str, uuid: str, entries: list[dict[str, Any]]) -> Any:

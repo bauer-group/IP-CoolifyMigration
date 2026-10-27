@@ -20,6 +20,7 @@ from typing import Any
 import structlog
 
 from bg_coolify_migrate.api import resources as api_resources
+from bg_coolify_migrate.api import schedules as api_schedules
 from bg_coolify_migrate.api.resources import Placement, public_git_url
 from bg_coolify_migrate.discovery import docker, quiesce
 from bg_coolify_migrate.dns import extract as dns_extract
@@ -434,6 +435,16 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                     target_uuid=target_uuid,
                     consequence="The source was never stopped; the created target will be deleted.",
                 )
+
+            # After the gates: a dockercompose app's service names, which a task's
+            # `container` must match, exist only once its compose has loaded.
+            await api_schedules.copy_scheduled_tasks(
+                ctx.api,
+                collection=snapshot.collection,
+                source_uuid=snapshot.uuid,
+                target_uuid=target_uuid,
+                kind=snapshot.kind,
+            )
     except Exception:
         # The saga compensates only COMPLETED steps, so a refusal part-way
         # through CREATE — the compose gate, the service rehearsal, a 422 on

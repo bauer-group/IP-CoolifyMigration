@@ -138,6 +138,23 @@ tags v4.1.2 through v4.5.0 (2026-10-26). Read upstream at a **release tag**, nev
   detaches and never stops. The UI's removal stops first — except on an
   unreachable server, where it detaches anyway. CREATE re-checks the count
   (`steps._refuse_multi_server`) before parking anything.
+- **Scheduled tasks** exist for applications and services only (no database
+  route or column), readable and creatable from v4.1.2 with one six-field array
+  (`ScheduledTasksController` v4.1.2:57 = v4.5.0:81). An absent `enabled`
+  defaults to TRUE, so a disabled task is always sent `enabled: false`. From
+  4.4.0 `command` is hidden without can_read_sensitive and `timeout` is
+  `max:36000`; from 4.5.0 an ENABLED task needs `deploy`, and `container` also
+  matches a full container name (it embeds the source uuid, so the plan warns
+  instead of rewriting it, invariant 10).
+  The scheduler skips a resource whose status does not contain 'running'
+  (`ScheduledJobManager` v4.5.0:670-681), and a never-started target reads
+  'exited'. That skip is the only thing keeping carried tasks inert before START.
+  The UI's "execute now" and `artisan` RunScheduledJobsManually bypass it, and
+  before 4.5 the job's app branch also sees stopped containers, so never call
+  either. A template service or a git-compose app takes its sub-service names
+  from the CURRENT catalog or git HEAD, so CREATE checks each task's container
+  against the target. A POST retried on 502/504 can save a task twice, so CREATE
+  re-reads and counts. Deleting the target deletes its tasks (model hooks).
 
 ### Learned the hard way, from a real instance
 
@@ -277,3 +294,4 @@ Conventional Commits, **past-tense** subject (`added`, `fixed`, `updated`), max
 | Is the stack really stopped? | `discovery/quiesce.py` |
 | Which fields may we send? | `api/fields.py` |
 | What can the target NOT reproduce? | `domain/fidelity.py` |
+| Are scheduled tasks carried? | `api/schedules.py`, `domain/schedules.py` |

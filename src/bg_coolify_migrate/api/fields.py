@@ -478,6 +478,22 @@ STORAGE_PERSISTENT_ONLY: frozenset[str] = frozenset({"name", "host_path"})
 #: Fields valid only for `type=file`.
 STORAGE_FILE_ONLY: frozenset[str] = frozenset({"content", "is_directory", "is_host_file", "fs_path"})
 
+# ── Scheduled tasks ──────────────────────────────────────────────────────────
+# POST /v1/{applications|services}/{uuid}/scheduled-tasks
+# (ScheduledTasksController::createTask). The same six fields at every release,
+# v4.1.2:57 through v4.5.0:81. An ABSENT `timeout` becomes 300 and an absent
+# `enabled` becomes TRUE (v4.5.0:126-127), so a disabled task must be sent with
+# enabled=false explicitly or it comes back armed on the target.
+
+SCHEDULED_TASK_CREATE: frozenset[str] = frozenset(
+    {"name", "command", "frequency", "container", "timeout", "enabled"}
+)
+SCHEDULED_TASK_REQUIRED: frozenset[str] = frozenset({"name", "command", "frequency"})
+#: Only these two have task routes (routes/api.php v4.1.2:195-205, v4.5.0:441-453),
+#: and the scheduled_tasks table has only application_id/service_id — a database
+#: cannot hold one through any API.
+SCHEDULED_TASK_COLLECTIONS: frozenset[str] = frozenset({"applications", "services"})
+
 # ── Environment variables ────────────────────────────────────────────────────
 # Identical for single create and bulk. Bulk body is {"data": [...]} — the key is
 # literally `data`. Unlike create endpoints, bulk SILENTLY DROPS unknown keys
