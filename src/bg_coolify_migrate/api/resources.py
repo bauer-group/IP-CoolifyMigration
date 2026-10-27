@@ -50,10 +50,10 @@ from bg_coolify_migrate.api.fields import (
 )
 from bg_coolify_migrate.dns import wildcard as dns_wildcard
 from bg_coolify_migrate.dns.extract import (
-    ROUTE_ENV_KEYS,
     is_generated,
     is_service_url_key,
     normalise_host,
+    route_env_keys,
 )
 from bg_coolify_migrate.domain import domains
 from bg_coolify_migrate.domain.kinds import ResourceKind, create_route
@@ -435,15 +435,19 @@ def source_restore_body(
     *,
     source_wildcard: str | None,
     version: Version | None = None,
+    source_envs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """The body that gives a source back its domains, journalled before CREATE writes.
 
     Applications: their original domains (:func:`domains.restore_body`). Services:
-    the original URLs of their sub-applications holding custom hosts
-    (:func:`service_restore_body`). ``None`` when there is nothing to give back.
+    the original URLs of their sub-applications holding custom hosts, and the
+    route-key rows holding one (:func:`service_restore_body`; ``source_envs`` is
+    the service's env list). ``None`` when there is nothing to give back.
     """
     if snapshot.collection == "services":
-        return service_restore_body(source, source_wildcard=source_wildcard)
+        return service_restore_body(
+            source, source_wildcard=source_wildcard, source_envs=source_envs
+        )
     return domains.restore_body(snapshot, source, version=version)
 
 
@@ -791,17 +795,57 @@ def service_custom_urls(
 
 
 def service_restore_body(
-    source: dict[str, Any], *, source_wildcard: str | None
+    source: dict[str, Any],
+    *,
+    source_wildcard: str | None,
+    source_envs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """The body that gives the source back its custom URLs, or ``None``. PURE.
 
     Journaled as ``parked_domains`` before any write for the resource. Nothing
     touches a service's domains before FINALIZE, so a rollback before it finds
     the source unchanged and :func:`restore_service_urls` sends nothing; the
-    body matters once FINALIZE has released the hosts.
+    body matters once FINALIZE has released the hosts — its sub-application URLs
+    (``urls``) and the route-key rows of a SPECIFIC_SERVICES image
+    (``route_envs``, :func:`service_route_urls`).
     """
-    urls = service_custom_urls(source, source_wildcard=source_wildcard)
-    return {"urls": urls} if urls else None
+    body: dict[str, Any] = {}
+    if urls := service_custom_urls(source, source_wildcard=source_wildcard):
+        body["urls"] = urls
+    route = service_route_urls(
+        source_envs or [],
+        route_keys=route_env_keys(source.get("applications")),
+        source_wildcard=source_wildcard,
+    )
+    if route:
+        body["route_envs"] = route
+    return body or None
+
+
+def service_route_urls(
+    envs: list[dict[str, Any]], *, route_keys: Collection[str], source_wildcard: str | None
+) -> list[dict[str, str]]:
+    """``[{key, url}]`` of the route-key rows that hold a CUSTOM host. PURE.
+
+    A SPECIFIC_SERVICES image (minio, logto, garage, silo) is routed from these
+    rows, not from its sub-application's fqdn (dns/extract.py
+    ``SPECIFIC_SERVICE_ROUTE_KEYS``), so a kept source holds those hosts through
+    them. Rows of keys the stack's images do not route from are none of ours, a
+    locked row (no ``value``) cannot be read, and a value with credentials in it
+    is never journalled — each is left alone. The value is journalled under
+    ``url``: the journal refuses a ``value`` key.
+    """
+    out: list[dict[str, str]] = []
+    for env in envs:
+        key = str(env.get("key") or "")
+        value = env.get("value")
+        if key not in route_keys or env.get("is_preview") or not isinstance(value, str):
+            continue
+        if any("@" in urlsplit(p if "://" in p else f"//{p}").netloc for p in value.split(",")):
+            continue
+        if domains.custom_hosts(value, source_wildcard=source_wildcard):
+            out.append({"key": key, "url": value})
+    return out
 
 
 def service_urls_body(
@@ -975,9 +1019,10 @@ async def restore_service_urls(api: CoolifyClient, uuid: str, body: dict[str, An
     A ``force_domain_override`` in ``body`` is passed on (the caller's 409 retry).
     Returns whether a PATCH was sent.
     """
+    sent = await _restore_route_envs(api, uuid, body.get("route_envs"))
     wanted = [e for e in body.get("urls") or [] if isinstance(e, dict) and e.get("name")]
     if not wanted:
-        return False
+        return sent
     source = await api.get_resource("services", uuid)
     present = {
         str(app.get("name")) for app in source.get("applications") or [] if isinstance(app, dict)
@@ -994,12 +1039,43 @@ async def restore_service_urls(api: CoolifyClient, uuid: str, body: dict[str, An
             diff.append({"name": name, "url": url})
     if not diff:
         log.debug("api.service.urls_unchanged", uuid=uuid)
-        return False
+        return sent
     patch: dict[str, Any] = {"urls": diff}
     if body.get("force_domain_override"):
         patch["force_domain_override"] = True
     await api.update_resource("services", uuid, filter_body(patch, SERVICE_UPDATE))
     log.info("api.service.urls_restored", uuid=uuid, count=len(diff))
+    return True
+
+
+async def _restore_route_envs(api: CoolifyClient, uuid: str, route_envs: object) -> bool:
+    """Put a service's route-key rows back, upserting only what differs.
+
+    Runs first: an env upsert never 409s, and the rows must be back before the
+    restart re-parses the stack (``generateServiceSpecificFqdns`` reads them).
+    """
+    entries = route_envs if isinstance(route_envs, list) else []
+    wanted = [
+        e
+        for e in entries
+        if isinstance(e, dict) and e.get("key") and isinstance(e.get("url"), str)
+    ]
+    if not wanted:
+        return False
+    current = {
+        str(env.get("key")): env.get("value")
+        for env in await api.get_envs("services", uuid)
+        if isinstance(env, dict) and not env.get("is_preview")
+    }
+    diff = [
+        {"key": str(e["key"]), "value": str(e["url"])}
+        for e in wanted
+        if _url_key(str(current.get(str(e["key"])) or "")) != _url_key(str(e["url"]))
+    ]
+    if not diff:
+        return False
+    await api.set_envs_bulk("services", uuid, diff)
+    log.info("api.service.route_envs_restored", uuid=uuid, keys=[e["key"] for e in diff])
     return True
 
 
@@ -1068,6 +1144,11 @@ async def release_service_urls(
     a blank url sets fqdn=null (ServicesController v4.1.2:118-121,
     v4.5.0:209-212).
 
+    A SPECIFIC_SERVICES image is routed from env rows instead
+    (:func:`service_route_urls`); those holding a custom host are blanked too,
+    and Coolify regenerates an empty one on the next parse (docker.php
+    v4.5.0:680-688).
+
     From 4.4 removing a hostname queues ReleaseRemovedDnsHostnamesJob; the live
     target holds it, so a Coolify-managed record is re-referenced, not deleted
     (ManagedDnsRecordCleanup v4.5.0:322-333). Never raises: the source is
@@ -1076,12 +1157,23 @@ async def release_service_urls(
     try:
         source = await api.get_resource("services", uuid)
         urls = service_custom_urls(source, source_wildcard=source_wildcard)
-        if not urls:
-            return True
-        await api.update_resource(
-            "services", uuid, {"urls": [{"name": e["name"], "url": ""} for e in urls]}
-        )
-        log.info("api.service.urls_released", uuid=uuid, count=len(urls))
+        if urls:
+            await api.update_resource(
+                "services", uuid, {"urls": [{"name": e["name"], "url": ""} for e in urls]}
+            )
+            log.info("api.service.urls_released", uuid=uuid, count=len(urls))
+        route_keys = route_env_keys(source.get("applications"))
+        if route_keys:
+            route = service_route_urls(
+                await api.get_envs("services", uuid),
+                route_keys=route_keys,
+                source_wildcard=source_wildcard,
+            )
+            if route:
+                await api.set_envs_bulk(
+                    "services", uuid, [{"key": e["key"], "value": ""} for e in route]
+                )
+                log.info("api.service.route_envs_released", uuid=uuid, keys=[e["key"] for e in route])
         return True
     except CoolifyApiError as exc:
         log.warning(
@@ -1115,6 +1207,7 @@ def build_env_entries(
     source_wildcard: str | None = None,
     tag: str | None = None,
     lock_preview_twins: bool = False,
+    route_keys: Collection[str] = (),
 ) -> list[dict[str, Any]]:
     """Prepare env vars for the target. PURE.
 
@@ -1144,7 +1237,9 @@ def build_env_entries(
 
     For a service (``collection="services"``) a row that names where the stack
     lives is also dropped when it names the SOURCE: see
-    :func:`_names_the_source`.
+    :func:`_names_the_source`. ``route_keys`` are the keys the service's own
+    images are routed from (``dns_extract.route_env_keys``) — any other row of
+    those names is a plain variable and copied verbatim.
     """
     entries: list[dict[str, Any]] = []
     previews_sent: set[str] = set()
@@ -1160,7 +1255,7 @@ def build_env_entries(
         if not entry.get("key"):
             continue
         if collection == "services" and _names_the_source(
-            entry, source_wildcard=source_wildcard, tag=tag
+            entry, source_wildcard=source_wildcard, tag=tag, route_keys=route_keys
         ):
             continue
         entries.append(entry)
@@ -1176,12 +1271,18 @@ def build_env_entries(
 
 
 def _names_the_source(
-    entry: dict[str, Any], *, source_wildcard: str | None, tag: str | None
+    entry: dict[str, Any],
+    *,
+    source_wildcard: str | None,
+    tag: str | None,
+    route_keys: Collection[str] = (),
 ) -> bool:
     """Whether a service's URL row would plant a SOURCE host in the target. PURE.
 
-    Only ``SERVICE_FQDN_*`` / ``SERVICE_URL_*`` and the SPECIFIC_SERVICES route
-    keys (:data:`~bg_coolify_migrate.dns.extract.ROUTE_ENV_KEYS`). Their values
+    Only ``SERVICE_FQDN_*`` / ``SERVICE_URL_*`` and the route keys of the
+    stack's own SPECIFIC_SERVICES images (``route_keys``; for any other image a
+    LOGTO_ENDPOINT is a client's setting, which Coolify neither routes nor
+    regenerates, so dropping it would leave the target without it). Their values
     are RESOLVED hosts, not placeholders. A directly declared one is rebuilt
     from the sub-application's fqdn on every parse (parsers.php v4.5.0:2626-2723),
     but one that is only referenced is firstOrCreate'd (v4.5.0:2733-2821) and
@@ -1194,7 +1295,7 @@ def _names_the_source(
     operator's choice, an OAuth callback base say, and is copied verbatim.
     """
     key = str(entry.get("key") or "")
-    if not (is_service_url_key(key) or key in ROUTE_ENV_KEYS):
+    if not (is_service_url_key(key) or key in route_keys):
         return False
     value = entry.get("value")
     if not isinstance(value, str):
@@ -1221,6 +1322,7 @@ async def copy_envs(
     source_wildcard: str | None = None,
     tag: str | None = None,
     recovered: Secrets | None = None,
+    route_keys: Collection[str] = (),
 ) -> int:
     """Copy environment variables source -> target. Returns the count.
 
@@ -1240,6 +1342,7 @@ async def copy_envs(
         source_wildcard=source_wildcard,
         tag=tag,
         lock_preview_twins=collection == "applications",
+        route_keys=route_keys,
     )
     if not entries:
         log.info("api.envs.none", source=source_uuid)

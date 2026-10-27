@@ -118,8 +118,9 @@ certificate for it. This is not a cutover, so `--accept-dns` does not apply.
 Change the target's domain in Coolify to a host under the target's wildcard (or
 a custom domain), then `coolify-migrate resume <id>`. For a service, the gate
 reads each sub-application's domain, the routing variables of a minio, logto,
-garage or silo image (`MINIO_SERVER_URL` and friends) and Host() labels written
-into a custom compose — not the derived `SERVICE_URL_*` variables.
+garage or silo image (`MINIO_SERVER_URL` and friends — only when the stack runs
+that image; for any other image they are ordinary variables) and Host() labels
+written into a custom compose — not the derived `SERVICE_URL_*` variables.
 
 ### "resolves to neither source nor target"
 

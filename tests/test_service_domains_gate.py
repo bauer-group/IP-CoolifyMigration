@@ -78,6 +78,30 @@ class TestRouteEnv:
             ("s3.example.com", HostnameOrigin.SERVICE_ROUTE_ENV)
         ]
 
+    def test_route_keys_come_from_the_images_the_stack_runs(self) -> None:
+        # Finding 5: Coolify routes from these keys only for a SPECIFIC_SERVICES
+        # image (serviceType() compares the image up to its first ':').
+        apps = [
+            {"name": "s3", "image": "quay.io/minio/minio:RELEASE.2025-04-22"},
+            {"name": "auth", "image": "svhd/logto"},
+            {"name": "web", "image": "ghcr.io/acme/nextjs-app:1.0"},
+            "junk",
+            {"name": "x", "image": None},
+        ]
+        assert extract.route_env_keys(apps) == frozenset(
+            {"MINIO_SERVER_URL", "MINIO_BROWSER_REDIRECT_URL", "LOGTO_ENDPOINT", "LOGTO_ADMIN_ENDPOINT"}
+        )
+        assert extract.route_env_keys([{"image": "dxflrs/garage:v1"}]) == frozenset(
+            {"GARAGE_S3_API_URL", "GARAGE_WEB_URL", "GARAGE_ADMIN_URL"}
+        )
+        assert extract.route_env_keys("junk") == frozenset()
+
+    def test_a_client_setting_on_another_image_is_not_a_route(self) -> None:
+        envs: list[dict[str, object]] = [
+            {"key": "LOGTO_ENDPOINT", "value": "https://auth.example.com"}
+        ]
+        assert extract.from_service_route_env(envs, frozenset()) == []
+
     def test_service_url_keys(self) -> None:
         assert extract.is_service_url_key("SERVICE_URL_WEB_80")
         assert extract.is_service_url_key("service_fqdn_web")
@@ -88,7 +112,10 @@ class TestCollectService:
     def test_derived_rows_are_ignored_and_compose_labels_are_read(self) -> None:
         compose = "    labels:\n      - traefik.http.routers.x.rule=Host(`docs.example.com`)\n"
         hosts = extract.collect_service(
-            applications=[{"name": "web", "url": "https://shop.example.com"}],
+            applications=[
+                {"name": "web", "url": "https://shop.example.com"},
+                {"name": "auth", "image": "svhd/logto:1.27"},
+            ],
             envs=[
                 {"key": "SERVICE_URL_WEB", "value": "https://stale.example.com"},
                 {"key": "LOGTO_ENDPOINT", "value": "https://auth.example.com"},
@@ -100,6 +127,16 @@ class TestCollectService:
             "docs.example.com",
             "shop.example.com",
         ]
+
+    def test_a_logto_endpoint_of_a_client_image_is_not_gated(self) -> None:
+        # Finding 5: a Next.js app using the Logto SDK points LOGTO_ENDPOINT at a
+        # Logto that stays on the source. Gating it would demand a cutover that
+        # breaks that Logto.
+        hosts = extract.collect_service(
+            applications=[{"name": "web", "image": "ghcr.io/acme/nextjs-app:1.0"}],
+            envs=[{"key": "LOGTO_ENDPOINT", "value": "https://auth.example.com"}],
+        )
+        assert hosts == []
 
 
 class TestBoundToSource:
@@ -131,9 +168,25 @@ class TestBoundToSource:
 
 
 class TestServiceUrlRows:
-    def _keys(self, envs: list[dict[str, Any]], *, collection: str = "services") -> list[str]:
-        entries = build_env_entries(envs, collection=collection, source_wildcard=SRC_WC, tag="t1")
+    MINIO = frozenset({"MINIO_SERVER_URL", "MINIO_BROWSER_REDIRECT_URL"})
+
+    def _keys(
+        self,
+        envs: list[dict[str, Any]],
+        *,
+        collection: str = "services",
+        route_keys: frozenset[str] = MINIO,
+    ) -> list[str]:
+        entries = build_env_entries(
+            envs, collection=collection, source_wildcard=SRC_WC, tag="t1", route_keys=route_keys
+        )
         return [e["key"] for e in entries]
+
+    def test_a_route_key_of_another_image_is_copied_verbatim(self) -> None:
+        # Finding 5: Coolify neither routes nor regenerates it for that image;
+        # dropping it would leave the target's client without its endpoint.
+        envs = [{"key": "LOGTO_ENDPOINT", "value": f"https://auth.{SRC_WC}"}]
+        assert self._keys(envs, route_keys=frozenset()) == ["LOGTO_ENDPOINT"]
 
     def test_rows_naming_the_source_are_left_to_the_target(self) -> None:
         envs = [
@@ -292,7 +345,7 @@ class TestServiceGate:
     ) -> None:
         _mock_target(
             respx_mock,
-            applications=[{"name": "minio", "fqdn": None}],
+            applications=[{"name": "minio", "fqdn": None, "image": "pgsty/silo:1.0"}],
             envs=[{"key": "MINIO_SERVER_URL", "value": "https://s3.example.com"}],
         )
         _resolver(monkeypatch, {"s3.example.com": SOURCE_IP})

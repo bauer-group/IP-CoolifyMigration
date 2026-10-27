@@ -781,3 +781,142 @@ class TestRollbackAfterFinalize:
 
         assert order == ["rename back", "restore urls", "restart", "delete target"]
         assert result.compensations_failed == []
+
+
+# ── finding 7: the env filter's wiring at engine level ──────────────────────
+
+
+class TestCreateTargetEnvFilterWiring:
+    async def test_source_wildcard_tag_and_route_keys_reach_the_filter(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """Drop any kwarg from step_create_target's copy_envs call and this fails."""
+        from bg_coolify_migrate.domain import domains
+
+        tag = domains.parking_tag(ctx.plan.project, ctx.plan.environment)
+        minio = _source()
+        minio["applications"][0] = {
+            **minio["applications"][0],
+            "image": "quay.io/minio/minio:RELEASE.2025-04-22",
+        }
+        _mock_create(respx_mock, source=minio)
+        respx_mock.get(f"{BASE}/services/svc1/envs").mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {"key": "SERVICE_URL_API", "value": f"https://api.{SRC_WC}"},  # wildcard
+                    {"key": "SERVICE_URL_OLD", "value": f"https://old-{tag}.shop.example.com"},
+                    {"key": "MINIO_SERVER_URL", "value": "http://s3-svc1.10.0.0.1.sslip.io"},
+                    {"key": "SERVICE_URL_CALLBACK", "value": "https://auth.example.com/cb"},
+                ],
+            )
+        )
+        bulk = respx_mock.patch(f"{BASE}/services/tgt1/envs/bulk").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        respx_mock.patch(f"{BASE}/services/tgt1").mock(return_value=httpx.Response(200, json={}))
+
+        await steps.step_create_target(ctx)
+
+        sent = [e["key"] for e in _body(bulk)["data"]]
+        assert sent == ["SERVICE_URL_CALLBACK"]
+
+
+# ── finding 8: a SPECIFIC_SERVICES image's route keys at FINALIZE ───────────
+
+MINIO_KEYS = frozenset({"MINIO_SERVER_URL", "MINIO_BROWSER_REDIRECT_URL"})
+
+
+def _minio_source() -> dict[str, Any]:
+    """A silo/minio service: routed from MINIO_SERVER_URL, its fqdn null."""
+    return {
+        "uuid": "svc1",
+        "applications": [
+            {"uuid": "sa-minio", "name": "minio", "fqdn": None, "image": "pgsty/silo:1.2"}
+        ],
+    }
+
+
+class TestServiceRouteUrls:
+    def test_only_route_rows_holding_a_custom_host(self) -> None:
+        envs = [
+            {"key": "MINIO_SERVER_URL", "value": "https://s3.example.com"},
+            {"key": "MINIO_BROWSER_REDIRECT_URL", "value": f"https://c.{SRC_WC}"},  # bound
+            {"key": "LOGTO_ENDPOINT", "value": "https://auth.example.com"},  # not this image
+            {"key": "MINIO_SERVER_URL", "is_preview": True, "value": "https://p.example.com"},
+        ]
+        assert resources.service_route_urls(
+            envs, route_keys=MINIO_KEYS, source_wildcard=SRC_WC
+        ) == [{"key": "MINIO_SERVER_URL", "url": "https://s3.example.com"}]
+
+    def test_locked_and_credential_bearing_rows_are_left_alone(self) -> None:
+        envs = [
+            {"key": "MINIO_SERVER_URL"},  # locked: no value in any read
+            {"key": "MINIO_BROWSER_REDIRECT_URL", "value": "https://u:p@s3.example.com"},
+        ]
+        assert resources.service_route_urls(envs, route_keys=MINIO_KEYS, source_wildcard=None) == []
+
+    def test_the_restore_body_carries_them_under_url(self) -> None:
+        # The journal refuses a `value` key; a URL is not a secret.
+        envs = [{"key": "MINIO_SERVER_URL", "value": "https://s3.example.com"}]
+        body = resources.service_restore_body(
+            _minio_source(), source_wildcard=SRC_WC, source_envs=envs
+        )
+        assert body == {"route_envs": [{"key": "MINIO_SERVER_URL", "url": "https://s3.example.com"}]}
+        from bg_coolify_migrate.domain import domains
+
+        assert domains.restore_summary(body) == "MINIO_SERVER_URL=https://s3.example.com"
+        # Not a holder Coolify's DNS cleanup counts: never blocks a target delete.
+        assert domains.body_hosts(body) == []
+
+
+class TestRouteEnvReleaseAndRestore:
+    async def test_finalize_blanks_a_custom_route_row(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.get(f"{BASE}/services/svc1").mock(
+            return_value=httpx.Response(200, json=_minio_source())
+        )
+        respx_mock.get(f"{BASE}/services/svc1/envs").mock(
+            return_value=httpx.Response(
+                200, json=[{"key": "MINIO_SERVER_URL", "value": "https://s3.example.com"}]
+            )
+        )
+        bulk = respx_mock.patch(f"{BASE}/services/svc1/envs/bulk").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        assert await resources.release_service_urls(api, "svc1", source_wildcard=SRC_WC)
+        assert _body(bulk) == {"data": [{"key": "MINIO_SERVER_URL", "value": ""}]}
+
+    async def test_a_stack_without_a_specific_image_reads_no_envs(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        source = _source(applications=_source()["applications"][1:])
+        respx_mock.get(f"{BASE}/services/svc1").mock(return_value=httpx.Response(200, json=source))
+        assert await resources.release_service_urls(api, "svc1", source_wildcard=SRC_WC)
+        assert [c.request.url.path for c in respx_mock.calls] == ["/api/v1/services/svc1"]
+
+    async def test_the_restore_puts_the_row_back_before_anything_else(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.get(f"{BASE}/services/svc1/envs").mock(
+            return_value=httpx.Response(200, json=[{"key": "MINIO_SERVER_URL", "value": None}])
+        )
+        bulk = respx_mock.patch(f"{BASE}/services/svc1/envs/bulk").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        body = {"route_envs": [{"key": "MINIO_SERVER_URL", "url": "https://s3.example.com"}]}
+        assert await resources.restore_service_urls(api, "svc1", body) is True
+        assert _body(bulk) == {"data": [{"key": "MINIO_SERVER_URL", "value": "https://s3.example.com"}]}
+
+    async def test_an_unchanged_row_is_not_written(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.get(f"{BASE}/services/svc1/envs").mock(
+            return_value=httpx.Response(
+                200, json=[{"key": "MINIO_SERVER_URL", "value": "https://S3.example.com/"}]
+            )
+        )
+        body = {"route_envs": [{"key": "MINIO_SERVER_URL", "url": "https://s3.example.com"}, "x"]}
+        assert await resources.restore_service_urls(api, "svc1", body) is False
+        assert [c.request.method for c in respx_mock.calls] == ["GET"]

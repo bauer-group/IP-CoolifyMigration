@@ -301,15 +301,16 @@ def restore_summary(body: Mapping[str, Any]) -> str:
     """
     if "domains" in body:
         return str(body.get("domains") or "")
-    for key in ("docker_compose_domains", "urls"):
+    parts: list[str] = []
+    for key, label in (("docker_compose_domains", "name"), ("urls", "name"), ("route_envs", "key")):
         entries = body.get(key)
         if isinstance(entries, list):
-            return ", ".join(
-                f"{e.get('name')}={e.get('domain') or e.get('url') or ''}"
+            parts.extend(
+                f"{e.get(label)}={e.get('domain') or e.get('url') or ''}"
                 for e in entries
                 if isinstance(e, dict)
             )
-    return "?"
+    return ", ".join(parts) or "?"
 
 
 # ── conflicts ────────────────────────────────────────────────────────────────

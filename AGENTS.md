@@ -385,9 +385,16 @@ the release it starts in — read that module before adding a rule.
   minio, logto, garage (and silo from 4.5) go through
   `generateServiceSpecificFqdns` (parsers.php v4.1.2:2527-2528, v4.5.0:3386-3389;
   docker.php v4.5.0:660-760): `MINIO_SERVER_URL`, `LOGTO_ENDPOINT`,
-  `GARAGE_S3_API_URL` and friends (`dns/extract.py::ROUTE_ENV_KEYS`). The gate
-  reads those, each sub-application's domain and a custom compose's own Host()
-  labels — never the derived SERVICE_URL_*/SERVICE_FQDN_* rows.
+  `GARAGE_S3_API_URL` and friends (`dns/extract.py::SPECIFIC_SERVICE_ROUTE_KEYS`)
+  — but ONLY when the sub-application's image, up to its first `:`, is in
+  `SPECIFIC_SERVICES` (`ServiceApplication::serviceType`, v4.5.0:171-181,
+  constants.php :102-111). For any other image a `LOGTO_ENDPOINT` is a client's
+  setting: never gated, never dropped from the copy (`extract.route_env_keys`).
+  The gate reads those keys, each sub-application's domain and a custom
+  compose's own Host() labels — never the derived SERVICE_URL_*/SERVICE_FQDN_*
+  rows. FINALIZE blanks a route row holding a custom host (Coolify regenerates
+  an empty one, docker.php v4.5.0:680-688), and the restore body journals it
+  as `route_envs: [{key, url}]` — `url`, because the journal refuses `value`.
 - **`updateCompose` and the parser rebuild only DIRECTLY declared
   SERVICE_URL_*/SERVICE_FQDN_* rows.** A row that is only referenced (`${...}`) is
   `firstOrCreate`d and keeps whatever was copied into it for good (services.php

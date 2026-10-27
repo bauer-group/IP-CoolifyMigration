@@ -413,9 +413,20 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
             # the read 404s and the create 422s.
 
             # The way back for FINALIZE's release, journalled before any write for
-            # this resource.
+            # this resource. A service's includes the route-key rows its images
+            # are routed from (minio, logto, garage).
+            route_keys: frozenset[str] = frozenset()
+            source_envs: list[dict[str, Any]] | None = None
+            if snapshot.collection == "services":
+                route_keys = dns_extract.route_env_keys(source_full.get("applications"))
+                if route_keys:
+                    source_envs = await ctx.api.get_envs(snapshot.collection, snapshot.uuid)
             restore = api_resources.source_restore_body(
-                snapshot, source_full, source_wildcard=source_wildcard, version=version
+                snapshot,
+                source_full,
+                source_wildcard=source_wildcard,
+                version=version,
+                source_envs=source_envs,
             )
             if restore is not None:
                 parked[snapshot.uuid] = restore
@@ -454,6 +465,7 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                 source_wildcard=source_wildcard,
                 tag=tag,
                 recovered=recovered.get(snapshot.uuid),
+                route_keys=route_keys,
             )
             await api_resources.copy_storages(
                 ctx.api,
