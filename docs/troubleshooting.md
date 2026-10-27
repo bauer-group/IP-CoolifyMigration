@@ -623,8 +623,11 @@ container name. The task was still created. Point its container at one of the
 ### "the target's scheduled tasks do not match what was created"
 
 A create timed out at a proxy (502/504) after Coolify had already saved it, and
-the retry saved it a second time. CREATE refuses a doubled cron, deletes the
-target and leaves the source running. Re-run the migration.
+the retry saved it a second time; or a task CREATE made was not listed back.
+CREATE compares the target's tasks with the ones it created by uuid (a name
+can change on the way, because the API trims spaces the UI keeps), refuses a
+doubled cron, deletes the target and leaves the source running. Re-run the
+migration.
 
 ## Database backup schedules
 

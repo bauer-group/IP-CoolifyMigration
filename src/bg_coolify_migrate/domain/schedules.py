@@ -166,7 +166,11 @@ def task_container_mismatches(tasks: list[dict[str, Any]], available: set[str]) 
 
 
 def copy_count_mismatches(sent: Iterable[str], found: Iterable[str]) -> dict[str, tuple[int, int]]:
-    """``{name: (created, present)}`` wherever the two counts differ. PURE.
+    """``{uuid: (created, present)}`` wherever the two counts differ. PURE.
+
+    Keyed by the uuids the creates returned and the target holds, never by a
+    name: the API trims the names it is sent, so a source name with a stray
+    space would read as one task missing and another doubled.
 
     The client retries a POST on 429/502/503/504, and a proxy error that arrives
     after Coolify committed the row turns one create into two. Nothing upstream

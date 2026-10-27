@@ -166,7 +166,9 @@ tags v4.1.2 through v4.5.0 (2026-10-26). Read upstream at a **release tag**, nev
   either. A template service or a git-compose app takes its sub-service names
   from the CURRENT catalog or git HEAD, so CREATE checks each task's container
   against the target. A POST retried on 502/504 can save a task twice, so CREATE
-  re-reads and counts. Deleting the target deletes its tasks (model hooks).
+  re-reads and counts the uuids the creates returned, never names: the API trims
+  every string (TrimStrings) while Livewire skips it, so a UI-typed "nightly "
+  arrives as "nightly". Deleting the target deletes its tasks (model hooks).
 - **Database backup schedules** (`/databases/{uuid}/backups`, every release)
   create through `$backupConfigFields` (v4.1.2:704, v4.5.0:1057).
   `missing_backup_notification_days` arrives with its column (4.3.18/4.4.0) and

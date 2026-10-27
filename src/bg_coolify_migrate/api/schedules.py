@@ -114,8 +114,15 @@ async def copy_scheduled_tasks(
 
     Every body is built BEFORE the first POST, so an unreadable command fails
     while the target still holds none. After the POSTs the target is re-read and
-    counted (see :func:`~bg_coolify_migrate.domain.schedules.copy_count_mismatches`):
-    a doubled task would run every cron twice per tick, so it fails CREATE.
+    its tasks counted against the uuids the creates returned (see
+    :func:`~bg_coolify_migrate.domain.schedules.copy_count_mismatches`): a doubled
+    task would run every cron twice per tick, so it fails CREATE.
+
+    Counted by uuid, never by name. The API trims every string it receives
+    (TrimStrings is global middleware, Kernel.php v4.1.2:56, v4.5.0:61), while
+    the UI's Add form saves a name untrimmed (Livewire skips that middleware), so
+    a source task "nightly " comes back as "nightly" and a name count would call
+    it doubled on every run.
     """
     if collection not in SCHEDULED_TASK_COLLECTIONS:
         return 0
@@ -125,23 +132,21 @@ async def copy_scheduled_tasks(
     if not bodies:
         return 0
 
-    for body in bodies:
-        await api.create_scheduled_task(collection, target_uuid, body)
+    created = [await api.create_scheduled_task(collection, target_uuid, body) for body in bodies]
 
     names = [str(b["name"]) for b in bodies]
     present = await api.get_scheduled_tasks(collection, target_uuid)
-    if mismatched := copy_count_mismatches(names, [str(t.get("name")) for t in present]):
-        detail = ", ".join(
-            f"{name!r}: {found} on the target, {sent} created"
-            for name, (sent, found) in mismatched.items()
-        )
+    if copy_count_mismatches(created, [str(t.get("uuid")) for t in present]):
+        unexpected = sorted(str(t.get("name")) for t in present if t.get("uuid") not in created)
         raise CoolifyApiError(
-            f"the target's scheduled tasks do not match what was created ({detail})",
+            "the target's scheduled tasks do not match what was created "
+            f"({len(present)} on the target, {len(created)} created"
+            + (f"; not created by this run: {unexpected})" if unexpected else ")"),
             hint=(
                 "A create that timed out at a proxy (502/504) after Coolify had saved "
-                "it was retried and saved twice. A doubled task runs every cron twice. "
-                "The source was never stopped; the created target will be deleted — "
-                "re-run the migration."
+                "it was retried and saved twice, or a created task was not reported "
+                "back. A doubled task runs every cron twice. The source was never "
+                "stopped; the created target will be deleted — re-run the migration."
             ),
         )
     log.info("api.scheduled_tasks.copied", count=len(bodies), names=names, target=target_uuid)

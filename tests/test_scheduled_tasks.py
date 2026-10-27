@@ -63,6 +63,16 @@ def _task(**kw: Any) -> dict[str, Any]:
     return {**base, **kw}
 
 
+def _saved(*uuids: str) -> list[httpx.Response]:
+    """createTask's answers, one per POST: the saved task with its own uuid, 201."""
+    return [httpx.Response(201, json={"uuid": u}) for u in uuids]
+
+
+def _held(*tasks: tuple[str, str]) -> httpx.Response:
+    """The target's task list, as ``(uuid, name)`` pairs."""
+    return httpx.Response(200, json=[{"uuid": u, "name": n} for u, n in tasks])
+
+
 class _Recorder:
     """Stands in for a module's structlog logger, so assertions see every event.
 
@@ -141,8 +151,21 @@ class TestClient:
             return_value=httpx.Response(201, json={"uuid": "t1"})
         )
         body = {"name": "n", "command": "true", "frequency": "daily", "enabled": False}
-        await api.create_scheduled_task("services", "u1", body)
+        assert await api.create_scheduled_task("services", "u1", body) == "t1"
         assert json.loads(route.calls[0].request.read()) == body
+
+    async def test_a_create_without_a_uuid_fails_and_never_echoes_the_command(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # The uuid is what CREATE counts; the answer echoes the command, so it is
+        # not attached to the error.
+        respx_mock.post(f"{BASE}/services/u1/scheduled-tasks").mock(
+            return_value=httpx.Response(201, json={"name": "n", "command": SECRET_COMMAND})
+        )
+        with pytest.raises(CoolifyApiError, match="returned no uuid") as exc_info:
+            await api.create_scheduled_task("services", "u1", {"name": "n"})
+        assert SECRET_COMMAND not in str(exc_info.value)
+        assert SECRET_COMMAND not in repr(exc_info.value.__dict__)
 
 
 # ── body ─────────────────────────────────────────────────────────────────────
@@ -209,10 +232,10 @@ class TestCopyScheduledTasks:
             return_value=httpx.Response(200, json=source)
         )
         post = respx_mock.post(f"{BASE}/applications/tgt1/scheduled-tasks").mock(
-            return_value=httpx.Response(201, json={"uuid": "x"})
+            side_effect=_saved("t1", "t2")
         )
         respx_mock.get(f"{BASE}/applications/tgt1/scheduled-tasks").mock(
-            return_value=httpx.Response(200, json=[{"name": "nightly"}, {"name": "paused"}])
+            return_value=_held(("t1", "nightly"), ("t2", "paused"))
         )
 
         count = await copy_scheduled_tasks(
@@ -242,7 +265,7 @@ class TestCopyScheduledTasks:
             return_value=httpx.Response(201, json={"uuid": "x"})
         )
         respx_mock.get(f"{BASE}/services/tgt1/scheduled-tasks").mock(
-            return_value=httpx.Response(200, json=[{"name": "nightly"}])
+            return_value=_held(("x", "nightly"))
         )
         count = await copy_scheduled_tasks(
             api,
@@ -338,9 +361,12 @@ class TestCopyScheduledTasks:
             return_value=httpx.Response(201, json={"uuid": "x"})
         )
         respx_mock.get(f"{BASE}/applications/tgt1/scheduled-tasks").mock(
-            return_value=httpx.Response(200, json=[{"name": "nightly"}, {"name": "nightly"}])
+            return_value=_held(("lost", "nightly"), ("x", "nightly"))
         )
-        with pytest.raises(CoolifyApiError, match="'nightly': 2 on the target, 1 created") as exc:
+        with pytest.raises(
+            CoolifyApiError,
+            match=r"2 on the target, 1 created; not created by this run: \['nightly'\]",
+        ) as exc:
             await copy_scheduled_tasks(
                 api,
                 collection="applications",
@@ -350,6 +376,59 @@ class TestCopyScheduledTasks:
             )
         assert "twice" in (exc.value.hint or "")
         assert SECRET_COMMAND not in str(exc.value)
+
+    @pytest.mark.parametrize("name", ["nightly backup ", " nightly backup", "nightly backup\t"])
+    async def test_a_name_the_api_trims_is_not_a_doubled_task(
+        self, api: CoolifyClient, respx_mock: respx.Router, name: str
+    ) -> None:
+        """REGRESSION: the UI's Add form keeps a stray space, the API trims it.
+
+        The target holds "nightly backup" for a source task "nightly backup ".
+        Counted by name, that read as one task missing and another doubled, and
+        CREATE failed on every run with a hint to re-run.
+        """
+        respx_mock.get(f"{BASE}/applications/src1/scheduled-tasks").mock(
+            return_value=httpx.Response(200, json=[_task(name=name)])
+        )
+        post = respx_mock.post(f"{BASE}/applications/tgt1/scheduled-tasks").mock(
+            side_effect=_saved("t1")
+        )
+        respx_mock.get(f"{BASE}/applications/tgt1/scheduled-tasks").mock(
+            return_value=_held(("t1", name.strip()))
+        )
+        count = await copy_scheduled_tasks(
+            api,
+            collection="applications",
+            source_uuid="src1",
+            target_uuid="tgt1",
+            kind=ResourceKind.APP_DOCKERIMAGE,
+        )
+        assert count == 1
+        assert json.loads(post.calls[0].request.read())["name"] == name, "sent as it is"
+
+    async def test_a_task_the_target_does_not_report_fails_the_copy(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.get(f"{BASE}/applications/src1/scheduled-tasks").mock(
+            return_value=httpx.Response(
+                200, json=[_task(), _task(uuid="t-src-2", name="weekly", container=None)]
+            )
+        )
+        respx_mock.post(f"{BASE}/applications/tgt1/scheduled-tasks").mock(
+            side_effect=_saved("t1", "t2")
+        )
+        respx_mock.get(f"{BASE}/applications/tgt1/scheduled-tasks").mock(
+            return_value=_held(("t1", "nightly"))
+        )
+        with pytest.raises(CoolifyApiError, match=r"1 on the target, 2 created\)") as exc:
+            await copy_scheduled_tasks(
+                api,
+                collection="applications",
+                source_uuid="src1",
+                target_uuid="tgt1",
+                kind=ResourceKind.APP_DOCKERIMAGE,
+            )
+        assert "not reported back" in (exc.value.hint or "")
 
     async def test_the_retry_that_doubles_a_task_is_caught(
         self, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
@@ -367,7 +446,7 @@ class TestCopyScheduledTasks:
             side_effect=[httpx.Response(502), httpx.Response(201, json={"uuid": "x"})]
         )
         respx_mock.get(f"{BASE}/applications/tgt1/scheduled-tasks").mock(
-            return_value=httpx.Response(200, json=[{"name": "nightly"}, {"name": "nightly"}])
+            return_value=_held(("lost", "nightly"), ("x", "nightly"))
         )
         async with CoolifyClient(HOST, "tok", max_retries=2) as retrying:
             with pytest.raises(CoolifyApiError, match="do not match"):
@@ -391,7 +470,7 @@ class TestCopyScheduledTasks:
             return_value=httpx.Response(201, json={"uuid": "x"})
         )
         respx_mock.get(f"{BASE}/services/tgt1/scheduled-tasks").mock(
-            return_value=httpx.Response(200, json=[{"name": "nightly"}])
+            return_value=_held(("x", "nightly"))
         )
         respx_mock.get(f"{BASE}/services/tgt1").mock(
             return_value=httpx.Response(
@@ -430,7 +509,7 @@ class TestCopyScheduledTasks:
             return_value=httpx.Response(201, json={"uuid": "x"})
         )
         respx_mock.get(f"{BASE}/services/tgt1/scheduled-tasks").mock(
-            return_value=httpx.Response(200, json=[{"name": "nightly"}])
+            return_value=_held(("x", "nightly"))
         )
         respx_mock.get(f"{BASE}/services/tgt1").mock(
             return_value=httpx.Response(200, json={"applications": [{"name": "app"}]})
@@ -453,10 +532,10 @@ class TestCopyScheduledTasks:
             )
         )
         respx_mock.post(f"{BASE}/applications/tgt1/scheduled-tasks").mock(
-            return_value=httpx.Response(201, json={"uuid": "x"})
+            side_effect=_saved("t1", "t2")
         )
         respx_mock.get(f"{BASE}/applications/tgt1/scheduled-tasks").mock(
-            return_value=httpx.Response(200, json=[{"name": "ok"}, {"name": "lost"}])
+            return_value=_held(("t1", "ok"), ("t2", "lost"))
         )
         respx_mock.get(f"{BASE}/applications/tgt1").mock(
             return_value=httpx.Response(
@@ -486,7 +565,7 @@ class TestCopyScheduledTasks:
             return_value=httpx.Response(201, json={"uuid": "x"})
         )
         respx_mock.get(f"{BASE}/applications/tgt1/scheduled-tasks").mock(
-            return_value=httpx.Response(200, json=[{"name": "nightly"}])
+            return_value=_held(("x", "nightly"))
         )
         respx_mock.get(f"{BASE}/applications/tgt1").mock(
             return_value=httpx.Response(200, json={"docker_compose_raw": None})
@@ -510,7 +589,7 @@ class TestCopyScheduledTasks:
             return_value=httpx.Response(201, json={"uuid": "x"})
         )
         respx_mock.get(f"{BASE}/services/tgt1/scheduled-tasks").mock(
-            return_value=httpx.Response(200, json=[{"name": "nightly"}])
+            return_value=_held(("x", "nightly"))
         )
         respx_mock.get(f"{BASE}/services/tgt1").mock(return_value=httpx.Response(500))
         count = await copy_scheduled_tasks(
@@ -534,7 +613,7 @@ class TestCopyScheduledTasks:
             return_value=httpx.Response(201, json={"uuid": "x"})
         )
         respx_mock.get(f"{BASE}/applications/tgt1/scheduled-tasks").mock(
-            return_value=httpx.Response(200, json=[{"name": "nightly"}])
+            return_value=_held(("x", "nightly"))
         )
         await copy_scheduled_tasks(
             api,
@@ -703,10 +782,10 @@ class TestCreateTarget:
         ]
         delete = _service_create(respx_mock, source)
         post = respx_mock.post(f"{BASE}/services/tgt1/scheduled-tasks").mock(
-            return_value=httpx.Response(201, json={"uuid": "x"})
+            side_effect=_saved("t1", "t2")
         )
         respx_mock.get(f"{BASE}/services/tgt1/scheduled-tasks").mock(
-            return_value=httpx.Response(200, json=[{"name": "nightly"}, {"name": "paused"}])
+            return_value=_held(("t1", "nightly"), ("t2", "paused"))
         )
 
         result = await steps.step_create_target(ctx)
@@ -746,7 +825,7 @@ class TestCreateTarget:
             return_value=httpx.Response(201, json={"uuid": "x"})
         )
         respx_mock.get(f"{BASE}/services/tgt1/scheduled-tasks").mock(
-            return_value=httpx.Response(200, json=[{"name": "nightly"}, {"name": "nightly"}])
+            return_value=_held(("lost", "nightly"), ("x", "nightly"))
         )
         with pytest.raises(CoolifyApiError, match="do not match"):
             await steps.step_create_target(ctx)

@@ -408,11 +408,22 @@ class CoolifyClient:
         """
         return _as_list(await self.get(f"/{collection}/{uuid}/scheduled-tasks"))
 
-    async def create_scheduled_task(self, collection: str, uuid: str, body: dict[str, Any]) -> Any:
-        """Create one task. Retried on 429/502/503/504 like every POST, so a proxy
-        error after Coolify committed the row can double it — the caller re-reads
-        the target and counts (``api.schedules.copy_scheduled_tasks``)."""
-        return await self.post(f"/{collection}/{uuid}/scheduled-tasks", body)
+    async def create_scheduled_task(self, collection: str, uuid: str, body: dict[str, Any]) -> str:
+        """Create one task; returns its uuid.
+
+        createTask answers 201 with the saved task, uuid included (v4.1.2:117,
+        v4.5.0:146). Retried on 429/502/503/504 like every POST, so a proxy error
+        after Coolify committed the row can double it — the caller re-reads the
+        target and counts these uuids (``api.schedules.copy_scheduled_tasks``).
+        The answer is never attached to the error: it echoes the ``command``.
+        """
+        created = await self.post(f"/{collection}/{uuid}/scheduled-tasks", body)
+        task_uuid = created.get("uuid") if isinstance(created, dict) else None
+        if not task_uuid:
+            raise CoolifyApiError(
+                f"creating a scheduled task on {collection} {uuid} returned no uuid"
+            )
+        return str(task_uuid)
 
     async def get_backups(self, uuid: str) -> list[dict[str, Any]]:
         """A standalone database's backup schedules, each execution reduced.
