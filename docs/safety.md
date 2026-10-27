@@ -169,10 +169,15 @@ A pin is released when Coolify's own containers reference the data again:
   fallback copy**: the next cleanup deletes its volumes. The plan says so for
   every server with the setting on; turn it off there, or back the data up,
   if you want one.
-- **Source, rollback**, as the very last step, once the restarted source mounts
-  its volumes again. If it does not within `DEPLOY_TIMEOUT`, or the source was
-  never restarted, the pin stays and the report says so: once the source runs,
-  `docker rm <pin>` there removes it.
+- **Source, rollback**, as the very last step, once running containers of the
+  restarted source keep every volume mounted for a settle window
+  (`STOP_TIMEOUT`, at least two minutes): a container seen once is no evidence
+  — Coolify removes a restarted container that fails its health check, and a
+  stop already in its queue can still land. If that does not happen within
+  `DEPLOY_TIMEOUT`, or the restart failed after a stop was requested, the pin
+  stays and the report says so: once the source runs,
+  `coolify-migrate unpin <id>` removes it (never a second `rollback`, which
+  would redeploy the running source).
 
 A rollback can be run again — the report asks for it when a target had to be
 kept or a restart failed — and every compensation is then replayed. The source

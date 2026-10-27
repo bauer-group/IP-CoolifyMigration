@@ -422,8 +422,10 @@ async def undo_quiesce(ctx: MigrationContext, undo_info: dict[str, Any]) -> None
         raise RuntimeError(
             "could not restart: "
             + "; ".join(failures)
-            + " (its volume pins against Coolify's Docker cleanup stay until it runs again; "
-            f"`coolify-migrate rollback {ctx.migration_id}` retries only these)"
+            + " (its volume pins against Coolify's Docker cleanup stay until it runs again;"
+            f" `coolify-migrate rollback {ctx.migration_id}` retries only these restarts"
+            " and then releases the pins - or start it yourself, then"
+            f" `coolify-migrate unpin {ctx.migration_id}`)"
         )
 
 
@@ -583,9 +585,9 @@ async def undo_release_source_pins(ctx: MigrationContext, undo_info: dict[str, A
 
     A kept pin is not a compensation failure. The source is no worse off than
     before - better: its data survives the cleanup - so the outcome stays
-    ROLLED_BACK and the run report names the pin, with the one remedy that does
-    not restart a serving source: ``docker rm`` once it runs. ``rollback <id>``
-    again is offered only where it has a restart left to do, or none to repeat.
+    ROLLED_BACK and the run report names the pin. ``coolify-migrate unpin
+    <id>``, once the source runs, removes it - never ``rollback <id>`` again,
+    which replays every compensation and redeploys a source serving by then.
     """
     stopped = _source_was_stopped(ctx)
     restarted = stopped and _restart_succeeded(ctx.journal.read())
@@ -622,19 +624,17 @@ async def undo_release_source_pins(ctx: MigrationContext, undo_info: dict[str, A
         restarted=restarted,
     )
     remove = f"docker rm {' '.join(outcome.kept)}"
+    unpin = f"coolify-migrate unpin {ctx.migration_id}"
     if restarted:
-        remedy = (
-            f"Once the source mounts them again: {remove} there (or coolify-migrate "
-            f"rollback {ctx.migration_id}, which does not restart it again)."
-        )
+        remedy = f"Once the source mounts them again: {unpin} (or {remove} there)."
     elif stopped:
         remedy = (
             f"The source is not running: coolify-migrate rollback {ctx.migration_id} "
             "restarts it and then removes the pin. If you start it yourself instead, "
-            f"{remove} there once it runs - not the rollback, which would restart it again."
+            f"{unpin} once it runs - not the rollback, which would restart it again."
         )
     else:
-        remedy = f"Once the source runs: {remove} there."
+        remedy = f"Once the source runs: {unpin} (or {remove} there)."
     ctx.notices.append(
         f"{', '.join(outcome.kept)} still pins the source's volume(s) "
         f"{', '.join(outcome.unmounted)} on {ctx.plan.source_server.name}: {why}, so "

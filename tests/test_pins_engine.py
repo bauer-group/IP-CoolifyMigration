@@ -163,6 +163,7 @@ class TestQuiesce:
         # The saga's rollback runs next and restarts the source: sending the
         # operator into a second rollback would restart a serving source again.
         assert "coolify-migrate rollback" not in hint
+        assert f"coolify-migrate unpin {MID}" in hint
         # The step itself leaves the pin: the source is down until the restart.
         assert source.containers[pin].volumes == [VOL]
 
@@ -683,10 +684,10 @@ class TestReleaseSourcePins:
         await compensations.undo_release_source_pins(ctx, {})
 
         assert "src-pin" in source.containers
-        # Nothing stopped it and no restart is owed: a rollback has nothing to do
-        # for it, so the notice names the one thing that removes the pin.
-        assert "docker rm src-pin" in ctx.notices[0]
-        assert "coolify-migrate rollback" not in ctx.notices[0]
+        # `rollback <id>` again would replay every compensation: redeploy the
+        # source serving by then, and DELETE a target that is long gone.
+        assert "src-pin" in ctx.notices[0] and f"coolify-migrate unpin {MID}" in ctx.notices[0]
+        assert "rollback" not in ctx.notices[0]
         kept = [
             r.detail
             for r in ctx.journal.read()
@@ -926,6 +927,71 @@ async def test_a_kept_pin_reaches_the_report_and_the_outcome_stays_rolled_back(
     assert result.outcome is Outcome.ROLLED_BACK
     assert len(result.notices) == 1 and "src-pin" in result.notices[0]
     assert "notice: " in run_report.plain_result(result, migration_id=MID)
+
+
+class TestUnpinCommand:
+    """`coolify-migrate unpin <id>`: the pin cleanup on its own, for a kept pin.
+
+    The notices used to send the operator back to `rollback <id>`, which
+    replays the whole compensation plan - a `/restart` of the source serving
+    by then (a fresh outage), and a DELETE of a target already deleted.
+    """
+
+    async def _unpin(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: FakeDaemon, *, last: str
+    ) -> dict[str, pins.Release]:
+        journal = Journal.create(tmp_path, MID)
+        journal.append("step_completed", state="create_target", detail={"target_uuids": {}})
+        journal.append(last)
+
+        @asynccontextmanager
+        async def hosts(*_a: Any, **_kw: Any) -> AsyncIterator[tuple[FakeDaemon, FakeDaemon]]:
+            yield source, _target()
+
+        async def no_wait(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(runner, "open_hosts", hosts)
+        monkeypatch.setattr(pins.asyncio, "sleep", no_wait)
+        async with CoolifyClient(HOST, "tok", max_retries=0) as api:
+            return await runner.unpin_migration(
+                api, Settings(_env_file=None, state_dir=tmp_path), _plan(), MID
+            )
+
+    async def test_releases_once_the_source_runs_and_restarts_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, respx_mock: respx.Router
+    ) -> None:
+        source = _source(VOL)
+        source.add("postgres-db1", labels=COOLIFY, volumes=(VOL,))
+        source.add("src-pin", state="created", labels=_labels(pins.SOURCE), volumes=(VOL,))
+
+        outcome = await self._unpin(tmp_path, monkeypatch, source, last="rolled_back")
+
+        assert outcome[pins.SOURCE].released == ("src-pin",)
+        assert "src-pin" not in source.containers
+        assert not respx_mock.calls  # no restart, no delete: no Coolify call at all
+
+    async def test_keeps_a_pin_no_running_container_mounts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        source = _source(VOL)
+        source.add("postgres-db1", state="exited", labels=COOLIFY, volumes=(VOL,))
+        source.add("src-pin", state="created", labels=_labels(pins.SOURCE), volumes=(VOL,))
+
+        outcome = await self._unpin(tmp_path, monkeypatch, source, last="rolled_back")
+
+        assert outcome[pins.SOURCE].kept == ("src-pin",)
+        assert "src-pin" in source.containers
+
+    async def test_refuses_a_migration_that_has_not_finished(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Blocked at the DNS gate, say: its pins protect a run still open.
+        source = _source(VOL)
+        source.add("src-pin", state="created", labels=_labels(pins.SOURCE), volumes=(VOL,))
+        with pytest.raises(MigrationError, match="has not finished"):
+            await self._unpin(tmp_path, monkeypatch, source, last="blocked")
+        assert "src-pin" in source.containers
 
 
 async def test_a_finalize_notice_reaches_the_report_of_a_run(

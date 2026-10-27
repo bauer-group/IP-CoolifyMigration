@@ -14,6 +14,7 @@ coolify-migrate --help
 | `run <selector> --to <server>` | Execute a migration for a scope. |
 | `resume <id>` | Continue a blocked or interrupted migration. |
 | `rollback <id>` | Undo a migration. |
+| `unpin <id>` | Remove the volume pins a finished migration had to keep, once running containers keep their volumes mounted. Restarts nothing; exits `1` while a pin still has to stay. |
 | `status [id]` | List migrations, or show one in detail. |
 | `server plan` / `server run` | Migrate the Coolify instance itself. |
 

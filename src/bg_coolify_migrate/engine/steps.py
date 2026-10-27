@@ -1071,14 +1071,14 @@ def _name_source_pins(ctx: MigrationContext, exc: MigrationError, pinned: list[s
         return
     # No `rollback <id>` advice: the rollback that follows this error already
     # restarts the source and removes the pin, and running it again would
-    # restart a source that is serving by then.
+    # restart a source that is serving by then. `unpin` does only the unpin.
     note = (
         f"The source's volumes are pinned by {', '.join(pinned)} - a container that is "
         "never started: no process, writes nothing - so Coolify's Docker cleanup cannot "
         "delete them while the source is down. The rollback restarts the source and "
-        "removes the pin once the source mounts its volumes again; the run report names "
-        f"a pin it has to keep (then `docker rm` it on {ctx.plan.source_server.name} "
-        "once the source runs)."
+        "removes the pin once the source keeps its volumes mounted; the run report names "
+        f"a pin it has to keep (then `coolify-migrate unpin {ctx.migration_id}` once the "
+        "source runs)."
     )
     exc.hint = f"{exc.hint}\n\n{note}" if exc.hint else note
 
@@ -2652,10 +2652,11 @@ async def _unpin_target(ctx: MigrationContext) -> pins.Release:
     if outcome.kept:
         ctx.notices.append(
             f"{', '.join(outcome.kept)} still pins target volume(s) "
-            f"{', '.join(outcome.unmounted)} on {ctx.plan.target_server.name}: no target "
-            "container mounts them, so without the pin Coolify's Docker cleanup could delete "
-            "the copied data. Check the resource's storages; once something mounts them, "
-            f"`docker rm {' '.join(outcome.kept)}` there."
+            f"{', '.join(outcome.unmounted)} on {ctx.plan.target_server.name}: no running "
+            "target container mounts them, so without the pin Coolify's Docker cleanup could "
+            "delete the copied data. Check the resource's storages; once something mounts them: "
+            f"coolify-migrate unpin {ctx.migration_id} "
+            f"(or docker rm {' '.join(outcome.kept)} there)."
         )
     return outcome
 

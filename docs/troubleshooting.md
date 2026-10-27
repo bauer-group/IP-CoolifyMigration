@@ -288,17 +288,27 @@ daemon answers and has disk space, then re-run.
 
 A run or a rollback ended with a pin it deliberately did not remove:
 
-- **after a rollback**, the restarted source did not mount its volumes within
-  `DEPLOY_TIMEOUT` — or its restart failed. Removing the pin then would let
-  Coolify's next cleanup delete the
-  source's data on a server with *Delete unused volumes* on. If the restart
-  failed, `coolify-migrate rollback <id>` again retries it and then removes the
-  pin. If you start the source yourself, remove the pin with `docker rm <pin>`
-  once it runs instead — a rollback would restart it once more. A source that a
-  rollback already restarted is never restarted again by a second one.
-- **after a finalize**, a copied target volume is mounted by no target
+- **after a rollback**, the restarted source did not keep its volumes mounted
+  — no running container mounted them within `DEPLOY_TIMEOUT`, or one did and
+  was gone again within the settle window (Coolify removes a restarted
+  container that fails its health check) — or its restart failed, so a stop
+  the run had asked for could still land. Removing the pin then would let
+  Coolify's next cleanup delete the source's data on a server with *Delete
+  unused volumes* on. Get the source running, then
+  `coolify-migrate unpin <id>`: it removes the pin once running containers keep
+  the volumes mounted for the settle window (`STOP_TIMEOUT`, at least two
+  minutes), and touches nothing else. Do **not** run `rollback <id>` again for
+  this — it replays every compensation, and its restart redeploys a source that
+  is serving by then.
+- **after a finalize**, a copied target volume is mounted by no running target
   container. Check the resource's storages in Coolify; once something mounts the
-  volume, `docker rm <pin>` on the target removes the pin.
+  volume, `coolify-migrate unpin <id>` (or `docker rm <pin>` on the target)
+  removes the pin.
+
+`unpin` only works on a migration that has finished or rolled back; while one is
+blocked or interrupted its pins belong to the run — resume it or roll it back.
+It exits `1` while a pin still has to stay, naming the volume nothing running
+mounts.
 
 A pin is a stopped container that never ran; it holds no process and writes
 nothing. List a migration's pins with

@@ -655,6 +655,55 @@ class TestResumeAndRollbackNeedAPlan:
         assert "no saved plan" in result.stderr
 
 
+class TestUnpin:
+    """The way out a kept volume pin's notice names - not a second rollback."""
+
+    def _invoke(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: dict[str, object]
+    ) -> object:
+        from bg_coolify_migrate.engine import runner as engine_runner
+        from tests.test_engine_steps import _plan
+
+        state = tmp_path / "state"
+        engine_runner.save_plan(state, "mig-001", _plan())
+        monkeypatch.setenv("STATE_DIR", str(state))
+        monkeypatch.setenv("COOLIFY_URL", HOST)
+        monkeypatch.setenv("COOLIFY_TOKEN", "tok")
+
+        async def fake_unpin(*_a: object, **_kw: object) -> dict[str, object]:
+            return outcome
+
+        monkeypatch.setattr(engine_runner, "unpin_migration", fake_unpin)
+        return runner.invoke(app, ["unpin", "mig-001"])
+
+    def test_a_kept_pin_exits_1_and_says_how_to_remove_it(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from bg_coolify_migrate.discovery.pins import Release
+
+        result = self._invoke(
+            monkeypatch,
+            tmp_path,
+            {"source": Release(kept=("src-pin",), unmounted=("v1",)), "target": Release()},
+        )
+        assert result.exit_code == 1  # type: ignore[attr-defined]
+        assert "docker rm src-pin" in result.stdout  # type: ignore[attr-defined]
+
+    def test_released_pins_exit_0(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from bg_coolify_migrate.discovery.pins import Release
+
+        result = self._invoke(
+            monkeypatch,
+            tmp_path,
+            {"source": Release(released=("src-pin",)), "target": Release()},
+        )
+        assert result.exit_code == 0  # type: ignore[attr-defined]
+        assert "src-pin" in result.stdout  # type: ignore[attr-defined]
+
+    def test_is_listed_in_the_help(self) -> None:
+        assert "unpin" in runner.invoke(app, ["--help"]).stdout
+
+
 class TestRunValidation:
     def test_invalid_finalize_policy_is_rejected(self) -> None:
         result = runner.invoke(app, ["run", "shop", "--to", "x", "--finalize", "obliterate"])

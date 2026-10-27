@@ -14,12 +14,17 @@ from pathlib import Path
 import structlog
 
 from bg_coolify_migrate.api.client import CoolifyClient
+from bg_coolify_migrate.discovery import pins
 from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.dns.gate import is_definitive
 from bg_coolify_migrate.domain.domains import dns_rollback_note, parking_tag
 from bg_coolify_migrate.domain.plan import MigrationPlan, ServerRef, TransferMode
 from bg_coolify_migrate.domain.statemachine import Outcome, State
-from bg_coolify_migrate.engine.compensations import build_compensations, source_data_refusal
+from bg_coolify_migrate.engine.compensations import (
+    build_compensations,
+    settle_window,
+    source_data_refusal,
+)
 from bg_coolify_migrate.engine.context import (
     MigrationContext,
     deserialise_mounts,
@@ -445,3 +450,57 @@ async def rollback_migration(
         result = await _with_rollback_notes(result, ctx)
         log.info("migration.rolled_back", id=migration_id, outcome=result.outcome.value)
         return result
+
+
+async def unpin_migration(
+    api: CoolifyClient,
+    settings: Settings,
+    plan: MigrationPlan,
+    migration_id: str,
+    *,
+    trust_host_key: bool = False,
+    host_key_prompt: HostKeyPrompt | None = None,
+) -> dict[str, pins.Release]:
+    """Remove the volume pins a FINISHED migration kept, where it is now safe.
+
+    The way out a kept pin's notice names. Re-running ``rollback`` instead
+    replays every compensation - its ``/restart`` redeploys a source that is
+    serving by then. This does one thing: on each side, release the pins once
+    running containers keep every pinned volume mounted across the settle
+    window (``compensations.settle_window``); idle pins go at once. Writes
+    nothing to the journal and calls no Coolify API.
+
+    Refused while the migration is unfinished: its pins are part of a run that
+    a resume or a rollback still has to finish.
+    """
+    journal = Journal.open(settings.resolved_state_dir(), migration_id)
+    if not journal.is_finished:
+        raise MigrationError(
+            f"migration {migration_id} has not finished",
+            hint=(
+                "Its pins protect a run that is still open. Resume it "
+                f"(`coolify-migrate resume {migration_id}`) or roll it back "
+                f"(`coolify-migrate rollback {migration_id}`); either removes them."
+            ),
+        )
+    settle = settle_window(settings)
+    async with open_hosts(
+        api,
+        settings,
+        plan.source_server,
+        plan.target_server,
+        trust_host_key=trust_host_key,
+        host_key_prompt=host_key_prompt,
+    ) as (source_host, target_host):
+        out: dict[str, pins.Release] = {}
+        for side, host in ((pins.SOURCE, source_host), (pins.TARGET, target_host)):
+            out[side] = await pins.release_when_referenced(
+                host, migration_id=migration_id, side=side, timeout=0.0, settle=settle
+            )
+        log.info(
+            "migration.unpinned",
+            id=migration_id,
+            released=[n for r in out.values() for n in r.released],
+            kept=[n for r in out.values() for n in r.kept],
+        )
+        return out

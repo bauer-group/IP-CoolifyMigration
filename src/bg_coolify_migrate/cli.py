@@ -1317,6 +1317,79 @@ async def _rollback(
         return result.exit_code
 
 
+@app.command(no_args_is_help=True)
+def unpin(
+    migration_id: Annotated[str, typer.Argument(help="From `coolify-migrate status`.")],
+    trust_host_key: Annotated[
+        bool, typer.Option("--trust-host-key", help=_TRUST_HOST_KEY_HELP)
+    ] = False,
+    log_level: Annotated[str, typer.Option(help="DEBUG|INFO|WARNING|ERROR")] = "INFO",
+    log_format: Annotated[str, typer.Option(help="console|json")] = "console",
+) -> None:
+    """Remove the volume pins a finished migration had to keep.
+
+    A pin goes only once running containers keep every volume it holds
+    mounted for the settle window, so this waits a few minutes. Changes nothing
+    in Coolify and restarts nothing. Exits 1 when a pin still has to stay.
+    """
+    settings = _settings(log_level, log_format)
+    try:
+        code = asyncio.run(_unpin(settings, migration_id, trust_host_key))
+    except MigrationError as exc:
+        _fail(exc)
+        return
+    raise typer.Exit(code)
+
+
+async def _unpin(settings: Settings, migration_id: str, trust_host_key: bool = False) -> int:
+    from bg_coolify_migrate.api.client import CoolifyClient
+    from bg_coolify_migrate.engine.compensations import settle_window
+    from bg_coolify_migrate.engine.runner import load_plan, unpin_migration
+
+    console = get_console()
+    url, token = settings.require_coolify()
+    migration_plan = load_plan(settings.resolved_state_dir(), migration_id)
+    servers = {
+        "source": migration_plan.source_server.name,
+        "target": migration_plan.target_server.name,
+    }
+    console.print(
+        f"Releasing each pin once running containers keep its volumes mounted for "
+        f"{settle_window(settings):.0f}s...",
+        style="muted",
+    )
+    async with CoolifyClient(url, token, verify=settings.coolify_verify_tls) as api:
+        outcome = await unpin_migration(
+            api,
+            settings,
+            migration_plan,
+            migration_id,
+            trust_host_key=trust_host_key,
+            host_key_prompt=_host_key_decision(),  # type: ignore[arg-type]
+        )
+    kept = False
+    for side, release in outcome.items():
+        server = servers[side]
+        if release.released:
+            console.print(
+                Text.assemble(f"released on {server}: ", ", ".join(release.released))
+            )
+        if release.kept:
+            kept = True
+            console.print(
+                Text.assemble(
+                    ("kept", "warn"),
+                    f" on {server}: {', '.join(release.kept)} - no running container kept "
+                    f"{', '.join(release.unmounted)} mounted. Get the {side} running and "
+                    "re-run, or remove the pin by hand once you know the volume is "
+                    f"referenced: docker rm {' '.join(release.kept)}",
+                )
+            )
+    if not kept and not any(r.released for r in outcome.values()):
+        console.print(f"migration {migration_id} holds no volume pins", style="muted")
+    return 1 if kept else 0
+
+
 # ── status ───────────────────────────────────────────────────────────────────
 
 
