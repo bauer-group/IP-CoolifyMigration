@@ -141,7 +141,7 @@ async def wait_for_container(host: RemoteHost, name: str, *, timeout: float = 18
     raise AssertionError(f"{name} never became ready (last status: {last or 'absent'})")
 
 
-async def wait_until_healthy(host: RemoteHost, name: str, *, timeout: float = 240) -> None:
+async def wait_until_healthy(host: RemoteHost, name: str, *, timeout: float = 420) -> None:
     """Block until Coolify's health check on the container passes.
 
     Engine-agnostic, unlike wait_for_container's pg_isready. Coolify puts a
@@ -151,7 +151,8 @@ async def wait_until_healthy(host: RemoteHost, name: str, *, timeout: float = 24
     Generous by default: mysql:8 and mongo:7 spend 40-60s on first-boot
     initialisation, during which their health check legitimately reports
     unhealthy. That is not a failure, it is the image initialising its data
-    directory — waiting less would flake against the slow engines only.
+    directory — waiting less would flake against the slow engines only. 420s,
+    not 240: a mysql:8 first boot took longer than 240 on a loaded workstation.
     """
     import asyncio
 
@@ -275,3 +276,43 @@ async def db_exec(host: RemoteHost, container: str, argv: str, *, stdin: str | N
     )
     result.check()
     return result.stdout.strip()
+
+
+#: What an engine says while its image is still initialising, after Coolify's
+#: health check already passed. mysql:8 and postgres run a TEMPORARY server to
+#: initialise the data directory and then restart into the real one (ERROR 2002 /
+#: 1045; "shutting down" / "starting up"); clickhouse answers its health check
+#: before the native port listens (Code: 210). None of it is the migration.
+_STILL_INITIALISING = (
+    "ERROR 2002",
+    "ERROR 1045",
+    "Code: 210",
+    "Connection refused",
+    "the database system is shutting down",
+    "the database system is starting up",
+    "is not yet accepting connections",
+)
+
+
+async def db_exec_when_ready(
+    host: RemoteHost, container: str, argv: str, *, stdin: str | None = None, timeout: float = 180
+) -> str:
+    """:func:`db_exec`, retried while the engine is still initialising.
+
+    "healthy" is not "ready" on first boot (see :data:`_STILL_INITIALISING`).
+    Only for SEEDING a fresh source: the migration itself only ever starts a
+    target whose data directory already exists.
+    """
+    import asyncio
+
+    from bg_coolify_migrate.transfer.ssh import SshError
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        try:
+            return await db_exec(host, container, argv, stdin=stdin)
+        except SshError as exc:
+            initialising = any(marker in str(exc) for marker in _STILL_INITIALISING)
+            if not initialising or asyncio.get_running_loop().time() >= deadline:
+                raise
+            await asyncio.sleep(5)

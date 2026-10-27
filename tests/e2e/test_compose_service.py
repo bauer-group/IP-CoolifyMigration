@@ -40,7 +40,7 @@ from bg_coolify_migrate.domain.statemachine import FinalizePolicy, Outcome, Stat
 from bg_coolify_migrate.engine.planner import build_plan
 from bg_coolify_migrate.settings.base import Settings
 
-from .conftest import db_exec, ssh_to, wait_until_healthy
+from .conftest import db_exec, db_exec_when_ready, ssh_to, wait_until_healthy
 
 pytestmark = [pytest.mark.e2e, pytest.mark.asyncio]
 
@@ -175,7 +175,7 @@ async def compose_stack(
             container = await _store_container(source, service_uuid)
             await wait_until_healthy(source, container)
             values = ",".join(f"('{c}',{n})" for c, n in SEED)
-            await db_exec(
+            await db_exec_when_ready(
                 source,
                 container,
                 "psql -U shop -d shopdb -tA -v ON_ERROR_STOP=1",

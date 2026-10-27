@@ -34,7 +34,7 @@ from bg_coolify_migrate.engine.runner import run_migration
 from bg_coolify_migrate.settings.base import Settings
 from bg_coolify_migrate.transfer.ssh import SshError
 
-from .conftest import db_exec, ssh_to, tinker, wait_until_healthy
+from .conftest import db_exec, db_exec_when_ready, ssh_to, tinker, wait_until_healthy
 
 pytestmark = [pytest.mark.e2e, pytest.mark.asyncio]
 
@@ -204,30 +204,16 @@ async def _deploy(
     return str(created["uuid"])
 
 
-async def _seed_once_ready(source: Any, container: str, engine: Engine, *, timeout: float = 120) -> None:
+async def _seed_once_ready(source: Any, container: str, engine: Engine, *, timeout: float = 180) -> None:
     """Seed, retrying while the image is still initialising its data directory.
 
-    "healthy" is not "ready" on first boot. mysql:8's entrypoint runs a TEMPORARY
-    server to initialise the data directory and only then the real one, and
-    Coolify's `mysqladmin ping` health check passes against the temporary one —
-    mysqladmin even exits 0 on "Access denied". A seed in that window fails with
-    ERROR 2002 (the socket is gone between the two servers) or 1045 (root's
-    password is not set yet), seen on consecutive 4.5.0 runs. That is the image
-    starting up, not the migration; the migration only ever starts a target whose
-    data directory already exists.
+    "healthy" is not "ready" on first boot: see conftest.db_exec_when_ready for
+    what each engine says in that window (mysql:8's temporary init server,
+    clickhouse's native port opening after its health check passes).
     """
-    import asyncio
-
-    deadline = asyncio.get_running_loop().time() + timeout
-    while True:
-        try:
-            await db_exec(source, container, engine.seed_argv, stdin=engine.seed_stdin)
-            return
-        except SshError as exc:
-            initialising = "ERROR 2002" in str(exc) or "ERROR 1045" in str(exc)
-            if not initialising or asyncio.get_running_loop().time() >= deadline:
-                raise
-            await asyncio.sleep(5)
+    await db_exec_when_ready(
+        source, container, engine.seed_argv, stdin=engine.seed_stdin, timeout=timeout
+    )
 
 
 @pytest_asyncio.fixture
