@@ -17,10 +17,36 @@ at the source:
 
 So the gate is not a nicety — starting early actively damages the ability to
 migrate at all. It is also *resumable by design*: you flip DNS, then continue.
+
+What blocks, and how an operator answers it (per host, never globally, for
+anything but a plain cutover):
+
+* CUTOVER_NEEDED — the host still resolves to the source. ``--accept-dns`` (or
+  ``--accept-dns-host HOST``) proceeds and cuts it over in parallel.
+* ELSEWHERE — the host resolves to neither server: a CDN, a proxy or a load
+  balancer (Cloudflare's orange cloud among them) whose ORIGIN DNS cannot show.
+  It may well still be the source — invariant 7 in all but name — so it blocks
+  for every provider until the operator accepts that one host
+  (``--accept-dns-host HOST``) after checking the origin.
+* VANISHED — the host resolved at plan time and DNS now answers that it does
+  not (NXDOMAIN, an empty answer): a deleted record (Coolify deletes a record it
+  manages when a hostname loses its last holder, 4.4+), which Traefik's ACME
+  would now burn validations on. Accepted per host too.
+* UNANSWERED — the host resolved at plan time and DNS could not be asked now (a
+  timeout, SERVFAIL): nothing is known about where it points, so it blocks, and
+  a resume asks again. Accepted per host too.
+
+An address BOTH servers answer as — a wildcard base they share, or one CDN in
+front of both wildcards — proves neither server: a host that resolves only to
+such addresses is ELSEWHERE, never READY or CUTOVER_NEEDED.
+
+A host that did not resolve at plan time either stays UNRESOLVED and passes:
+it serves nobody (the e2e rig's ``.invalid`` hosts).
 """
 
 from __future__ import annotations
 
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -38,13 +64,25 @@ class Verdict(StrEnum):
     """Still resolves to the source. A custom domain that must be repointed."""
 
     ELSEWHERE = "elsewhere"
-    """Resolves to neither — typically a CDN/proxy (Cloudflare's orange cloud)
-    in front. DNS then tells us nothing about the origin, so we cannot decide.
-    Surfaced for a human rather than guessed at."""
+    """Resolves to neither server — typically a CDN/proxy (Cloudflare's orange
+    cloud) or a load balancer in front. DNS then tells us nothing about the
+    origin, which may still be the source. Blocks until the operator accepts
+    that host explicitly."""
+
+    VANISHED = "vanished"
+    """Resolved at plan time, and DNS now answers that it does not (NXDOMAIN, no
+    records): a record was deleted between plan and start. Blocks until
+    recreated, or accepted explicitly."""
+
+    UNANSWERED = "unanswered"
+    """Resolved at plan time, and DNS could not be asked now (a timeout, SERVFAIL,
+    no reachable nameserver). That proves no deletion, but nothing proves the
+    host left the source either. Blocks until a resume gets an answer, or the
+    host is accepted explicitly."""
 
     UNRESOLVED = "unresolved"
-    """NXDOMAIN or no answer. Suspicious but not blocking: the domain is not
-    serving anyone right now anyway."""
+    """NXDOMAIN or no answer, and no answer at plan time either. Not blocking:
+    the domain is not serving anyone right now anyway."""
 
     GENERATED = "generated"
     """A Coolify-generated *.sslip.io style name that encodes the server IP and
@@ -57,6 +95,12 @@ class Verdict(StrEnum):
     The target answers on its own hostname, so this never gates."""
 
 
+#: The verdicts that stop the start until DNS changes or the operator accepts.
+BLOCKING: frozenset[Verdict] = frozenset(
+    {Verdict.CUTOVER_NEEDED, Verdict.ELSEWHERE, Verdict.VANISHED, Verdict.UNANSWERED}
+)
+
+
 @dataclass(frozen=True, slots=True)
 class Resolution:
     """The resolved facts for one hostname."""
@@ -66,6 +110,22 @@ class Resolution:
     ttl: int | None = None
     cname_chain: tuple[str, ...] = ()
     error: str | None = None
+    nameservers: tuple[str, ...] = ()
+    """The authoritative nameservers of the host's zone, by NAME — what tells a
+    Cloudflare zone apart (``dns/managed.py``). Messages only, never gating."""
+
+
+def is_definitive(resolution: Resolution) -> bool:
+    """Whether a resolution is an ANSWER rather than a failure to get one.
+
+    Addresses, NXDOMAIN or an empty answer are answers. A timeout or an
+    unreachable nameserver says nothing about the record, so nothing that cannot
+    be resumed may be decided on it.
+    """
+    if resolution.addresses:
+        return True
+    error = resolution.error or ""
+    return "NXDOMAIN" in error or "no A/AAAA records" in error
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,10 +137,12 @@ class HostVerdict:
     addresses: tuple[str, ...]
     ttl: int | None = None
     detail: str = ""
+    baseline: tuple[str, ...] = ()
+    """What the host resolved to at plan time (VANISHED says what to recreate)."""
 
     @property
     def blocks(self) -> bool:
-        return self.verdict is Verdict.CUTOVER_NEEDED
+        return self.verdict in BLOCKING
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,9 +161,35 @@ class DnsGateReport:
     def is_blocked(self) -> bool:
         return bool(self.blocked)
 
+    def unaccepted(
+        self, *, accept_cutover: bool, accepted_hosts: Collection[str] = ()
+    ) -> tuple[HostVerdict, ...]:
+        """The blocking verdicts the operator has NOT answered.
+
+        ``accept_cutover`` (``--accept-dns``) answers a plain cutover only — the
+        host resolves to the source, and the operator chose to finish and flip
+        it in parallel. ELSEWHERE, VANISHED and UNANSWERED say something is wrong
+        with what DNS shows, or that it showed nothing, so only an explicit,
+        per-host acceptance answers them.
+        """
+        return tuple(
+            v
+            for v in self.blocked
+            if v.hostname.host not in accepted_hosts
+            and not (accept_cutover and v.verdict is Verdict.CUTOVER_NEEDED)
+        )
+
     @property
     def ambiguous(self) -> tuple[HostVerdict, ...]:
         return tuple(v for v in self.verdicts if v.verdict is Verdict.ELSEWHERE)
+
+    @property
+    def vanished(self) -> tuple[HostVerdict, ...]:
+        return tuple(v for v in self.verdicts if v.verdict is Verdict.VANISHED)
+
+    @property
+    def unanswered(self) -> tuple[HostVerdict, ...]:
+        return tuple(v for v in self.verdicts if v.verdict is Verdict.UNANSWERED)
 
     @property
     def ready(self) -> tuple[HostVerdict, ...]:
@@ -112,19 +200,63 @@ class DnsGateReport:
         """URLs rewritten onto the target's wildcard — reported, never gating."""
         return tuple(v for v in self.verdicts if v.verdict is Verdict.SERVER_BOUND)
 
-    def cutover_checklist(self) -> list[str]:
+    def cutover_checklist(
+        self,
+        verdicts: tuple[HostVerdict, ...] | None = None,
+        *,
+        cloudflare_hosts: Collection[str] = (),
+    ) -> list[str]:
         """Actionable instructions, not a diagnosis.
 
         The operator needs to know which record to change, to what, and how long
         the old answer will linger. A long TTL is the difference between a
-        five-minute cutover and an hour of split traffic.
+        five-minute cutover and an hour of split traffic. ``cloudflare_hosts``
+        (zone on Cloudflare, Coolify >= 4.4) get the one place they can be
+        changed: Coolify never re-points a record it manages.
         """
         lines: list[str] = []
-        target = self.target_ips[0] if self.target_ips else "<target ip>"
-        for verdict in self.blocked:
+        # Never an address the source answers as too: a record pointed there
+        # would reach the source as much as the target.
+        shared = set(self.source_ips) & set(self.target_ips)
+        own = [ip for ip in self.target_ips if ip not in shared]
+        target = own[0] if own else "<target ip>"
+        for verdict in self.blocked if verdicts is None else verdicts:
+            host = verdict.hostname.host
             ttl = f" (TTL {verdict.ttl}s)" if verdict.ttl else ""
             current = ", ".join(verdict.addresses) or "?"
-            lines.append(f"{verdict.hostname.host}: {current} -> {target}{ttl}")
+            if verdict.verdict is Verdict.ELSEWHERE:
+                where = (
+                    "an address both servers answer as"
+                    if shared & set(verdict.addresses)
+                    else "neither server"
+                )
+                line = (
+                    f"{host}: resolves to {current}, {where} - make sure its origin "
+                    f"(CDN, proxy, load balancer) is {target}, then accept it: "
+                    f"--accept-dns-host {host}"
+                )
+            elif verdict.verdict is Verdict.VANISHED:
+                was = ", ".join(verdict.baseline) or "?"
+                line = (
+                    f"{host}: resolved to {was} at plan time, now to nothing - recreate the "
+                    f"record -> {target}, or accept it: --accept-dns-host {host}"
+                )
+            elif verdict.verdict is Verdict.UNANSWERED:
+                was = ", ".join(verdict.baseline) or "?"
+                line = (
+                    f"{host}: resolved to {was} at plan time, and DNS could not be asked "
+                    f"now - resume to ask again; if it does point at {target}, accept it: "
+                    f"--accept-dns-host {host}"
+                )
+            else:
+                line = f"{host}: {current} -> {target}{ttl}"
+            if host in cloudflare_hosts:
+                line += (
+                    " [Cloudflare zone: change the record at Cloudflare; Coolify cannot "
+                    "re-point a record it manages - for one it does not, the target's "
+                    "Domains > Configure DNS > Replace record works]"
+                )
+            lines.append(line)
         return lines
 
     @property
@@ -138,6 +270,7 @@ def classify(
     source_ips: frozenset[str],
     target_ips: frozenset[str],
     source_wildcard: str | None = None,
+    baseline: tuple[str, ...] = (),
 ) -> HostVerdict:
     """Decide what one hostname's DNS state means. PURE.
 
@@ -145,7 +278,8 @@ def classify(
     wildcard) and a generated hostname are both decided before DNS is even
     consulted, because each encodes the server and would otherwise look like
     ``CUTOVER_NEEDED`` forever — the first is rewritten onto the target's
-    wildcard, the second follows the server by its embedded IP.
+    wildcard, the second follows the server by its embedded IP. ``baseline`` is
+    what the host resolved to at plan time (``()`` when it did not).
     """
     if source_wildcard and under_wildcard(resolution.hostname.host, source_wildcard):
         return HostVerdict(
@@ -166,6 +300,34 @@ def classify(
         )
 
     if resolution.error or not resolution.addresses:
+        if baseline and not is_definitive(resolution):
+            # A timeout or SERVFAIL is no answer: calling it a deleted record sent
+            # operators to recreate one that still exists. It blocks all the same
+            # — the source is stopped by now, and nothing proves the host left it.
+            return HostVerdict(
+                hostname=resolution.hostname,
+                verdict=Verdict.UNANSWERED,
+                addresses=(),
+                ttl=resolution.ttl,
+                detail=(
+                    f"resolved to {', '.join(baseline)} at plan time; DNS could not be "
+                    f"asked now ({resolution.error or 'no answer'}) - a resume asks again"
+                ),
+                baseline=baseline,
+            )
+        if baseline:
+            return HostVerdict(
+                hostname=resolution.hostname,
+                verdict=Verdict.VANISHED,
+                addresses=(),
+                ttl=resolution.ttl,
+                detail=(
+                    f"resolved to {', '.join(baseline)} at plan time, now to nothing "
+                    f"({resolution.error or 'no A/AAAA records'}) - its record was deleted "
+                    "or its zone broke since"
+                ),
+                baseline=baseline,
+            )
         return HostVerdict(
             hostname=resolution.hostname,
             verdict=Verdict.UNRESOLVED,
@@ -175,13 +337,20 @@ def classify(
         )
 
     addresses = set(resolution.addresses)
+    # An address both servers answer as — a wildcard base they share, or one CDN
+    # in front of both wildcards — tells them apart no more than a CDN does.
+    # Counted as either, it read as READY first, and a host still on the source
+    # passed the gate.
+    shared = source_ips & target_ips
+    on_target = addresses & (target_ips - shared)
+    on_source = addresses & (source_ips - shared)
 
-    if addresses & target_ips:
+    if on_target:
         # Already pointing at the target. If it ALSO points at the source we are
         # mid-cutover with both live, which is fine to proceed from — the target
         # is what we are about to start.
         detail = "resolves to the target"
-        if addresses & source_ips:
+        if on_source:
             detail = "resolves to BOTH source and target (cutover in progress)"
         return HostVerdict(
             hostname=resolution.hostname,
@@ -191,7 +360,7 @@ def classify(
             detail=detail,
         )
 
-    if addresses & source_ips:
+    if on_source:
         return HostVerdict(
             hostname=resolution.hostname,
             verdict=Verdict.CUTOVER_NEEDED,
@@ -200,15 +369,28 @@ def classify(
             detail="still resolves to the source server",
         )
 
+    if addresses & shared:
+        return HostVerdict(
+            hostname=resolution.hostname,
+            verdict=Verdict.ELSEWHERE,
+            addresses=resolution.addresses,
+            ttl=resolution.ttl,
+            detail=(
+                "resolves only to an address BOTH servers answer as — a wildcard base "
+                "they share, or one CDN in front of both. DNS cannot tell which one it "
+                "reaches, and it may still be the source: check it, then accept this host."
+            ),
+        )
+
     return HostVerdict(
         hostname=resolution.hostname,
         verdict=Verdict.ELSEWHERE,
         addresses=resolution.addresses,
         ttl=resolution.ttl,
         detail=(
-            "resolves to neither source nor target — likely a CDN or reverse proxy "
-            "(e.g. Cloudflare) in front. DNS cannot tell us where the origin points; "
-            "check the CDN's origin setting before starting the target."
+            "resolves to neither source nor target — a CDN, reverse proxy or load "
+            "balancer (e.g. Cloudflare) in front. DNS cannot tell us where the origin "
+            "points, and it may still be the source: check it, then accept this host."
         ),
     )
 
@@ -219,11 +401,16 @@ def build_report(
     source_ips: frozenset[str],
     target_ips: frozenset[str],
     source_wildcard: str | None = None,
+    baselines: Mapping[str, tuple[str, ...]] | None = None,
 ) -> DnsGateReport:
     """Classify every hostname into one report."""
     verdicts = tuple(
         classify(
-            r, source_ips=source_ips, target_ips=target_ips, source_wildcard=source_wildcard
+            r,
+            source_ips=source_ips,
+            target_ips=target_ips,
+            source_wildcard=source_wildcard,
+            baseline=(baselines or {}).get(r.hostname.host, ()),
         )
         for r in resolutions
     )

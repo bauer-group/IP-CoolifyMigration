@@ -47,7 +47,7 @@ import json
 from collections.abc import Collection, Iterable, Mapping
 from typing import Any
 
-from bg_coolify_migrate.dns.extract import is_generated, normalise_host
+from bg_coolify_migrate.dns.extract import is_generated, normalise_host, route_env_keys
 from bg_coolify_migrate.dns.wildcard import under_wildcard
 from bg_coolify_migrate.domain.kinds import ResourceKind
 from bg_coolify_migrate.domain.plan import ResourceSnapshot
@@ -153,6 +153,39 @@ def resource_custom_hosts(
         values: Iterable[str] = compose_domains(source.get("docker_compose_domains")).values()
     else:
         values = [str(source.get("fqdn") or "")]
+    out: list[str] = []
+    for value in values:
+        out.extend(custom_hosts(value, source_wildcard=source_wildcard))
+    return list(dict.fromkeys(out))
+
+
+def source_custom_hosts(
+    snapshot: ResourceSnapshot,
+    source: Mapping[str, Any],
+    envs: Iterable[Mapping[str, Any]] = (),
+    *,
+    source_wildcard: str | None,
+) -> list[str]:
+    """Every custom host a source serves — what DNS must follow it to the target.
+
+    An application's ``fqdn`` or compose domains; a service's sub-application
+    ``url``/``fqdn`` and the route-key rows of the SPECIFIC_SERVICES images it
+    runs (``envs`` is its env list). Databases serve none.
+    """
+    if snapshot.collection == "applications":
+        return resource_custom_hosts(snapshot, source, source_wildcard=source_wildcard)
+    if snapshot.collection != "services":
+        return []
+    values: list[str] = []
+    for app in source.get("applications") or []:
+        if isinstance(app, Mapping):
+            values.extend(str(app.get(k) or "") for k in ("url", "fqdn"))
+    keys = route_env_keys(source.get("applications"))
+    values.extend(
+        str(env.get("value") or "")
+        for env in envs
+        if str(env.get("key") or "") in keys and isinstance(env.get("value"), str)
+    )
     out: list[str] = []
     for value in values:
         out.extend(custom_hosts(value, source_wildcard=source_wildcard))
@@ -444,32 +477,45 @@ def dns_rollback_note(
     source_ip: str,
     source_wildcard: str | None,
     target_wildcard: str | None,
+    now_on_target: Iterable[str] = (),
+    vanished: Mapping[str, tuple[str, ...]] | None = None,
 ) -> str | None:
-    """What a rollback after DNS_GATE cannot do for the operator, or ``None``.
+    """What a rollback cannot do for the operator about DNS, or ``None``.
 
-    ``dns_gate`` is that step's journalled detail. Its ``ready`` hosts already
-    resolved to the target, and its ``cutover_accepted`` hosts were to be cut
-    over in parallel. The rollback gives the source its domains back and
-    restarts it, but DNS still sends their traffic to the target it removed —
-    so the custom domain stays dead, and the source's proxy fails its ACME
-    challenge, until the records point back. Server-bound hosts (under either
-    server's wildcard) never moved by DNS and are left out.
+    The flip-back checklist. ``dns_gate`` is that step's journalled detail: its
+    ``ready`` hosts already resolved to the target, its ``cutover_accepted`` and
+    ``accepted`` hosts were to be cut over in parallel. ``now_on_target`` are
+    hosts the rollback's own re-resolution found on the target — a cutover made
+    by hand, which no journal saw. The rollback gives the source its domains
+    back and restarts it, but DNS still sends their traffic to the target it
+    removed — so the custom domain stays dead, and the source's proxy fails its
+    ACME challenge, until the records point back. ``vanished`` are hosts that
+    resolved at plan time and resolve to nothing now (their plan-time
+    addresses): their records must be recreated. Server-bound hosts (under
+    either server's wildcard) never moved by DNS and are left out.
     """
     hosts: set[str] = set()
-    for key in ("ready", "cutover_accepted"):
-        listed = dns_gate.get(key)
-        if not isinstance(listed, list):
+    listed: list[object] = list(now_on_target)
+    for key in ("ready", "cutover_accepted", "accepted"):
+        found = dns_gate.get(key)
+        if isinstance(found, list):
+            listed.extend(found)
+    for host in listed:
+        if not isinstance(host, str) or not host:
             continue
-        for host in listed:
-            if not isinstance(host, str) or not host:
-                continue
-            if under_wildcard(host, source_wildcard) or under_wildcard(host, target_wildcard):
-                continue
-            hosts.add(host)
-    if not hosts:
-        return None
-    return (
-        f"point DNS for {', '.join(sorted(hosts))} back to {source_ip}: the source "
-        "serves them again, but DNS still sends their traffic to the target this "
-        "rollback removed"
-    )
+        if under_wildcard(host, source_wildcard) or under_wildcard(host, target_wildcard):
+            continue
+        hosts.add(host)
+    parts: list[str] = []
+    if hosts:
+        parts.append(
+            f"point DNS for {', '.join(sorted(hosts))} back to {source_ip}: the source "
+            "serves them again, but DNS still sends their traffic to the target this "
+            "rollback removed"
+        )
+    for host, was in sorted((vanished or {}).items()):
+        parts.append(
+            f"recreate the DNS record of {host} -> {source_ip}: it resolved to "
+            f"{', '.join(was)} when the migration was planned and resolves to nothing now"
+        )
+    return "; ".join(parts) or None

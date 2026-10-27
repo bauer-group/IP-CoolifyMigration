@@ -14,6 +14,8 @@ from pathlib import Path
 import structlog
 
 from bg_coolify_migrate.api.client import CoolifyClient
+from bg_coolify_migrate.dns import resolve as dns_resolve
+from bg_coolify_migrate.dns.gate import is_definitive
 from bg_coolify_migrate.domain.domains import dns_rollback_note, parking_tag
 from bg_coolify_migrate.domain.plan import MigrationPlan, ServerRef, TransferMode
 from bg_coolify_migrate.domain.statemachine import Outcome, State
@@ -22,6 +24,7 @@ from bg_coolify_migrate.engine.context import (
     MigrationContext,
     deserialise_mounts,
     deserialise_volume_pairs,
+    dns_baseline_of,
 )
 from bg_coolify_migrate.engine.executor import RunResult, Saga
 from bg_coolify_migrate.engine.steps import build_steps
@@ -207,25 +210,72 @@ async def _execute(
         )
         result = await saga.run(start_from=start_from)
         result.notices.extend(ctx.notices)
-        return _with_rollback_notes(result, ctx)
+        return await _with_rollback_notes(result, ctx)
 
 
-def _with_rollback_notes(result: RunResult, ctx: MigrationContext) -> RunResult:
-    """Add what a rollback leaves for the operator to do by hand.
+async def _with_rollback_notes(result: RunResult, ctx: MigrationContext) -> RunResult:
+    """Add what a rollback leaves for the operator to do by hand: DNS to flip back.
 
-    Read from the JOURNAL, so an explicit rollback after a crash says it too.
+    Read from the JOURNAL — so an explicit rollback after a crash says it too —
+    and from DNS itself, re-resolved now: a host someone already pointed at the
+    target, or one whose record vanished since the plan, is in no journal.
     """
     if result.outcome not in (Outcome.ROLLED_BACK, Outcome.ROLLBACK_FAILED):
         return result
+    gate = ctx.journal.undo_info(State.DNS_GATE.value)
+    now_on_target, vanished = await _dns_after_rollback(ctx, gate)
     note = dns_rollback_note(
-        ctx.journal.undo_info(State.DNS_GATE.value),
+        gate,
         source_ip=ctx.plan.source_server.ip,
         source_wildcard=ctx.plan.source_server.wildcard_domain or None,
         target_wildcard=ctx.plan.target_server.wildcard_domain or None,
+        now_on_target=now_on_target,
+        vanished=vanished,
     )
     if note:
         result.notes.append(note)
     return result
+
+
+async def _dns_after_rollback(
+    ctx: MigrationContext, gate: dict[str, object]
+) -> tuple[list[str], dict[str, tuple[str, ...]]]:
+    """Re-resolve the custom hosts at the end of a rollback.
+
+    Returns the hosts that resolve to the TARGET now, and those that resolved at
+    plan time but definitively resolve to nothing now (with their plan-time
+    addresses). Best-effort: DNS that cannot be asked adds no note, never a
+    failure — the rollback itself is done.
+    """
+    baseline = dns_baseline_of(ctx.journal, ctx.plan)
+    hosts = set(baseline)
+    for key in ("ready", "cutover_accepted", "accepted"):
+        listed = gate.get(key)
+        if isinstance(listed, list):
+            hosts.update(h for h in listed if isinstance(h, str) and h)
+    if not hosts:
+        return [], {}
+    try:
+        target_ips = await dns_resolve.server_addresses(
+            ctx.plan.target_server.ip, ctx.plan.target_server.wildcard_domain or None
+        )
+        source_ips = await dns_resolve.server_addresses(
+            ctx.plan.source_server.ip, ctx.plan.source_server.wildcard_domain or None
+        )
+        now = await dns_resolve.resolve_hosts(sorted(hosts))
+    except Exception as exc:  # the rollback is done; this only adds advice
+        log.warning("rollback.dns_recheck_failed", error=str(exc)[:120])
+        return [], {}
+    # Only what the TARGET alone answers as: an address both servers share (one
+    # wildcard base, one CDN) is no reason to tell anyone to flip a record back.
+    target_only = target_ips - source_ips
+    on_target = sorted(h for h, r in now.items() if set(r.addresses) & target_only)
+    vanished = {
+        h: baseline[h].addresses
+        for h, r in now.items()
+        if h in baseline and baseline[h].addresses and not r.addresses and is_definitive(r)
+    }
+    return on_target, vanished
 
 
 async def run_migration(
@@ -236,6 +286,7 @@ async def run_migration(
     migration_id: str | None = None,
     accept_drift: bool = False,
     accept_dns: bool = False,
+    accept_hosts: frozenset[str] = frozenset(),
     delete_previews: bool = False,
     trust_host_key: bool = False,
     host_key_prompt: HostKeyPrompt | None = None,
@@ -269,6 +320,7 @@ async def run_migration(
             target_host=target_host,
             accept_drift=accept_drift,
             accept_dns=accept_dns,
+            accepted_hosts=frozenset(accept_hosts),
             delete_previews=delete_previews,
         )
         result = await _execute(ctx, start_from=State.INIT, on_state=on_state)
@@ -284,6 +336,7 @@ async def resume_migration(
     *,
     accept_drift: bool = False,
     accept_dns: bool = False,
+    accept_hosts: frozenset[str] = frozenset(),
     trust_host_key: bool = False,
     host_key_prompt: HostKeyPrompt | None = None,
     on_state: Callable[[State], Awaitable[None]] | None = None,
@@ -323,6 +376,7 @@ async def resume_migration(
             target_host=target_host,
             accept_drift=accept_drift,
             accept_dns=accept_dns,
+            accepted_hosts=frozenset(accept_hosts),
         )
         # Rehydrate what earlier states recorded, so compensations and later
         # steps see the same world.
@@ -386,6 +440,6 @@ async def rollback_migration(
         )
         result = await saga.rollback()
         result.notices.extend(ctx.notices)
-        result = _with_rollback_notes(result, ctx)
+        result = await _with_rollback_notes(result, ctx)
         log.info("migration.rolled_back", id=migration_id, outcome=result.outcome.value)
         return result

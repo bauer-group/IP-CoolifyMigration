@@ -30,7 +30,9 @@ _DECISION_STYLE = {
 _VERDICT_STYLE = {
     Verdict.READY: "ok",
     Verdict.CUTOVER_NEEDED: "err",
-    Verdict.ELSEWHERE: "warn",
+    Verdict.ELSEWHERE: "err",
+    Verdict.VANISHED: "err",
+    Verdict.UNANSWERED: "err",
     Verdict.UNRESOLVED: "warn",
     Verdict.GENERATED: "muted",
     Verdict.SERVER_BOUND: "ok",

@@ -286,9 +286,27 @@ safety story. It is also why a rollback is **refused** once a FINALIZE with
 remaining compensation aims at the target. FINALIZE journals its policy before
 it touches anything, so the refusal holds even when it died part-way.
 
-A rollback cannot move DNS. When the DNS gate had already found a custom domain
-pointing at the target (or you accepted the cutover), the run report ends with
-the hosts to point back at the source.
+A rollback cannot move DNS. It re-resolves every custom host at its end: a host
+now pointing at the target (found by the gate, accepted, or changed by hand) is
+listed to point back at the source, and one whose record vanished since the plan
+is listed to recreate.
+
+## DNS is checked against the plan, per host
+
+The plan records what each custom host resolved to (hosts, addresses, TTL and
+the zone's nameserver names — never a secret), and the journal keeps it. The DNS
+gate blocks, per host, a domain still on the source (a cutover: `--accept-dns`
+proceeds in parallel), one on **neither** server — a CDN, proxy or load balancer
+whose origin may still be the source, for every provider — one that resolved
+at plan time and resolves to nothing now, and one that resolved at plan time
+and whose lookup fails now (a timeout is no deletion, but it shows nothing
+either; a resume asks again). The last three are accepted only by name
+(`--accept-dns-host HOST`). Each server's address set includes its
+wildcard base, the public address custom records usually point at; an address
+both sets hold (a shared wildcard, one CDN in front of both) proves neither, so
+a host on it alone blocks like one on neither server. CREATE
+re-checks the plan's hosts while the source still serves and refuses, with
+nothing stopped, when one moved or vanished.
 
 A crash mid-step is covered too. CREATE journals each target and each restore
 body before it writes them, so `coolify-migrate rollback <id>` also undoes the

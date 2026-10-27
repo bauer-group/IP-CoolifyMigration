@@ -199,7 +199,7 @@ def _ctx(journal: Journal) -> Any:
 
 class TestTheRollbackSaysSo:
     @pytest.mark.parametrize("outcome", [Outcome.ROLLED_BACK, Outcome.ROLLBACK_FAILED])
-    def test_a_rollback_after_the_dns_gate_carries_the_note(
+    async def test_a_rollback_after_the_dns_gate_carries_the_note(
         self, tmp_path: Path, outcome: Outcome
     ) -> None:
         journal = Journal.create(tmp_path, "n1")
@@ -208,24 +208,24 @@ class TestTheRollbackSaysSo:
             state=State.DNS_GATE.value,
             detail={"ready": [], "cutover_accepted": ["shop.example.com"]},
         )
-        result = runner._with_rollback_notes(
+        result = await runner._with_rollback_notes(
             RunResult(outcome=outcome, reached=None), _ctx(journal)
         )
         assert len(result.notes) == 1
         assert "shop.example.com back to 10.0.0.1" in result.notes[0]
 
-    def test_a_successful_run_carries_none(self, tmp_path: Path) -> None:
+    async def test_a_successful_run_carries_none(self, tmp_path: Path) -> None:
         journal = Journal.create(tmp_path, "n2")
         journal.append(
             "step_completed", state=State.DNS_GATE.value, detail={"ready": ["shop.example.com"]}
         )
-        result = runner._with_rollback_notes(
+        result = await runner._with_rollback_notes(
             RunResult(outcome=Outcome.SUCCEEDED, reached=None), _ctx(journal)
         )
         assert result.notes == []
 
-    def test_no_dns_gate_no_note(self, tmp_path: Path) -> None:
-        result = runner._with_rollback_notes(
+    async def test_no_dns_gate_no_note(self, tmp_path: Path) -> None:
+        result = await runner._with_rollback_notes(
             RunResult(outcome=Outcome.ROLLED_BACK, reached=None),
             _ctx(Journal.create(tmp_path, "n3")),
         )

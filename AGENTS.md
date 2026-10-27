@@ -90,7 +90,8 @@ decision, the decision is in the wrong layer.
 - **Tempted to block on drift?** Don't. We build the target exactly as the source
   is configured and report what could still differ; whether that is compatible is
   the operator's judgement about their stack. Blocking belongs to things that are
-  not judgements (a refused volume, live previews, DNS pointing at the source).
+  not judgements (a refused volume, live previews, DNS pointing at the source,
+  or at something DNS cannot place).
 - **Touching the transfer?** Every rsync flag in `transfer/rsync.py::BASE_FLAGS`
   is there for a reason documented in the module docstring. Removing one is a
   data-integrity change.
@@ -555,6 +556,31 @@ why `domain/domains.py` hands every hostname over make-before-break.
   then one PATCH claims them. The update ignores `domains` when the target
   server's proxy should not run (v4.5.0:3566) and keeps compose entries only for
   services in the loaded compose (:3667-3682) — hence the read-back.
+- **The DNS gate decides per host, and only a cutover is accepted globally.**
+  ELSEWHERE (neither server — a CDN, proxy or load balancer; a proxied
+  Cloudflare record looks exactly like this) BLOCKS for every provider: its
+  origin may still be the source. VANISHED (resolved at PLAN, a definitive
+  NXDOMAIN or empty answer now) blocks too, and so does UNANSWERED (resolved at
+  PLAN, the lookup times out or SERVFAILs now): a failed lookup is no deletion,
+  but the source is stopped by then and nothing shows where the host points.
+  All three are accepted only by name (`--accept-dns-host`,
+  `ctx.accepted_hosts`); `--accept-dns` stays the answer to CUTOVER_NEEDED alone.
+  An address BOTH servers' sets hold (a wildcard base they share, one CDN in
+  front of both) proves neither: `gate.classify` matches each side on what only
+  it answers as, so a host on shared addresses alone is ELSEWHERE. Counted for
+  both, it read as READY and a host still on the source passed.
+  Cloudflare/NS/CNAME classification (`dns/managed.py`) only words messages and
+  plan warnings — never gate on it (vanity nameservers, partial setups and every
+  other CDN would slip through). Each server's address set includes its wildcard
+  base (and a probe label under it), the public address custom records point at.
+- **The DNS baseline is taken at PLAN and journalled** (`plan.dns_baseline`,
+  PLAN's step detail; `context.dns_baseline_of` reads the journal first). It is
+  re-checked at the gate (VANISHED), at the end of CREATE while the source still
+  serves (a custom host that left the source refuses with zero downtime — on a
+  DEFINITIVE answer only, `gate.is_definitive`: a timeout proves nothing), and at
+  the end of every rollback (the flip-back list, `domains.dns_rollback_note`).
+  Unit tests never touch the real resolver: `tests/conftest.py::_offline_dns`
+  answers "offline" (not definitive) unless a test patches resolution itself.
 
 ## Verify + ship
 

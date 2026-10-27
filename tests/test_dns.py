@@ -24,6 +24,7 @@ from bg_coolify_migrate.dns.extract import (
     real_hostnames,
 )
 from bg_coolify_migrate.dns.gate import (
+    HostVerdict,
     Resolution,
     Verdict,
     build_report,
@@ -233,15 +234,62 @@ class TestClassify:
         assert verdict.verdict is Verdict.READY
         assert "BOTH" in verdict.detail
 
-    def test_points_elsewhere_is_ambiguous_not_blocking(self) -> None:
-        # A CDN in front means DNS cannot tell us where the origin points. We
-        # surface it for a human rather than guessing.
+    def test_points_elsewhere_blocks_for_every_provider(self) -> None:
+        # A CDN, proxy or load balancer in front means DNS cannot tell us where
+        # the origin points - it may still be the source (invariant 7). Blocks
+        # until the operator accepts that one host.
         verdict = classify(
             Resolution(_h("a.example.com"), ("104.21.1.1",)), source_ips=SOURCE, target_ips=TARGET
         )
         assert verdict.verdict is Verdict.ELSEWHERE
-        assert verdict.blocks is False
+        assert verdict.blocks is True
         assert "CDN" in verdict.detail
+
+    def test_a_host_that_resolved_at_plan_time_and_no_longer_does_vanished(self) -> None:
+        verdict = classify(
+            Resolution(_h("a.example.com"), (), error="NXDOMAIN"),
+            source_ips=SOURCE,
+            target_ips=TARGET,
+            baseline=("10.0.0.1",),
+        )
+        assert verdict.verdict is Verdict.VANISHED
+        assert verdict.blocks is True
+        assert verdict.baseline == ("10.0.0.1",)
+        assert "10.0.0.1 at plan time" in verdict.detail
+
+    @pytest.mark.parametrize("error", ["LifetimeTimeout", "NoNameservers", None])
+    def test_a_failed_lookup_is_no_deletion_but_still_blocks(self, error: str | None) -> None:
+        # A timeout says nothing about the record: not VANISHED ("recreate it"),
+        # yet it blocks — the source is stopped and nothing shows where it points.
+        verdict = classify(
+            Resolution(_h("a.example.com"), (), error=error),
+            source_ips=SOURCE,
+            target_ips=TARGET,
+            baseline=("10.0.0.1",),
+        )
+        assert verdict.verdict is Verdict.UNANSWERED
+        assert verdict.blocks is True
+        assert verdict.baseline == ("10.0.0.1",)
+        assert "could not be asked" in verdict.detail
+
+    def test_a_failed_lookup_without_a_baseline_stays_unresolved(self) -> None:
+        verdict = classify(
+            Resolution(_h("a.example.invalid"), (), error="LifetimeTimeout"),
+            source_ips=SOURCE,
+            target_ips=TARGET,
+        )
+        assert verdict.verdict is Verdict.UNRESOLVED
+        assert verdict.blocks is False
+
+    def test_unresolved_then_and_now_stays_non_blocking(self) -> None:
+        verdict = classify(
+            Resolution(_h("a.example.invalid"), (), error="NXDOMAIN"),
+            source_ips=SOURCE,
+            target_ips=TARGET,
+            baseline=(),
+        )
+        assert verdict.verdict is Verdict.UNRESOLVED
+        assert verdict.blocks is False
 
     def test_generated_never_blocks(self) -> None:
         # Even though it resolves to the source IP, it encodes that IP and will
@@ -299,6 +347,58 @@ class TestClassify:
         assert verdict.blocks is True
 
 
+class TestSharedAddresses:
+    """An address both servers answer as proves neither (a shared wildcard, one CDN)."""
+
+    # Both wildcards resolve to the source's public address, or to one CDN.
+    SRC = frozenset({"203.0.113.5"})
+    TGT = frozenset({"198.51.100.6", "203.0.113.5"})
+
+    def _classify(self, *addresses: str, source: frozenset[str] = SRC) -> HostVerdict:
+        return classify(
+            Resolution(_h("shop.example.com"), addresses), source_ips=source, target_ips=self.TGT
+        )
+
+    def test_a_host_on_a_shared_address_is_not_ready(self) -> None:
+        verdict = self._classify("203.0.113.5")
+        assert verdict.verdict is Verdict.ELSEWHERE
+        assert verdict.blocks is True
+        assert "BOTH servers answer as" in verdict.detail
+
+    def test_a_proxied_host_behind_one_cdn_for_both_blocks(self) -> None:
+        cdn = frozenset({"104.21.1.1", "172.67.2.2"})
+        verdict = classify(
+            Resolution(_h("shop.example.com"), ("104.21.1.1", "172.67.2.2")),
+            source_ips=frozenset({"10.0.0.5"}) | cdn,
+            target_ips=frozenset({"10.0.0.6"}) | cdn,
+        )
+        assert verdict.verdict is Verdict.ELSEWHERE
+        report = build_report(
+            [Resolution(_h("shop.example.com"), ("104.21.1.1",))],
+            source_ips=frozenset({"10.0.0.5"}) | cdn,
+            target_ips=frozenset({"10.0.0.6"}) | cdn,
+        )
+        assert report.unaccepted(accept_cutover=True)
+
+    def test_an_address_of_the_target_alone_still_proves_it(self) -> None:
+        assert self._classify("198.51.100.6", "203.0.113.5").verdict is Verdict.READY
+
+    def test_an_address_of_the_source_alone_still_proves_it(self) -> None:
+        source = self.SRC | {"192.0.2.9"}
+        verdict = self._classify("192.0.2.9", "203.0.113.5", source=source)
+        assert verdict.verdict is Verdict.CUTOVER_NEEDED
+
+    def test_the_checklist_never_points_a_record_at_a_shared_address(self) -> None:
+        report = build_report(
+            [Resolution(_h("shop.example.com"), ("203.0.113.5",))],
+            source_ips=self.SRC,
+            target_ips=frozenset({"203.0.113.5", "250.0.0.6"}),
+        )
+        (line,) = report.cutover_checklist()
+        assert "an address both servers answer as" in line
+        assert "is 250.0.0.6" in line
+
+
 class TestReport:
     def test_blocked_when_any_hostname_points_at_source(self) -> None:
         report = build_report(
@@ -342,14 +442,74 @@ class TestReport:
         )
         assert report.max_ttl == 3600
 
-    def test_ambiguous_surfaced_separately(self) -> None:
+    def test_ambiguous_surfaced_separately_and_blocking(self) -> None:
         report = build_report(
             [Resolution(_h("cdn.example.com"), ("104.21.1.1",))],
             source_ips=SOURCE,
             target_ips=TARGET,
         )
         assert len(report.ambiguous) == 1
-        assert report.is_blocked is False
+        assert report.is_blocked is True
+
+    def _mixed(self) -> object:
+        return build_report(
+            [
+                Resolution(_h("cut.example.com"), ("10.0.0.1",), ttl=300),
+                Resolution(_h("cdn.example.com"), ("104.21.1.1",)),
+                Resolution(_h("gone.example.com"), (), error="NXDOMAIN"),
+                Resolution(_h("ok.example.com"), ("10.0.0.2",)),
+            ],
+            source_ips=SOURCE,
+            target_ips=TARGET,
+            baselines={"gone.example.com": ("10.0.0.1",)},
+        )
+
+    def test_accept_dns_answers_a_cutover_only(self) -> None:
+        report = self._mixed()
+        open_ = report.unaccepted(accept_cutover=True)  # type: ignore[attr-defined]
+        assert [v.hostname.host for v in open_] == ["cdn.example.com", "gone.example.com"]
+
+    def test_a_host_is_accepted_one_by_one(self) -> None:
+        report = self._mixed()
+        open_ = report.unaccepted(  # type: ignore[attr-defined]
+            accept_cutover=False, accepted_hosts={"cdn.example.com", "gone.example.com"}
+        )
+        assert [v.hostname.host for v in open_] == ["cut.example.com"]
+        assert report.vanished[0].hostname.host == "gone.example.com"  # type: ignore[attr-defined]
+
+    def test_the_checklist_says_what_to_do_per_verdict(self) -> None:
+        report = self._mixed()
+        lines = report.cutover_checklist(cloudflare_hosts={"cut.example.com"})  # type: ignore[attr-defined]
+        assert lines[0].startswith("cut.example.com: 10.0.0.1 -> 10.0.0.2 (TTL 300s)")
+        assert "Cloudflare zone" in lines[0] and "Replace record" in lines[0]
+        assert "--accept-dns-host cdn.example.com" in lines[1]
+        assert "resolved to 10.0.0.1 at plan time" in lines[2]
+        assert "recreate the record -> 10.0.0.2" in lines[2]
+
+    def test_an_unanswered_host_is_accepted_by_name_only(self) -> None:
+        report = build_report(
+            [Resolution(_h("slow.example.com"), (), error="LifetimeTimeout")],
+            source_ips=SOURCE,
+            target_ips=TARGET,
+            baselines={"slow.example.com": ("10.0.0.1",)},
+        )
+        assert [v.hostname.host for v in report.unanswered] == ["slow.example.com"]
+        assert report.vanished == ()
+        assert report.unaccepted(accept_cutover=True)
+        assert not report.unaccepted(accept_cutover=False, accepted_hosts={"slow.example.com"})
+        (line,) = report.cutover_checklist()
+        assert "could not be asked" in line and "resume" in line
+        assert "recreate" not in line
+        assert "--accept-dns-host slow.example.com" in line
+
+    def test_definitive_answers(self) -> None:
+        from bg_coolify_migrate.dns.gate import is_definitive
+
+        assert is_definitive(Resolution(_h("a.b.c"), ("1.2.3.4",)))
+        assert is_definitive(Resolution(_h("a.b.c"), (), error="NXDOMAIN"))
+        assert is_definitive(Resolution(_h("a.b.c"), (), error="no A/AAAA records"))
+        assert not is_definitive(Resolution(_h("a.b.c"), (), error="LifetimeTimeout"))
+        assert not is_definitive(Resolution(_h("a.b.c"), ()))
 
     def test_empty_report_is_not_blocked(self) -> None:
         assert build_report([], source_ips=SOURCE, target_ips=TARGET).is_blocked is False

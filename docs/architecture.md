@@ -87,9 +87,11 @@ COPY           pin target volumes;                     undo: drop target volumes
    |
 VERIFY         content + metadata manifests both sides
    |
-DNS_GATE       custom domain -> source?  STOP, exit 3, resumable
+DNS_GATE       custom domain -> source, neither server, or vanished
+               since PLAN?  STOP, exit 3, resumable
                (server-bound wildcard URLs rewritten, never gate;
-                --accept-dns downgrades the stop to a warning)
+                --accept-dns accepts a cutover, --accept-dns-host HOST
+                one host on neither server, vanished or unanswered)
    |
 START_TARGET   deploy                                  undo: stop target
    |

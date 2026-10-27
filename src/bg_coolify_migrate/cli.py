@@ -844,6 +844,16 @@ async def _build(
 
 # ── run ──────────────────────────────────────────────────────────────────────
 
+_ACCEPT_DNS_HOST_HELP = (
+    "Accept ONE host the DNS gate cannot place (repeatable): one that resolves to "
+    "neither server - a CDN, proxy or load balancer whose origin you checked points "
+    "at the target - or one whose record vanished since the plan, or whose lookup "
+    "failed. --accept-dns never "
+    "covers those; it accepts a plain cutover only."
+)
+
+
+
 
 @app.command()
 def run(
@@ -882,6 +892,9 @@ def run(
             )
         ),
     ] = False,
+    accept_dns_host: Annotated[
+        list[str] | None, typer.Option("--accept-dns-host", help=_ACCEPT_DNS_HOST_HELP)
+    ] = None,
     delete_previews: Annotated[
         bool, typer.Option(help="Delete preview deployments first (they block the copy).")
     ] = False,
@@ -922,6 +935,7 @@ def run(
                 policy=policy,
                 accept_drift=accept_drift,
                 accept_dns=accept_dns,
+                accept_hosts=_accepted_hosts(accept_dns_host),
                 delete_previews=delete_previews,
                 trust_host_key=trust_host_key,
                 source_wildcard=source_wildcard,
@@ -944,6 +958,7 @@ async def _run(
     policy: FinalizePolicy,
     accept_drift: bool,
     accept_dns: bool = False,
+    accept_hosts: frozenset[str] = frozenset(),
     delete_previews: bool,
     trust_host_key: bool = False,
     source_wildcard: str | None = None,
@@ -1035,6 +1050,7 @@ async def _run(
                     migration_id=migration_id,
                     accept_drift=accept_drift,
                     accept_dns=accept_dns,
+                    accept_hosts=accept_hosts,
                     delete_previews=delete_previews,
                     trust_host_key=trust_host_key,
                     host_key_prompt=None,  # keys pre-accepted; never prompt under Live
@@ -1098,6 +1114,23 @@ def _confirm_plans(plans: list[MigrationPlan]) -> bool:
     return all(wizard.confirm_destructive(migration_plan) for migration_plan in plans)
 
 
+def _accepted_hosts(raw: list[str] | None) -> frozenset[str]:
+    """``--accept-dns-host`` values as the gate compares them: bare, lowercase hosts.
+
+    A value that is no usable hostname is refused here, before anything runs —
+    silently accepting nothing would leave the operator blocked without a reason.
+    """
+    from bg_coolify_migrate.dns.extract import normalise_host
+
+    hosts: set[str] = set()
+    for value in raw or []:
+        host = normalise_host(value)
+        if host is None:
+            raise typer.BadParameter(f"not a hostname: {value!r}", param_hint="--accept-dns-host")
+        hosts.add(host)
+    return frozenset(hosts)
+
+
 # ── resume / rollback ────────────────────────────────────────────────────────
 
 
@@ -1117,6 +1150,9 @@ def resume(
             )
         ),
     ] = False,
+    accept_dns_host: Annotated[
+        list[str] | None, typer.Option("--accept-dns-host", help=_ACCEPT_DNS_HOST_HELP)
+    ] = None,
     trust_host_key: Annotated[
         bool, typer.Option("--trust-host-key", help=_TRUST_HOST_KEY_HELP)
     ] = False,
@@ -1131,7 +1167,14 @@ def resume(
     settings = _settings(log_level, log_format)
     try:
         code = asyncio.run(
-            _resume(settings, migration_id, accept_drift, accept_dns, trust_host_key)
+            _resume(
+                settings,
+                migration_id,
+                accept_drift,
+                accept_dns,
+                trust_host_key,
+                accept_hosts=_accepted_hosts(accept_dns_host),
+            )
         )
     except MigrationError as exc:
         _fail(exc)
@@ -1145,6 +1188,8 @@ async def _resume(
     accept_drift: bool,
     accept_dns: bool = False,
     trust_host_key: bool = False,
+    *,
+    accept_hosts: frozenset[str] = frozenset(),
 ) -> int:
     from bg_coolify_migrate.api.client import CoolifyClient
     from bg_coolify_migrate.engine.runner import load_plan, resume_migration
@@ -1170,6 +1215,7 @@ async def _resume(
                 migration_id,
                 accept_drift=accept_drift,
                 accept_dns=accept_dns,
+                accept_hosts=accept_hosts,
                 trust_host_key=trust_host_key,
                 host_key_prompt=None,
                 on_state=reporter.on_state,

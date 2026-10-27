@@ -11,7 +11,6 @@ FINALIZE.
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -24,13 +23,16 @@ from bg_coolify_migrate.api import schedules as api_schedules
 from bg_coolify_migrate.api.resources import Placement, public_git_url
 from bg_coolify_migrate.discovery import docker, pins, quiesce
 from bg_coolify_migrate.dns import extract as dns_extract
+from bg_coolify_migrate.dns import managed as dns_managed
 from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.dns import wildcard as dns_wildcard
 from bg_coolify_migrate.dns.gate import (
     Resolution,
+    Verdict,
     bound_to_source,
     build_report,
     explain_why_blocking_matters,
+    is_definitive,
 )
 from bg_coolify_migrate.domain import domains, fidelity
 from bg_coolify_migrate.domain.kinds import GitAuth, ResourceKind
@@ -43,11 +45,17 @@ from bg_coolify_migrate.domain.naming import (
     pair_by_mount_path,
     pair_by_name_suffix,
 )
-from bg_coolify_migrate.domain.plan import ResourcePlan, ResourceSnapshot
+from bg_coolify_migrate.domain.plan import HostBaseline, ResourcePlan, ResourceSnapshot, ServerRef
 from bg_coolify_migrate.domain.statemachine import STOP_REQUESTED, FinalizePolicy, State
 from bg_coolify_migrate.domain.versions import parse_version
 from bg_coolify_migrate.engine import compensations, env_recovery, keys
-from bg_coolify_migrate.engine.context import MigrationContext, is_volume_row, serialise_mounts
+from bg_coolify_migrate.engine.context import (
+    MigrationContext,
+    dns_baseline_of,
+    is_volume_row,
+    serialise_dns_baseline,
+    serialise_mounts,
+)
 from bg_coolify_migrate.engine.planner import (
     build_manifest,
     inspect_all_mounts,
@@ -340,10 +348,13 @@ async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
 
 
 async def step_plan(ctx: MigrationContext) -> dict[str, Any]:
+    """Journal what the plan decided — and the DNS baseline every later check
+    compares against (hosts, addresses, TTL, nameserver names: no secrets)."""
     return {
         "total_bytes": ctx.plan.total_bytes,
         "volumes": sum(len(r.manifest.to_migrate) for r in ctx.plan.resources),
         "finalize_policy": ctx.plan.finalize_policy.value,
+        "dns_baseline": serialise_dns_baseline(ctx.plan.dns_baseline),
     }
 
 
@@ -530,6 +541,11 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                 target_uuid=target_uuid,
                 engine=snapshot.engine,
             )
+
+        # Last, while the source still serves: DNS must still send its custom
+        # hosts to it. If a record moved or vanished since the plan, the premise
+        # of this migration broke under it — stop with zero downtime.
+        await _refuse_moved_dns(ctx)
     except Exception as exc:
         # The saga compensates only COMPLETED steps, so a refusal part-way
         # through CREATE — the compose gate, the service rehearsal, a claim
@@ -543,6 +559,49 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
         raise
 
     return {"target_uuids": created}
+
+
+async def _refuse_moved_dns(ctx: MigrationContext) -> None:
+    """Re-check the plan's DNS baseline at the end of CREATE. Refuses on a change.
+
+    Only hosts that resolved to the source at plan time, and only on a
+    definitive answer (:func:`dns.gate.is_definitive`) — a timeout proves
+    nothing and a refusal here costs a full re-run. A custom host that now
+    resolves elsewhere, or to nothing, while the source still serves means a
+    record was changed or deleted since the plan (Coolify deletes one it manages
+    when a hostname loses its last holder, 4.4+; this run never lets that
+    happen): the migration's picture of the world is wrong, so it stops before
+    the source is touched.
+    """
+    baseline = dns_baseline_of(ctx.journal, ctx.plan)
+    if not baseline:
+        return
+    source_ips = await _server_addresses(ctx.plan.source_server)
+    on_source = sorted(h for h, entry in baseline.items() if set(entry.addresses) & source_ips)
+    if not on_source:
+        return
+    now = await dns_resolve.resolve_hosts(on_source)
+    moved = [
+        f"{host} ({', '.join(now[host].addresses) or now[host].error or 'nothing'}, was "
+        f"{', '.join(baseline[host].addresses)})"
+        for host in on_source
+        if host in now
+        and is_definitive(now[host])
+        and not set(now[host].addresses) & source_ips
+    ]
+    if not moved:
+        return
+    raise PreflightError(
+        "DNS no longer sends these custom hosts to the source, which still serves them: "
+        + "; ".join(moved),
+        hint=(
+            "Something changed or deleted their records since the plan — a person, a "
+            "provider, or Coolify itself (4.4+ deletes a record it manages when its "
+            "hostname loses its last holder). The source was never stopped; the targets "
+            "created by this run are deleted again. Put the records back (pointing at "
+            f"{ctx.plan.source_server.name}), then plan and migrate again."
+        ),
+    )
 
 
 async def _refuse_multi_server(
@@ -1832,27 +1891,14 @@ async def step_verify(ctx: MigrationContext) -> dict[str, Any]:
     return {"volumes_verified": verified, "differences": 0}
 
 
-async def _server_addresses(host: str) -> frozenset[str]:
-    """Resolve a server's ``ip`` field to actual addresses for the DNS verdict.
+async def _server_addresses(server: ServerRef) -> frozenset[str]:
+    """A server's addresses for the DNS verdict: its ``ip`` and its wildcard base.
 
-    Coolify's ``ip`` is often a HOSTNAME (``0046-20.cloud.bauer-group.com``), and
-    a domain's A record must be compared to an address, not to a name — comparing
-    ``1.2.3.4`` to ``0046-20…`` never matches, so every custom domain would read
-    as ELSEWHERE and the gate could never fire. An IP literal is used as-is; a
-    hostname that will not resolve falls back to itself, no worse than before.
+    See :func:`dns_resolve.server_addresses`. Coolify's ``ip`` is often a
+    hostname, and the wildcard base is the public address custom records really
+    point at.
     """
-    host = (host or "").strip()
-    if not host:
-        return frozenset()
-    try:
-        ipaddress.ip_address(host)
-        return frozenset({host})
-    except ValueError:
-        pass
-    resolution = await dns_resolve.resolve_one(
-        dns_extract.Hostname(host=host, origin=dns_extract.HostnameOrigin.FQDN, is_generated=False)
-    )
-    return frozenset(resolution.addresses) or frozenset({host})
+    return await dns_resolve.server_addresses(server.ip, server.wildcard_domain or None)
 
 
 def _refuse_hosts_bound_to_source(
@@ -1885,12 +1931,33 @@ def _refuse_hosts_bound_to_source(
     )
 
 
+def _cloudflare_hosts(ctx: MigrationContext, baseline: dict[str, HostBaseline]) -> set[str]:
+    """Hosts whose zone the baseline showed on Cloudflare, from Coolify 4.4.0.
+
+    Wording only (dns/managed.py): their checklist line says where the record
+    can be changed, since Coolify never re-points one it manages.
+    """
+    raw_version = ctx.journal.undo_info(State.PREFLIGHT.value).get("coolify_version")
+    version = parse_version(raw_version if isinstance(raw_version, str) else None)
+    return {
+        host
+        for host, entry in baseline.items()
+        if dns_managed.coolify_may_manage(entry.nameservers, entry.cname_chain, version=version)
+    }
+
+
 async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
-    """Refuse to start the target while a domain IT will serve still points at the source.
+    """Refuse to start the target while a domain IT will serve is not ready for it.
 
     Reads the TARGET's domains, not the source's: what matters is what the
     TARGET will answer on when it starts — server-bound hosts rewritten onto its
     wildcard, custom hosts it claimed at CREATE.
+
+    Per host (dns/gate.py): one still on the source needs a cutover
+    (--accept-dns proceeds in parallel); one on neither server (CDN, proxy, load
+    balancer — the origin may still be the source) and one that resolved at
+    plan time but no longer does are accepted only one by one
+    (--accept-dns-host HOST).
     """
     hostnames = []
     for resource in ctx.plan.resources:
@@ -1929,10 +1996,8 @@ async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
         return {"hostnames": 0, "verdict": "no real hostnames"}
     _refuse_hosts_bound_to_source(ctx, real)
 
-    # Coolify's server `ip` is often a hostname; resolve both sides to addresses so
-    # a domain's A record is compared to an address, not a name.
-    source_ips = await _server_addresses(ctx.plan.source_server.ip)
-    target_ips = await _server_addresses(ctx.plan.target_server.ip)
+    source_ips = await _server_addresses(ctx.plan.source_server)
+    target_ips = await _server_addresses(ctx.plan.target_server)
 
     # A target-wildcard URL already resolves to the target (READY); a custom domain
     # still resolves to the source (CUTOVER_NEEDED). Keep the source-wildcard skip
@@ -1942,6 +2007,7 @@ async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
     custom = [h for h in real if not dns_wildcard.under_wildcard(h.host, src_wildcard)]
     bound = [h for h in real if dns_wildcard.under_wildcard(h.host, src_wildcard)]
 
+    baseline = dns_baseline_of(ctx.journal, ctx.plan)
     resolutions = await dns_resolve.resolve_all(custom)
     resolutions.extend(Resolution(hostname=h, addresses=()) for h in bound)
     report = build_report(
@@ -1949,37 +2015,49 @@ async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
         source_ips=source_ips,
         target_ips=target_ips,
         source_wildcard=src_wildcard,
+        baselines={host: entry.addresses for host, entry in baseline.items()},
     )
     ctx.dns_report = report
 
-    if report.is_blocked:
-        blocked_hosts = ", ".join(v.hostname.host for v in report.blocked)
-        if not ctx.accept_dns:
-            # A live custom domain still points at the source. Refuse by default,
-            # but resumably: flip DNS (or pass --accept-dns) and continue.
-            raise DnsGateBlocked(
-                "DNS still points at the source for: "
-                + blocked_hosts
-                + "\n\n"
-                + explain_why_blocking_matters(),
-                hint="Cutover:\n  " + "\n  ".join(report.cutover_checklist()),
-                report=report,
-            )
-        # The operator accepted the cutover risk (custom domains only — DNS
-        # propagation lags). Proceed and finalize; the target may serve a stale
-        # certificate until DNS catches up.
+    unanswered = report.unaccepted(
+        accept_cutover=ctx.accept_dns, accepted_hosts=ctx.accepted_hosts
+    )
+    if unanswered:
+        # Refuse by default, but resumably: fix DNS (or accept) and continue.
+        raise DnsGateBlocked(
+            "DNS is not ready for: "
+            + ", ".join(f"{v.hostname.host} ({v.verdict.value})" for v in unanswered)
+            + "\n\n"
+            + explain_why_blocking_matters(),
+            hint="Before starting the target:\n  "
+            + "\n  ".join(
+                report.cutover_checklist(
+                    unanswered, cloudflare_hosts=_cloudflare_hosts(ctx, baseline)
+                )
+            ),
+            report=report,
+        )
+    if report.blocked:
+        # The operator answered every blocking host: a cutover to run in parallel
+        # (DNS propagation lags), or a host they vouched for one by one.
         log.warning(
-            "dns_gate.proceeding_despite_cutover",
+            "dns_gate.proceeding_on_acceptance",
             hosts=[v.hostname.host for v in report.blocked],
-            hint="operator accepted DNS drift; cut the record(s) over to the target",
+            hint="cut the record(s) over to the target / check the accepted origins",
         )
 
+    blocked = [v.hostname.host for v in report.blocked]
     return {
         "hostnames": len(real),
         "server_bound": [v.hostname.host for v in report.server_bound],
         "ready": [v.hostname.host for v in report.ready],
-        "cutover_accepted": [v.hostname.host for v in report.blocked] if ctx.accept_dns else [],
+        "cutover_accepted": [
+            v.hostname.host for v in report.blocked if v.verdict is Verdict.CUTOVER_NEEDED
+        ],
+        "accepted": sorted(set(blocked) & ctx.accepted_hosts),
         "ambiguous": [v.hostname.host for v in report.ambiguous],
+        "vanished": [v.hostname.host for v in report.vanished],
+        "unanswered": [v.hostname.host for v in report.unanswered],
     }
 
 

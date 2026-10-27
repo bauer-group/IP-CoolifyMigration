@@ -89,6 +89,26 @@ class ServerRef(BaseModel):
     """When that cleanup runs, in words — e.g. ``cron '0 0 * * *', on every run``."""
 
 
+class HostBaseline(BaseModel):
+    """What one of the source's custom hosts resolved to when the plan was made.
+
+    The DNS gate compares against it (a host that resolved then and does not now
+    was deleted — VANISHED), CREATE re-checks it while the source still serves,
+    and a rollback re-checks it at its end. Hostnames, addresses, a TTL and the
+    zone's nameserver NAMES — never a secret; journalled at PLAN.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    host: str
+    resource: str = ""
+    """The source resource that holds it, for the operator."""
+    addresses: tuple[str, ...] = ()
+    ttl: int | None = None
+    nameservers: tuple[str, ...] = ()
+    cname_chain: tuple[str, ...] = ()
+
+
 class ResourceRow(BaseModel):
     """One migratable resource, fully qualified. The unit of ``list``.
 
@@ -275,6 +295,10 @@ class MigrationPlan(BaseModel):
     notes: tuple[str, ...] = ()
     """Warnings about the move as a whole rather than one resource — e.g. the two
     servers issuing certificates differently."""
+    dns_baseline: tuple[HostBaseline, ...] = ()
+    """Every custom host of the plan's sources as DNS answered at plan time
+    (:class:`HostBaseline`). Empty for an old plan.json, which then simply has
+    no VANISHED verdicts."""
 
     @property
     def is_resource_scoped(self) -> bool:

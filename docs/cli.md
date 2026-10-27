@@ -197,6 +197,23 @@ propagation can lag by the record's TTL — confirm interactively, or pass
 temporary certificate error until DNS catches up. `--accept-dns` affects custom
 domains only; server-bound URLs are always rewritten regardless.
 
+Two answers DNS can give are never covered by `--accept-dns`, because they say
+something is wrong rather than late: a host that resolves to **neither** server
+(a CDN, proxy or load balancer whose origin DNS cannot show — it may still be
+the source), and a host that resolved when the migration was planned and
+resolves to **nothing** now (a deleted record) — or whose lookup fails now (a
+timeout; `resume` asks again). Each blocks until you fix it or accept that one
+host, by name, on `run` or `resume`:
+
+```bash
+coolify-migrate resume <migration-id> --accept-dns-host shop.example.com
+```
+
+The plan records what every custom host resolved to (its *DNS baseline*). CREATE
+checks it again while the source still serves — a custom host that stopped
+resolving to the source refuses the run before anything is stopped — and a
+rollback checks it at its end and lists the records to point back.
+
 ## Non-TTY output
 
 Piped or in CI, output switches to line-oriented text automatically — a plan in a

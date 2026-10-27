@@ -86,9 +86,12 @@ names (usually a redeploy of the source since the plan), then run again.
 
 Working as designed. It is a resumable stop, not a failure — the target is created
 and its data is verified. The gate checks the domains the **target** will serve
-(it claimed the source's custom domains at create) and compares them against the servers' **resolved** addresses (Coolify's `ip` is often
-a hostname). It fires for a **custom domain** (`shop.example.com`) that still
-points at the source. Server-bound URLs under a server's wildcard
+(it claimed the source's custom domains at create) and compares them against the
+servers' **resolved** addresses — each server's `ip` (often a hostname) and its
+wildcard base, which is the public address custom records usually point at. It
+fires, per host, for a **custom domain** (`shop.example.com`) that still points
+at the source, that resolves to neither server, or that resolved when the
+migration was planned and resolves to nothing now. Server-bound URLs under a server's wildcard
 (`pdf-tool.app.0046-20…`) are rewritten onto the target's wildcard automatically
 and never gate — see *Domains & DNS* in the CLI reference — unless one was NOT
 rewritten and the target would serve it on the source's wildcard (below).
@@ -107,6 +110,8 @@ budget, so even a correct cutover an hour later cannot get a certificate.
 If you accept that risk — you want to finalize now and repoint DNS in parallel,
 knowing propagation lags by the record's TTL — confirm interactively or pass
 `--accept-dns` (on `run` or `resume`). The gate then warns instead of blocking.
+`--accept-dns` covers that plain cutover only; the cases below are accepted one
+host at a time.
 
 ### "the target would serve hostname(s) bound to the SOURCE server's wildcard"
 
@@ -122,11 +127,52 @@ garage or silo image (`MINIO_SERVER_URL` and friends — only when the stack run
 that image; for any other image they are ordinary variables) and Host() labels
 written into a custom compose — not the derived `SERVICE_URL_*` variables.
 
-### "resolves to neither source nor target"
+### "… (elsewhere)": resolves to neither source nor target
 
-A CDN or reverse proxy (typically Cloudflare's orange cloud) is in front. DNS
-then tells us nothing about where the origin points, so we surface it rather than
-guess. Check the CDN's origin setting before starting the target.
+A CDN, reverse proxy or load balancer is in front (Cloudflare's orange cloud, or
+any other). DNS then tells us nothing about where the origin points — and it may
+well still be the source, which is exactly the ACME failure the gate exists to
+prevent. So it blocks, for every provider. The same goes for a host that resolves
+only to an address **both** servers answer as — a wildcard base they share, or
+one CDN in front of both wildcards: DNS cannot tell them apart. Make sure the
+origin points at the target, then accept that one host:
+
+```bash
+coolify-migrate resume <id> --accept-dns-host shop.example.com
+```
+
+### "… (vanished)": resolved at plan time, resolves to nothing now
+
+The host's record was deleted (or its zone broke) since the plan. From Coolify
+4.4 a record Coolify manages at Cloudflare is deleted when its hostname loses
+its last holder — this tool hands every hostname over so that never happens, but
+a person or another tool can. Recreate the record pointing at the target (the
+checklist names the old value), or accept the host with `--accept-dns-host` if
+you know why it is gone.
+
+### "… (unanswered)": resolved at plan time, DNS could not be asked now
+
+The lookup timed out or the zone's nameservers failed (SERVFAIL, none
+reachable). That is no answer at all: the record may be fine. But the source is
+already stopped and nothing shows where the host points, so the gate does not
+guess. Run `coolify-migrate resume <id>` to ask again; if DNS stays unreachable
+and you have checked that the record points at the target, accept the host with
+`--accept-dns-host`.
+
+### "DNS no longer sends these custom hosts to the source, which still serves them"
+
+CREATE refused, before anything was stopped: a custom host that resolved to the
+source when the migration was planned now resolves elsewhere or to nothing. Its
+record changed under the migration. The targets created by this run are deleted
+again. Put the record back, then plan and migrate again. (A lookup that merely
+timed out never triggers this.)
+
+### After a rollback: "point DNS for … back to …" / "recreate the DNS record of …"
+
+The rollback re-resolves every custom host at its end. A host that now resolves
+to the target — through the gate, an accepted cutover, or a change you made by
+hand — must be pointed back at the source, and one whose record vanished since
+the plan must be recreated. The run report lists both.
 
 ## Drift needs my decision (exit 4)
 

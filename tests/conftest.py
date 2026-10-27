@@ -116,3 +116,26 @@ class FakeHost:
 @pytest.fixture
 def fake_host() -> FakeHost:
     return FakeHost()
+
+
+@pytest.fixture(autouse=True)
+def _offline_dns(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No unit test asks the real DNS.
+
+    The planner takes a DNS baseline and the engine resolves server wildcard
+    bases; on a workstation that would be network I/O, slow and flaky, in tests
+    that are about something else. Every lookup answers "offline" — no address,
+    and NOT a definitive answer, so no check acts on it. A test that is about DNS
+    patches ``resolve_one``/``resolve_all`` itself (its patch wins). The e2e and
+    integration suites are left on the real resolver.
+    """
+    if request.node.get_closest_marker("e2e") or request.node.get_closest_marker("integration"):
+        return
+    from bg_coolify_migrate.dns import resolve
+    from bg_coolify_migrate.dns.extract import Hostname
+    from bg_coolify_migrate.dns.gate import Resolution
+
+    async def offline(hostname: Hostname, config: object = None) -> Resolution:
+        return Resolution(hostname=hostname, addresses=(), error="offline (unit test)")
+
+    monkeypatch.setattr(resolve, "resolve_one", offline)

@@ -34,6 +34,7 @@ from bg_coolify_migrate.discovery.docker import (
     LABEL_PROJECT,
     LABEL_RESOURCE,
 )
+from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.domain import compose as compose_mod
 from bg_coolify_migrate.domain import domains, fidelity
 from bg_coolify_migrate.domain.drift import RebuildDriftReport, assess_rebuild_drift
@@ -54,6 +55,7 @@ from bg_coolify_migrate.domain.manifest import (
 )
 from bg_coolify_migrate.domain.naming import slugify
 from bg_coolify_migrate.domain.plan import (
+    HostBaseline,
     MigrationPlan,
     ResourcePlan,
     ResourceRow,
@@ -826,6 +828,8 @@ async def build_plan(
 
     plans: list[ResourcePlan] = []
     source_server: dict[str, Any] | None = None
+    # (snapshot, GET, envs) of each source, for the DNS baseline after the loop.
+    served: list[tuple[ResourceSnapshot, dict[str, Any], list[dict[str, Any]]]] = []
 
     for collection, resource in resources:
         snapshot, containers, full = await snapshot_resource(
@@ -913,6 +917,7 @@ async def build_plan(
         except Exception as exc:  # diagnostics only, never fatal
             log.debug("planner.envs_unavailable", uuid=snapshot.uuid, error=str(exc)[:120])
         warnings.extend(env_key_warnings(envs))
+        served.append((snapshot, full, envs))
         # Locked values are read back from the file Coolify wrote on the source
         # server; the fidelity env rules then judge what is left. Values stay
         # inside review_envs — the plan gets lines and key names only.
@@ -968,6 +973,8 @@ async def build_plan(
     if target_wildcard:
         target_ref = target_ref.model_copy(update={"wildcard_domain": target_wildcard})
 
+    baseline = await dns_baseline(served, source_wildcard=source_ref.wildcard_domain or None)
+
     return MigrationPlan(
         project=project_name,
         environment=environment,
@@ -980,6 +987,46 @@ async def build_plan(
         # The matched resource's real name, not the user's input, so the label
         # filter slugifies exactly what Coolify wrote onto the containers.
         selected_resources=tuple(p.snapshot.name for p in plans) if only_resource else (),
+        dns_baseline=baseline,
+    )
+
+
+async def dns_baseline(
+    served: list[tuple[ResourceSnapshot, dict[str, Any], list[dict[str, Any]]]],
+    *,
+    source_wildcard: str | None,
+) -> tuple[HostBaseline, ...]:
+    """Resolve every custom host the sources serve, as DNS answers NOW. Reads only.
+
+    The baseline later checks compare against (dns/gate.py VANISHED, CREATE's
+    re-check while the source serves, the rollback's flip-back list). Through
+    the zone's authoritative nameservers, whose names it keeps: they tell a
+    Cloudflare zone apart for the plan warning. Fail-soft — no baseline is a
+    plan without those checks, never a refusal.
+    """
+    owners: dict[str, str] = {}
+    for snapshot, full, envs in served:
+        for host in domains.source_custom_hosts(
+            snapshot, full, envs, source_wildcard=source_wildcard
+        ):
+            owners.setdefault(host, snapshot.name)
+    if not owners:
+        return ()
+    try:
+        resolved = await dns_resolve.resolve_hosts(sorted(owners))
+    except Exception as exc:  # diagnostics only, never fatal
+        log.warning("planner.dns_baseline_unavailable", error=str(exc)[:120])
+        return ()
+    return tuple(
+        HostBaseline(
+            host=host,
+            resource=owners[host],
+            addresses=resolution.addresses,
+            ttl=resolution.ttl,
+            nameservers=resolution.nameservers,
+            cname_chain=resolution.cname_chain,
+        )
+        for host, resolution in sorted(resolved.items())
     )
 
 

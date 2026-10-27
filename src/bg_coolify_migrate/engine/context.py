@@ -17,7 +17,7 @@ from typing import Any, TypeGuard
 from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.domain.manifest import DockerMount
 from bg_coolify_migrate.domain.naming import VolumeEndpoint, VolumePair
-from bg_coolify_migrate.domain.plan import MigrationPlan
+from bg_coolify_migrate.domain.plan import HostBaseline, MigrationPlan
 from bg_coolify_migrate.journal.store import Journal
 from bg_coolify_migrate.settings.base import Settings
 from bg_coolify_migrate.transfer.ssh import RemoteHost
@@ -119,6 +119,13 @@ class MigrationContext:
     proceeds, because DNS propagation lags and the operator has chosen to finish
     the migration and cut the record over in parallel. Server-bound wildcard URLs
     are unaffected — they are rewritten onto the target, never cut over."""
+
+    accepted_hosts: frozenset[str] = frozenset()
+    """Hosts the operator accepted ONE BY ONE (--accept-dns-host).
+
+    The only answer to a host that resolves to neither server (a CDN, proxy or
+    load balancer whose origin DNS cannot show) or that vanished since the plan:
+    --accept-dns answers a plain cutover, never those (dns/gate.py)."""
 
     delete_previews: bool = False
 
@@ -224,4 +231,46 @@ def deserialise_volume_pairs(raw: object) -> dict[str, list[VolumePair]]:
                 )
             )
         out[str(uuid)] = pairs
+    return out
+
+
+def serialise_dns_baseline(baseline: tuple[HostBaseline, ...]) -> dict[str, dict[str, Any]]:
+    """The plan's DNS baseline as PLAN journals it: hosts, addresses, TTL, NS names."""
+    return {
+        entry.host: {
+            "resource": entry.resource,
+            "addresses": list(entry.addresses),
+            "ttl": entry.ttl,
+            "nameservers": list(entry.nameservers),
+            "cname_chain": list(entry.cname_chain),
+        }
+        for entry in baseline
+    }
+
+
+def dns_baseline_of(journal: Journal, plan: MigrationPlan) -> dict[str, HostBaseline]:
+    """The DNS baseline taken at PLAN, by host — the journal's first, the plan's else.
+
+    The journal's is what this run's PLAN recorded; a plan.json made earlier and
+    resumed carries the same. Junk rows are skipped: a lost baseline only means
+    a check that cannot run, never a wrong one.
+    """
+    raw = journal.undo_info("plan").get("dns_baseline")
+    if not isinstance(raw, dict) or not raw:
+        return {entry.host: entry for entry in plan.dns_baseline}
+    out: dict[str, HostBaseline] = {}
+    for host, entry in raw.items():
+        if not isinstance(host, str) or not isinstance(entry, dict):
+            continue
+        try:
+            out[host] = HostBaseline(
+                host=host,
+                resource=str(entry.get("resource") or ""),
+                addresses=tuple(str(a) for a in entry.get("addresses") or ()),
+                ttl=entry.get("ttl") if isinstance(entry.get("ttl"), int) else None,
+                nameservers=tuple(str(n) for n in entry.get("nameservers") or ()),
+                cname_chain=tuple(str(c) for c in entry.get("cname_chain") or ()),
+            )
+        except (TypeError, ValueError):
+            continue
     return out
