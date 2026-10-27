@@ -260,6 +260,11 @@ shipped inside a green unit suite. `tests/e2e/README.md` has the full table.
   anonymous volume is only `docker stop`ped, and `/start`/`/restart` then 422
   until someone clicks "Keep current data". The manifest refuses such a volume at
   plan time, so a run never reaches it.
+  And because the containers are gone, the source is DOWN as soon as a stop was
+  requested — even if QUIESCE then fails (SIGKILL refusal, gate timeout) and never
+  completes. QUIESCE journals `stop_requested` before the request; the rollback
+  owes RESTART_SOURCE from it (`statemachine.source_was_stopped` — reuse it, never
+  `"quiesce" in completed`).
 - **Exit code 137 cannot be polled for**, for the same reason: both commands go
   out in one SSH invocation, so a SIGKILLed container exists for milliseconds.
   The guard that makes invariant 9 mean anything reads the **daemon event log**

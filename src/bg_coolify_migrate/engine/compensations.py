@@ -20,7 +20,7 @@ import structlog
 from bg_coolify_migrate.api import resources as api_resources
 from bg_coolify_migrate.discovery import docker, pins
 from bg_coolify_migrate.domain import domains
-from bg_coolify_migrate.domain.statemachine import Compensation, State
+from bg_coolify_migrate.domain.statemachine import Compensation, State, source_was_stopped
 from bg_coolify_migrate.engine import keys
 from bg_coolify_migrate.engine.context import MigrationContext
 from bg_coolify_migrate.errors import CoolifyApiError
@@ -390,13 +390,16 @@ async def undo_restore_source_name(ctx: MigrationContext, undo_info: dict[str, A
 
 
 def _source_was_stopped(ctx: MigrationContext) -> bool:
-    """Did this run stop the source? The one place that decides it.
+    """Did this run (possibly) stop the source? Engine side of the one rule.
 
-    Today: QUIESCE completed. A QUIESCE that failed after its stop request is
-    not completed, so it reads as "not stopped" here and no wait is spent on a
-    restart that is not owed.
+    :func:`statemachine.source_was_stopped`: QUIESCE completed, OR it journalled
+    its ``stop_requested`` marker — a QUIESCE that failed after its stop request
+    never completes, yet the source is down and the rollback owes (and runs)
+    its restart, so the unpin must wait for it like after any other restart.
     """
-    return State.QUIESCE.value in ctx.journal.completed_states()
+    return source_was_stopped(
+        ctx.journal.completed_states(), ctx.journal.undo_info(State.QUIESCE.value)
+    )
 
 
 def _restart_succeeded(records: Iterable[JournalRecord]) -> bool:

@@ -227,6 +227,7 @@ class Saga:
             self._completed,
             in_flight=in_flight if in_flight in known else None,
             undo_incomplete=[s for s in incomplete if s in known],
+            markers=self.journal.details(),
         )
         return [str(s) for s in owed]
 

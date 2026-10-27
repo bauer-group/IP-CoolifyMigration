@@ -32,8 +32,9 @@ about a system we have already lost track of.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -284,15 +285,36 @@ def rollback_plan(completed: Sequence[State]) -> tuple[RollbackStep, ...]:
     )
 
 
+#: Journalled by QUIESCE (a ``step_started`` detail) immediately BEFORE it asks
+#: Coolify to stop anything. From that moment the source may be down whatever
+#: the step does next.
+STOP_REQUESTED = "stop_requested"
+
+
+def source_was_stopped(completed: Collection[str], markers: Mapping[str, Any]) -> bool:
+    """True if this run may have stopped the source.
+
+    ``markers`` is QUIESCE's merged journal detail. QUIESCE completing is not
+    the only way: it fails AFTER the stop request when a data holder was
+    SIGKILLed or the stop gate timed out, and Coolify's stop removes the
+    containers (``docker rm -f``) — so the source is down, yet QUIESCE never
+    completed and nothing would restart it.
+    """
+    return State.QUIESCE.value in {str(s) for s in completed} or markers.get(STOP_REQUESTED) is True
+
+
 def owed_states(
     completed: Sequence[str],
     *,
     in_flight: str | None = None,
     undo_incomplete: Sequence[str] = (),
+    markers: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[str, ...]:
     """The F1 states whose compensations a rollback owes.
 
-    Completed states, always. The explicit ``rollback`` command also passes:
+    Completed states, always — plus QUIESCE whenever the source may have been
+    stopped (:func:`source_was_stopped`, read from ``markers``: every state's
+    merged journal detail). The explicit ``rollback`` command also passes:
 
     * ``in_flight`` — the state a crashed run was inside. Its step journals what
       it did as it goes (CREATE records each target and each restore body before
@@ -305,12 +327,14 @@ def owed_states(
 
     QUIESCE is never owed merely for being in flight or flagged: a crash before
     the stop request leaves the source running, and restarting it then would be
-    an outage this tool caused.
+    an outage this tool caused. Only the stop marker makes it owed.
     """
     owed = dict.fromkeys(str(s) for s in completed)
     for state in (in_flight, *undo_incomplete):
         if state and str(state) != State.QUIESCE.value:
             owed.setdefault(str(state))
+    if source_was_stopped(owed, (markers or {}).get(State.QUIESCE.value) or {}):
+        owed.setdefault(State.QUIESCE.value)
     return tuple(owed)
 
 

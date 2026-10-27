@@ -310,6 +310,14 @@ class Journal:
                 merged.update(record.detail)
         return merged
 
+    def details(self) -> dict[str, dict[str, Any]]:
+        """Every state's merged detail — :meth:`undo_info` for all of them, one read."""
+        merged: dict[str, dict[str, Any]] = {}
+        for record in self.read():
+            if record.state is not None and record.event != "rollback_step":
+                merged.setdefault(record.state, {}).update(record.detail)
+        return merged
+
     @property
     def is_finished(self) -> bool:
         last = self.last_event()

@@ -44,7 +44,7 @@ from bg_coolify_migrate.domain.naming import (
     pair_by_name_suffix,
 )
 from bg_coolify_migrate.domain.plan import ResourcePlan, ResourceSnapshot
-from bg_coolify_migrate.domain.statemachine import FinalizePolicy, State
+from bg_coolify_migrate.domain.statemachine import STOP_REQUESTED, FinalizePolicy, State
 from bg_coolify_migrate.domain.versions import parse_version
 from bg_coolify_migrate.engine import compensations, env_recovery, keys
 from bg_coolify_migrate.engine.context import MigrationContext, is_volume_row, serialise_mounts
@@ -876,6 +876,11 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
         # below, and a skewed workstation would silently shrink it.
         since = await quiesce.now_on(ctx.source_host)
 
+        # From here the source may be down whatever this step does next — and it
+        # can still fail (a SIGKILLed data holder, the stop gate timing out)
+        # without ever completing. The marker makes the rollback owe the restart
+        # anyway (statemachine.source_was_stopped).
+        ctx.journal.append("step_started", state="quiesce", detail={STOP_REQUESTED: True})
         await _request_stop(ctx)
 
         report = await quiesce.wait_until_stopped(
@@ -938,17 +943,23 @@ async def _pin_source(ctx: MigrationContext) -> list[str]:
 def _name_source_pins(ctx: MigrationContext, exc: MigrationError, pinned: list[str]) -> None:
     """Tell the operator which container keeps the stopped source's data alive.
 
-    A QUIESCE that fails after the stop is never completed, so no restart is
-    owed and the source stays down - and its pin deliberately stays with it.
+    A QUIESCE that fails after the stop is never completed, but its
+    ``stop_requested`` marker makes the rollback restart the source, and the
+    pin goes once the restarted source mounts its volumes again. Should that
+    restart fail, the source stays down - and its pin deliberately with it.
     """
     if not pinned:
         return
+    # No `rollback <id>` advice: the rollback that follows this error already
+    # restarts the source and removes the pin, and running it again would
+    # restart a source that is serving by then.
     note = (
-        f"The source's volumes stay pinned by {', '.join(pinned)} - a container that is "
+        f"The source's volumes are pinned by {', '.join(pinned)} - a container that is "
         "never started: no process, writes nothing - so Coolify's Docker cleanup cannot "
-        "delete them while the source is down. Once it runs again, "
-        f"`coolify-migrate rollback {ctx.migration_id}` removes the pin, or "
-        f"`docker rm {' '.join(pinned)}` on {ctx.plan.source_server.name}."
+        "delete them while the source is down. The rollback restarts the source and "
+        "removes the pin once the source mounts its volumes again; the run report names "
+        f"a pin it has to keep (then `docker rm` it on {ctx.plan.source_server.name} "
+        "once the source runs)."
     )
     exc.hint = f"{exc.hint}\n\n{note}" if exc.hint else note
 

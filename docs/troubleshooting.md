@@ -192,6 +192,11 @@ Raise the resource's stop grace period in Coolify, or raise `STOP_TIMEOUT`, and
 retry. This is fatal by design: mirroring an unflushed data directory
 byte-exactly just gives you a faithful copy of corruption.
 
+The run rolls back on its own, and that includes restarting the source: the stop
+had already been requested, and Coolify's stop removes the containers, so the
+source is down although QUIESCE never completed. The same holds when the stop
+gate times out.
+
 A kill of a container that mounts none of the migrated volumes — an app server,
 a worker, a sidecar — is logged as `quiesce.killed_without_data` and does not
 stop the run. Nothing it held is being copied. Fix its shutdown path anyway.
@@ -213,8 +218,8 @@ daemon answers and has disk space, then re-run.
 A run or a rollback ended with a pin it deliberately did not remove:
 
 - **after a rollback**, the restarted source did not mount its volumes within
-  `DEPLOY_TIMEOUT` — or it was never restarted, because QUIESCE failed after the
-  stop. Removing the pin then would let Coolify's next cleanup delete the
+  `DEPLOY_TIMEOUT` — or its restart failed. Removing the pin then would let
+  Coolify's next cleanup delete the
   source's data on a server with *Delete unused volumes* on. Get the source
   running, then `coolify-migrate rollback <id>` again: it removes the pin once
   the volumes are mounted.

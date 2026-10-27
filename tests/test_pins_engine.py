@@ -159,8 +159,11 @@ class TestQuiesce:
             await steps.step_quiesce(ctx)
         pin = next(iter(source.containers))
         hint = exc.value.hint or ""
-        assert pin in hint and f"coolify-migrate rollback {MID}" in hint
-        # The pin deliberately stays: the source is down and nothing restarts it.
+        assert pin in hint and "removes the pin" in hint
+        # The saga's rollback runs next and restarts the source: sending the
+        # operator into a second rollback would restart a serving source again.
+        assert "coolify-migrate rollback" not in hint
+        # The step itself leaves the pin: the source is down until the restart.
         assert source.containers[pin].volumes == [VOL]
 
     async def test_an_already_stopped_resource_pins_its_planned_volumes(
@@ -515,8 +518,9 @@ class TestReleaseSourcePins:
     async def test_zero_wait_when_quiesce_never_completed(
         self, ctx: MigrationContext, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # QUIESCE failed after the stop: no restart is owed, the source is down,
-        # and the pin must stay - without spending deploy_timeout finding out.
+        # No stop on record - QUIESCE neither completed nor journalled its
+        # stop_requested marker - so no restart ran: one look, and a pin whose
+        # volume nothing mounts stays, without spending deploy_timeout on it.
         source = _src(ctx)
         source.add("src-pin", state="created", labels=_labels(pins.SOURCE), volumes=(VOL,))
         ctx.journal.append("step_completed", state="create_target", detail={})
@@ -539,6 +543,29 @@ class TestReleaseSourcePins:
                 "unmounted": [VOL],
             }
         ]
+
+    async def test_waits_after_a_quiesce_that_failed_after_its_stop_request(
+        self, ctx: MigrationContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # QUIESCE never completed, but its stop_requested marker makes the
+        # restart owed (statemachine.source_was_stopped) - so the unpin waits
+        # for that restart's remount exactly as after a completed QUIESCE.
+        source = _src(ctx)
+        source.add("src-pin", state="created", labels=_labels(pins.SOURCE), volumes=(VOL,))
+        ctx.journal.append("step_completed", state="create_target", detail={})
+        ctx.journal.append("step_started", state="quiesce", detail={"stop_requested": True})
+        ctx.journal.append("step_failed", state="quiesce", detail={})
+        _restart(ctx, ok=True)
+        waits: list[float] = []
+
+        async def remount(seconds: float) -> None:
+            waits.append(seconds)
+            source.add("postgres-db1", labels=COOLIFY, volumes=(VOL,))
+
+        monkeypatch.setattr(pins.asyncio, "sleep", remount)
+
+        await compensations.undo_release_source_pins(ctx, {})
+        assert waits and "src-pin" not in source.containers
 
     async def test_zero_wait_when_the_restart_failed(
         self, ctx: MigrationContext, monkeypatch: pytest.MonkeyPatch
