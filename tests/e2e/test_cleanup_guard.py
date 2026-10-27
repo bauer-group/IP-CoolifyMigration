@@ -188,7 +188,23 @@ async def test_coolify_cleanup_between_copy_and_start_deletes_nothing(
 ) -> None:
     """The widest window: source stopped, target filled, nothing mounts either."""
     a, b = str(rig["server_a"]["uuid"]), str(rig["server_b"]["uuid"])
-    plan = await _plan(api, settings, rig, seeded_pg["project"])
+
+    # The plan reads the setting off GET /servers/{uuid} - proven live here,
+    # because a field we only believe is serialised is the 2.5.6 tags outage.
+    original = await api.get(f"/servers/{a}/docker-cleanup")
+    await api.patch(f"/servers/{a}/docker-cleanup", {"delete_unused_volumes": True})
+    try:
+        plan = await _plan(api, settings, rig, seeded_pg["project"])
+    finally:
+        await api.patch(
+            f"/servers/{a}/docker-cleanup",
+            {"delete_unused_volumes": bool(original.get("delete_unused_volumes"))},
+        )
+    assert plan.source_server.prunes_unused_volumes
+    assert any(
+        "Delete unused volumes" in w and plan.source_server.name in w for w in plan.warnings
+    ), plan.warnings
+
     mid = make_migration_id(plan.project, plan.environment)
     seen: dict[str, list[str]] = {}
 

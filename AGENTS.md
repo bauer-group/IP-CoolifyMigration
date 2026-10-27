@@ -436,6 +436,12 @@ the release it starts in — read that module before adding a rule.
   and `/restart` redeploys with proxy labels built at job time - waiting any
   earlier would hold back the parked-domain restore until the source had
   deployed under the parked names.
+- **The plan reads the setting off `GET /servers/{uuid}`**, whose eager-loaded
+  `settings` carry `delete_unused_volumes`, `docker_cleanup_frequency`,
+  `force_docker_cleanup` and `docker_cleanup_threshold` at every release
+  (v4.1.2:ServersController.php:166-171, v4.5.0:218-224). The dedicated
+  `GET /servers/{uuid}/docker-cleanup` exists only from 4.3.0. A warning, never
+  a refusal; under KEEP/RENAME it says the stopped source is no fallback copy.
 
 ## Verify + ship
 

@@ -166,8 +166,9 @@ A pin is released when Coolify's own containers reference the data again:
   volume a container references, and says nothing when it fails to.
 - **Source, KEEP/RENAME**, at FINALIZE after the rename. The kept source then
   has no containers, so on a server that prunes unused volumes it is **no
-  fallback copy**: the next cleanup deletes its volumes. Turn the setting off
-  there, or back the data up, if you want one.
+  fallback copy**: the next cleanup deletes its volumes. The plan says so for
+  every server with the setting on; turn it off there, or back the data up,
+  if you want one.
 - **Source, rollback**, as the very last step, once the restarted source mounts
   its volumes again. If it does not within `DEPLOY_TIMEOUT`, or the source was
   never restarted, the pin stays and the report says so: once the source runs,

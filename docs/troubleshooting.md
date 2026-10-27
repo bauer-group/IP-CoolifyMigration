@@ -228,6 +228,19 @@ nothing. List a migration's pins with
 warning `preflight.foreign_pin` means another migration's pin mounts this
 stack's volume: harmless, and that migration's finalize or rollback removes it.
 
+## Plan warning: "server 'X' has 'Delete unused volumes' on"
+
+Not a blocker. That server's Docker cleanup (Coolify > Server > Docker
+Cleanup) runs `docker volume prune -af`, which deletes every volume no
+container references, and a stopped resource has no containers. The migration
+pins what it stops and fills, so the move itself is safe.
+
+The second line is the one to act on: after a KEEP or RENAME finalize the
+source stays stopped with no containers, so the next cleanup on that server
+deletes its volumes. If you want the old source as a fallback copy, turn
+*Delete unused volumes* off on the source server before you finalize, or back
+the data up. The tool never changes the setting for you.
+
 ## Quiesce failed: preview deployments present
 
 Coolify's stop endpoint does **not** stop preview containers

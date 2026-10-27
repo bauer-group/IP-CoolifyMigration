@@ -1213,6 +1213,43 @@ def server_refusals(
     return []
 
 
+def _truthy(value: object) -> bool:
+    """A settings flag as Laravel may serialise it: bool, 0/1, or a string."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "t")
+    return value is True or value == 1
+
+
+def docker_cleanup(server: dict[str, Any]) -> tuple[bool, str]:
+    """Does Coolify's Docker cleanup prune unused volumes on this server, and when?
+
+    ``settings.delete_unused_volumes`` turns ``docker volume prune -af`` on
+    (v4.1.2:CleanupDocker.php:61-63, v4.5.0:166-168). The job runs on
+    ``docker_cleanup_frequency``, and then on every run with
+    ``force_docker_cleanup`` (the default), otherwise only at or above
+    ``docker_cleanup_threshold`` percent disk usage
+    (v4.5.0:app/Jobs/DockerCleanupJob.php:115,136,156). ``GET /servers/{uuid}``
+    serialises all four at every supported release, so no version gate.
+
+    Returns ``(prunes, when)``; ``(False, "")`` when off or not reported.
+    """
+    settings = _settings(server)
+    if not _truthy(settings.get("delete_unused_volumes")):
+        return False, ""
+    frequency = settings.get("docker_cleanup_frequency")
+    schedule = (
+        f"cron {frequency.strip()!r}"
+        if isinstance(frequency, str) and frequency.strip()
+        else "its schedule"
+    )
+    if _truthy(settings.get("force_docker_cleanup")):
+        return True, f"{schedule}, on every run"
+    threshold = settings.get("docker_cleanup_threshold")
+    if isinstance(threshold, int | str) and str(threshold).strip().isdigit():
+        return True, f"{schedule}, when disk usage is at or above {str(threshold).strip()}%"
+    return True, f"{schedule}, when disk usage crosses its threshold"
+
+
 def server_warnings(source_server: dict[str, Any], target_server: dict[str, Any]) -> list[str]:
     """Server-level settings that change what every migrated resource gets."""
     src, tgt = _settings(source_server), _settings(target_server)

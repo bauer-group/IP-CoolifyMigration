@@ -102,6 +102,7 @@ def server_ref(server: dict[str, Any]) -> ServerRef:
     # gets a default URL, and thus what we rewrite that URL onto for the target.
     settings = server.get("settings")
     wildcard = str(settings.get("wildcard_domain") or "") if isinstance(settings, dict) else ""
+    prunes, cleanup = fidelity.docker_cleanup(server)
     return ServerRef(
         uuid=str(server.get("uuid", "")),
         name=str(server.get("name", "?")),
@@ -114,6 +115,8 @@ def server_ref(server: dict[str, Any]) -> ServerRef:
         user=str(server.get("user") or "root"),
         port=int(server.get("port", 22) or 22),
         wildcard_domain=wildcard,
+        prunes_unused_volumes=prunes,
+        docker_cleanup=cleanup,
     )
 
 

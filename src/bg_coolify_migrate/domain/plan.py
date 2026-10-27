@@ -80,6 +80,13 @@ class ServerRef(BaseModel):
     default URL under it, and that URL is BOUND to this server — migrating a
     resource rewrites the URL onto the target server's wildcard. Empty when the
     server has none configured."""
+    prunes_unused_volumes: bool = False
+    """Coolify's Docker cleanup on this server deletes every volume no container
+    references (``settings.delete_unused_volumes``). A warning, never a
+    refusal: the migration pins what it exposes either way (discovery/pins.py),
+    and whether the server should prune is the operator's call."""
+    docker_cleanup: str = ""
+    """When that cleanup runs, in words — e.g. ``cron '0 0 * * *', on every run``."""
 
 
 class ResourceRow(BaseModel):
@@ -288,10 +295,43 @@ class MigrationPlan(BaseModel):
     @property
     def warnings(self) -> tuple[str, ...]:
         out: list[str] = list(self.notes)
+        out.extend(_volume_prune_notes(self))
         for r in self.resources:
             out.extend(f"{r.snapshot.name}: {w}" for w in r.warnings)
             out.extend(f"{r.snapshot.name}: {w}" for w in r.manifest.warnings)
         return tuple(out)
+
+
+def _volume_prune_notes(plan: MigrationPlan) -> list[str]:
+    """What a server that prunes unused volumes means for this move. PURE.
+
+    Derived from the plan on every read rather than baked into ``notes``: the
+    run command swaps ``finalize_policy`` onto a plan that is already built
+    (``model_copy``), and the second note depends on it.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for role, server in (("source", plan.source_server), ("target", plan.target_server)):
+        if not server.prunes_unused_volumes or server.uuid in seen:
+            continue
+        seen.add(server.uuid)
+        out.append(
+            f"{role} server {server.name!r} has 'Delete unused volumes' on: Coolify's Docker "
+            f"cleanup ({server.docker_cleanup or 'scheduled'}) runs `docker volume prune -af`, "
+            "which deletes every volume no container references, and Coolify's stop removes "
+            "a resource's containers. This migration pins every volume it stops or fills "
+            "with a never-started container (bg-coolify-migrate-pin-...) until finalize or "
+            "rollback."
+        )
+    source = plan.source_server
+    if source.prunes_unused_volumes and plan.finalize_policy is not FinalizePolicy.DELETE:
+        out.append(
+            f"after finalize the source stays stopped ({plan.finalize_policy.value}) with no "
+            f"containers, so the next Docker cleanup on {source.name!r} deletes its volumes: "
+            f"it is no fallback copy there. Turn 'Delete unused volumes' off on "
+            f"{source.name!r}, or back the data up, if you want one."
+        )
+    return out
 
 
 def select_strategy(kind: ResourceKind, *, builds: bool, has_volumes: bool) -> Strategy:
