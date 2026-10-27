@@ -54,11 +54,16 @@ app = typer.Typer(
     ),
     no_args_is_help=True,
     add_completion=False,
+    # Never render frame locals in a crash report: they hold env values, the API
+    # token and SSH keys. Pinned rather than inherited from whichever Typer
+    # release happens to be installed (the supported range starts at 0.15).
+    pretty_exceptions_show_locals=False,
 )
 
 server_app = typer.Typer(
     help="Migrate the Coolify instance itself to a new host.",
     no_args_is_help=True,
+    pretty_exceptions_show_locals=False,
 )
 app.add_typer(server_app, name="server")
 

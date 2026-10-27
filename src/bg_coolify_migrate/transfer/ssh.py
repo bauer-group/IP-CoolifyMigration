@@ -28,7 +28,7 @@ import asyncio
 import shlex
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
@@ -71,12 +71,18 @@ class HostKeyUnknown(PreflightError):
 
 @dataclass(frozen=True, slots=True)
 class CommandResult:
-    """The outcome of one remote command."""
+    """The outcome of one remote command.
+
+    ``stdout``/``stderr`` are kept out of ``repr``: a result is a local in many
+    frames and an attribute of many objects, and some commands print secrets
+    (``cat`` of a Coolify .env file). A repr that reaches a traceback, an
+    assertion message or a log line must name the command, not its output.
+    """
 
     command: str
     exit_status: int
-    stdout: str
-    stderr: str
+    stdout: str = field(repr=False)
+    stderr: str = field(repr=False)
 
     @property
     def ok(self) -> bool:

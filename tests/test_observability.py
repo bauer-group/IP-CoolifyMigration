@@ -42,6 +42,8 @@ class TestRedaction:
             "authorization",
             "real_value",
             "docker_compose_raw",
+            "internal_db_url",
+            "external_db_url",
         ],
     )
     def test_sensitive_keys_are_redacted(self, key: str) -> None:
@@ -124,6 +126,58 @@ class TestSetupLogging:
 
         structlog.get_logger("test").warning("still.works", detail="x")
         assert "still.works" in replacement.getvalue()
+
+
+class TestNoLocalsInCrashReports:
+    """A traceback must never become a dump of every variable in scope.
+
+    The redaction processor sees the event dict; it never sees the locals Rich
+    formats from the frames afterwards. structlog's default console formatter
+    shows them, and the executor logs unexpected errors with ``log.exception`` —
+    so a crash inside copy_envs printed a resource's env values.
+    """
+
+    SENTINEL = "s3ntinel-env-value-7f3a"
+
+    def test_console_exception_does_not_render_locals(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import structlog
+
+        setup_logging(log_format="console", force=True)
+        log = structlog.get_logger("test")
+
+        def copy_envs_like() -> None:
+            env_value = self.SENTINEL  # noqa: F841 - the local under test
+            raise RuntimeError("boom")
+
+        try:
+            copy_envs_like()
+        except RuntimeError:
+            log.exception("engine.unexpected")
+
+        err = capsys.readouterr().err
+        assert "engine.unexpected" in err
+        assert "RuntimeError" in err, "the traceback itself must still be rendered"
+        assert self.SENTINEL not in err
+
+    def test_typer_apps_never_show_locals(self) -> None:
+        from bg_coolify_migrate.cli import app, server_app
+
+        assert app.pretty_exceptions_show_locals is False
+        assert server_app.pretty_exceptions_show_locals is False
+
+    def test_command_output_stays_out_of_repr(self) -> None:
+        from bg_coolify_migrate.transfer.ssh import CommandResult
+
+        result = CommandResult(
+            command="cat -- /data/coolify/services/x/.env",
+            exit_status=0,
+            stdout=f"API_SECRET={self.SENTINEL}",
+            stderr=self.SENTINEL,
+        )
+        assert self.SENTINEL not in repr(result)
+        assert "cat -- /data/coolify/services/x/.env" in repr(result)
 
 
 class TestSettings:

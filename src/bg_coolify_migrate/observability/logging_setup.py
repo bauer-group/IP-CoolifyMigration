@@ -40,6 +40,9 @@ _SENSITIVE_KEY_FRAGMENTS: tuple[str, ...] = (
     "credential",
     "real_value",
     "docker_compose_raw",
+    # A database GET's internal_db_url/external_db_url embed the server password
+    # (StandaloneRedis v4.5.0:309-318 rawurlencodes it into the userinfo).
+    "db_url",
 )
 
 _REDACTED = "«redacted»"
@@ -95,6 +98,22 @@ def _redact(_logger: Any, _method: str, event_dict: dict[str, Any]) -> dict[str,
     }
 
 
+def _traceback_formatter(*, colors: bool) -> Any:
+    """structlog's Rich traceback, WITHOUT the local variables of every frame.
+
+    structlog's default console formatter is ``RichTracebackFormatter(
+    show_locals=True)``, and the redaction processor never sees what it renders:
+    locals are formatted from the frames, after the processors ran. Any
+    ``log.exception`` — the executor's handler for an unexpected error is one —
+    then printed every local in scope, and frames in ``copy_envs`` hold the env
+    values of a whole resource. The traceback keeps file, line and code; only
+    the variable dump goes. Same colour choice as structlog's own default.
+    """
+    return structlog.dev.RichTracebackFormatter(
+        color_system="truecolor" if colors else None, show_locals=False
+    )
+
+
 def setup_logging(
     *,
     log_level: str = "INFO",
@@ -132,7 +151,11 @@ def setup_logging(
         renderer: Any = structlog.processors.JSONRenderer()
         shared.append(structlog.processors.format_exc_info)
     else:
-        renderer = structlog.dev.ConsoleRenderer(colors=sys.stderr.isatty())
+        colors = sys.stderr.isatty()
+        renderer = structlog.dev.ConsoleRenderer(
+            colors=colors,
+            exception_formatter=_traceback_formatter(colors=colors),
+        )
 
     structlog.configure(
         processors=[*shared, renderer],
