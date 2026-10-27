@@ -150,6 +150,40 @@ volumes:
 
 Refusing beats silently starting with an empty volume.
 
+## "this application also deploys to N additional server(s)"
+
+Refused, on every Coolify release, and no flag overrides it. The target is
+created on the target server only, so the additional deployments would be
+dropped — and while Coolify's stop of the source reaches them, this tool can only
+check the source server's daemon, so a copy left running there would keep serving
+the domain next to the new target.
+
+1. **Remove each additional server on the source** in the application's
+   **Servers** tab (Configuration), **while that server is reachable**. Coolify
+   stops the application there before detaching it — but on an unreachable
+   server it skips the stop and detaches anyway, leaving the containers running
+   unmanaged. Do **not** use the API's
+   `DELETE /applications/{uuid}/destinations/{destination_uuid}`: it never stops
+   anything, it only detaches.
+2. **Migrate.** The next plan sees no additional servers and proceeds normally.
+3. **Add the servers back to the target** in its Servers tab (or, on 4.3+, with
+   `POST /applications/{uuid}/destinations`) — **except the migration's target
+   server**: it is the primary now, and Coolify refuses an additional destination
+   on the primary's own server.
+
+If the application has persistent storage, each additional server holds its
+**own** copy of the volumes. Only the primary server's copy is migrated, and
+removing a server leaves its copy behind on that server.
+
+On Coolify >= 4.4 step 1 is **one-way** for an application with persistent
+storage or built from docker compose: Coolify will not add servers back to such
+an application. Deploying to several servers also needs a Docker image set in the
+General tab.
+
+The same check runs again when the target is created, so a server attached
+between plan and run stops the migration before anything of that application is
+parked or created; whatever the run created before it is deleted again.
+
 ## "TLS is on for this database … the target starts WITHOUT TLS"
 
 A warning, not a refusal. Coolify reports a database's SSL setting in every read

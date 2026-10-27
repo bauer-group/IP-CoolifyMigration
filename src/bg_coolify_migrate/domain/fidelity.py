@@ -59,6 +59,11 @@ EXACT_ENV_ESCAPING_SINCE: Version = (4, 5, 0)
 COMPOSE_SCALE_CHECK_SINCE: Version = (4, 5, 0)
 #: convertDockerRunToCompose maps flags it used to ignore.
 RUN_OPTIONS_PARSER_SINCE: Version = (4, 5, 0)
+#: GET/POST/DELETE /applications/{uuid}/destinations exist (routes/api.php v4.3.0:269-271).
+APPLICATION_DESTINATIONS_API_SINCE: Version = (4, 3, 0)
+#: add_destination refuses compose apps, persistent storage and a proxy mismatch; a
+#: multi-server deploy needs a Docker image (ensureRegistryImageForMultipleServers).
+MULTI_SERVER_RESTRICTIONS_SINCE: Version = (4, 4, 0)
 
 _WEBHOOK_SECRET_FIELDS = (
     "manual_webhook_secret_github",
@@ -91,6 +96,9 @@ def _settings(source: dict[str, Any]) -> dict[str, Any]:
 def application_refusals(source: dict[str, Any], *, version: Version | None) -> list[str]:
     """What makes this application's create 422, or its routing silently wrong."""
     out: list[str] = []
+
+    if multi_server := multi_server_refusal(source, version=version):
+        out.append(multi_server)
 
     if at_least(version, WEBHOOK_SECRET_MIN_LENGTH_SINCE):
         short = [
@@ -148,6 +156,98 @@ def application_refusals(source: dict[str, Any], *, version: Version | None) -> 
             )
 
     return out
+
+
+def _count(value: object) -> int:
+    """A non-negative count off the wire: an int or a digit string, never a bool."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(value, 0)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return 0
+
+
+def additional_servers(source: dict[str, Any]) -> tuple[int, tuple[str, ...]]:
+    """How many additional servers an application deploys to, and their names. PURE.
+
+    Every Application query carries a global ``withCount(additional_servers,
+    additional_networks)`` scope (Application.php v4.1.2:244-249, v4.5.0:306-311),
+    so GET /applications/{uuid} returns both ``*_count`` keys on every supported
+    release; both count rows of the one ``additional_destinations`` pivot. The
+    ``additional_servers`` rows themselves are serialised only because the status
+    accessor lazy-loads them (v4.5.0:1019-1020) — so the count decides, and the
+    names are display-only enrichment.
+
+    Those rows are full Server models: on a root token they can carry proxy
+    configuration (DNS provider tokens) and nested settings
+    (api.php v4.5.0:130-134), so only ``name`` and ``uuid`` are ever read. Before
+    4.5 the pivot could hold duplicate rows (deduplicated by migration
+    2026_09_21_070754), so names are listed once each.
+    """
+    counts = [
+        _count(source.get("additional_servers_count")),
+        _count(source.get("additional_networks_count")),
+    ]
+    names: list[str] = []
+    entries = source.get("additional_servers")
+    if isinstance(entries, list):
+        counts.append(len(entries))
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            label = entry.get("name") or entry.get("uuid")
+            if label and str(label) not in names:
+                names.append(str(label))
+    return max(counts), tuple(names)
+
+
+def multi_server_refusal(source: dict[str, Any], *, version: Version | None) -> str | None:
+    """An application that also deploys to additional servers. NOT version-gated.
+
+    The hazard exists on every release: the target is created on one server, so
+    the additional deployments are dropped; QUIESCE can poll only the source
+    server's daemon (invariant 9), while Coolify's fan-out stop returns early on
+    the first non-functional server up to 4.3.x (StopApplication v4.1.2:18-25);
+    and FINALIZE's delete orphans the per-server volumes (DeleteResourceJob
+    v4.5.0:70-71,99-100). Only the REMEDY depends on the release: the
+    destinations route exists from 4.3.0, add_destination's restrictions from 4.4.
+    """
+    count, names = additional_servers(source)
+    if not count:
+        return None
+    re_add = (
+        "in its Servers tab or with POST /applications/{uuid}/destinations"
+        if at_least(version, APPLICATION_DESTINATIONS_API_SINCE)
+        else "in its Servers tab"
+    )
+    rules = (
+        " On Coolify >= 4.4 this removal is one-way for an application with persistent "
+        "storage or built from docker compose, because Coolify will not add servers back "
+        "to such an application. Deploying to several servers also needs a Docker image "
+        "set in the General tab."
+        if at_least(version, MULTI_SERVER_RESTRICTIONS_SINCE)
+        else ""
+    )
+    listed = " (" + ", ".join(names) + ")" if names else ""
+    return (
+        f"this application also deploys to {count} additional server(s){listed}. The target "
+        "would be created on the target server only, so those deployments would be "
+        "dropped. Coolify's stop of the source does reach them, but this tool can check "
+        "the daemon of the source server only, and a copy still running there would keep "
+        "serving the domain next to the target. Remove each additional server on the "
+        "source in the application's Servers tab (Configuration) while that server is "
+        "reachable. Coolify stops the application there before detaching, but on an "
+        "unreachable server it skips the stop and detaches anyway. The API's DELETE "
+        "/applications/{uuid}/destinations/{destination_uuid} never stops anything; it "
+        f"only detaches. Then migrate, and add the servers back to the target {re_add}, "
+        "except the migration's target server: it becomes the primary, and Coolify "
+        "refuses an additional destination on the primary's own server. If the "
+        "application has persistent storage, each additional server holds its OWN copy "
+        "of the volumes. Only the primary server's copy is migrated, and removing a "
+        "server leaves its copy on that server." + rules
+    )
 
 
 def application_warnings(source: dict[str, Any], *, version: Version | None) -> list[str]:

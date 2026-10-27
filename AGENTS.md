@@ -127,6 +127,17 @@ tags v4.1.2 through v4.5.0 (2026-10-26). Read upstream at a **release tag**, nev
 - Every request body passes `TrimStrings` and **`ConvertEmptyStringsToNull`**
   (`Kernel.php:61-62`): an empty string we send arrives as `null`. From 4.5 an
   empty and a null env value render differently, so "send `""`" is never a fix.
+- **Multi-server applications are refused on every release.** Every
+  `GET /applications/{uuid}` carries `additional_servers_count` (a global
+  `withCount` scope, Application.php v4.1.2:244-249 .. v4.5.0:306-311); the
+  `additional_servers` rows ride along only via a lazy load, and on a root token
+  they carry proxy config and server settings — read `name`/`uuid` only.
+  `StopApplication` fans out to them but, up to 4.3.x, returns on the first
+  non-functional server, and we can poll only the source's daemon (invariant 9).
+  `/applications/{uuid}/destinations` exists from 4.3.0; its DELETE only
+  detaches and never stops. The UI's removal stops first — except on an
+  unreachable server, where it detaches anyway. CREATE re-checks the count
+  (`steps._refuse_multi_server`) before parking anything.
 
 ### Learned the hard way, from a real instance
 

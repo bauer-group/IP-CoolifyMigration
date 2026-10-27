@@ -26,6 +26,7 @@ from bg_coolify_migrate.dns import extract as dns_extract
 from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.dns import wildcard as dns_wildcard
 from bg_coolify_migrate.dns.gate import Resolution, build_report, explain_why_blocking_matters
+from bg_coolify_migrate.domain import fidelity
 from bg_coolify_migrate.domain.kinds import GitAuth, ResourceKind
 from bg_coolify_migrate.domain.manifest import DockerMount
 from bg_coolify_migrate.domain.naming import (
@@ -38,6 +39,7 @@ from bg_coolify_migrate.domain.naming import (
 )
 from bg_coolify_migrate.domain.plan import ResourcePlan, ResourceSnapshot
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
+from bg_coolify_migrate.domain.versions import parse_version
 from bg_coolify_migrate.engine import compensations, keys
 from bg_coolify_migrate.engine.context import MigrationContext, serialise_mounts
 from bg_coolify_migrate.engine.planner import (
@@ -352,6 +354,8 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
         for resource in ctx.plan.resources:
             snapshot = resource.snapshot
             source_full = await ctx.api.get_resource(snapshot.collection, snapshot.uuid)
+            if snapshot.collection == "applications":
+                await _refuse_multi_server(ctx, snapshot, source_full)
 
             # NO TAG TRANSFER. Tags are deliberately not carried — see the note on
             # SERVICE_CREATE in api/fields.py. Coolify's tag endpoints and the `tags`
@@ -446,6 +450,37 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
         raise
 
     return {"target_uuids": created}
+
+
+async def _refuse_multi_server(
+    ctx: MigrationContext, snapshot: ResourceSnapshot, source_full: dict[str, Any]
+) -> None:
+    """Re-check, at CREATE, the plan's refusal of a multi-server application.
+
+    The plan was refused if the application deployed to additional servers when
+    it was made; a server attached in the UI since then would otherwise be
+    dropped from the target and left serving next to it. Costs no API call on
+    the common path: ``source_full`` is the GET CREATE reads anyway. Runs before
+    park_source_domains, so nothing of THIS resource is parked or created yet;
+    those made earlier in the loop are undone by step_create_target's handler.
+    """
+    if not fidelity.additional_servers(source_full)[0]:
+        return
+    # Only now, for the remedy's version-gated wording; unknown reads as newest.
+    try:
+        version = parse_version(await ctx.api.version())
+    except Exception as exc:  # the refusal stands either way
+        log.debug("create.version_unavailable", error=str(exc)[:120])
+        version = None
+    raise PreflightError(
+        f"{snapshot.name}: {fidelity.multi_server_refusal(source_full, version=version)}",
+        hint=(
+            "An additional server was attached after the plan was made. Nothing of "
+            f"{snapshot.name} was parked or created; anything created before it in "
+            "this run is deleted again. The source was never stopped. Re-plan once "
+            "the servers are removed."
+        ),
+    )
 
 
 async def _assert_compose_target_ready(

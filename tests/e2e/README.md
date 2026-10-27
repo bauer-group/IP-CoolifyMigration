@@ -124,6 +124,11 @@ typo away from silently copying nothing.
   as one plan, each with distinct data. Proves the n>1 case: migrating only the
   first, or crossing one resource's volume to another's target, fails a
   fingerprint.
+- `test_multi_server_app.py` — an nginx application on server-a with server-b
+  attached as an additional destination (never deployed, so nothing to pull).
+  Pins that the live GET carries `additional_servers_count` and the server rows
+  the refusal names, that the plan blocks and the run creates nothing on
+  server-b, and that detaching the server lifts the refusal.
 - `test_rollback.py` — injects a fault after the volumes are copied and asserts
   the world is put back: target deleted from server-b, source still running on
   server-a with its data intact. This is what caught finding 15.
