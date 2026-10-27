@@ -2193,6 +2193,9 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
     policy = ctx.plan.finalize_policy
     stamp = ctx.migration_id.split("-")[-1]
     actions: list[str] = []
+    # On disk before anything is touched: after a DELETE has begun, no rollback
+    # may run, even if this step dies part-way (statemachine.rollback_refusal).
+    ctx.journal.append("step_started", state="finalize", detail={"policy": policy.value})
 
     # Unpinning hands each volume back to Coolify's steady state, and when that
     # happens depends on the side and the policy - see _unpin_target and

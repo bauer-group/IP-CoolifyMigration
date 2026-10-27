@@ -38,6 +38,7 @@ from bg_coolify_migrate.domain.statemachine import (
     Outcome,
     owed_states,
     rollback_plan_for,
+    rollback_refusal,
 )
 from bg_coolify_migrate.errors import (
     DnsGateBlocked,
@@ -90,6 +91,9 @@ class RunResult:
     compensations_failed: list[tuple[Compensation, str]] = field(default_factory=list)
     notices: list[str] = field(default_factory=list)
     """Left for the operator by a step or a compensation; never changes the outcome."""
+    notes: list[str] = field(default_factory=list)
+    """What the operator still has to do by hand — things no compensation can
+    reach, like a DNS record that already points at the target."""
 
     @property
     def ok(self) -> bool:
@@ -126,6 +130,7 @@ class Saga:
         compensation_map: Mapping[Any, tuple[Compensation, ...]] | None = None,
         precedence: Mapping[Any, Any] | None = None,
         owed: Callable[..., Sequence[str]] | None = None,
+        refusal: Callable[[Mapping[str, Mapping[str, Any]]], str | None] | None = None,
     ) -> None:
         self.journal = journal
         self.context = context
@@ -143,6 +148,8 @@ class Saga:
         # Which states a rollback owes beyond the completed ones (domain rule).
         # None: completions only, which is all F2 has ever planned from.
         self._owed_rule = owed if owed is not None else (owed_states if f1 else None)
+        # When no rollback may run at all (domain rule).
+        self._refusal = refusal if refusal is not None else (rollback_refusal if f1 else None)
         self._keys = [str(s) for s in self._order]
         self._terminal = self._keys[-1]
         self._completed: list[str] = []
@@ -217,6 +224,27 @@ class Saga:
         self._completed = _states_from_journal(self.journal, set(self._keys))
         return await self._rollback(self._order[0], None, explicit=True)
 
+    def _refuse_if_irreversible(self, error: MigrationError | None) -> None:
+        """Raise instead of rolling back when a rollback would destroy data.
+
+        Raised, not returned as ROLLBACK_FAILED: that outcome tells the operator
+        the source was NOT deleted, and here it was. Nothing is marked finished,
+        so the journal stays as it is for whoever adjudicates it.
+        """
+        reason = self._refusal(self.journal.details()) if self._refusal else None
+        if reason is None:
+            return
+        self.journal.append("rollback_refused", detail={"reason": reason[:500]})
+        log.error("saga.rollback_refused", reason=reason[:200])
+        raise RollbackError(
+            f"rollback refused: {reason}",
+            hint=(
+                "Nothing was undone. Check the target in Coolify - it holds the data. "
+                "If FINALIZE stopped part-way, delete what is left of the source by hand "
+                f"once the target is verified.\nJournal: {self.journal.path}"
+            ),
+        ) from error
+
     def _owed(self, *, explicit: bool) -> list[str]:
         if self._owed_rule is None:
             return list(self._completed)
@@ -234,6 +262,7 @@ class Saga:
     async def _rollback(
         self, failed_at: Any, error: MigrationError | None, *, explicit: bool = False
     ) -> RunResult:
+        self._refuse_if_irreversible(error)
         plan = rollback_plan_for(
             self._owed(explicit=explicit),
             order=self._keys,

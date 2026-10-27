@@ -255,7 +255,14 @@ is a target this migration created — never a third party's resource.
 
 **Rollback is cheap because the source is never destroyed until FINALIZE.** That
 is the one thing Geczy's script gets right, and it is the backbone of the whole
-safety story.
+safety story. It is also why a rollback is **refused** once a FINALIZE with
+`delete` has begun: the target then holds the only copy of the data, and every
+remaining compensation aims at the target. FINALIZE journals its policy before
+it touches anything, so the refusal holds even when it died part-way.
+
+A rollback cannot move DNS. When the DNS gate had already found a custom domain
+pointing at the target (or you accepted the cutover), the run report ends with
+the hosts to point back at the source.
 
 A crash mid-step is covered too. CREATE journals each target and each restore
 body before it writes them, so `coolify-migrate rollback <id>` also undoes the

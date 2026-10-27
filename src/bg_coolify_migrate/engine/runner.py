@@ -14,9 +14,9 @@ from pathlib import Path
 import structlog
 
 from bg_coolify_migrate.api.client import CoolifyClient
-from bg_coolify_migrate.domain.domains import parking_tag
+from bg_coolify_migrate.domain.domains import dns_rollback_note, parking_tag
 from bg_coolify_migrate.domain.plan import MigrationPlan, ServerRef, TransferMode
-from bg_coolify_migrate.domain.statemachine import State
+from bg_coolify_migrate.domain.statemachine import Outcome, State
 from bg_coolify_migrate.engine.compensations import build_compensations
 from bg_coolify_migrate.engine.context import (
     MigrationContext,
@@ -207,7 +207,25 @@ async def _execute(
         )
         result = await saga.run(start_from=start_from)
         result.notices.extend(ctx.notices)
+        return _with_rollback_notes(result, ctx)
+
+
+def _with_rollback_notes(result: RunResult, ctx: MigrationContext) -> RunResult:
+    """Add what a rollback leaves for the operator to do by hand.
+
+    Read from the JOURNAL, so an explicit rollback after a crash says it too.
+    """
+    if result.outcome not in (Outcome.ROLLED_BACK, Outcome.ROLLBACK_FAILED):
         return result
+    note = dns_rollback_note(
+        ctx.journal.undo_info(State.DNS_GATE.value),
+        source_ip=ctx.plan.source_server.ip,
+        source_wildcard=ctx.plan.source_server.wildcard_domain or None,
+        target_wildcard=ctx.plan.target_server.wildcard_domain or None,
+    )
+    if note:
+        result.notes.append(note)
+    return result
 
 
 async def run_migration(
@@ -368,5 +386,6 @@ async def rollback_migration(
         )
         result = await saga.rollback()
         result.notices.extend(ctx.notices)
+        result = _with_rollback_notes(result, ctx)
         log.info("migration.rolled_back", id=migration_id, outcome=result.outcome.value)
         return result

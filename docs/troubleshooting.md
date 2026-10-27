@@ -407,6 +407,26 @@ confirmed finalize. Inspect with:
 coolify-migrate status <id>
 ```
 
+### "rollback refused: FINALIZE ran with policy 'delete'"
+
+The one exit 8 where the source **is** gone: the migration got as far as deleting
+it, with the confirmation `delete` requires. From there the **target is the only
+copy** of the data, and undoing the run would mean stopping the target,
+dropping its volumes and deleting it — so nothing was undone, on purpose.
+
+Check the target in Coolify: it holds the data. If FINALIZE stopped part-way,
+some source resources may still exist; delete them by hand once the target is
+verified. The journal named in the hint shows what FINALIZE recorded.
+
+### "point DNS for … back to …"
+
+Not an error — a step a rollback cannot take for you. The DNS gate had already
+found these custom domains pointing at the target (or you accepted the cutover
+with `--accept-dns`). The source has its domains back and runs again, but DNS
+still sends their traffic to the target this rollback removed. Point the records
+back at the source; until then those domains are dead, and the source's proxy
+cannot obtain a certificate for them.
+
 ### "creating the target failed, and undoing it did not complete"
 
 CREATE failed before anything was stopped, then could not fully undo itself —

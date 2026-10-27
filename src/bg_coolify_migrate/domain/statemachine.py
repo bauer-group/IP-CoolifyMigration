@@ -338,6 +338,26 @@ def owed_states(
     return tuple(owed)
 
 
+def rollback_refusal(markers: Mapping[str, Mapping[str, Any]]) -> str | None:
+    """Why no rollback may run at all, or ``None``. ``markers``: per-state journal detail.
+
+    FINALIZE(delete) deletes the SOURCE with its volumes. Once it has begun, the
+    target holds the only copy of the data, and what a rollback would still do
+    aims at the target — STOP_TARGET, DROP_TARGET_VOLUMES and
+    DELETE_TARGET_RESOURCE(delete_volumes=True) would destroy that copy too.
+    ``step_finalize`` journals its policy before it touches anything, so this
+    holds for a finished, a failed and a crashed FINALIZE alike.
+    """
+    finalize = markers.get(State.FINALIZE.value) or {}
+    if finalize.get("policy") == FinalizePolicy.DELETE.value:
+        return (
+            "FINALIZE ran with policy 'delete', so the source is deleted (or partly "
+            "deleted) and the target holds the only copy of its data - a rollback "
+            "would delete that copy too"
+        )
+    return None
+
+
 def requires_source_restart(completed: Sequence[State]) -> bool:
     """True if a rollback must restart the source because we stopped it."""
     return _STOPS_SOURCE in set(completed)

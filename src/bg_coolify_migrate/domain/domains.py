@@ -286,3 +286,40 @@ def restore_summary(body: Mapping[str, Any]) -> str:
                 if isinstance(e, dict)
             )
     return "?"
+
+
+def dns_rollback_note(
+    dns_gate: Mapping[str, Any],
+    *,
+    source_ip: str,
+    source_wildcard: str | None,
+    target_wildcard: str | None,
+) -> str | None:
+    """What a rollback after DNS_GATE cannot do for the operator, or ``None``.
+
+    ``dns_gate`` is that step's journalled detail. Its ``ready`` hosts already
+    resolved to the target, and its ``cutover_accepted`` hosts were to be cut
+    over in parallel. The rollback gives the source its domains back and
+    restarts it, but DNS still sends their traffic to the target it removed —
+    so the custom domain stays dead, and the source's proxy fails its ACME
+    challenge, until the records point back. Server-bound hosts (under either
+    server's wildcard) never moved by DNS and are left out.
+    """
+    hosts: set[str] = set()
+    for key in ("ready", "cutover_accepted"):
+        listed = dns_gate.get(key)
+        if not isinstance(listed, list):
+            continue
+        for host in listed:
+            if not isinstance(host, str) or not host:
+                continue
+            if under_wildcard(host, source_wildcard) or under_wildcard(host, target_wildcard):
+                continue
+            hosts.add(host)
+    if not hosts:
+        return None
+    return (
+        f"point DNS for {', '.join(sorted(hosts))} back to {source_ip}: the source "
+        "serves them again, but DNS still sends their traffic to the target this "
+        "rollback removed"
+    )
