@@ -460,6 +460,14 @@ the release it starts in — read that module before adding a rule.
   for byte, so a wrong guess or a secret-manager line is "unrecoverable", never a
   different value (`test_round_trip_property_exact_or_nothing`). Indistinguishable
   secret-manager lines are carried as their resolved value — documented, accepted.
+- **The round trip cannot see a legacy value cut at its own newline** — the cut
+  first line re-encodes to itself. Only the NEXT line proves where a record not
+  closed by `"` ends: the end of the file, or a line Coolify certainly wrote
+  (a row; HOST=0.0.0.0 without a HOST row; PORT=digits once `ports_exposes` is
+  known). PORT/HOST/COOLIFY_*/SERVICE_* are written only sometimes (build pack,
+  compose parsing version, settings, release), so a record followed by one of
+  those is refused, never trusted (`_open_ended`). Do not "repair" such a record
+  by joining lines: that carries another row's line as part of the value.
 - **The file is what Coolify LAST WROTE, so it is checked first.** Every unlocked
   row in it must encode exactly as the API's `real_value` predicts (legacy rows:
   `real_value` IS the written form, v4.5.0 EnvironmentVariable.php:265-283);
@@ -480,11 +488,22 @@ the release it starts in — read that module before adding a rule.
   call any `{{x.y}}`-wrapped value shared. Shared locked rows are never recovered
   (the file holds the resolved value, not the reference).
 - **A value-less bulk entry nulls the row on applications only**; services and
-  databases `updateOrCreate` and keep the old value. Never send one either way.
-  The application created hook copies a new row into an UNLOCKED preview twin,
-  so a carried locked value is followed by a locked preview entry.
+  databases `updateOrCreate` and keep the old value. Never send one by accident;
+  the one deliberate use is the blank locked preview row below.
+- **The application created hook copies a new production row into an UNLOCKED
+  preview twin — unless a preview row with that key already exists.** So every
+  preview entry of an application's bulk goes BEFORE every production entry
+  (`build_env_entries`): a carried locked value gets a locked preview copy (no
+  source preview row) and a source preview row that is locked gets a BLANK
+  locked one — never the production value, the plan says PR deploys run
+  without it. All previews first, not each before its own row: up to 4.3.x the
+  bulk caches the preview rows at its first preview item (v4.1.2:3127), and a
+  later one would create a second row beside a twin made after that.
 - **Values live only in `Secrets`** (repr: key names), never in a ResourcePlan,
   plan.json, the journal or a log line; CREATE re-reads before its first write.
+  Recovery is never persisted, so a resumed CREATE re-runs it from the files.
+  That says nothing about the targets an interrupted CREATE already made (with
+  recovered values in their env rows): undoing those is the rollback's job.
 
 ### Coolify's Docker cleanup (release tags v4.1.2 through v4.5.0)
 

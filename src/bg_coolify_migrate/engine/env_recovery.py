@@ -13,8 +13,12 @@ two moments they are needed:
   first write. A promised key that can no longer be read, or a credential the
   target would regenerate, refuses with nothing changed. The Secrets it returns
   live in the step's locals until copy_envs has sent them; they are never put
-  on the context and never journaled, which is also what makes a resumed CREATE
-  safe: it simply reads the files again.
+  on the context and never journaled.
+
+Recovery is therefore never persisted, and a resumed CREATE re-runs it from the
+files. That is all it says about a resume: the targets an interrupted CREATE had
+already created — env rows, recovered values included — are not this module's
+to find or undo; that is the rollback's handling of an interrupted attempt.
 """
 
 from __future__ import annotations
@@ -57,10 +61,11 @@ async def _recover(
     envs: Sequence[dict[str, Any]],
     *,
     version: Version | None,
-    internal_db_url: str | None,
+    full: dict[str, Any],
 ) -> tuple[le.LockedRecovery, str]:
     """Read the file and recover. Returns the recovery and the file's path."""
     source = await envfiles.read_source_config(source_host, snapshot.collection, snapshot.uuid)
+    ports = full.get("ports_exposes") if snapshot.collection == "applications" else None
     recovery = le.recover(
         envs,
         source,
@@ -70,7 +75,8 @@ async def _recover(
         compose_app=snapshot.kind is ResourceKind.APP_GIT_COMPOSE,
         compose=snapshot.docker_compose_raw,
         engine=snapshot.engine,
-        internal_db_url=internal_db_url,
+        internal_db_url=_db_url(full, snapshot),
+        ports_exposes=ports if isinstance(ports, str) else None,
     )
     return recovery, source.path
 
@@ -79,6 +85,11 @@ def _db_url(full: dict[str, Any], snapshot: ResourceSnapshot) -> str | None:
     """internal_db_url — only for the one engine that needs it, never stored."""
     url = full.get("internal_db_url") if snapshot.engine is DatabaseEngine.REDIS else None
     return url if isinstance(url, str) else None
+
+
+def _needs_full(snapshot: ResourceSnapshot) -> bool:
+    """Whether recovery reads the resource itself: Redis's URL, an app's ports."""
+    return snapshot.engine is DatabaseEngine.REDIS or snapshot.collection == "applications"
 
 
 async def review_envs(
@@ -106,13 +117,7 @@ async def review_envs(
     if _has_locked(envs):
         failure: str | None = None
         try:
-            recovery, path = await _recover(
-                source_host,
-                snapshot,
-                envs,
-                version=version,
-                internal_db_url=_db_url(full, snapshot),
-            )
+            recovery, path = await _recover(source_host, snapshot, envs, version=version, full=full)
         except Exception as exc:  # a pure function failing must not stop the plan
             failure = type(exc).__name__
         if failure is not None:
@@ -205,17 +210,9 @@ async def _recover_for_create_one(
     if not _has_locked(envs):
         return None
     full = (
-        await api.get_resource(snapshot.collection, snapshot.uuid)
-        if snapshot.engine is DatabaseEngine.REDIS
-        else {}
+        await api.get_resource(snapshot.collection, snapshot.uuid) if _needs_full(snapshot) else {}
     )
-    recovery, _ = await _recover(
-        source_host,
-        snapshot,
-        envs,
-        version=await version.get(),
-        internal_db_url=_db_url(full, snapshot),
-    )
+    recovery, _ = await _recover(source_host, snapshot, envs, version=await version.get(), full=full)
     return recovery
 
 

@@ -6,7 +6,9 @@ is_shown_once kept. A unit suite can prove the decoder; only a real instance can
 prove the three things that matter here:
 
 * the carried SERVICE_PASSWORD is the one the copied data was initialised with —
-  the target's Postgres accepts it over TCP (scram), against the COPIED data;
+  the target's Postgres accepts it over TCP (scram) on the container's own
+  address, against the COPIED data, and rejects a wrong one; and the target's
+  .env line for it is the source's, byte for byte;
 * the carried value is the FILE's, not the container's: ``$HOME`` arrives
   literally, where the container environment would have expanded it;
 * no secret reaches plan.json, the journal or the log output.
@@ -65,12 +67,32 @@ volumes:
   shopdata:
 """
 
-#: Over TCP, so pg_hba's scram-sha-256 applies: the password must be the one the
-#: COPIED data directory was initialised with. chr(58) is ':' without quoting.
-TCP_FINGERPRINT = (
-    'sh -c \'PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U "$POSTGRES_USER" '
-    '-d shopdb -tA -c "SELECT count(*)||chr(58)||sum(cents) FROM orders"\''
-)
+
+def _psql_over_tcp(password: str) -> str:
+    """psql to the container's OWN address, never loopback, with ``password``.
+
+    The image's initdb runs without --auth, so pg_hba.conf starts with
+    ``host all all 127.0.0.1/32 trust`` (and ``local ... trust``); the entrypoint
+    only APPENDS ``host all all all scram-sha-256``. That file lives in PGDATA —
+    the copied volume — so over loopback the target would accept ANY password.
+    Only the container's own address meets the scram line. An empty or loopback
+    address aborts (exit 97) instead of quietly falling back to a trusted path.
+    chr(58) is ':' without quoting.
+    """
+    return (
+        "sh -c '"
+        'addr=$(hostname -i | cut -d" " -f1); '
+        'case "$addr" in ""|127.*|::1) echo "no non-loopback address" >&2; exit 97;; esac; '
+        f'PGPASSWORD={password} psql -h "$addr" -U "$POSTGRES_USER" '
+        '-d shopdb -tA -c "SELECT count(*)||chr(58)||sum(cents) FROM orders"'
+        "'"
+    )
+
+
+#: The password must be the one the COPIED data directory was initialised with.
+TCP_FINGERPRINT = _psql_over_tcp('"$POSTGRES_PASSWORD"')
+#: The negative control: proves the check above can tell a wrong password.
+TCP_WRONG_PASSWORD = _psql_over_tcp("not-the-password")
 SEED = (
     "sh -c 'psql -U \"$POSTGRES_USER\" -d shopdb -tA -v ON_ERROR_STOP=1'",
     "CREATE TABLE orders(id serial primary key, customer text, cents int);"
@@ -184,10 +206,12 @@ async def locked_service(
             )
             await api.restart("services", uuid)
             source_line = await _wait_for_line(source, uuid, "API_SECRET")
+            password_line = await _env_line(source, uuid, "SERVICE_PASSWORD_POSTGRES")
             container = await _store_container(source, uuid)
             await wait_until_healthy(source, container)
 
         assert fingerprint == "2:134100", f"seed did not take: {fingerprint!r}"
+        assert password_line, "the source .env has no SERVICE_PASSWORD_POSTGRES line"
         yield {
             "project": project_name,
             "name": service_name,
@@ -195,6 +219,7 @@ async def locked_service(
             "password": password,
             "fingerprint": fingerprint,
             "api_secret_line": source_line,
+            "password_line": password_line,
         }
     finally:
         await _cleanup(api, suffix, project_uuid)
@@ -245,11 +270,18 @@ async def test_locked_service_credentials_are_carried_still_locked(
     async with ssh_to(api, str(rig["server_b"]["uuid"]), settings) as target_host:
         container = await _store_container(target_host, target_uuid)
         await wait_until_healthy(target_host, container)
-        # scram over TCP against the COPIED data: only the source's password works.
+        # scram over the container's own address against the COPIED data: only
+        # the source's password works — and a wrong one must be refused, or the
+        # check could not tell a mis-carried password from the right one.
         arrived = await db_exec(target_host, container, TCP_FINGERPRINT)
+        wrong = await target_host.run(f"docker exec {container} {TCP_WRONG_PASSWORD}", timeout=90)
         target_line = await _env_line(target_host, target_uuid, "API_SECRET")
+        password_line = await _env_line(target_host, target_uuid, "SERVICE_PASSWORD_POSTGRES")
 
     assert arrived == locked_service["fingerprint"]
+    assert not wrong.ok and wrong.exit_status != 97, "a wrong password opened the copied data"
+    assert "password authentication failed" in wrong.stderr + wrong.stdout
+    assert password_line == locked_service["password_line"], "the carried password differs"
     assert target_line == locked_service["api_secret_line"], "the .env line changed in transit"
     assert "$HOME" in (target_line or ""), "a container-sourced value would have expanded $HOME"
 

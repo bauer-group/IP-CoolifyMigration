@@ -12,6 +12,7 @@ RemoteSecretValueFormatter.php:17-33; v4.1.2 docker.php:1267-1280).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
@@ -233,6 +234,45 @@ class TestRules:
         assert rec.left_to_target == ("SERVICE_FQDN_APP", "SERVICE_URL_APP")
         assert len(rec.recovered) == 0 and rec.unrecoverable == {}
 
+    def test_a_compose_app_leaves_all_three_generated_names_to_the_target(self) -> None:
+        """Its deploy writes SERVICE_FQDN_/URL_/NAME_ from domains and compose, never rows."""
+        envs = [row("SERVICE_FQDN_WEB"), row("SERVICE_URL_WEB"), row("SERVICE_NAME_WEB")]
+        rec = le.recover(
+            envs,
+            source(APP_ENV, dotenv([("SERVICE_NAME_WEB", "web"), ("HOST", "0.0.0.0")])),
+            collection="applications",
+            uuid="app1",
+            compose_app=True,
+        )
+        assert rec.left_to_target == ("SERVICE_FQDN_WEB", "SERVICE_NAME_WEB", "SERVICE_URL_WEB")
+        assert rec.unrecoverable == {}, "SERVICE_NAME_ is not build-time only"
+
+    def test_a_plain_apps_service_url_row_is_its_own_and_is_recovered(self) -> None:
+        """Nothing regenerates it on a non-compose target (v4.5.0 ADJ.php:1749-1811)."""
+        envs = [row("SERVICE_URL_BILLING")]
+        text = dotenv([("SERVICE_URL_BILLING", f'"https://user:{SENTINEL}@billing.example"')])
+        rec = le.recover(envs, source(APP_ENV, text), collection="applications", uuid="app1")
+        assert rec.left_to_target == ()
+        assert rec.recovered.get("SERVICE_URL_BILLING") == f"https://user:{SENTINEL}@billing.example"
+
+    def test_a_plain_apps_unreadable_service_url_row_is_reported_missing(self) -> None:
+        cfg = SourceConfig(path=APP_ENV, kind=FileKind.DOTENV, unavailable="gone")
+        rec = le.recover(
+            [row("SERVICE_FQDN_X")], cfg, collection="applications", uuid="app1"
+        )
+        assert rec.left_to_target == () and rec.unrecoverable == {"SERVICE_FQDN_X": "gone"}
+
+    def test_a_databases_service_url_row_is_recovered(self) -> None:
+        text = compose_file("db1", [("SERVICE_URL_X", "https://x.example")])
+        rec = le.recover(
+            [row("SERVICE_URL_X")],
+            source(DB_COMPOSE, text, FileKind.COMPOSE),
+            collection="databases",
+            uuid="db1",
+        )
+        assert rec.left_to_target == ()
+        assert rec.recovered.get("SERVICE_URL_X") == "https://x.example"
+
     def test_build_time_only_and_buildpack_control(self) -> None:
         envs = [row("NPM_TOKEN", is_runtime=False), row("NIXPACKS_NODE_VERSION"), row("RAILPACKX")]
         rec = le.recover(envs, source(APP_ENV, ""), collection="applications", uuid="app1")
@@ -342,6 +382,142 @@ class TestRules:
         envs = [row("TOKEN", version="4.4.7"), row("LIT", version="4.4.7", is_literal=True)]
         rec = recover_service(envs, dotenv([("TOKEN", "x"), ("LIT", "'open")]))
         assert "TOKEN" in rec.unrecoverable
+
+
+class TestSpillIntoGeneratedLines:
+    """A legacy value cut at its own newline, the rest looking like a generated line.
+
+    The cut-off first line re-encodes to itself, so only WHICH line follows can
+    tell. Upstream writes PORT/HOST/COOLIFY_*/SERVICE_* only sometimes (v4.5.0
+    ADJ.php:1824-1833, 3941-4040; shared.php:4546-4563), so such a line proves
+    nothing about where the value before it ends.
+    """
+
+    @staticmethod
+    def _app(
+        envs: list[dict[str, Any]], lines: list[tuple[str, str]], **kw: Any
+    ) -> le.LockedRecovery:
+        return le.recover(
+            envs, source(APP_ENV, dotenv(lines)), collection="applications", uuid="app1", **kw
+        )
+
+    def test_a_compose_app_never_writes_port(self) -> None:
+        """K='abc\\nPORT=1' (legacy plain): the PORT line is K's own tail."""
+        env = row("K", version="4.4.7")
+        rec = self._app(
+            [env],
+            [("K", written(env, "abc\nPORT=1")), ("HOST", "0.0.0.0")],
+            version=V45,
+            compose_app=True,
+            compose="services:\n  web:\n    image: x\n",
+        )
+        assert "K" not in rec.recovered
+        assert "cannot be delimited exactly" in rec.unrecoverable["K"]
+
+    def test_a_compose_apps_dotenv_blob_spilling_into_port(self) -> None:
+        env = row("APP_ENV_BLOB", version="4.4.7", is_multiline=True)
+        value = "DATABASE_URL='postgres://u:pw@db/x'\nPORT=3000"
+        rec = self._app(
+            [env],
+            [("APP_ENV_BLOB", written(env, value))],
+            version=V45,
+            compose_app=True,
+        )
+        assert "APP_ENV_BLOB" not in rec.recovered
+        assert "APP_ENV_BLOB" in rec.unrecoverable
+
+    def test_a_coolify_branch_line_proves_nothing(self) -> None:
+        """Written for compose parsing v1/v2 only — which no API read pins down."""
+        env = row("K", version="4.4.7")
+        rec = self._app(
+            [env],
+            [("K", written(env, "abc\nCOOLIFY_BRANCH=x")), ("HOST", "0.0.0.0")],
+            version=V45,
+            compose_app=True,
+        )
+        assert "may continue this value" in rec.unrecoverable["K"]
+
+    def test_a_build_only_host_row_means_no_host_line(self) -> None:
+        env = row("K", version="4.4.7")
+        rec = self._app(
+            [env, row("HOST", "h", is_runtime=False)],
+            [("K", written(env, "abc\nHOST=x")), ("PORT", "80")],
+            version=V45,
+            ports_exposes="80",
+        )
+        assert "K" not in rec.recovered
+
+    def test_default_variables_may_be_off(self) -> None:
+        """A multiline value saved on 4.3 whose tail reads COOLIFY_SERVER_IP=..."""
+        env = row("TLS_KEY", version="4.3.10", is_multiline=True)
+        value = "abc'\nCOOLIFY_SERVER_IP=10.0.0.5"
+        rec = self._app(
+            [env],
+            [("TLS_KEY", written(env, value)), ("PORT", "80"), ("HOST", "0.0.0.0")],
+            version=V45,
+            ports_exposes="80",
+        )
+        assert "TLS_KEY" not in rec.recovered
+
+    def test_a_plain_value_spilling_into_a_default_variable(self) -> None:
+        env = row("K", version="4.4.7")
+        rec = self._app(
+            [env],
+            [("K", written(env, "abc\nCOOLIFY_SERVER_IP=1.2.3.4")), ("HOST", "0.0.0.0")],
+            version=V45,
+        )
+        assert "K" not in rec.recovered
+
+    def test_a_service_with_an_unknown_compose(self) -> None:
+        env = row("K", version="4.4.7")
+        rec = recover_service([env], dotenv([("K", written(env, "abc\nSERVICE_NAME_X=y"))]))
+        assert "K" not in rec.recovered
+        assert "may continue this value" in rec.unrecoverable["K"]
+
+    def test_a_null_row_a_compose_may_omit_proves_nothing(self) -> None:
+        env = row("K", version="4.4.7")
+        rec = recover_service(
+            [env, row("MAYBE", None)], dotenv([("K", written(env, "abc\nMAYBE="))])
+        )
+        assert "K" not in rec.recovered
+
+    # ── and no false alarm where the next line is certain ──
+
+    def test_the_last_row_before_a_known_port_is_recovered(self) -> None:
+        env = row("K", version="4.4.7")
+        lines = [("K", "abc"), ("PORT", "3000"), ("HOST", "0.0.0.0")]
+        rec = self._app([env], lines, version=V45, ports_exposes="3000,3001")
+        assert rec.recovered.get("K") == "abc"
+
+    def test_an_unknown_ports_exposes_fails_closed(self) -> None:
+        """Without ports_exposes the PORT line may be K's tail: refused, never guessed."""
+        env = row("K", version="4.4.7")
+        lines = [("K", "abc"), ("PORT", "3000"), ("HOST", "0.0.0.0")]
+        rec = self._app([env], lines, version=V45)
+        assert "may continue this value" in rec.unrecoverable["K"]
+
+    def test_a_port_line_of_another_shape_proves_nothing(self) -> None:
+        env = row("K", version="4.4.7")
+        lines = [("K", "abc"), ("PORT", "3000x"), ("HOST", "0.0.0.0")]
+        rec = self._app([env], lines, version=V45, ports_exposes="3000")
+        assert "K" not in rec.recovered
+
+    def test_the_last_row_before_host_is_recovered(self) -> None:
+        env = row("K", version="4.4.7")
+        rec = self._app(
+            [env], [("K", "abc"), ("HOST", "0.0.0.0")], version=V45, compose_app=True
+        )
+        assert rec.recovered.get("K") == "abc"
+
+    def test_a_host_line_of_another_shape_proves_nothing(self) -> None:
+        env = row("K", version="4.4.7")
+        rec = self._app([env], [("K", "abc"), ("HOST", "x")], version=V45, compose_app=True)
+        assert "K" not in rec.recovered
+
+    def test_a_closed_exact_record_needs_no_proof(self) -> None:
+        env = row("K")
+        rec = self._app([env], [("K", '"abc"'), ("COOLIFY_BRANCH", '"main"')], version=V45)
+        assert rec.recovered.get("K") == "abc"
 
 
 class TestPreviewMarker:
@@ -815,6 +991,18 @@ _FRAGMENTS = [
     "\nA=x",
     "\nK=dup",
     '\nB="q"',
+    # spills into keys Coolify writes only sometimes (generated lines)
+    "\nPORT=3000",
+    "'\nPORT=3000",
+    "\nPORT=1",
+    "\nHOST=x",
+    "\nHOST=0.0.0.0",
+    "'\nHOST=0.0.0.0",
+    "\nCOOLIFY_BRANCH=main",
+    "'\nCOOLIFY_SERVER_IP=10.0.0.5",
+    "\nSERVICE_NAME_X=y",
+    "\nSERVICE_NAME_WEB=web",
+    "\nSERVICE_URL_WEB=http://w",
     '{\n  "u": "a=b"\n}',
     '{"a": "$b"}',
     "[1, 2]",
@@ -828,51 +1016,103 @@ _FRAGMENTS = [
 ]
 
 
+_WEB_COMPOSE = "services:\n  web:\n    image: x\n"
+
+
+@dataclass(frozen=True)
+class _Case:
+    """One file laid out the way Coolify writes it, with K's value spilling or not."""
+
+    value: str
+    flags: dict[str, Any]
+    exact: bool
+    collection: str
+    compose_app: bool
+    compose: str | None
+    k_last: bool
+    """K is the last row: the generated tail (or the end of the file) follows it."""
+    port_line: bool
+    ports_exposes: str | None
+    host_line: bool
+    """Else the app has a build-only HOST row, so Coolify writes no HOST line."""
+
+    @property
+    def kind(self) -> FileKind:
+        return FileKind.COMPOSE if self.collection == "databases" else FileKind.DOTENV
+
+
 @st.composite
-def _cases(draw: st.DrawFn) -> tuple[str, dict[str, Any], str, FileKind, bool]:
+def _cases(draw: st.DrawFn) -> _Case:
     value = "".join(draw(st.lists(st.sampled_from(_FRAGMENTS), min_size=1, max_size=8)))
-    value = value.strip(" \t\n\r\0\x0b")
-    flags = {
-        "is_literal": draw(st.booleans()),
-        "is_multiline": draw(st.booleans()),
-    }
-    exact = draw(st.booleans())
     collection = draw(st.sampled_from(["applications", "services", "databases"]))
-    kind = FileKind.COMPOSE if collection == "databases" else FileKind.DOTENV
-    return value, flags, collection, kind, exact
+    compose_app = collection == "applications" and draw(st.booleans())
+    port_line = collection == "applications" and not compose_app and draw(st.booleans())
+    return _Case(
+        value=value.strip(" \t\n\r\0\x0b"),
+        flags={"is_literal": draw(st.booleans()), "is_multiline": draw(st.booleans())},
+        exact=draw(st.booleans()),
+        collection=collection,
+        compose_app=compose_app,
+        compose=(
+            draw(st.sampled_from([None, _WEB_COMPOSE]))
+            if compose_app or collection == "services"
+            else None
+        ),
+        k_last=draw(st.booleans()),
+        port_line=port_line,
+        ports_exposes=draw(st.sampled_from(["80", None])) if port_line else None,
+        host_line=draw(st.booleans()),
+    )
 
 
-@settings(max_examples=400, deadline=None)
+@settings(max_examples=600, deadline=None)
 @given(_cases())
-def test_round_trip_property_exact_or_nothing(
-    case: tuple[str, dict[str, Any], str, FileKind, bool],
-) -> None:
-    value, flags, collection, kind, exact = case
+def test_round_trip_property_exact_or_nothing(case: _Case) -> None:
+    value, kind = case.value, case.kind
     assume(value)
-    version = "4.5.0" if exact else "4.4.7"
-    target = row("K", version=version, **flags)
+    target = row("K", version="4.5.0" if case.exact else "4.4.7", **case.flags)
     a = row("A", "plain-a")
     b = row("B", "b$1 'x'", version="4.3.10")
-    lines = [
-        ("A", written(a, "plain-a", kind)),
-        ("K", written(target, value, kind)),
-        ("B", written(b, "b$1 'x'", kind)),
-    ]
-    if collection == "applications":
-        lines = [
-            ("COOLIFY_CONTAINER_NAME", '"app1-20261027T101010"'),
-            *lines,
-            ("PORT", "80"),
-            ("HOST", "0.0.0.0"),
-        ]
+    envs = [a, target, b]
+    rows = [("A", written(a, "plain-a", kind))]
+    k_line = ("K", written(target, value, kind))
+    b_line = ("B", written(b, "b$1 'x'", kind))
+    rows += [b_line, k_line] if case.k_last else [k_line, b_line]
+    lines = rows
+    if case.collection == "applications":
+        head = [("COOLIFY_CONTAINER_NAME", '"app1-20261027T101010"')]
+        if case.compose_app:
+            head += [
+                ("SERVICE_URL_WEB", "http://web.example.com"),
+                ("SERVICE_FQDN_WEB", "web.example.com"),
+                ("SERVICE_NAME_WEB", "web"),
+            ]
+        tail = [("PORT", "80")] if case.port_line else []
+        if case.host_line:
+            tail.append(("HOST", "0.0.0.0"))
+        else:
+            envs.append(row("HOST", "h", is_runtime=False))
+        lines = [*head, *rows, *tail]
+    elif case.collection == "services":
+        lines = [("SERVICE_NAME_WEB", "web"), *rows]
+
     if kind is FileKind.COMPOSE:
         cfg = source(DB_COMPOSE, compose_file("db1", lines), kind)
         uuid = "db1"
     else:
-        cfg = source(APP_ENV if collection == "applications" else SVC_ENV, dotenv(lines))
-        uuid = "app1" if collection == "applications" else "svc1"
+        cfg = source(APP_ENV if case.collection == "applications" else SVC_ENV, dotenv(lines))
+        uuid = "app1" if case.collection == "applications" else "svc1"
 
-    rec = le.recover([a, target, b], cfg, collection=collection, uuid=uuid, version=V45)
+    rec = le.recover(
+        envs,
+        cfg,
+        collection=case.collection,
+        uuid=uuid,
+        version=V45,
+        compose_app=case.compose_app,
+        compose=case.compose,
+        ports_exposes=case.ports_exposes,
+    )
 
     if "K" in rec.recovered:
         assert rec.recovered.get("K") == value, "recovered a DIFFERENT value"
@@ -880,12 +1120,18 @@ def test_round_trip_property_exact_or_nothing(
         assert "K" in rec.unrecoverable
 
     raw = written(target, value, kind)
-    delimited = (
-        kind is FileKind.COMPOSE
-        or raw[0] == '"'  # exact: every inner quote is escaped
-        or "\n" not in raw
-        or (raw[0] == "'" and "'\n" not in raw[1:])
-    )
+    if kind is FileKind.COMPOSE or raw[0] == '"':  # exact: every inner quote is escaped
+        delimited = True
+    else:
+        on_one_record = "\n" not in raw or (raw[0] == "'" and "'\n" not in raw[1:])
+        # What follows K must be a line Coolify certainly wrote, or the end.
+        if not case.k_last:
+            proven_end = True  # B, an unlocked non-null row
+        elif case.port_line:
+            proven_end = case.ports_exposes is not None
+        else:
+            proven_end = True  # HOST=0.0.0.0 with no HOST row, or the end of the file
+        delimited = on_one_record and proven_end
     if delimited:
         assert rec.recovered.get("K") == value, (
             f"failed to recover a cleanly written value: {rec.unrecoverable}"

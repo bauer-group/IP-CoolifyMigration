@@ -63,7 +63,7 @@ without the key; set it by hand. The reason says what to do:
 | `… changed while it was read` | Coolify was rewriting the file. Plan again. |
 | `build-time only: Coolify never writes it to the server` | Build-only variables live only in the throwaway build container. Unlock the variable, or set it on the target. |
 | `a {{...}} shared-variable reference` | The file holds the resolved value, not the reference. Unlock it on the source, or set it on the target. |
-| `… cannot be delimited exactly` / `… is ambiguous` / `… is not in the encoding Coolify uses …` | A multi-line value saved before Coolify 4.5, or a secret-manager value. Delete and re-add the variable unlocked (or save it again on 4.5 and redeploy), then migrate. |
+| `… cannot be delimited exactly` / `… is ambiguous` / `… is not in the encoding Coolify uses …` | A value saved before Coolify 4.5 whose end the file cannot prove (a multi-line one, or one followed by a line Coolify writes only sometimes, such as `PORT=` or `COOLIFY_*=`), or a secret-manager value. Delete and re-add the variable unlocked (or save it again on 4.5 and redeploy), then migrate. |
 | `the source database's API connection URL and … disagree` | The Redis password in the database record and the running compose differ. Restart the source database once. |
 
 A locked **build-time** variable of an application the target rebuilds gets an

@@ -148,28 +148,90 @@ class TestBuildEnvEntries:
         envs = [locked("API_SECRET", is_preview=True)]
         assert build_env_entries(envs, Secrets({"API_SECRET": "prod"})) == []
 
-    def test_an_applications_preview_twin_is_locked_too(self) -> None:
-        """The created hook copies the row into an UNLOCKED preview twin."""
+    def test_an_applications_preview_twin_is_locked_before_it_exists(self) -> None:
+        """The created hook copies a new row into an UNLOCKED preview twin — unless a
+        preview row exists. The locked one goes FIRST, so no twin is ever made: a bulk
+        that 422s on a later item (no transaction) leaves nothing readable behind."""
         entries = build_env_entries(
-            [locked("API_SECRET")], Secrets({"API_SECRET": "v"}), lock_preview_twins=True
+            [locked("API_SECRET"), {"key": "LATER", "value": "x", "is_preview": False}],
+            Secrets({"API_SECRET": "v"}),
+            lock_preview_twins=True,
         )
-        assert [(e["key"], e["is_preview"], e["is_shown_once"], e["value"]) for e in entries] == [
-            ("API_SECRET", False, True, "v"),
+        assert [
+            (e["key"], e["is_preview"], e.get("is_shown_once"), e["value"]) for e in entries
+        ] == [
             ("API_SECRET", True, True, "v"),
+            ("API_SECRET", False, True, "v"),
+            ("LATER", False, None, "x"),
         ]
 
-    def test_a_readable_source_preview_row_is_left_to_overwrite_the_twin(self) -> None:
+    def test_a_readable_source_preview_row_goes_first_and_is_not_doubled(self) -> None:
         envs = [locked("API_SECRET"), {"key": "API_SECRET", "value": "pv", "is_preview": True}]
         entries = build_env_entries(envs, Secrets({"API_SECRET": "v"}), lock_preview_twins=True)
-        assert [(e["is_preview"], e["value"]) for e in entries] == [(False, "v"), (True, "pv")]
+        assert [(e["is_preview"], e["value"]) for e in entries] == [(True, "pv"), (False, "v")]
 
-    def test_a_locked_unrecoverable_source_preview_still_gets_a_locked_twin(self) -> None:
-        envs = [locked("API_SECRET"), locked("API_SECRET", is_preview=True)]
-        entries = build_env_entries(envs, Secrets({"API_SECRET": "v"}), lock_preview_twins=True)
-        assert [(e["is_preview"], e["is_shown_once"]) for e in entries] == [
-            (False, True),
-            (True, True),
+    def test_a_locked_source_preview_gets_a_blank_locked_row_never_the_production_value(
+        self,
+    ) -> None:
+        """The plan says PR deployments run WITHOUT it: they must not get production's.
+
+        A blank preview entry ahead of the production one: the preview branch stores
+        null (v4.5.0 ApplicationsController.php:4252/4276), and the created hook then
+        finds a preview row and makes no twin with the production value.
+        """
+        envs = [locked("DB_PASSWORD"), locked("DB_PASSWORD", is_preview=True, is_literal=True)]
+        entries = build_env_entries(
+            envs, Secrets({"DB_PASSWORD": "PROD-SECRET"}), lock_preview_twins=True
+        )
+        assert entries[0] == {
+            "key": "DB_PASSWORD",
+            "value": None,
+            "is_preview": True,
+            "is_shown_once": True,
+            "is_literal": True,
+            "is_multiline": False,
+            "is_runtime": True,
+            "is_buildtime": True,
+        }
+        assert [(e["is_preview"], e["value"]) for e in entries] == [
+            (True, None),
+            (False, "PROD-SECRET"),
         ]
+
+    def test_a_readable_production_row_with_a_locked_preview_gets_a_blank_one_too(
+        self,
+    ) -> None:
+        envs = [{"key": "DB_HOST", "value": "prod-db"}, locked("DB_HOST", is_preview=True)]
+        entries = build_env_entries(envs, lock_preview_twins=True)
+        assert [(e.get("is_preview"), e["value"]) for e in entries] == [
+            (True, None),
+            (None, "prod-db"),
+        ]
+
+    def test_every_preview_entry_precedes_every_production_entry(self) -> None:
+        """Up to 4.3.x the bulk caches the preview rows at its first preview item: a
+        twin made after that is invisible to a later preview item, which would then
+        create a second preview row."""
+        envs = [
+            {"key": "A", "value": "a"},
+            locked("B"),
+            {"key": "C", "value": "c"},
+            {"key": "A", "value": "pa", "is_preview": True},
+            locked("C", is_preview=True),
+        ]
+        entries = build_env_entries(envs, Secrets({"B": "b"}), lock_preview_twins=True)
+        flags = [bool(e.get("is_preview")) for e in entries]
+        assert flags == sorted(flags, reverse=True), "a preview entry after a production one"
+        assert sorted((e["key"], e["value"]) for e in entries if e.get("is_preview")) == [
+            ("A", "pa"),
+            ("B", "b"),
+            ("C", None),
+        ]
+
+    def test_services_keep_their_order_and_get_no_preview_entries(self) -> None:
+        envs = [{"key": "B", "value": "b"}, locked("A")]
+        entries = build_env_entries(envs, Secrets({"A": "a"}), collection="services")
+        assert [(e["key"], e.get("is_preview")) for e in entries] == [("B", None), ("A", False)]
 
 
 @pytest.fixture
@@ -207,6 +269,7 @@ class TestCopyEnvs:
                     if k not in ("version", "is_shared")
                 },
                 "value": SENTINEL,
+                "is_preview": True,
             },
             {
                 **{
@@ -215,7 +278,6 @@ class TestCopyEnvs:
                     if k not in ("version", "is_shared")
                 },
                 "value": SENTINEL,
-                "is_preview": True,
             },
         ]
         assert SENTINEL not in repr(logs)
@@ -275,6 +337,16 @@ _REDIS = {
     "engine": DatabaseEngine.REDIS,
     "image": "redis:7.2",
 }
+#: A dockercompose APPLICATION: applicationParser firstOrCreates SERVICE_PASSWORD_*
+#: on the target just as a service does (v4.5.0 parsers.php:1435-1444).
+_COMPOSE_APP = {
+    "uuid": "app1",
+    "name": "shop",
+    "collection": "applications",
+    "kind": ResourceKind.APP_GIT_COMPOSE,
+    "docker_compose_raw": "services:\n  db:\n    image: postgres:16\n",
+}
+APP_ENV = "/data/coolify/applications/app1/.env"
 
 
 async def _plan(
@@ -364,6 +436,23 @@ class TestPlan:
         assert f"{SVC_ENV} is missing or unreadable on the source server (exit 1)" in reason
         assert plan.resources[0].recover_env_keys == ()
 
+    async def test_a_compose_apps_unreadable_generated_secret_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Not merely 'created WITHOUT': the target would generate its own password."""
+        host = FakeHost()
+        host.on(r"^cat -- ", exit_status=1)
+        plan = await _plan(
+            monkeypatch, envs=[locked("SERVICE_PASSWORD_DB")], host=host, shape=_COMPOSE_APP
+        )
+        refusals = plan.resources[0].refusals
+        assert any(
+            "['SERVICE_PASSWORD_DB']" in r and "its OWN freshly generated value" in r
+            for r in refusals
+        ), refusals
+        assert f"{APP_ENV} is missing or unreadable" in "\n".join(refusals)
+        assert not any("SERVICE_PASSWORD_DB" in w for w in plan.resources[0].warnings)
+
     async def test_a_locked_service_fqdn_is_left_to_the_target_not_reported_missing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -373,6 +462,26 @@ class TestPlan:
         assert any("['SERVICE_FQDN_APP'] are generated by the target" in w for w in warnings)
         assert not any("WITHOUT" in w for w in warnings)
         assert not plan.is_blocked
+
+    async def test_a_plain_apps_locked_service_url_is_reported_missing_not_generated(
+        self,
+    ) -> None:
+        """Only services and compose apps generate SERVICE_URL_*; a Dockerfile app does not."""
+        host = FakeHost()
+        host.on(r"^cat -- ", exit_status=1)
+        review = await env_recovery.review_envs(
+            host,  # type: ignore[arg-type]
+            snapshot=ResourceSnapshot(
+                uuid="app1", name="web", collection="applications", kind=ResourceKind.APP_GIT_BUILD
+            ),
+            full={},
+            envs=[locked("SERVICE_URL_BILLING")],
+            version=(4, 5, 0),
+            compose=None,
+        )
+        text = "\n".join(review.warnings)
+        assert "['SERVICE_URL_BILLING']" in text and "WITHOUT them" in text
+        assert "generated by the target" not in text
 
     async def test_nothing_locked_reads_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         host = FakeHost()
@@ -551,6 +660,25 @@ class TestCreate:
             await steps.step_create_target(ctx)
         assert order == []
 
+    async def test_a_compose_apps_unreadable_generated_secret_refuses_unpromised(
+        self, tmp_path: Path, order: list[tuple[str, Any]]
+    ) -> None:
+        """A plan made before the key was locked never promised it; CREATE still refuses."""
+        api = _CreateApi([locked("SERVICE_PASSWORD_DB")])
+        host = FakeHost()
+        host.on(r"^cat -- ", exit_status=1)
+        snapshot = ResourceSnapshot(**_COMPOSE_APP)  # type: ignore[arg-type]
+        plan = _db_plan().model_copy(
+            update={"resources": (ResourcePlan(snapshot=snapshot, strategy=Strategy.COPY_DATA),)}
+        )
+        ctx = _ctx(tmp_path, api, plan, host)
+
+        with pytest.raises(EnvRecoveryError) as exc_info:
+            await steps.step_create_target(ctx)
+
+        assert "['SERVICE_PASSWORD_DB'] can no longer be read back" in str(exc_info.value)
+        assert order == [], "nothing may be written before the recovery passes"
+
     async def test_other_unrecoverable_keys_are_dropped_by_name(
         self, tmp_path: Path, order: list[tuple[str, Any]]
     ) -> None:
@@ -623,10 +751,45 @@ class TestCreate:
         recovered = dict(order)["copy_envs"]
         assert recovered is not None and recovered.get("POSTGRES_PASSWORD") == "pw"
 
-    async def test_recovery_is_safe_to_rerun(
+    async def test_an_applications_ports_exposes_reaches_the_recovery(self) -> None:
+        """The last row before PORT is delimited only by a ports_exposes the API states.
+
+        Without it the PORT line may be the legacy value's own tail, and the key
+        is refused rather than carried cut short — at PLAN and at CREATE alike.
+        """
+        snapshot = ResourceSnapshot(
+            uuid="app1", name="web", collection="applications", kind=ResourceKind.APP_GIT_BUILD
+        )
+        envs = [locked("API_SECRET", version="4.4.7")]
+        app_env = "/data/coolify/applications/app1/.env"
+        text = "API_SECRET=abc\nPORT=3000\nHOST=0.0.0.0"
+
+        async def review(full: dict[str, Any]) -> tuple[str, ...]:
+            result = await env_recovery.review_envs(
+                serving(app_env, text),  # type: ignore[arg-type]
+                snapshot=snapshot,
+                full=full,
+                envs=envs,
+                version=(4, 5, 0),
+                compose=None,
+            )
+            return result.recover_env_keys
+
+        assert await review({"ports_exposes": "3000"}) == ("API_SECRET",)
+        assert await review({"ports_exposes": None}) == ()
+
+        resources = [ResourcePlan(snapshot=snapshot, strategy=Strategy.COPY_DATA)]
+        known = _CreateApi(envs, full={"ports_exposes": "3000"})
+        out = await env_recovery.recover_for_create(known, serving(app_env, text), resources)  # type: ignore[arg-type]
+        assert out["app1"].get("API_SECRET") == "abc"
+        assert "get_resource app1" in known.calls
+        unknown = _CreateApi(envs, full={})
+        assert await env_recovery.recover_for_create(unknown, serving(app_env, text), resources) == {}  # type: ignore[arg-type]
+
+    async def test_recovery_reruns_from_the_files(
         self, tmp_path: Path, order: list[tuple[str, Any]]
     ) -> None:
-        """A resumed CREATE reads the files again; no value was ever persisted."""
+        """A resumed CREATE re-runs the recovery; no value was ever persisted to reuse."""
         api = _CreateApi([locked("POSTGRES_PASSWORD")])
         host = serving(DB_COMPOSE, _db_compose(["POSTGRES_PASSWORD=pw"]))
         plan = _db_plan(promised=("POSTGRES_PASSWORD",))

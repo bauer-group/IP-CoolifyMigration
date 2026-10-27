@@ -1256,16 +1256,23 @@ def build_env_entries(
     the source server (domain/locked_envs.py): then it is sent with
     ``is_shown_once`` still true. A locked PREVIEW row is never filled — no
     production deploy writes its value anywhere. An entry without a value is
-    never sent: on applications it would null the row (v4.5.0
-    ApplicationsController.php:4291).
+    never sent by accident: on applications it nulls the row (v4.5.0
+    ApplicationsController.php:4252, 4291) — the one deliberate use is below.
 
     ``lock_preview_twins`` (applications only): creating a production row makes
-    Coolify copy it into an UNLOCKED preview twin (EnvironmentVariable created
-    hook, v4.5.0:118-148, is_shown_once not copied). Where no preview row of the
-    source will overwrite that twin, a locked preview entry with the same value
-    follows, so the bulk's preview branch (:4249-4272) locks the twin instead of
-    exposing the secret through every read. Never for services/databases: their
-    bulk upserts by key alone, and an is_preview entry would REPLACE the row.
+    Coolify copy it into an UNLOCKED preview twin unless a preview row with that
+    key exists (EnvironmentVariable created hook, v4.5.0:118-148, is_shown_once
+    not copied). So EVERY preview entry goes before every production entry, with
+    the ones :func:`_preview_for` adds: the bulk's preview branch (:4249-4287)
+    creates each preview row, the production entries after them find it, and no
+    twin ever holds a carried secret unlocked — not even when the bulk, which has
+    no transaction, 422s half-way. All of them first, not each just ahead of its
+    own production entry: up to 4.3.x the bulk looks preview rows up in a
+    collection loaded once per request (``->environment_variables_preview->where``,
+    v4.1.2:3127, v4.3.10:3591), so a twin made after that load is invisible to a
+    later preview item, which would create a second preview row. Never for
+    services/databases: their bulk upserts by key alone, and an is_preview entry
+    would REPLACE the row.
 
     For a service (``collection="services"``) a row that names where the stack
     lives is also dropped when it names the SOURCE: see
@@ -1274,14 +1281,14 @@ def build_env_entries(
     those names is a plain variable and copied verbatim.
     """
     entries: list[dict[str, Any]] = []
-    previews_sent: set[str] = set()
-    filled: list[dict[str, Any]] = []
+    filled: set[str] = set()
     for env in source_envs:
+        key = str(env.get("key") or "")
         if "value" in env:
             entry = filter_body(env, ENV_FIELDS)
-        elif recovered is not None and not env.get("is_preview") and env.get("key") in recovered:
-            entry = filter_body({**env, "value": recovered.get(str(env["key"]))}, ENV_FIELDS)
-            filled.append(entry)
+        elif recovered is not None and not env.get("is_preview") and key in recovered:
+            entry = filter_body({**env, "value": recovered.get(key)}, ENV_FIELDS)
+            filled.add(key)
         else:
             continue
         if not entry.get("key"):
@@ -1291,15 +1298,47 @@ def build_env_entries(
         ):
             continue
         entries.append(entry)
-        if entry.get("is_preview"):
-            previews_sent.add(str(entry["key"]))
-    if lock_preview_twins:
-        entries.extend(
-            {**entry, "is_preview": True, "is_shown_once": True}
-            for entry in filled
-            if entry.get("key") and str(entry["key"]) not in previews_sent
-        )
-    return entries
+    if not lock_preview_twins:
+        return entries
+
+    previews = [e for e in entries if e.get("is_preview")]
+    production = [e for e in entries if not e.get("is_preview")]
+    sent = {str(e["key"]) for e in previews}
+    source_previews = {
+        str(env["key"]): env for env in source_envs if env.get("is_preview") and env.get("key")
+    }
+    for entry in production:
+        key = str(entry["key"])
+        if key in sent:
+            continue
+        preview = _preview_for(entry, source_previews.get(key), filled=key in filled)
+        if preview is not None:
+            previews.append(preview)
+            sent.add(key)
+    return previews + production
+
+
+def _preview_for(
+    entry: dict[str, Any], source_preview: dict[str, Any] | None, *, filled: bool
+) -> dict[str, Any] | None:
+    """The preview entry an application's production ``entry`` needs, if any. PURE.
+
+    * the source's preview row is LOCKED: a blank, locked preview row — whatever
+      the production value is. The plan says the target's pull-request
+      deployments run without it; the hook's twin would instead hand them the
+      PRODUCTION value where the source deliberately used another one.
+    * the production value was recovered and the source has no preview row:
+      Coolify's own twin, locked (a locked copy of the recovered value).
+
+    Otherwise None: a readable preview row is sent as itself, and a readable
+    production row's twin is what Coolify makes on the source too.
+    """
+    if source_preview is not None and "value" not in source_preview:
+        locked = filter_body(source_preview, ENV_FIELDS)
+        return {**locked, "value": None, "is_preview": True, "is_shown_once": True}
+    if filled and source_preview is None:
+        return {**entry, "is_preview": True, "is_shown_once": True}
+    return None
 
 
 def _names_the_source(
