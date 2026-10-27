@@ -507,6 +507,39 @@ def _git_build_snapshot() -> ResourceSnapshot:
 
 
 class TestCreateApplication:
+    async def test_an_image_app_never_sends_its_build_pack(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        """Regression: the GET says build_pack 'dockerimage', which no create accepts.
+
+        Every create validates a sent build_pack against BuildPackTypes, an enum
+        without 'dockerimage' (helpers/api.php v4.1.2:95 .. v4.5.0:192), so the
+        carried field 422'd every image app — found by the first e2e run that
+        migrated one.
+        """
+        import json
+
+        route = respx_mock.post(f"{BASE}/applications/dockerimage").mock(
+            return_value=httpx.Response(201, json={"uuid": "a2"})
+        )
+        snapshot = ResourceSnapshot(
+            uuid="a1", name="web", collection="applications", kind=ResourceKind.APP_DOCKERIMAGE
+        )
+        await create_resource(
+            api,
+            snapshot,
+            _placement(),
+            {
+                "build_pack": "dockerimage",
+                "docker_registry_image_name": "nginx",
+                "docker_registry_image_tag": "1.27-alpine",
+                "ports_exposes": "80",
+            },
+        )
+        body = json.loads(route.calls[0].request.read())
+        assert "build_pack" not in body
+        assert body["docker_registry_image_name"] == "nginx"
+
     async def test_github_app_snapshot_creates_via_the_private_route(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:

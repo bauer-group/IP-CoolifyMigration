@@ -611,6 +611,13 @@ async def create_application(
     body["name"] = snapshot.name
     body["instant_deploy"] = False
 
+    # The image route sets the build pack itself, and every create validates a
+    # SENT build_pack against BuildPackTypes, which has no 'dockerimage'
+    # (sharedDataApplications, helpers/api.php v4.1.2:95 .. v4.5.0:192). The
+    # source GET reports 'dockerimage', so carrying it 422'd every image app.
+    if segment == "dockerimage":
+        body.pop("build_pack", None)
+
     # The GET never carries these — it serialises source_type/source_id and
     # private_key_id, which the PLANNER resolved into the uuids the private
     # create routes require. Without them the filtered body cannot satisfy
