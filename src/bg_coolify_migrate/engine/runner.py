@@ -205,7 +205,9 @@ async def _execute(
             compensations=build_compensations(),
             on_state=on_state,
         )
-        return await saga.run(start_from=start_from)
+        result = await saga.run(start_from=start_from)
+        result.notices.extend(ctx.notices)
+        return result
 
 
 async def run_migration(
@@ -365,5 +367,6 @@ async def rollback_migration(
             compensations=build_compensations(),
         )
         result = await saga.rollback()
+        result.notices.extend(ctx.notices)
         log.info("migration.rolled_back", id=migration_id, outcome=result.outcome.value)
         return result

@@ -116,6 +116,7 @@ class TestFailureRollsBack:
         assert rec.compensations == [
             Compensation.RESTART_SOURCE,
             Compensation.DELETE_TARGET_RESOURCE,
+            Compensation.RELEASE_SOURCE_PINS,
         ]
 
     async def test_failure_before_any_side_effect_has_nothing_to_undo(

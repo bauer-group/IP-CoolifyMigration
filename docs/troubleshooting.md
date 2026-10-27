@@ -196,6 +196,38 @@ A kill of a container that mounts none of the migrated volumes — an app server
 a worker, a sidecar — is logged as `quiesce.killed_without_data` and does not
 stop the run. Nothing it held is being copied. Fix its shutdown path anyway.
 
+## Quiesce failed: could not pin the source's volumes (exit 5)
+
+Before it stops anything, the migration creates a never-started container that
+keeps Coolify's Docker cleanup off the source's volumes (see
+[safety](safety.md#coolifys-docker-cleanup-cannot-prune-the-data-in-flight)).
+The `docker create` on the source failed, so the run refused to stop the source
+unprotected. **Nothing was stopped**; the created target is deleted.
+
+The hint carries Docker's own error. The pin needs no registry: it imports an
+empty image with `head -c 10240 /dev/zero | docker import -`, so check that the
+daemon answers and has disk space, then re-run.
+
+## "Left in place: ... still pins ..."
+
+A run or a rollback ended with a pin it deliberately did not remove:
+
+- **after a rollback**, the restarted source did not mount its volumes within
+  `DEPLOY_TIMEOUT` — or it was never restarted, because QUIESCE failed after the
+  stop. Removing the pin then would let Coolify's next cleanup delete the
+  source's data on a server with *Delete unused volumes* on. Get the source
+  running, then `coolify-migrate rollback <id>` again: it removes the pin once
+  the volumes are mounted.
+- **after a finalize**, a copied target volume is mounted by no target
+  container. Check the resource's storages in Coolify; once something mounts the
+  volume, `docker rm <pin>` on the target removes the pin.
+
+A pin is a stopped container that never ran; it holds no process and writes
+nothing. List a migration's pins with
+`docker ps -a --filter label=bg-coolify-migrate.migration=<id>`. A PREFLIGHT
+warning `preflight.foreign_pin` means another migration's pin mounts this
+stack's volume: harmless, and that migration's finalize or rollback removes it.
+
 ## Quiesce failed: preview deployments present
 
 Coolify's stop endpoint does **not** stop preview containers

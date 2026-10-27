@@ -73,14 +73,17 @@ PREFLIGHT      token scope; reachability; rsync/docker present; disk vs REAL siz
    |
 PLAN           build the plan + provisional manifest   [dry-run stops here]
    |
-CREATE_TARGET  API only, instant_deploy=false          undo: delete target
+CREATE_TARGET  API only, instant_deploy=false          undo: delete target,
+                                                             then unpin source (last)
    |
-QUIESCE        stop, then POLL the daemon by label     undo: restart source
+QUIESCE        pin source volumes; stop, then POLL     undo: restart source
+               the daemon by label
    |
 DISCOVER       authoritative post-stop reconciliation;
                pair old->new by mount_path
    |
-COPY           parallel rsync -aHAXS --numeric-ids     undo: drop target volumes
+COPY           pin target volumes;                     undo: drop target volumes
+               parallel rsync -aHAXS --numeric-ids
    |
 VERIFY         content + metadata manifests both sides
    |
@@ -93,7 +96,7 @@ START_TARGET   deploy                                  undo: stop target
 HEALTHCHECK    per resource: one serving, none broken
                (a one-shot service at exit 0 does not block)
    |
-FINALIZE       keep | rename | delete                  <- the only irreversible step
+FINALIZE       unpin; keep | rename | delete           <- the only irreversible step
 ```
 
 Three orderings are deliberate and worth the argument:

@@ -95,6 +95,10 @@ decision, the decision is in the wrong layer.
   is there for a reason documented in the module docstring. Removing one is a
   data-integrity change.
 - **Touching quiesce?** It has no `--force` and must not grow one.
+- **Leaving a volume unmounted across a step?** Pin it (`discovery/pins.py`)
+  first. Unmounted is what Coolify's `docker volume prune -af` deletes. Never
+  flip the server's cleanup setting instead: a crash leaves it flipped, and a
+  manual API run overrides it anyway.
 
 ## Verified upstream facts (do not re-derive)
 
@@ -406,6 +410,33 @@ the release it starts in — read that module before adding a rule.
 - **Values live only in `Secrets`** (repr: key names), never in a ResourcePlan,
   plan.json, the journal or a log line; CREATE re-reads before its first write.
 
+### Coolify's Docker cleanup (release tags v4.1.2 through v4.5.0)
+
+- **"Delete unused volumes" deletes every volume no container references.**
+  `docker volume prune -af`, no filter (v4.1.2:CleanupDocker.php:61-63,
+  v4.5.0:166-168). Off by default, but it runs on the server's cron or above
+  its disk threshold, and the API's run endpoint (4.3.0+) takes it as a
+  per-request override (v4.5.0:ServerDockerCleanupController.php:280-287) - so
+  never rely on the setting. Coolify's stop removes the containers, so the
+  stopped source's volumes, and the target's between COPY and START, are
+  exactly what it deletes.
+- **Its container cleanup removes only `coolify.managed=true` containers**
+  (`docker container prune` up to 4.4.3, `docker ps -a ... | xargs docker rm`
+  from 4.4.4; v4.1.2:51, v4.5.0:211-216), and the helper reaper lists only
+  running ones. A created, never-started, unlabelled container is therefore a
+  durable reference: that is a pin. `docker rmi` without `-f` keeps the image a
+  pin uses; `--pull never` because a fresh import can be pruned before the
+  create.
+- **A pinned volume survives Coolify's delete.** `docker volume rm -f` refuses a
+  referenced volume and apps/databases swallow it (v4.5.0:Application.php:575,
+  StandalonePostgresql.php:180). Every pin is released BEFORE anything Coolify
+  deletes - FINALIZE under DELETE, the target delete in a rollback.
+- **The source unpin is the LAST compensation** (`RELEASE_SOURCE_PINS`, owed
+  from CREATE_TARGET). It waits for the restarted source to mount its volumes,
+  and `/restart` redeploys with proxy labels built at job time - waiting any
+  earlier would hold back the parked-domain restore until the source had
+  deployed under the parked names.
+
 ## Verify + ship
 
 ```bash
@@ -431,3 +462,4 @@ Conventional Commits, **past-tense** subject (`added`, `fixed`, `updated`), max
 | What can the target NOT reproduce? | `domain/fidelity.py` |
 | Are scheduled tasks and backup schedules carried? | `api/schedules.py`, `domain/schedules.py` |
 | Can a locked variable be carried? | `domain/locked_envs.py` |
+| Is the data safe from Coolify's cleanup? | `discovery/pins.py` |

@@ -182,8 +182,12 @@ def _source_host(*, probe: str = "REACH") -> FakeHost:
     host = FakeHost()
     host.on(r"command -v rsync", exit_status=0)
     host.on(r"command -v docker", exit_status=0)
-    host.on(r"docker ps", stdout="")
+    host.on(r"docker ps", stdout="")  # also: no volume pins
     host.on(r"command -v bash", stdout=probe)
+    # Volume pins (discovery/pins.py) and the key revoke a rollback now runs.
+    # Narrow patterns, and last: a test's own route must keep winning.
+    host.on(r"docker volume ls", stdout="")
+    host.on(r"rm -rf /root/\.coolify-migrate/", exit_status=0)
     return host
 
 
@@ -194,6 +198,11 @@ def _target_host(*, free_kb: str = "99999999") -> FakeHost:
     host.on(r"command -v rsync", exit_status=0)
     host.on(r"command -v docker", exit_status=0)
     host.on(r"df -Pk", stdout=free_kb)
+    # No volume pins, and the key revoke a rollback now runs. NOT a bare
+    # `docker ps`: the healthcheck tests add their own after this, and FakeHost
+    # matches in insertion order.
+    host.on(r"label=bg-coolify-migrate\.role=pin", stdout="")
+    host.on(r"authorized_keys\.bak", exit_status=0)
     return host
 
 
@@ -1539,6 +1548,8 @@ class TestFinalize:
         ctx.target_host = FakeHost()  # type: ignore[assignment]
         ctx.source_host.on(r"rm -rf", exit_status=0)  # type: ignore[attr-defined]
         ctx.target_host.on(r"sed -i", exit_status=0)  # type: ignore[attr-defined]
+        for host in (ctx.source_host, ctx.target_host):
+            host.on(r"docker ps", stdout="")  # type: ignore[attr-defined]  # no pins
 
         result = await steps.step_finalize(ctx)
         assert result["policy"] == "keep"
@@ -1555,6 +1566,8 @@ class TestFinalize:
         ctx.target_host = FakeHost()  # type: ignore[assignment]
         ctx.source_host.on(r"rm -rf", exit_status=0)  # type: ignore[attr-defined]
         ctx.target_host.on(r"sed -i", exit_status=0)  # type: ignore[attr-defined]
+        for host in (ctx.source_host, ctx.target_host):
+            host.on(r"docker ps", stdout="")  # type: ignore[attr-defined]  # no pins
 
         result = await steps.step_finalize(ctx)
         assert any("renamed postgres" in a for a in result["actions"])
@@ -1570,6 +1583,8 @@ class TestFinalize:
         ctx.target_host = FakeHost()  # type: ignore[assignment]
         ctx.source_host.on(r"rm -rf", exit_status=0)  # type: ignore[attr-defined]
         ctx.target_host.on(r"sed -i", exit_status=0)  # type: ignore[attr-defined]
+        for host in (ctx.source_host, ctx.target_host):
+            host.on(r"docker ps", stdout="")  # type: ignore[attr-defined]  # no pins
 
         result = await steps.step_finalize(ctx)
         assert "deleted postgres" in result["actions"]
@@ -1583,6 +1598,8 @@ class TestFinalize:
         source.on(r"rm -rf", exit_status=0)
         target = FakeHost()
         target.on(r"sed -i", exit_status=0)
+        for host in (source, target):
+            host.on(r"docker ps", stdout="")  # no pins
         ctx.source_host = source  # type: ignore[assignment]
         ctx.target_host = target  # type: ignore[assignment]
 
@@ -1638,6 +1655,7 @@ class TestCompensations:
     async def test_drop_volumes(self, ctx: MigrationContext) -> None:
         target = FakeHost()
         target.on(r"docker volume rm", exit_status=0)
+        target.on(r"docker ps", stdout="")  # no volume pins
         ctx.target_host = target  # type: ignore[assignment]
         await compensations.undo_copy(ctx, {"volumes_copied": ["postgres-data-db2"]})
         assert any("docker volume rm" in c for c in target.commands)
@@ -1646,6 +1664,7 @@ class TestCompensations:
         # A volume that will not drop must not stop the source from restarting.
         target = FakeHost()
         target.on(r"docker volume rm", exit_status=1, stderr="volume in use")
+        target.on(r"docker ps", stdout="")  # no volume pins
         ctx.target_host = target  # type: ignore[assignment]
         await compensations.undo_copy(ctx, {"volumes_copied": ["v1"]})
 

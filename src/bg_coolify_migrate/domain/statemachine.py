@@ -97,6 +97,9 @@ class Compensation(StrEnum):
     REVOKE_EPHEMERAL_KEY = "revoke_ephemeral_key"
     RESTORE_SOURCE_NAME = "restore_source_name"
     RESTORE_SOURCE_FQDN = "restore_source_fqdn"
+    RELEASE_SOURCE_PINS = "release_source_pins"
+    """Remove the containers that keep Coolify's Docker cleanup off the stopped
+    source's volumes (``discovery/pins.py``) — once the source mounts them again."""
 
     # ── F2 (instance migration) ──────────────────────────────────────────────
     START_SOURCE_DOCKER = "start_source_docker"
@@ -125,8 +128,18 @@ ORDER: tuple[State, ...] = (
 #: What each state must undo if the run is rolled back after it completed.
 #: A state absent from this map completed without side effects (PREFLIGHT, PLAN,
 #: DISCOVER, VERIFY and DNS_GATE only read).
+#:
+#: RELEASE_SOURCE_PINS hangs off CREATE_TARGET although QUIESCE makes the pins,
+#: for two reasons. It must be owed even when QUIESCE fails AFTER the stop —
+#: QUIESCE is then never completed — and CREATE_TARGET always is by then. And
+#: CREATE_TARGET's tuple is the last a rollback runs, so the unpin waits for the
+#: restarted source only after the target delete has given the source back its
+#: parked domains. Waiting any earlier would hold that restore back until the
+#: restart's deploy had built its proxy labels from the PARKED names (the
+#: restart redeploys; the restore is a PATCH that does not). Pins are found by
+#: label, so it is a no-op when none exist.
 _COMPENSATION: dict[State, tuple[Compensation, ...]] = {
-    State.CREATE_TARGET: (Compensation.DELETE_TARGET_RESOURCE,),
+    State.CREATE_TARGET: (Compensation.DELETE_TARGET_RESOURCE, Compensation.RELEASE_SOURCE_PINS),
     State.QUIESCE: (Compensation.RESTART_SOURCE,),
     State.COPY: (Compensation.DROP_TARGET_VOLUMES, Compensation.REVOKE_EPHEMERAL_KEY),
     State.START_TARGET: (Compensation.STOP_TARGET,),

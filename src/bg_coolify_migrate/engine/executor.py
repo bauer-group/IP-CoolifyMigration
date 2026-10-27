@@ -86,6 +86,8 @@ class RunResult:
     error: MigrationError | None = None
     compensations_run: list[Compensation] = field(default_factory=list)
     compensations_failed: list[tuple[Compensation, str]] = field(default_factory=list)
+    notices: list[str] = field(default_factory=list)
+    """Left for the operator by a step or a compensation; never changes the outcome."""
 
     @property
     def ok(self) -> bool:

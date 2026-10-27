@@ -136,6 +136,46 @@ the list of volumes that will move, rather than as a refusal — refusing makes 
 stopped stack permanently unmigratable, which is a worse answer than an informed
 operator.
 
+## Coolify's Docker cleanup cannot prune the data in flight
+
+A server with **Delete unused volumes** on runs `docker volume prune -af` as
+part of Coolify's Docker cleanup: on its schedule, whenever disk usage crosses
+the threshold, and on any manual run (the API's run endpoint can force the
+volume prune per request even with the setting off). That prune deletes every
+volume **no container references** — and a migration creates exactly those.
+Coolify's stop removes the source's containers, so from QUIESCE on nothing
+references the source's volumes; and the target's volumes are filled in COPY
+while nothing mounts them yet.
+
+So the migration **pins** them: before the stop on the source, and before the
+first byte on the target, it creates a container that references every one of
+those volumes and is never started. Docker counts a created container as a
+reference; it carries no `coolify.*` label, and Coolify's container cleanup only
+removes `coolify.managed` containers; its image is an empty one imported on the
+server, so there is nothing to pull. The mounts are read-only and nothing runs,
+so a pin writes no byte and changes no ownership. Pins are named
+`bg-coolify-migrate-pin-<migration id>-<side>-<hash>` and labelled with the
+migration id, which is how the tool finds them again after a crash.
+
+A pin is released when Coolify's own containers reference the data again:
+
+- **Target**, at FINALIZE, once a target container mounts each volume. A copied
+  volume that no target container mounts keeps its pin, and the run report
+  names it — under DELETE it is the only copy left.
+- **Source, DELETE**, at FINALIZE before the delete. Coolify cannot delete a
+  volume a container references, and says nothing when it fails to.
+- **Source, KEEP/RENAME**, at FINALIZE after the rename. The kept source then
+  has no containers, so on a server that prunes unused volumes it is **no
+  fallback copy**: the next cleanup deletes its volumes. Turn the setting off
+  there, or back the data up, if you want one.
+- **Source, rollback**, as the very last step, once the restarted source mounts
+  its volumes again. If it does not within `DEPLOY_TIMEOUT`, or the source was
+  never restarted, the pin stays and the report says so: once the source runs,
+  `coolify-migrate rollback <id>` again removes it.
+
+The tool never changes the server's cleanup setting: a crash would leave it
+changed, and a manual run overrides it anyway.
+
 ## Security invariants
 
 Enforced in code. See `AGENTS.md` for the authoritative list.
@@ -191,7 +231,7 @@ Every state that mutates anything has a compensating action, journalled to disk
 with enough information to run after a total crash of your machine.
 
 ```text
-CREATE_TARGET  -> delete the target
+CREATE_TARGET  -> delete the target; then, last of all, unpin the source's volumes
 QUIESCE        -> restart the source
 COPY           -> drop the target's volumes, revoke the ephemeral key
 START_TARGET   -> stop the target

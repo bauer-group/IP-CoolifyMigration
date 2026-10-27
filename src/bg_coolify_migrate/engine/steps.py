@@ -22,7 +22,7 @@ import structlog
 from bg_coolify_migrate.api import resources as api_resources
 from bg_coolify_migrate.api import schedules as api_schedules
 from bg_coolify_migrate.api.resources import Placement, public_git_url
-from bg_coolify_migrate.discovery import docker, quiesce
+from bg_coolify_migrate.discovery import docker, pins, quiesce
 from bg_coolify_migrate.dns import extract as dns_extract
 from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.dns import wildcard as dns_wildcard
@@ -57,6 +57,7 @@ from bg_coolify_migrate.engine.planner import (
 )
 from bg_coolify_migrate.errors import (
     DnsGateBlocked,
+    MigrationError,
     PreflightError,
     QuiesceError,
     RebuildDriftBlocked,
@@ -105,6 +106,18 @@ async def _label_independent_containers(
     volumes = [i.source_name for i in resource.manifest.to_migrate if i.source_name]
     if volumes:
         for container in await docker.containers_mounting(ctx.source_host, volumes=volumes):
+            # A STOPPED pin is no hidden writer: it never runs and only keeps
+            # Coolify's cleanup off the volume. A running container wearing the
+            # label is not a pin (pins.is_pin) and still counts.
+            if pins.is_pin(container):
+                log.warning(
+                    "preflight.foreign_pin",
+                    pin=container.name,
+                    migration=container.labels.get(pins.LABEL_MIGRATION),
+                    hint="harmless while it exists; remove it with docker rm once that "
+                    "migration is finalized or rolled back",
+                )
+                continue
             found.setdefault(container.id, container)
     return list(found.values())
 
@@ -757,26 +770,35 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
     # ask a container what it had mounted.
     captured = await _capture_mounts(ctx)
 
-    # The source's clock, not ours: it is the window for the event-log check
-    # below, and a skewed workstation would silently shrink it.
-    since = await quiesce.now_on(ctx.source_host)
+    # Pin BEFORE the stop: Coolify's stop removes the containers, and from that
+    # moment nothing references the source's volumes - which is all Coolify's
+    # `docker volume prune -af` asks. A failure here costs nothing.
+    source_pins = await _pin_source(ctx)
 
-    await _request_stop(ctx)
+    try:
+        # The source's clock, not ours: it is the window for the event-log check
+        # below, and a skewed workstation would silently shrink it.
+        since = await quiesce.now_on(ctx.source_host)
 
-    report = await quiesce.wait_until_stopped(
-        ctx.source_host,
-        label_filters=observed_labels(ctx.plan),
-        timeout=ctx.settings.stop_timeout,
-    )
+        await _request_stop(ctx)
 
-    # "Every container is gone" is not "every container shut down cleanly", and
-    # after a Coolify stop the containers are always gone. The exit codes only
-    # survive in the daemon's event log, so that is where we look.
-    killed = await quiesce.killed_since(
-        ctx.source_host, since=since, label_filters=observed_labels(ctx.plan)
-    )
-    if killed:
-        _refuse_if_killed_data_holder(ctx, killed)
+        report = await quiesce.wait_until_stopped(
+            ctx.source_host,
+            label_filters=observed_labels(ctx.plan),
+            timeout=ctx.settings.stop_timeout,
+        )
+
+        # "Every container is gone" is not "every container shut down cleanly", and
+        # after a Coolify stop the containers are always gone. The exit codes only
+        # survive in the daemon's event log, so that is where we look.
+        killed = await quiesce.killed_since(
+            ctx.source_host, since=since, label_filters=observed_labels(ctx.plan)
+        )
+        if killed:
+            _refuse_if_killed_data_holder(ctx, killed)
+    except MigrationError as exc:
+        _name_source_pins(ctx, exc, source_pins)
+        raise
 
     # Counts come from the PRE-stop capture. The report cannot know them: a
     # Coolify stop removes containers as it stops them, so the final snapshot is
@@ -786,7 +808,53 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
         "containers_stopped": sum(len(names) for names in captured.values()),
         "container_names": sorted(n for names in captured.values() for n in names),
         "elapsed": round(report.elapsed, 1),
+        "source_pins": source_pins,
     }
+
+
+async def _pin_source(ctx: MigrationContext) -> list[str]:
+    """Pin every volume the source mounts, while it still mounts them.
+
+    The WHOLE source is pinned, not only what will be copied: until FINALIZE it
+    is the rollback, and a rollback onto a pruned volume restarts an empty
+    database. A pin that cannot be made refuses the stop rather than proceed
+    unprotected — nothing has been stopped yet, so the refusal is free.
+    """
+    volumes = sorted({v for found in ctx.source_pin_volumes.values() for v in found})
+    try:
+        pinned = await pins.ensure(
+            ctx.source_host, migration_id=ctx.migration_id, side=pins.SOURCE, volumes=volumes
+        )
+    except (MigrationError, ValueError) as exc:
+        raise QuiesceError(
+            f"could not pin the source's volumes on {ctx.plan.source_server.name} against "
+            "Coolify's Docker cleanup",
+            hint=(
+                "Nothing was stopped; the source keeps serving and the created target will "
+                f"be deleted.\n{exc}"
+            ),
+        ) from exc
+    if pinned:
+        ctx.journal.append("step_started", state="quiesce", detail={"source_pins": pinned})
+    return pinned
+
+
+def _name_source_pins(ctx: MigrationContext, exc: MigrationError, pinned: list[str]) -> None:
+    """Tell the operator which container keeps the stopped source's data alive.
+
+    A QUIESCE that fails after the stop is never completed, so no restart is
+    owed and the source stays down - and its pin deliberately stays with it.
+    """
+    if not pinned:
+        return
+    note = (
+        f"The source's volumes stay pinned by {', '.join(pinned)} - a container that is "
+        "never started: no process, writes nothing - so Coolify's Docker cleanup cannot "
+        "delete them while the source is down. Once it runs again, "
+        f"`coolify-migrate rollback {ctx.migration_id}` removes the pin, or "
+        f"`docker rm {' '.join(pinned)}` on {ctx.plan.source_server.name}."
+    )
+    exc.hint = f"{exc.hint}\n\n{note}" if exc.hint else note
 
 
 #: How long to keep re-asking Coolify to stop a stack it believes is already
@@ -893,6 +961,28 @@ def _containers_holding_data(
     return tuple(sorted(holders))
 
 
+def _source_volumes_to_pin(
+    resource: ResourcePlan, containers: list[docker.Container], mounts: list[DockerMount]
+) -> list[str]:
+    """Every docker volume the source mounts, plus the planned ones. PURE.
+
+    Mounted, because the whole source must survive until FINALIZE - it is the
+    rollback. Planned, because an already-stopped resource has no mounts to
+    read and its declared volumes are just as unreferenced.
+
+    A PREVIEW's volumes are left alone. Coolify deletes a preview's volumes
+    with ``docker volume rm -f`` and, from 4.4, throws when that refuses a
+    volume in use (v4.5.0:app/Models/ApplicationPreview.php:72-80) - a pin
+    would break the preview delete ``--delete-previews`` just asked for.
+    """
+    previews = {handle for c in containers if c.is_preview for handle in (c.id, c.name) if handle}
+    mounted = {
+        m.name for m in mounts if m.type == "volume" and m.name and m.container not in previews
+    }
+    planned = {i.source_name for i in resource.manifest.to_migrate if i.source_name}
+    return sorted(mounted | planned)
+
+
 async def _capture_mounts(ctx: MigrationContext) -> dict[str, list[str]]:
     """Record every container mount before the stop erases the containers.
 
@@ -947,6 +1037,7 @@ async def _capture_mounts(ctx: MigrationContext) -> dict[str, list[str]]:
             # correctly means "this resource had no mounts".
             ctx.pre_stop_mounts[snapshot.uuid] = []
             ctx.data_containers[snapshot.uuid] = ()
+            ctx.source_pin_volumes[snapshot.uuid] = _source_volumes_to_pin(resource, [], [])
             captured[snapshot.uuid] = []
             if resource.manifest.to_migrate:
                 log.warning(
@@ -961,6 +1052,7 @@ async def _capture_mounts(ctx: MigrationContext) -> dict[str, list[str]]:
         mounts = await inspect_all_mounts(ctx.source_host, containers)
         ctx.pre_stop_mounts[snapshot.uuid] = mounts
         ctx.data_containers[snapshot.uuid] = _containers_holding_data(resource, containers, mounts)
+        ctx.source_pin_volumes[snapshot.uuid] = _source_volumes_to_pin(resource, containers, mounts)
         captured[snapshot.uuid] = sorted(c.name for c in containers)
         log.info(
             "quiesce.mounts_captured",
@@ -1291,6 +1383,7 @@ async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
     a uuid.
     """
     pairs_recorded: dict[str, list[dict[str, str]]] = {}
+    source_pins: set[str] = set()
 
     for resource in ctx.plan.resources:
         snapshot = resource.snapshot
@@ -1328,6 +1421,17 @@ async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
             reasons = "; ".join(i.reason for i in manifest.refused)
             raise TransferError(f"{snapshot.name}: {reasons}")
 
+        # A volume only `volume ls` or `/storages` show was never mounted, so
+        # QUIESCE could not pin it. A no-op for every other volume.
+        source_pins.update(
+            await pins.ensure(
+                ctx.source_host,
+                migration_id=ctx.migration_id,
+                side=pins.SOURCE,
+                volumes=[i.source_name for i in manifest.to_migrate if i.source_name],
+            )
+        )
+
         source_eps = [
             VolumeEndpoint(name=i.source_name, mount_path=i.mount_path)
             for i in manifest.to_migrate
@@ -1358,7 +1462,7 @@ async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
                     }
                 )
 
-    return {"volume_pairs": pairs_recorded}
+    return {"volume_pairs": pairs_recorded, "source_pins": sorted(source_pins)}
 
 
 def _transfer_endpoint(ctx: MigrationContext) -> tuple[str, int, str | None]:
@@ -1459,6 +1563,21 @@ async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
         detail={"key_fingerprint": ctx.ephemeral_key.fingerprint},
     )
 
+    # Create every target volume, then pin them all, BEFORE the first byte: from
+    # here until the target's own containers exist nothing references them, and
+    # Coolify's `docker volume prune -af` deletes exactly that.
+    targets = [
+        pair.target.name
+        for resource in ctx.plan.resources
+        for pair in ctx.volume_pairs.get(resource.snapshot.uuid, [])
+    ]
+    for name in targets:
+        await docker.create_volume(ctx.target_host, name)
+    target_pins = await pins.ensure(
+        ctx.target_host, migration_id=ctx.migration_id, side=pins.TARGET, volumes=targets
+    )
+    ctx.journal.append("step_started", state="copy", detail={"target_pins": target_pins})
+
     # What the source looks like BEFORE the transfer, to compare against
     # afterwards. Taking this at the end instead — which is what the first cut
     # did — compares the state to itself and can never disagree.
@@ -1467,7 +1586,6 @@ async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
     copied: list[str] = []
     for resource in ctx.plan.resources:
         for pair in ctx.volume_pairs.get(resource.snapshot.uuid, []):
-            await docker.create_volume(ctx.target_host, pair.target.name)
             await _copy_one(ctx, pair.source_path, pair.target_path)
             copied.append(pair.target.name)
 
@@ -1476,7 +1594,11 @@ async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
     await quiesce.assert_still_stopped(
         ctx.source_host, label_filters=observed_labels(ctx.plan), since=before
     )
-    return {"volumes_copied": copied, "key_fingerprint": ctx.ephemeral_key.fingerprint}
+    return {
+        "volumes_copied": copied,
+        "key_fingerprint": ctx.ephemeral_key.fingerprint,
+        "target_pins": target_pins,
+    }
 
 
 async def _copy_one(ctx: MigrationContext, source_path: str, target_path: str) -> None:
@@ -1963,6 +2085,22 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
     stamp = ctx.migration_id.split("-")[-1]
     actions: list[str] = []
 
+    # Unpinning hands each volume back to Coolify's steady state, and when that
+    # happens depends on the side and the policy - see _unpin_target and
+    # _unpin_source. Only the DELETE unpin may fail the step.
+    target = await _unpin_target(ctx)
+    released = list(target.released)
+    left = list(target.kept)
+    if policy is FinalizePolicy.DELETE:
+        # BEFORE the delete, and fatal: Coolify's `docker volume rm -f` cannot
+        # remove a volume a pin references and swallows the refusal for apps and
+        # databases (v4.5.0:app/Models/Application.php:575,
+        # StandalonePostgresql.php:180), so the "deleted" source would keep its
+        # data forever. Nothing irreversible has happened yet.
+        released += await pins.release(
+            ctx.source_host, migration_id=ctx.migration_id, side=pins.SOURCE
+        )
+
     for resource in ctx.plan.resources:
         snapshot = resource.snapshot
         if snapshot.collection == "services" and policy is not FinalizePolicy.DELETE:
@@ -1989,12 +2127,80 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
         await ctx.api.delete_resource(snapshot.collection, snapshot.uuid, delete_volumes=True)
         actions.append(f"deleted {snapshot.name}")
 
+    if policy is not FinalizePolicy.DELETE:
+        source = await _unpin_source(ctx)
+        released += source.released
+        left += source.kept
+
     await keys.revoke(source=ctx.source_host, target=ctx.target_host, migration_id=ctx.migration_id)
     return {
         "policy": policy.value,
         "actions": actions,
         "original_names": [r.snapshot.name for r in ctx.plan.resources],
+        "pins_released": released,
+        "pins_left": left,
     }
+
+
+async def _unpin_target(ctx: MigrationContext) -> pins.Release:
+    """Release the target's pins - but only for volumes its containers now mount.
+
+    HEALTHCHECK proves each resource has a container serving; it never asks
+    WHICH volumes are mounted. A paired volume no target container mounts would
+    be unreferenced the moment its pin goes, and under DELETE it is the only
+    copy left. So it keeps its pin, and the operator hears which volume.
+
+    Never fails the step: rolling back a healthy target over a ``docker rm``
+    would trade a stray container for an outage.
+    """
+    try:
+        outcome = await pins.release_when_referenced(
+            ctx.target_host, migration_id=ctx.migration_id, side=pins.TARGET, timeout=0.0
+        )
+    except Exception as exc:  # best-effort: never roll back a healthy target over this
+        log.warning("finalize.target_pins_left", error=str(exc)[:200])
+        ctx.notices.append(_pins_left_notice(ctx, ctx.plan.target_server.name, error=exc))
+        return pins.Release()
+    if outcome.kept:
+        ctx.notices.append(
+            f"{', '.join(outcome.kept)} still pins target volume(s) "
+            f"{', '.join(outcome.unmounted)} on {ctx.plan.target_server.name}: no target "
+            "container mounts them, so without the pin Coolify's Docker cleanup could delete "
+            "the copied data. Check the resource's storages; once something mounts them, "
+            f"`docker rm {' '.join(outcome.kept)}` there."
+        )
+    return outcome
+
+
+async def _unpin_source(ctx: MigrationContext) -> pins.Release:
+    """Release the kept or renamed source's pins - after the rename, never fatally.
+
+    The source now stays stopped with no containers, so on a server with
+    "Delete unused volumes" on, Coolify's next cleanup deletes its volumes: a
+    kept source is no fallback copy there. Deliberately so - a pin kept for
+    good would make a later delete of the renamed source silently keep its data
+    (``docker volume rm -f`` refuses, Coolify swallows it). A raise here would
+    roll back a healthy target and leave the source renamed: RESTORE_SOURCE_NAME
+    is owed only on a completed FINALIZE.
+    """
+    try:
+        released = await pins.release(
+            ctx.source_host, migration_id=ctx.migration_id, side=pins.SOURCE
+        )
+    except Exception as exc:  # best-effort: see the docstring
+        log.warning("finalize.source_pins_left", error=str(exc)[:200])
+        ctx.notices.append(_pins_left_notice(ctx, ctx.plan.source_server.name, error=exc))
+        return pins.Release()
+    return pins.Release(released=tuple(released))
+
+
+def _pins_left_notice(ctx: MigrationContext, server: str, *, error: Exception) -> str:
+    return (
+        f"could not remove this migration's volume pins on {server} "
+        f"({str(error).splitlines()[0][:120]}). Find them with "
+        f"`docker ps -a --filter label={pins.LABEL_MIGRATION}={ctx.migration_id}` and "
+        "`docker rm` each."
+    )
 
 
 def build_steps() -> dict[Any, Any]:

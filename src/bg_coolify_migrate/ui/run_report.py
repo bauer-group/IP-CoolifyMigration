@@ -59,6 +59,11 @@ def outcome_panel(result: RunResult, *, migration_id: str, elapsed: float | None
             lines.append(Text(f"  - {compensation.value}: {error}", style="err"))
         lines.append(Text(""))
 
+    if result.notices:
+        lines.append(Text("Left in place:", style="bold warn"))
+        lines.extend(Text(f"  - {notice}", style="warn") for notice in result.notices)
+        lines.append(Text(""))
+
     lines.append(Text(_next_step(result, migration_id), style="muted"))
 
     if elapsed is not None:
@@ -147,4 +152,5 @@ def plain_result(result: RunResult, *, migration_id: str) -> str:
         lines.append(f"undone: {compensation.value}")
     for compensation, error in result.compensations_failed:
         lines.append(f"undo_failed: {compensation.value}: {error}")
+    lines.extend(f"notice: {notice}" for notice in result.notices)
     return "\n".join(lines)

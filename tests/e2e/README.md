@@ -141,3 +141,14 @@ typo away from silently copying nothing.
 - `test_rollback.py` — injects a fault after the volumes are copied and asserts
   the world is put back: target deleted from server-b, source still running on
   server-a with its data intact. This is what caught finding 15.
+- `test_cleanup_guard.py` — runs **Coolify's own Docker cleanup** with the volume
+  prune forced on (`POST /servers/{uuid}/docker-cleanup/run`, 4.3.0+) on both
+  servers at the widest window — source stopped, target filled, nothing mounts
+  either — and again just before a rollback, then reads the rows back. Proves the
+  volume pins (`discovery/pins.py`) hold against the real prune, and that the
+  empty-image import works on the Alpine dind servers. Each run first creates a
+  canary volume and asserts the cleanup deleted it, so a cleanup that skipped
+  its volume prune cannot pass the test. **Not parallel-safe**: it prunes every
+  unused volume on both daemons, so run it alone or serially. Coolify's image
+  prune also removes the stopped source's postgres image, so the rollback's
+  restart re-pulls it.

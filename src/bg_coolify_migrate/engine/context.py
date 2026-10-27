@@ -82,6 +82,12 @@ class MigrationContext:
     #: after the fact — the containers are gone by then.
     data_containers: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
+    #: source resource uuid -> the volumes QUIESCE pins against Coolify's Docker
+    #: cleanup before it stops anything (``discovery/pins.py``). Decided in the
+    #: capture because only there are the containers visible: a preview's
+    #: volumes must stay unpinned, or Coolify's preview delete fails on them.
+    source_pin_volumes: dict[str, list[str]] = field(default_factory=dict)
+
     #: source resource uuid -> verification reports, one per volume
     verifications: dict[str, list[VerificationReport]] = field(default_factory=dict)
 
@@ -90,6 +96,11 @@ class MigrationContext:
 
     #: Set by the DNS gate so the report can render it even when we stop early.
     dns_report: object | None = None
+
+    #: What the operator must still do by hand that is neither a failure nor
+    #: undone - a volume pin kept because the source did not come back in time.
+    #: Copied onto the RunResult by the runner. Names only, never values.
+    notices: list[str] = field(default_factory=list)
 
     accept_drift: bool = False
     """The operator has already answered the compatibility question.

@@ -12,16 +12,18 @@ is recorded and the run reports honestly at the end.
 from __future__ import annotations
 
 import functools
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
 import structlog
 
 from bg_coolify_migrate.api import resources as api_resources
-from bg_coolify_migrate.discovery import docker
+from bg_coolify_migrate.discovery import docker, pins
+from bg_coolify_migrate.domain.statemachine import Compensation, State
 from bg_coolify_migrate.engine import keys
 from bg_coolify_migrate.engine.context import MigrationContext
 from bg_coolify_migrate.errors import CoolifyApiError
+from bg_coolify_migrate.journal.store import JournalRecord
 
 log = structlog.get_logger(__name__)
 
@@ -39,7 +41,7 @@ async def undo_create_target(ctx: MigrationContext, undo_info: dict[str, Any]) -
     a stuck target delete cannot also strand the source without its URL.
     """
     target_uuids: dict[str, str] = undo_info.get("target_uuids") or {}
-    delete_failures: list[str] = []
+    delete_failures: list[str] = await _release_target_side(ctx)
     for source_uuid, target_uuid in target_uuids.items():
         try:
             collection = ctx.collection_of(source_uuid)
@@ -85,6 +87,35 @@ async def undo_create_target(ctx: MigrationContext, undo_info: dict[str, Any]) -
     if delete_failures:
         # Surfaced so the rollback reports honestly; the source restore still ran.
         raise RuntimeError("could not delete target(s): " + ", ".join(delete_failures))
+
+
+async def _release_target_side(ctx: MigrationContext) -> list[str]:
+    """Unpin the target's volumes and revoke the transfer key, before the delete.
+
+    Both are owed by COPY, whose own compensations run only if COPY completed.
+    A COPY that fails part-way leaves its pins and its authorised key with
+    nothing to undo them - and a pinned volume survives the delete below, since
+    Coolify's ``docker volume rm -f`` cannot remove a referenced volume and
+    swallows the refusal (v4.5.0:app/Models/StandalonePostgresql.php:180). Both
+    are found by markers carrying the migration id, so this is exact, and a
+    no-op when there is nothing to undo.
+
+    Best-effort: a failure is reported, never allowed to stop the delete.
+    """
+    failures: list[str] = []
+    try:
+        await pins.release(ctx.target_host, migration_id=ctx.migration_id, side=pins.TARGET)
+    except Exception as exc:
+        failures.append(f"target pins: {str(exc)[:200]}")
+        log.error("compensate.target_pins_release_failed", error=str(exc)[:200])
+    try:
+        await keys.revoke(
+            source=ctx.source_host, target=ctx.target_host, migration_id=ctx.migration_id
+        )
+    except Exception as exc:
+        failures.append(f"transfer key: {str(exc)[:200]}")
+        log.error("compensate.key_revoke_failed", error=str(exc)[:200])
+    return failures
 
 
 async def _restore_source_domains(
@@ -148,7 +179,12 @@ async def undo_quiesce(ctx: MigrationContext, undo_info: dict[str, Any]) -> None
 
 
 async def undo_copy(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
-    """Drop the target's volumes so a resumed run cannot merge into a partial copy."""
+    """Drop the target's volumes so a resumed run cannot merge into a partial copy.
+
+    Unpinned first: Docker refuses to remove a volume a container references,
+    even with ``-f``, and ``remove_volume`` only logs that refusal.
+    """
+    await pins.release(ctx.target_host, migration_id=ctx.migration_id, side=pins.TARGET)
     volumes: list[str] = undo_info.get("volumes_copied") or []
     for name in volumes:
         await docker.remove_volume(ctx.target_host, name)
@@ -218,9 +254,87 @@ async def undo_restore_source_fqdn(ctx: MigrationContext, undo_info: dict[str, A
     return
 
 
-def build_compensations() -> dict[Any, Any]:
-    from bg_coolify_migrate.domain.statemachine import Compensation
+def _source_was_stopped(ctx: MigrationContext) -> bool:
+    """Did this run stop the source? The one place that decides it.
 
+    Today: QUIESCE completed. A QUIESCE that failed after its stop request is
+    not completed, so it reads as "not stopped" here and no wait is spent on a
+    restart that is not owed.
+    """
+    return State.QUIESCE.value in ctx.journal.completed_states()
+
+
+def _restart_succeeded(records: Iterable[JournalRecord]) -> bool:
+    """Did the CURRENT rollback restart the source? PURE.
+
+    The latest RESTART_SOURCE outcome after the last ``rollback_started``: a
+    journal can hold several rollbacks, and an earlier one's success says
+    nothing about this one.
+    """
+    ok: bool | None = None
+    for record in records:
+        if record.event == "rollback_started":
+            ok = None
+        elif (
+            record.event == "rollback_step"
+            and record.detail.get("compensation") == Compensation.RESTART_SOURCE.value
+            and "ok" in record.detail
+        ):
+            ok = record.detail["ok"] is True
+    return ok is True
+
+
+async def undo_release_source_pins(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
+    """Unpin the source's volumes - the last act of every rollback.
+
+    Released only once something other than a pin mounts every pinned volume:
+    a volume unpinned before the restarted source mounts it again is exactly
+    what Coolify's ``docker volume prune -af`` deletes. Waited for up to
+    ``deploy_timeout`` only when this rollback restarted the source; otherwise
+    one look - the source is still serving (QUIESCE failed before the stop), or
+    down with no restart coming (QUIESCE failed after it, or the restart
+    failed), and then the pin must stay.
+
+    A kept pin is not a compensation failure. The source is no worse off than
+    before - better: its data survives the cleanup - so the outcome stays
+    ROLLED_BACK and the run report names the pin. ``rollback <id>`` again, once
+    the source runs, removes it.
+    """
+    restarted = _source_was_stopped(ctx) and _restart_succeeded(ctx.journal.read())
+    outcome = await pins.release_when_referenced(
+        ctx.source_host,
+        migration_id=ctx.migration_id,
+        side=pins.SOURCE,
+        timeout=ctx.settings.deploy_timeout if restarted else 0.0,
+    )
+    if not outcome.kept:
+        return
+
+    ctx.journal.append(
+        "rollback_step",
+        state=State.CREATE_TARGET.value,
+        detail={
+            "compensation": Compensation.RELEASE_SOURCE_PINS.value,
+            "pins_kept": list(outcome.kept),
+            "unmounted": list(outcome.unmounted),
+        },
+    )
+    log.warning(
+        "compensate.source_pins_kept",
+        pins=list(outcome.kept),
+        unmounted=list(outcome.unmounted),
+        restarted=restarted,
+    )
+    ctx.notices.append(
+        f"{', '.join(outcome.kept)} still pins the source's volume(s) "
+        f"{', '.join(outcome.unmounted)} on {ctx.plan.source_server.name}: nothing mounts "
+        "them yet, so without the pin Coolify's Docker cleanup could delete them. Once the "
+        f"source runs again: coolify-migrate rollback {ctx.migration_id} "
+        f"(or docker rm {' '.join(outcome.kept)} there)."
+    )
+
+
+def build_compensations() -> dict[Any, Any]:
     return {
         Compensation.DELETE_TARGET_RESOURCE: undo_create_target,
         Compensation.RESTART_SOURCE: undo_quiesce,
@@ -229,4 +343,5 @@ def build_compensations() -> dict[Any, Any]:
         Compensation.STOP_TARGET: undo_start_target,
         Compensation.RESTORE_SOURCE_NAME: undo_restore_source_name,
         Compensation.RESTORE_SOURCE_FQDN: undo_restore_source_fqdn,
+        Compensation.RELEASE_SOURCE_PINS: undo_release_source_pins,
     }

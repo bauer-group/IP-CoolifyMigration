@@ -96,7 +96,12 @@ class TestRollbackPlan:
 
     def test_failure_after_create_target_deletes_it(self) -> None:
         plan = rollback_plan([State.INIT, State.PREFLIGHT, State.PLAN, State.CREATE_TARGET])
-        assert [s.compensation for s in plan] == [Compensation.DELETE_TARGET_RESOURCE]
+        # RELEASE_SOURCE_PINS is owed from CREATE_TARGET on; with no pins yet it
+        # finds none by label and does nothing.
+        assert [s.compensation for s in plan] == [
+            Compensation.DELETE_TARGET_RESOURCE,
+            Compensation.RELEASE_SOURCE_PINS,
+        ]
 
     def test_failure_after_quiesce_restarts_source_then_deletes_target(self) -> None:
         plan = rollback_plan([State.CREATE_TARGET, State.QUIESCE])
@@ -104,6 +109,7 @@ class TestRollbackPlan:
         assert [s.compensation for s in plan] == [
             Compensation.RESTART_SOURCE,
             Compensation.DELETE_TARGET_RESOURCE,
+            Compensation.RELEASE_SOURCE_PINS,
         ]
 
     def test_failure_mid_copy_drops_volumes_revokes_key_and_restarts(self) -> None:
@@ -113,7 +119,24 @@ class TestRollbackPlan:
             Compensation.REVOKE_EPHEMERAL_KEY,
             Compensation.RESTART_SOURCE,
             Compensation.DELETE_TARGET_RESOURCE,
+            Compensation.RELEASE_SOURCE_PINS,
         ]
+
+    def test_source_pins_are_released_last(self) -> None:
+        """After the restart AND after the target delete restores parked domains.
+
+        Waiting for the restarted source to re-mount its volumes any earlier
+        would hold the domain restore back until the restart's deploy had built
+        its proxy labels from the parked names.
+        """
+        for completed in (
+            [State.CREATE_TARGET, State.QUIESCE],
+            [State.CREATE_TARGET, State.QUIESCE, State.COPY, State.START_TARGET],
+            list(ORDER),
+        ):
+            plan = rollback_plan(completed)
+            assert plan[-1].compensation is Compensation.RELEASE_SOURCE_PINS
+            assert plan[-1].because_of == State.CREATE_TARGET
 
     def test_ordering_stops_target_before_dropping_its_volumes(self) -> None:
         # A volume in use by a running container cannot be removed; and deleting
