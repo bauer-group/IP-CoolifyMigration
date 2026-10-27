@@ -575,6 +575,13 @@ class TestReleaseSourcePins:
         await compensations.undo_release_source_pins(ctx, {})
         assert "src-pin" not in source.containers
 
+    async def test_a_failed_restart_says_the_pins_stay(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.post(f"{BASE}/databases/db1/restart").mock(return_value=httpx.Response(500))
+        with pytest.raises(RuntimeError, match=r"could not restart.*pins .* stay"):
+            await compensations.undo_quiesce(ctx, {})
+
     async def test_no_pins_is_a_noop(self, ctx: MigrationContext) -> None:
         await compensations.undo_release_source_pins(ctx, {})
         assert [c for c in _src(ctx).commands if c.startswith("docker rm")] == []

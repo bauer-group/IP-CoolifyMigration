@@ -175,7 +175,13 @@ async def undo_quiesce(ctx: MigrationContext, undo_info: dict[str, Any]) -> None
                 error=str(exc)[:200],
             )
     if failures:
-        raise RuntimeError("could not restart: " + "; ".join(failures))
+        # The source stays down, so RELEASE_SOURCE_PINS will find its volumes
+        # unmounted and keep their pins; say so where the operator looks first.
+        raise RuntimeError(
+            "could not restart: "
+            + "; ".join(failures)
+            + " (its volume pins against Coolify's Docker cleanup stay until it runs again)"
+        )
 
 
 async def undo_copy(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
