@@ -34,6 +34,8 @@ from bg_coolify_migrate.discovery.docker import (
     LABEL_PROJECT,
     LABEL_RESOURCE,
 )
+from bg_coolify_migrate.dns import gate as dns_gate
+from bg_coolify_migrate.dns import managed as dns_managed
 from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.domain import compose as compose_mod
 from bg_coolify_migrate.domain import domains, fidelity
@@ -974,13 +976,22 @@ async def build_plan(
         target_ref = target_ref.model_copy(update={"wildcard_domain": target_wildcard})
 
     baseline = await dns_baseline(served, source_wildcard=source_ref.wildcard_domain or None)
+    notes = list(fidelity.server_warnings(source_server, target))
+    if cloudflare := dns_managed.cloudflare_note(baseline, version=coolify_version):
+        notes.append(cloudflare)
+    if elsewhere := await _elsewhere_note(baseline, source_ref, target_ref):
+        notes.append(elsewhere)
+    if shared := await shared_hostname_note(
+        api, served, source_wildcard=source_ref.wildcard_domain or None
+    ):
+        notes.append(shared)
 
     return MigrationPlan(
         project=project_name,
         environment=environment,
         source_server=source_ref,
         target_server=target_ref,
-        notes=tuple(fidelity.server_warnings(source_server, target)),
+        notes=tuple(notes),
         resources=tuple(plans),
         finalize_policy=finalize_policy,
         transfer_mode=transfer_mode,
@@ -988,6 +999,78 @@ async def build_plan(
         # filter slugifies exactly what Coolify wrote onto the containers.
         selected_resources=tuple(p.snapshot.name for p in plans) if only_resource else (),
         dns_baseline=baseline,
+    )
+
+
+async def _elsewhere_note(
+    baseline: tuple[HostBaseline, ...], source: ServerRef, target: ServerRef
+) -> str | None:
+    """Warn of hosts the DNS gate will find on neither server (dns/gate.elsewhere_note).
+
+    Fail-soft: servers whose addresses cannot be resolved give no warning.
+    """
+    if not any(entry.addresses for entry in baseline):
+        return None
+    try:
+        source_ips = await dns_resolve.server_addresses(source.ip, source.wildcard_domain or None)
+        target_ips = await dns_resolve.server_addresses(target.ip, target.wildcard_domain or None)
+    except Exception as exc:  # diagnostics only, never fatal
+        log.debug("planner.server_addresses_unavailable", error=str(exc)[:120])
+        return None
+    return dns_gate.elsewhere_note(
+        {entry.host: entry.addresses for entry in baseline},
+        source_ips=source_ips,
+        target_ips=target_ips,
+    )
+
+
+def _custom_host_owners(
+    served: list[tuple[ResourceSnapshot, dict[str, Any], list[dict[str, Any]]]],
+    *,
+    source_wildcard: str | None,
+) -> dict[str, str]:
+    """``{custom host: name of the source serving it}`` across the plan."""
+    owners: dict[str, str] = {}
+    for snapshot, full, envs in served:
+        for host in domains.source_custom_hosts(
+            snapshot, full, envs, source_wildcard=source_wildcard
+        ):
+            owners.setdefault(host, snapshot.name)
+    return owners
+
+
+async def shared_hostname_note(
+    api: CoolifyClient,
+    served: list[tuple[ResourceSnapshot, dict[str, Any], list[dict[str, Any]]]],
+    *,
+    source_wildcard: str | None,
+) -> str | None:
+    """Warn when a resource OUTSIDE the plan holds one of its custom hostnames.
+
+    REST only: ``GET /applications`` carries every application's ``fqdn`` and
+    compose domains; ``GET /services`` does not load sub-applications
+    (ServicesController v4.5.0:270-283), so each other service is read once.
+    Fail-soft: a team the token cannot list is a plan without the warning.
+    """
+    owners = _custom_host_owners(served, source_wildcard=source_wildcard)
+    if not owners:
+        return None
+    own = {snapshot.uuid for snapshot, _, _ in served}
+    resources: list[tuple[str, dict[str, Any]]] = []
+    try:
+        for app in await api.get("/applications") or []:
+            if isinstance(app, dict):
+                resources.append(("application", app))
+        for service in await api.get("/services") or []:
+            uuid = service.get("uuid") if isinstance(service, dict) else None
+            if not uuid or uuid in own:
+                continue
+            resources.append(("service", await api.get_resource("services", str(uuid))))
+    except Exception as exc:  # diagnostics only, never fatal
+        log.debug("planner.shared_hostnames_unavailable", error=str(exc)[:120])
+        return None
+    return domains.outside_holder_note(
+        domains.outside_holders(owners, resources, exclude=own)
     )
 
 
@@ -1004,12 +1087,7 @@ async def dns_baseline(
     Cloudflare zone apart for the plan warning. Fail-soft — no baseline is a
     plan without those checks, never a refusal.
     """
-    owners: dict[str, str] = {}
-    for snapshot, full, envs in served:
-        for host in domains.source_custom_hosts(
-            snapshot, full, envs, source_wildcard=source_wildcard
-        ):
-            owners.setdefault(host, snapshot.name)
+    owners = _custom_host_owners(served, source_wildcard=source_wildcard)
     if not owners:
         return ()
     try:

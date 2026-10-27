@@ -192,6 +192,43 @@ def source_custom_hosts(
     return list(dict.fromkeys(out))
 
 
+def outside_holders(
+    hosts: Collection[str],
+    resources: Iterable[tuple[str, Mapping[str, Any]]],
+    *,
+    exclude: Collection[str],
+) -> dict[str, list[str]]:
+    """Which resources OUTSIDE the plan hold one of its custom hosts. PURE.
+
+    ``resources`` are ``(kind, GET)`` pairs from the team's list endpoints and
+    service GETs; ``exclude`` the uuids of the plan's sources. DNS moves per
+    HOSTNAME while Coolify holds per URL: a sibling on another path or port, or
+    a resource left out of a scoped run, shares the record — and the cutover
+    moves its traffic to a server where it does not run.
+    """
+    wanted = set(hosts)
+    out: dict[str, list[str]] = {}
+    for kind, resource in resources:
+        uuid = str(resource.get("uuid") or "")
+        if not uuid or uuid in exclude:
+            continue
+        for host in sorted(held_hosts(resource) & wanted):
+            out.setdefault(host, []).append(f"{kind} {resource.get('name')!r} ({uuid})")
+    return out
+
+
+def outside_holder_note(holders: Mapping[str, list[str]]) -> str | None:
+    """The plan warning for :func:`outside_holders`, or ``None``."""
+    if not holders:
+        return None
+    listed = "; ".join(f"{host} by {', '.join(who)}" for host, who in sorted(holders.items()))
+    return (
+        f"custom hostname(s) also served outside this plan: {listed}. DNS moves per "
+        "hostname, so the cutover sends their traffic to the target as well, where they "
+        "do not run. Migrate them in the same run, or give them their own hostname first."
+    )
+
+
 # ── what a resource holds ────────────────────────────────────────────────────
 
 

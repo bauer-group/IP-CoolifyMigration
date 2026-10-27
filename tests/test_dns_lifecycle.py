@@ -539,3 +539,161 @@ def test_journal_detail_of_the_baseline_is_plain_json() -> None:
 
     out = serialise_dns_baseline((HostBaseline(host="a.b.c", addresses=("1.2.3.4",)),))
     assert json.loads(json.dumps(out))["a.b.c"]["addresses"] == ["1.2.3.4"]
+
+
+# ── plan warnings: Cloudflare zones, hostnames held outside the plan ────────
+
+
+class TestCloudflareNote:
+    def _baseline(self) -> tuple[HostBaseline, ...]:
+        return (
+            HostBaseline(host="shop.example.com", nameservers=("ada.ns.cloudflare.com",)),
+            HostBaseline(host="cdn.example.com", cname_chain=("cdn.example.com.cdn.cloudflare.net",)),
+            HostBaseline(host="plain.example.com", nameservers=("ns1.hetzner.com",)),
+        )
+
+    def test_names_the_cloudflare_hosts_and_what_to_do(self) -> None:
+        note = managed.cloudflare_note(self._baseline(), version=(4, 5, 0))
+        assert note is not None
+        assert note.startswith("cdn.example.com, shop.example.com: the zone is on Cloudflare")
+        assert "plain.example.com" not in note
+        assert "make-before-break" in note and "never deletes" in note
+        assert "point each at the target in Cloudflare" in note
+        assert "Replace record" in note
+
+    def test_before_4_4_coolify_manages_nothing(self) -> None:
+        assert managed.cloudflare_note(self._baseline(), version=(4, 3, 24)) is None
+
+
+class TestOutsideHolders:
+    def test_a_resource_outside_the_plan_holding_a_host_is_named(self) -> None:
+        resources = [
+            ("application", {"uuid": "app1", "name": "shop", "fqdn": SHOP}),  # the source
+            ("application", {"uuid": "app9", "name": "blog", "fqdn": f"{SHOP}/blog"}),
+            ("service", {"uuid": "svc9", "name": "wiki", "applications": [{"url": SHOP}]}),
+            ("application", {"uuid": "app8", "name": "other", "fqdn": "https://x.example.com"}),
+            ("application", {"name": "no-uuid", "fqdn": SHOP}),
+        ]
+        holders = domains.outside_holders({"shop.example.com"}, resources, exclude={"app1"})
+        assert holders == {
+            "shop.example.com": ["application 'blog' (app9)", "service 'wiki' (svc9)"]
+        }
+        note = domains.outside_holder_note(holders)
+        assert note is not None and "outside this plan" in note and "app9" in note
+
+    def test_nothing_shared_is_no_note(self) -> None:
+        assert domains.outside_holder_note({}) is None
+
+
+class _ListApi:
+    def __init__(self, *, services_fail: bool = False) -> None:
+        self.services_fail = services_fail
+        self.read: list[str] = []
+
+    async def get(self, path: str, **_params: object) -> object:
+        if path == "/applications":
+            return [
+                {"uuid": "app1", "name": "shop", "fqdn": SHOP},
+                {"uuid": "app9", "name": "blog", "fqdn": f"{SHOP}/blog"},
+            ]
+        if path == "/services":
+            if self.services_fail:
+                raise RuntimeError("403")
+            return [{"uuid": "svc9", "name": "wiki"}, "junk"]
+        raise AssertionError(path)
+
+    async def get_resource(self, collection: str, uuid: str) -> dict[str, object]:
+        self.read.append(uuid)
+        return {"uuid": uuid, "name": "wiki", "applications": [{"url": "https://w.example.com"}]}
+
+
+class TestSharedHostnameNote:
+    async def test_the_planner_reads_the_lists_and_each_other_service(self) -> None:
+        api = _ListApi()
+        note = await planner.shared_hostname_note(
+            api,  # type: ignore[arg-type]
+            [(_app(), {"uuid": "app1", "fqdn": SHOP}, [])],
+            source_wildcard=None,
+        )
+        assert note is not None and "application 'blog' (app9)" in note
+        assert api.read == ["svc9"]
+
+    async def test_no_custom_host_reads_nothing(self) -> None:
+        api = _ListApi()
+        assert await planner.shared_hostname_note(api, [(_app(), {}, [])], source_wildcard=None) is None  # type: ignore[arg-type]
+        assert api.read == []
+
+    async def test_a_list_the_token_cannot_read_is_no_warning(self) -> None:
+        api = _ListApi(services_fail=True)
+        note = await planner.shared_hostname_note(
+            api,  # type: ignore[arg-type]
+            [(_app(), {"uuid": "app1", "fqdn": SHOP}, [])],
+            source_wildcard=None,
+        )
+        assert note is None
+
+
+class TestElsewhereHeadsUp:
+    def test_hosts_on_neither_server_are_named(self) -> None:
+        from bg_coolify_migrate.dns.gate import elsewhere_note
+
+        note = elsewhere_note(
+            {
+                "cdn.example.com": ("104.21.1.1",),
+                "shop.example.com": (SOURCE_IP,),
+                "new.example.com": (TARGET_IP,),
+                "none.example.com": (),
+            },
+            source_ips=frozenset({SOURCE_IP}),
+            target_ips=frozenset({TARGET_IP}),
+        )
+        assert note is not None and note.startswith("cdn.example.com resolve(s) to neither")
+        assert "--accept-dns-host" in note
+        assert "shop.example.com" not in note and "none.example.com" not in note
+
+    def test_an_address_both_servers_answer_as_counts_for_neither(self) -> None:
+        # One CDN in front of both wildcards: the gate will call it ELSEWHERE.
+        from bg_coolify_migrate.dns.gate import elsewhere_note
+
+        cdn = frozenset({"104.21.1.1"})
+        note = elsewhere_note(
+            {"cdn.example.com": ("104.21.1.1",), "shop.example.com": (SOURCE_IP,)},
+            source_ips=frozenset({SOURCE_IP}) | cdn,
+            target_ips=frozenset({TARGET_IP}) | cdn,
+        )
+        assert note is not None and note.startswith("cdn.example.com resolve(s)")
+        assert "shop.example.com" not in note
+
+    async def test_the_planner_asks_the_servers_once_and_warns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _answers(monkeypatch, {})  # both server ips are literals: no lookup needed
+        note = await planner._elsewhere_note(
+            (HostBaseline(host="cdn.example.com", addresses=("104.21.1.1",)),),
+            ServerRef(uuid="s1", name="old", ip=SOURCE_IP),
+            ServerRef(uuid="s2", name="new", ip=TARGET_IP),
+        )
+        assert note is not None and "cdn.example.com" in note
+
+    async def test_no_resolved_baseline_asks_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        asked = _answers(monkeypatch, {})
+        note = await planner._elsewhere_note(
+            (HostBaseline(host="x.example.com"),),
+            ServerRef(uuid="s1", name="old", ip="old.example.com"),
+            ServerRef(uuid="s2", name="new", ip="new.example.com"),
+        )
+        assert note is None and asked == []
+
+    async def test_servers_that_cannot_be_resolved_give_no_warning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def broken(ip: str, wildcard: str | None = None) -> frozenset[str]:
+            raise RuntimeError("down")
+
+        monkeypatch.setattr("bg_coolify_migrate.dns.resolve.server_addresses", broken)
+        note = await planner._elsewhere_note(
+            (HostBaseline(host="cdn.example.com", addresses=("104.21.1.1",)),),
+            ServerRef(uuid="s1", name="old", ip=SOURCE_IP),
+            ServerRef(uuid="s2", name="new", ip=TARGET_IP),
+        )
+        assert note is None

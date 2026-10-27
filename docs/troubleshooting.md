@@ -167,6 +167,31 @@ record changed under the migration. The targets created by this run are deleted
 again. Put the record back, then plan and migrate again. (A lookup that merely
 timed out never triggers this.)
 
+### Plan warning: "the zone is on Cloudflare, and Coolify >= 4.4 may manage these records"
+
+Not a problem by itself. From 4.4 Coolify can manage DNS records at Cloudflare,
+and it deletes one it manages when the hostname loses its last holder. The
+migration hands every hostname over make-before-break, so that never happens.
+What Coolify cannot do is re-point a record it manages — there is no API or UI
+path — so the cutover is yours: after the DNS gate, change the record at
+Cloudflare to the target's address. For a Cloudflare record Coolify does *not*
+manage, the target's **Domains > Configure DNS > Replace record** does it from
+Coolify's UI.
+
+### Plan warning: "… resolve(s) to neither server today"
+
+The host already resolves to something other than both servers — a CDN, proxy
+or load balancer. The DNS gate will stop before the target starts until you
+accept that host by name, and by then the source is stopped. Check where its
+origin will point, then pass `--accept-dns-host HOST` on the run itself.
+
+### Plan warning: "custom hostname(s) also served outside this plan"
+
+Another application or service of the team holds the same hostname (on another
+path or port, or simply not selected for this run). DNS moves per hostname, so
+the cutover would send its traffic to the target too, where it does not run.
+Migrate it in the same run, or give it its own hostname before the cutover.
+
 ### After a rollback: "point DNS for … back to …" / "recreate the DNS record of …"
 
 The rollback re-resolves every custom host at its end. A host that now resolves

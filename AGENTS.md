@@ -573,6 +573,14 @@ why `domain/domains.py` hands every hostname over make-before-break.
   plan warnings — never gate on it (vanity nameservers, partial setups and every
   other CDN would slip through). Each server's address set includes its wildcard
   base (and a probe label under it), the public address custom records point at.
+- **Two plan warnings, never refusals.** A custom host whose zone is on
+  Cloudflare (authoritative NS `*.ns.cloudflare.com` or a CNAME into
+  `*.cdn.cloudflare.net`) from 4.4.0 (`dns/managed.cloudflare_note`), and a
+  hostname also held by a resource outside the plan
+  (`domains.outside_holders`). REST only: `GET /applications` carries every
+  application's `fqdn`/`docker_compose_domains`, but `GET /services` does not
+  load sub-applications (ServicesController v4.5.0:270-283), so each other
+  service is read once; previews are invisible to both.
 - **The DNS baseline is taken at PLAN and journalled** (`plan.dns_baseline`,
   PLAN's step detail; `context.dns_baseline_of` reads the journal first). It is
   re-checked at the gate (VANISHED), at the end of CREATE while the source still
@@ -606,6 +614,7 @@ Conventional Commits, **past-tense** subject (`added`, `fixed`, `updated`), max
 | Which fields may we send? | `api/fields.py` |
 | What can the target NOT reproduce? | `domain/fidelity.py` |
 | Who holds a domain, and when may we force it? | `domain/domains.py` |
+| Could Coolify manage this DNS record? | `dns/managed.py` (wording only, never a gate) |
 | Are scheduled tasks and backup schedules carried? | `api/schedules.py`, `domain/schedules.py` |
 | Can a locked variable be carried? | `domain/locked_envs.py` |
 | Is the data safe from Coolify's cleanup? | `discovery/pins.py` |

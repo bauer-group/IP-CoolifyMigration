@@ -421,6 +421,34 @@ def build_report(
     )
 
 
+def elsewhere_note(
+    baseline: Mapping[str, tuple[str, ...]],
+    *,
+    source_ips: frozenset[str],
+    target_ips: frozenset[str],
+) -> str | None:
+    """The plan's heads-up for hosts that ALREADY resolve to neither server. PURE.
+
+    ``baseline`` is ``{host: plan-time addresses}``. Each such host will be
+    ELSEWHERE at the gate, which runs after the source is stopped — knowing now
+    lets the operator check the origin and accept the host on the run itself.
+    An address both servers answer as counts for neither, as in :func:`classify`.
+    """
+    either = source_ips ^ target_ips
+    hosts = sorted(
+        host for host, addresses in baseline.items() if addresses and not set(addresses) & either
+    )
+    if not hosts:
+        return None
+    return (
+        f"{', '.join(hosts)} resolve(s) to neither server today (or only to an address "
+        "both answer as) - a CDN, proxy or load "
+        "balancer in front? DNS cannot show its origin, so the DNS gate will stop before "
+        "the target starts until each is accepted by name: check that its origin will "
+        "point at the target, then pass --accept-dns-host HOST (on run, or on resume)."
+    )
+
+
 def bound_to_source(
     hostnames: list[Hostname], *, source_wildcard: str | None, target_wildcard: str | None
 ) -> list[Hostname]:
