@@ -33,6 +33,7 @@ from urllib.parse import urlsplit
 
 from bg_coolify_migrate.domain import compose as compose_mod
 from bg_coolify_migrate.domain import locked_envs
+from bg_coolify_migrate.domain.domains import compose_domains
 from bg_coolify_migrate.domain.kinds import DatabaseEngine
 from bg_coolify_migrate.domain.locked_envs import is_locked
 from bg_coolify_migrate.domain.versions import Version, at_least
@@ -44,6 +45,8 @@ from bg_coolify_migrate.domain.versions import Version, at_least
 SERVICE_URLS_NORMALISED_SINCE: Version = (4, 2, 0)
 #: An explicit domain port moves into the hidden applications.domain_port_overrides.
 PORT_OVERRIDES_HIDDEN_SINCE: Version = (4, 3, 15)
+#: ...and a compose service's domain port too (normalizeDockerComposeDomainPorts).
+COMPOSE_PORT_OVERRIDES_HIDDEN_SINCE: Version = (4, 4, 0)
 #: `host_path` leaves every storage create array (backported to the 4.3 line).
 HOST_PATH_REMOVED_SINCE: Version = (4, 3, 22)
 #: ManualWebhookSecret: a new secret must be >= 16 characters.
@@ -160,6 +163,9 @@ def application_refusals(source: dict[str, Any], *, version: Version | None) -> 
                 "If every domain uses one port, put it first in ports_exposes on the "
                 "source; otherwise migrate this application by hand."
             )
+
+    if at_least(version, COMPOSE_PORT_OVERRIDES_HIDDEN_SINCE):
+        out.extend(_compose_port_refusals(source))
 
     return out
 
@@ -301,6 +307,10 @@ def application_warnings(source: dict[str, Any], *, version: Version | None) -> 
         )
     if source.get("is_maintenance_enabled") is True:
         out.append(_MAINTENANCE_WARNING)
+    if at_least(version, COMPOSE_PORT_OVERRIDES_HIDDEN_SINCE) and (
+        compose_hidden_port_overrides(source) is None
+    ):
+        out.append(_COMPOSE_PORTS_UNCHECKED_WARNING)
     if at_least(version, RUN_OPTIONS_PARSER_SINCE) and (
         flags := newly_mapped_run_options(source.get("custom_docker_run_options"))
     ):
@@ -378,6 +388,132 @@ def hidden_port_overrides(source: dict[str, Any]) -> list[int]:
         except ValueError:
             continue
     return sorted(routed - {exposed} - explicit)
+
+
+_COMPOSE_PORTS_UNCHECKED_WARNING = (
+    "the parsed compose (docker_compose) could not be read, so it is unknown whether "
+    "a compose domain routes to an explicit port. Since 4.4 Coolify keeps such a port "
+    "in a hidden column no API read returns: the target would route the domain to the "
+    "service's first exposed port, and parking the source's domains would erase the "
+    "port on the source beyond what a rollback restores. Check the domains' ports in "
+    "Coolify before migrating."
+)
+
+
+def compose_hidden_port_overrides(source: dict[str, Any]) -> dict[str, list[int]] | None:
+    """Per compose service: ports its domain routes to that a portless domain cannot.
+
+    From 4.4.0 a ``docker_compose_domains`` save strips each domain's ``:port`` into
+    the hidden ``domain_port_overrides`` (normalizeDockerComposeDomainPorts,
+    ApplicationsController v4.4.0:6372, v4.5.0:6535-6551; absent at v4.3.15), and the
+    parser routes by that override, falling back to the service's first tcp
+    ``expose``/``ports`` entry (parsers.php v4.5.0:2158-2161, docker.php :883-906,
+    :1015-1017). The GET shows only the portless domain. Parking replaces the
+    domain list, and ``DomainPortOverrides::normalize`` drops overrides for domains
+    that are gone (v4.5.0 app/Support/DomainPortOverrides.php:27-75) — so neither
+    the target nor a rollback's restore can bring the port back.
+
+    The routing survives only in the generated labels of the parsed compose
+    (``docker_compose``, visible with read:sensitive, v4.5.0:122-126). Coolify's
+    own Traefik services are named ``http(s)-<n>-<uuid>[-<service>]``
+    (docker.php :1019-1025), which keeps a port label the operator wrote into the
+    compose — and which survives anyway — out of it.
+
+    Returns ``{}`` when nothing is hidden, and ``None`` when a compose app has
+    domains but its parsed compose cannot be read.
+    """
+    if source.get("build_pack") != "dockercompose":
+        return {}
+    domains_by_service = {
+        name: domain
+        for name, domain in compose_domains(source.get("docker_compose_domains")).items()
+        if domain.strip()
+    }
+    if not domains_by_service:
+        return {}
+    services = _parsed_compose_services(source.get("docker_compose"))
+    if services is None:
+        return None
+    uuid = re.escape(str(source.get("uuid") or ""))
+    generated = re.compile(
+        rf"traefik\.http\.services\.https?-\d+-{uuid}[^=]*\.loadbalancer\.server\.port=(\d+)"
+    )
+    out: dict[str, list[int]] = {}
+    for name, domain in domains_by_service.items():
+        body = services.get(name) or {}
+        labels = _compose_label_text(body.get("labels"))
+        routed = {int(p) for p in generated.findall(labels)} | {
+            int(p) for p in _CADDY_PORT.findall(labels)
+        }
+        fallback = _first_compose_port(body)
+        explicit: set[int] = set()
+        for url in domain.split(","):
+            try:
+                if (port := urlsplit(url.strip()).port) is not None:
+                    explicit.add(port)
+            except ValueError:
+                continue
+        hidden = sorted(routed - explicit - ({fallback} if fallback is not None else set()))
+        if hidden:
+            out[name] = hidden
+    return out
+
+
+def _compose_port_refusals(source: dict[str, Any]) -> list[str]:
+    hidden = compose_hidden_port_overrides(source)
+    if not hidden:
+        return []
+    detail = "; ".join(f"{name} -> {ports}" for name, ports in sorted(hidden.items()))
+    return [
+        f"compose service domains route to port(s) their domain does not name ({detail}). "
+        "Since 4.4 Coolify keeps such a port in a hidden column no API read returns, so "
+        "the target would route each domain to its service's first exposed port — and "
+        "parking the source's domains would erase the port on the source as well, beyond "
+        "what a rollback restores. Make that port the service's first `expose:` entry in "
+        "the compose (in git), redeploy the source, then migrate; or migrate it by hand."
+    ]
+
+
+def _parsed_compose_services(raw: object) -> dict[str, dict[str, Any]] | None:
+    """``services:`` of the parsed compose, or None when it cannot be read."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw
+    if "services" not in raw:
+        try:
+            text = base64.b64decode(raw, validate=True).decode("utf-8")
+        except (binascii.Error, ValueError):
+            return None
+    try:
+        return compose_mod.services(compose_mod.parse(text))
+    except compose_mod.ComposeError:
+        return None
+
+
+def _compose_label_text(labels: object) -> str:
+    if isinstance(labels, dict):
+        return "\n".join(f"{k}={v}" for k, v in labels.items())
+    if isinstance(labels, list):
+        return "\n".join(str(item) for item in labels)
+    return ""
+
+
+def _first_compose_port(service: dict[str, Any]) -> int | None:
+    """firstDockerComposeServicePort (docker.php v4.5.0:883-906): first tcp target."""
+    entries = list(service.get("expose") or []) + list(service.get("ports") or [])
+    for entry in entries:
+        if isinstance(entry, dict):
+            if str(entry.get("protocol") or "tcp") != "tcp":
+                continue
+            port = str(entry.get("target") or "")
+        else:
+            text = str(entry)
+            if "/" in text and text.rsplit("/", 1)[1] != "tcp":
+                continue
+            port = text.split("/", 1)[0].rsplit(":", 1)[-1]
+        if port.isdigit() and 1 <= int(port) <= 65535:
+            return int(port)
+    return None
 
 
 #: Flags convertDockerRunToCompose maps from v4.5.0 (bootstrap/helpers/constants.php

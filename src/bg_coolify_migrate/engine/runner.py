@@ -6,7 +6,6 @@ and it does not decide.
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -15,6 +14,7 @@ from pathlib import Path
 import structlog
 
 from bg_coolify_migrate.api.client import CoolifyClient
+from bg_coolify_migrate.domain.domains import parking_tag
 from bg_coolify_migrate.domain.plan import MigrationPlan, ServerRef, TransferMode
 from bg_coolify_migrate.domain.statemachine import State
 from bg_coolify_migrate.engine.compensations import build_compensations
@@ -78,11 +78,11 @@ def make_migration_id(project: str, environment: str, when: datetime | None = No
     """A short, stable, human-typeable id.
 
     Includes a timestamp so two migrations of the same project are distinct, and
-    a hash so the id survives a project name with spaces or slashes.
+    a hash so the id survives a project name with spaces or slashes. The hash is
+    the domain-parking tag (:func:`domains.parking_tag`), one helper for both.
     """
     stamp = (when or datetime.now(UTC)).strftime("%Y%m%d-%H%M%S")
-    digest = hashlib.sha256(f"{project}/{environment}".encode()).hexdigest()[:6]
-    return f"{stamp}-{digest}"
+    return f"{stamp}-{parking_tag(project, environment)}"
 
 
 async def ssh_target_for(api: CoolifyClient, server: ServerRef) -> SshTarget:

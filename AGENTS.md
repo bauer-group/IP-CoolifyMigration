@@ -304,6 +304,14 @@ the release it starts in — read that module before adding a rule.
 - **A domain's explicit port moved into hidden `domain_port_overrides` (4.3.15).**
   The GET shows a portless fqdn; only the generated proxy labels still show the
   routing. Parking the source's domains erases the override on the source too.
+  **Compose domains followed in 4.4.0** (`normalizeDockerComposeDomainPorts`,
+  v4.4.0:6372, v4.5.0:6535-6551; absent at v4.3.15): the parsed `docker_compose`
+  labels are the only witness, and `fidelity.compose_hidden_port_overrides` reads
+  them — a port that is not the service's first exposed one is refused.
+- **The parking tag is stable per project/environment** (`domains.parking_tag`,
+  the migration id's digest). A source still on `old-<tag>.` hosts — an earlier
+  run's un-park failed — is refused at plan time: a new run would park the parked
+  host again and journal it as the one to restore.
 - **Env rows saved before 4.5 keep the legacy escaping; every row we create is
   exact** (`uses_legacy_escaping`, hidden, unsettable). The row's `version` field
   tells which is which. Values with `\ " '`, a ` #` tail or quoted literals reach

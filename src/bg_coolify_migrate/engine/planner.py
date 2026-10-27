@@ -35,7 +35,7 @@ from bg_coolify_migrate.discovery.docker import (
     LABEL_RESOURCE,
 )
 from bg_coolify_migrate.domain import compose as compose_mod
-from bg_coolify_migrate.domain import fidelity
+from bg_coolify_migrate.domain import domains, fidelity
 from bg_coolify_migrate.domain.drift import RebuildDriftReport, assess_rebuild_drift
 from bg_coolify_migrate.domain.kinds import (
     BuildPack,
@@ -872,6 +872,11 @@ async def build_plan(
                 fidelity.compose_refusals(snapshot.docker_compose_raw, version=coolify_version)
             )
         refusals.extend(fidelity.server_refusals(target, collection=collection, source=full))
+        refusals.extend(
+            domains.leftover_parking_refusals(
+                full, name=snapshot.name, tag=domains.parking_tag(project_name, environment)
+            )
+        )
 
         if collection == "databases":
             warnings.extend(database_health_check_warnings(full))

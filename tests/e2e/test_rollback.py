@@ -30,6 +30,7 @@ import pytest
 import pytest_asyncio
 
 from bg_coolify_migrate.api.client import CoolifyClient
+from bg_coolify_migrate.domain.domains import parking_tag
 from bg_coolify_migrate.domain.plan import TransferMode
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy, Outcome
 from bg_coolify_migrate.engine import steps
@@ -316,7 +317,7 @@ async def test_rollback_brings_the_source_back_on_its_own_domain(
     result = await run_migration(api, settings, plan)
     assert result.outcome is Outcome.ROLLED_BACK, f"expected rollback, got {result}"
 
-    tag = make_migration_id(plan.project, plan.environment).split("-")[-1]
+    tag = parking_tag(plan.project, plan.environment)
     await _assert_source_serves_its_domain(api, settings, rig, domained_app, tag=tag)
     await _assert_target_gone(api, rig, domained_app["app_name"])
 
@@ -358,5 +359,6 @@ async def test_rollback_after_rename_restores_domains(
 
     source = await api.get_resource("applications", domained_app["app_uuid"])
     assert source.get("name") == domained_app["app_name"]
-    await _assert_source_serves_its_domain(api, settings, rig, domained_app, tag=mid.split("-")[-1])
+    tag = parking_tag(plan.project, plan.environment)
+    await _assert_source_serves_its_domain(api, settings, rig, domained_app, tag=tag)
     await _assert_target_gone(api, rig, domained_app["app_name"])

@@ -259,6 +259,32 @@ coolify-migrate run ... --delete-previews
 # or manually: DELETE /v1/applications/{uuid}/previews/{pr_id}
 ```
 
+## "still answers on old-xxxxxx.…, parked by an earlier migration"
+
+An earlier migration of this project freed the source's custom domain for its
+target by renaming it to `old-<tag>.<host>` in Coolify — and its rollback could
+not give it back. The tag is the same for every run of this project and
+environment, so a new run would read the parked host as the real one, park it a
+second time and lose the real domain from every record.
+
+Set the domain back to the host the message names (without the `old-…` prefix)
+on the source in Coolify, redeploy the source, then plan again.
+
+## "compose service domains route to port(s) their domain does not name"
+
+Coolify >= 4.4 moves the `:port` of a compose domain into a hidden column that
+no API read returns, and routes the domain there. The target would route it to
+the service's first exposed port instead, and parking the source's domains would
+erase the port on the source as well — a rollback could not bring it back.
+
+Make the port the service's **first** `expose:` entry in the compose (in git),
+redeploy the source so Coolify regenerates its labels, then migrate. Otherwise
+migrate the application by hand.
+
+If the plan instead **warns** that the parsed compose could not be read, the
+check could not run: confirm the compose domains' ports in Coolify before
+migrating.
+
 ## "anonymous volume: its id cannot be reproduced"
 
 Your compose has a mount like `- /data` with no source. Docker names it with a

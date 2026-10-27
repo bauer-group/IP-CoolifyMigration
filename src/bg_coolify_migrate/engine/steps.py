@@ -32,7 +32,7 @@ from bg_coolify_migrate.dns.gate import (
     build_report,
     explain_why_blocking_matters,
 )
-from bg_coolify_migrate.domain import fidelity
+from bg_coolify_migrate.domain import domains, fidelity
 from bg_coolify_migrate.domain.kinds import GitAuth, ResourceKind
 from bg_coolify_migrate.domain.manifest import DockerMount
 from bg_coolify_migrate.domain.naming import (
@@ -375,7 +375,9 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
 
     created: dict[str, str] = {}
     parked: dict[str, dict[str, Any]] = {}
-    tag = ctx.migration_id.split("-")[-1]
+    # Stable per project/environment, so the planner can recognise hosts an
+    # earlier run parked and never gave back (domains.leftover_parking_refusals).
+    tag = domains.parking_tag(ctx.plan.project, ctx.plan.environment)
     source_wildcard = placement.source_wildcard
     try:
         for resource in ctx.plan.resources:

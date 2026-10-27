@@ -26,6 +26,7 @@ source (``statemachine._PRECEDENCE``).
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
@@ -41,6 +42,17 @@ from bg_coolify_migrate.domain.versions import Version, at_least
 #: from v4.3.0 (ApplicationsController v4.3.0:2796, applied after the fqdn at
 #: :3115-3120; v4.5.0:3363, :3764-3775).
 NOINDEX_DOMAINS_SINCE: Version = (4, 3, 0)
+
+
+def parking_tag(project: str, environment: str) -> str:
+    """The ``<tag>`` in ``old-<tag>.<host>``: six hex digits of the project/env.
+
+    The same digest ends every migration id of this project and environment
+    (``runner.make_migration_id``), and it is deliberately STABLE across runs:
+    that is what lets the planner recognise hosts an earlier run parked and
+    never gave back (:func:`leftover_parking_refusals`).
+    """
+    return hashlib.sha256(f"{project}/{environment}".encode()).hexdigest()[:6]
 
 
 def compose_domains(raw: object) -> dict[str, str]:
@@ -161,6 +173,53 @@ def _noindex_domains(raw: object) -> list[str]:
     if not isinstance(raw, list):
         return []
     return [d for d in raw if isinstance(d, str) and d.strip()]
+
+
+def leftover_parked_hosts(fqdn: object, compose_domains_raw: object, tag: str) -> list[str]:
+    """Hosts still carrying THIS project's parking prefix, ``old-<tag>.``.
+
+    Only the exact prefix counts: ``old-shop.example.com`` is somebody's real
+    domain, not ours.
+    """
+    prefix = f"old-{tag}."
+    domain_strings = [str(fqdn or ""), *compose_domains(compose_domains_raw).values()]
+    hosts: list[str] = []
+    for domain_str in domain_strings:
+        for part in domain_str.split(","):
+            host = normalise_host(part)
+            if host and host.startswith(prefix):
+                hosts.append(host)
+    return list(dict.fromkeys(hosts))
+
+
+def leftover_parking_refusals(source: Mapping[str, Any], *, name: str, tag: str) -> list[str]:
+    """Refuse a source whose domains an earlier migration parked and never gave back.
+
+    Not a judgement call. The tag is stable per project/environment, so a run
+    would read ``old-<tag>.shop`` as the source's domain: it would park it again
+    (``old-<tag>.old-<tag>.shop``), journal the PARKED host as the one to
+    restore, and create the target on it — the real domain then exists in no
+    record this tool can see. Checks applications (``fqdn``, compose domains)
+    and a service's applications alike.
+    """
+    found = leftover_parked_hosts(source.get("fqdn"), source.get("docker_compose_domains"), tag)
+    for app in source.get("applications") or []:
+        if isinstance(app, Mapping):
+            found.extend(leftover_parked_hosts(app.get("fqdn"), None, tag))
+    if not found:
+        return []
+    prefix = f"old-{tag}."
+    real = []
+    for host in dict.fromkeys(found):
+        while host.startswith(prefix):
+            host = host[len(prefix) :]
+        real.append(host)
+    return [
+        f"{name} still answers on {', '.join(dict.fromkeys(found))}, parked by an earlier "
+        f"migration of this project that never gave it back. Set its domain back to "
+        f"{', '.join(dict.fromkeys(real))} in Coolify and redeploy, then migrate — a run "
+        "now would park the parked host again and lose the real one."
+    ]
 
 
 # ── restoring ────────────────────────────────────────────────────────────────
