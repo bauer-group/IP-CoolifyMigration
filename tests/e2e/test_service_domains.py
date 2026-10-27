@@ -35,7 +35,7 @@ from bg_coolify_migrate.domain.plan import TransferMode
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy, Outcome
 from bg_coolify_migrate.engine import steps
 from bg_coolify_migrate.engine.planner import build_plan, server_uuid_of
-from bg_coolify_migrate.engine.runner import run_migration
+from bg_coolify_migrate.engine.runner import make_migration_id, rollback_migration, run_migration
 from bg_coolify_migrate.errors import VerificationError
 from bg_coolify_migrate.settings.base import Settings
 
@@ -318,3 +318,42 @@ async def test_a_domain_held_elsewhere_refuses_before_the_stop(
                 break
             await asyncio.sleep(5)
         assert await _service_on(api, stack["name"], str(rig["server_b"]["uuid"])) is None
+
+
+async def test_rollback_after_finalize_restores_service_domains(
+    api: CoolifyClient, settings: Settings, rig: dict[str, Any]
+) -> None:
+    """(D) RENAME to DONE, then roll back: the URLs come back BEFORE the restart.
+
+    FINALIZE released web's custom URL (the target held it). /restart re-parses
+    the stack and bakes its labels at job time, and a urls PATCH only writes the
+    database — so only a restore that lands first gives the restarted source a
+    router for its own host. The target, which still held the host, goes last.
+    """
+    async with _stack(api, settings, rig, web_port=":8443") as stack:
+        plan = await _plan(api, settings, rig, stack)
+        mid = make_migration_id(plan.project, plan.environment)
+        result = await run_migration(api, settings, plan, migration_id=mid)
+        assert result.outcome is Outcome.SUCCEEDED, f"migration did not succeed: {result}"
+        released = _apps(await api.get_resource("services", stack["uuid"]))
+        assert f"shop-{stack['sfx']}" not in _url(released["web"]), "FINALIZE kept the host"
+
+        back = await rollback_migration(api, settings, plan, mid)
+        assert back.outcome is Outcome.ROLLED_BACK, f"expected rollback, got {back}"
+
+        source = _apps(await api.get_resource("services", stack["uuid"]))
+        assert _url(source["web"]) == stack["web_url"], "the port-bearing URL was not restored"
+        for _ in range(24):
+            if await _service_on(api, stack["name"], str(rig["server_b"]["uuid"])) is None:
+                break
+            await asyncio.sleep(5)
+        assert await _service_on(api, stack["name"], str(rig["server_b"]["uuid"])) is None
+
+        async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source_host:
+            web = await _container(source_host, stack["uuid"], "web")
+            routed = await _routed_hosts(source_host, web)
+        if not routed:
+            pytest.skip("rig server-a generates no proxy labels (proxy type none)")
+        assert f"shop-{stack['sfx']}.e2e.invalid" in routed, (
+            f"the restarted source does not route its own host: {routed}"
+        )

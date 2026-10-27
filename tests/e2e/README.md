@@ -137,7 +137,18 @@ typo away from silently copying nothing.
   leave the source's hosts exactly as they were, and a domain held by a third
   resource must refuse CREATE before the source is stopped — with a PORTLESS
   URL, because from 4.3.15 a port-bearing one never 409s against a portless
-  holder.
+  holder. A rollback AFTER a `rename` finalize must put the released URL (port
+  included) back BEFORE the restart: the restarted `web` container routes the
+  custom host, and the target that held it is gone.
+- `test_domain_handover.py` — the make-before-break hand-over for an
+  application: watched before QUIESCE, DNS_GATE and FINALIZE, the source still
+  holds its real host (never an `old-…` one) while the target already does, and
+  FINALIZE's journalled release is what takes it from the source. And the DNS
+  gate per host: an app on `one.one.one.one` (resolves to Cloudflare's 1.1.1.1,
+  never a rig server, zone on Cloudflare — the plan warns) blocks as
+  `elsewhere`, `--accept-dns` does not pass it, `--accept-dns-host` does. Skips
+  when the workstation has no public DNS. Managed-DNS rows are not seeded (the
+  rig cannot reach Cloudflare); the record logic is unit-tested.
 - `test_rollback.py` — injects a fault after the volumes are copied and asserts
   the world is put back: target deleted from server-b, source still running on
   server-a with its data intact. This is what caught finding 15. Its two

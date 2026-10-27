@@ -22,6 +22,8 @@ that FINALIZE never ran (so the source was never renamed or deleted).
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import uuid as uuidlib
 from collections.abc import AsyncIterator
 from typing import Any
@@ -173,25 +175,24 @@ async def _labels(host: Any, container: str) -> dict[str, str]:
     return dict(json.loads(result.stdout.strip() or "{}"))
 
 
-@pytest_asyncio.fixture
-async def domained_app(
-    api: CoolifyClient, settings: Settings, rig: dict[str, Any]
+@contextlib.asynccontextmanager
+async def deploy_domained_app(
+    api: CoolifyClient, settings: Settings, rig: dict[str, Any], *, host: str | None = None
 ) -> AsyncIterator[dict[str, Any]]:
-    """An nginx dockerimage app on server-a, on a custom domain, deployed.
+    """An nginx dockerimage app on server-a, on custom domain ``host``, deployed.
 
-    Also the rig's smoke test for APPLICATIONS: every other e2e test migrates a
-    database or a service, so this is the first application the rig deploys.
-    If it never comes up, the fixture errors at setup, and the rollback verdict
-    below is not read against a rig that cannot run applications at all.
+    ``host`` defaults to a fresh ``rb-<sfx>.example.com``, which resolves
+    nowhere: the DNS gate reads it UNRESOLVED at plan time and at the gate, and
+    passes. Also the rig's smoke test for APPLICATIONS: every other e2e test
+    migrates a database or a service, so this is the first application the rig
+    deploys. If it never comes up, setup fails, and no verdict below is read
+    against a rig that cannot run applications at all.
     """
-    import asyncio
-    import contextlib
-
     suffix = uuidlib.uuid4().hex[:8]
     project = await api.post("/projects", {"name": f"rbd-{suffix}", "description": "bgcm rollback"})
     project_uuid = str(project["uuid"])
     app_name = f"web-{suffix}"
-    host_name = f"rb-{suffix}.example.com"
+    host_name = host or f"rb-{suffix}.example.com"
     try:
         app = await api.post(
             "/applications/dockerimage",
@@ -237,6 +238,15 @@ async def domained_app(
                         )
         with contextlib.suppress(Exception):
             await api.delete(f"/projects/{project_uuid}")
+
+
+@pytest_asyncio.fixture
+async def domained_app(
+    api: CoolifyClient, settings: Settings, rig: dict[str, Any]
+) -> AsyncIterator[dict[str, Any]]:
+    """:func:`deploy_domained_app` on a host that resolves nowhere."""
+    async with deploy_domained_app(api, settings, rig) as app:
+        yield app
 
 
 async def _assert_source_serves_its_domain(
