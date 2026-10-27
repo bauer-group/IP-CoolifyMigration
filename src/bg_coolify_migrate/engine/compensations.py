@@ -11,6 +11,8 @@ is recorded and the run reports honestly at the end.
 
 from __future__ import annotations
 
+import functools
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import structlog
@@ -101,15 +103,21 @@ async def _restore_source_domains(
     is unconditionally correct: the domain is the source's own, and the only
     thing that could still be holding it is the target being torn down.
     """
+    # service-domains: a service restore GETs, compares and PATCHes only what
+    # differs (api_resources.restore_service_urls) — never re-writing a live
+    # source that still holds its originals. Same 409 retry below.
+    send: Callable[[dict[str, Any]], Awaitable[Any]]
+    if collection == "services":
+        send = functools.partial(api_resources.restore_service_urls, ctx.api, source_uuid)
+    else:
+        send = functools.partial(ctx.api.update_resource, collection, source_uuid)
     try:
-        await ctx.api.update_resource(collection, source_uuid, restore_body)
+        await send(restore_body)
     except CoolifyApiError as exc:
         if exc.status_code != 409:
             raise
         log.warning("compensate.source_domains_conflict_forcing", uuid=source_uuid)
-        await ctx.api.update_resource(
-            collection, source_uuid, {**restore_body, "force_domain_override": True}
-        )
+        await send({**restore_body, "force_domain_override": True})
 
 
 async def undo_quiesce(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:

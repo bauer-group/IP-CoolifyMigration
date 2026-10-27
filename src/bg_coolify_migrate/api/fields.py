@@ -200,14 +200,19 @@ SERVICE_CREATE: frozenset[str] = frozenset(
 #: sits AFTER the extra-field rejection at line 332, which validates *both*
 #: branches against the first list (line 296) — the one without it. So a compose
 #: create carrying ``connect_to_docker_network`` is rejected 422 before line 505
-#: is ever reached. The field is settable only on update; ``create_service``
-#: carries it with a follow-up PATCH. Found by the e2e compose-service migration.
+#: is ever reached. The field is settable only on update; it is carried by the
+#: follow-up PATCH in ``resources.finish_service_target``, together with the
+#: domains. Found by the e2e compose-service migration.
 #:
 #: v4.5.0 finally accepts it on create (both arrays), but v4.1.2-v4.4.7 still
 #: reject it, and the PATCH works on all of them — so it stays a PATCH.
 SERVICE_CREATE_CUSTOM_COMPOSE: frozenset[str] = SERVICE_CREATE
 
 #: PATCH /v1/services/{uuid}. Unlike applications, compose IS updatable here.
+#: `urls` items are exactly {name, url} ('array:name,url', ServicesController
+#: v4.1.2:971, v4.5.0:1259) — any other key is a 422. force_domain_override reaches a target
+#: only when every conflicting holder is the source's own sub-application
+#: (resources.finish_service_target).
 SERVICE_UPDATE: frozenset[str] = frozenset(
     {
         "name",

@@ -327,6 +327,21 @@ files**. A rollback can also be run after a successful migration, and then those
 dumps are the only copy of everything written since the cutover. The log line
 `compensate.target_backup_files_kept` names where they are. Delete them yourself
 once you are sure.
+## CREATE refused a service's domains
+
+Both refusals come before the source is stopped: the created target is deleted
+and the source keeps serving.
+
+- **"the target has no sub-application(s) [...] to carry the source's domains
+  to"** — a service is created from this instance's *current* template catalog,
+  and the template now names those containers differently, so their domains
+  would be served by nothing. Migrate the service by hand, or re-create the
+  source from the current template first.
+- **"the target cannot claim its domain(s): Domain ... is already in use by
+  ..."** — another resource of the team, or the Coolify instance itself, holds a
+  hostname the service serves. The tool forces a domain away only from the
+  source service itself, never from anything else. Free it on the resource the
+  message names, then run again.
 
 ## `422 This field is not allowed`
 

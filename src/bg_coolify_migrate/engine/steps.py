@@ -367,7 +367,7 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
             # 409s on a duplicate. Journal the restore body BEFORE creating, so a
             # failed create still un-parks them on rollback. Server-bound domains are
             # remapped onto the target's wildcard and never collide, so park leaves
-            # them alone.
+            # them alone. A service is never parked; only its restore body is kept.
             restore_body = await api_resources.park_source_domains(
                 ctx.api, snapshot, source_full, source_wildcard=source_wildcard, tag=tag
             )
@@ -390,6 +390,14 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                 state="create_target",
                 detail={"target_uuids": dict(created), "parked_domains": dict(parked)},
             )
+
+            # A service's domains ride its sub-applications: carried by one PATCH
+            # now the uuid is journaled, and before copy_envs (4.5 derives the
+            # target's SERVICE_URL_* rows from them in that PATCH).
+            if snapshot.collection == "services":
+                await api_resources.finish_service_target(
+                    ctx.api, snapshot, placement, source_full, target_uuid
+                )
 
             await api_resources.copy_envs(
                 ctx.api,
@@ -1850,6 +1858,12 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
 
     for resource in ctx.plan.resources:
         snapshot = resource.snapshot
+        if snapshot.collection == "services" and policy is not FinalizePolicy.DELETE:
+            # The target holds the source's custom hosts now; a kept source too
+            # would be a second router on each once restarted. Never raises.
+            await api_resources.release_service_urls(
+                ctx.api, snapshot.uuid, source_wildcard=ctx.plan.source_server.wildcard_domain or None
+            )
         if policy is FinalizePolicy.KEEP:
             actions.append(f"kept {snapshot.name}")
             continue

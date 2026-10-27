@@ -1036,6 +1036,11 @@ class TestCreateTarget:
             return_value=httpx.Response(200, json={"uuid": "svc1", "name": "budibase"})
         )
         respx_mock.post(f"{BASE}/services").mock(return_value=httpx.Response(201, json={"uuid": "tgt1"}))
+        # finish_service_target reads the target's sub-applications; the source
+        # above has no domains, so nothing is PATCHed.
+        respx_mock.get(f"{BASE}/services/tgt1").mock(
+            return_value=httpx.Response(200, json={"uuid": "tgt1", "applications": []})
+        )
         respx_mock.get(f"{BASE}/services/svc1/envs").mock(return_value=httpx.Response(200, json=[]))
         respx_mock.get(f"{BASE}/services/svc1/tags").mock(return_value=httpx.Response(200, json=[]))
         respx_mock.get(f"{BASE}/services/svc1/scheduled-tasks").mock(

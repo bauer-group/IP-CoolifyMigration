@@ -159,6 +159,14 @@ Docker-compose applications keep a domain **per service** (Coolify's
 `docker_compose_domains`, not `domains`); each service's URL is rewritten the
 same way, so a compose stack keeps every service's address on the new server.
 
+Services keep a domain per **sub-application** (each container of the stack),
+and each is carried the same way: server-bound URLs rewritten, custom domains
+carried verbatim with their port, Coolify-generated `sslip.io` names left for the
+target to generate its own. A service's source is never written to before
+finalize. Under `keep` as well as `rename`, finalize then clears the custom
+domains from the stopped source, so restarting it by hand cannot put a second
+router on a hostname the target now serves.
+
 **Custom domains** — `shop.example.com` and the like. These are
 server-independent: they move *with* the app, by repointing their DNS record at
 the target. Because the target's proxy requests an ACME certificate the moment it

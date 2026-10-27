@@ -213,7 +213,8 @@ shipped inside a green unit suite. `tests/e2e/README.md` has the full table.
   `$allowedFields` in `create_service` — line 296 (without it) and line 505
   (with it) — but the extra-field rejection at line 332 runs against 296 for
   BOTH the templated and the compose branch, so 505 never applies to validation.
-  It is settable only on update. `create_service` sends it via a follow-up PATCH.
+  It is settable only on update. `finish_service_target` sends it in the
+  follow-up PATCH that carries the domains, after the target uuid is journaled.
   This broke the compose-service (90%) migration until the e2e suite hit it —
   a source-reading whitelist that matched the wrong one of two arrays. v4.5.0
   finally accepts it on create; 4.1.2-4.4.7 do not, so it stays a PATCH.
@@ -294,6 +295,42 @@ the release it starts in — read that module before adding a rule.
   (`database_tls_identity_warning`, which carrying TLS must not silence). Dragonfly
   serves TLS on 6379 itself, Redis/KeyDB on an extra 6380. A carried `*_conf` that
   turns TLS on by itself is refused: the target gets the config, not the certs.
+
+### Service domains (release tags v4.1.2 -> v4.5.0)
+
+- **A service's domains live on its sub-applications** (`applications[].fqdn`);
+  the service has none. The proxy labels are generated from that column
+  (parsers.php v4.5.0:3389), so it is what CREATE carries — with ONE
+  `PATCH /services/{target}` `{"urls": [{name, url}]}`, the only write path valid
+  on every release (items are exactly `{name, url}`, ServicesController
+  v4.1.2:971, v4.5.0:1259; the per-sub-application PATCH exists only from 4.2).
+- **Read `url` before `fqdn`.** From 4.3.15 the port of a saved domain moves into
+  the hidden `domain_port_overrides`; the model appends `url`, which re-composes
+  it (ServiceApplication v4.5.0:18,215-242). Generated sslip hosts name the
+  SOURCE's uuid and IP and are never carried.
+- **Services are NOT parked.** Every `PATCH /services` re-parses the compose
+  before it applies `urls` (v4.5.0:1338), and on 4.5 `applyServiceUrls` rewrites
+  the SERVICE_URL_*/SERVICE_FQDN_* rows at once (`updateCompose`, v4.5.0:214) — so
+  parking would rewrite a LIVE source and couple every rollback to restoring
+  before `/restart`. Instead the target claims the hosts with
+  `force_domain_override`, and only when every `conflicts[].resource_uuid` of the
+  409 is one of the source's own sub-applications (that field is the holder's
+  uuid, `null` for the instance's own domain: domains.php v4.5.0:250-335). Any
+  other holder is refused before the stop. FINALIZE releases the source's custom
+  hosts (url `""` -> null) under KEEP as well as RENAME: the park tag is the
+  project/environment digest, not per run, and a kept source holding the target's
+  host is a second router the moment someone restarts it.
+- **The conflict check is port-blind against a portless holder (4.3.15+):** the
+  request key keeps its port, the stored fqdn lost it, so a port-bearing URL never
+  409s against the same host saved without one. Do not rely on a 409 to detect a
+  double claim of a port-bearing URL.
+- **From 4.4 a removed hostname queues `ReleaseRemovedDnsHostnamesJob`**, which
+  deletes a Coolify-managed DNS record no live resource uses (v4.5.0
+  ServicesController:125-145). Removing a host from a live source before the
+  target holds it can delete its record; at FINALIZE the target already uses it.
+- **A restore must not write a source that already holds its originals**
+  (`restore_service_urls` GETs, compares, PATCHes only the difference): the same
+  re-parse and `updateCompose` apply to it.
 
 ## Verify + ship
 
