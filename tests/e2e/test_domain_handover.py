@@ -19,6 +19,9 @@
     Cloudflare (so the 4.4+ plan warning shows too). Skips when the workstation
     has no public DNS.
 
+(D) FINALIZE re-reads the target before the source lets go: a host the target
+    lost since CREATE stays on the source, and the run names it.
+
 Managed-DNS rows are NOT seeded here: that needs an IntegrationToken, a zone and
 a record through tinker, and the rig cannot reach Cloudflare anyway. The record
 logic is unit-tested (tests/test_rollback_domains*.py); this pins the order.
@@ -143,3 +146,44 @@ async def test_a_host_resolving_elsewhere_blocks_until_accepted_by_name(
         assert done.outcome is Outcome.SUCCEEDED, f"accepting the host should pass: {done}"
         gate = Journal.open(settings.resolved_state_dir(), mid).undo_info("dns_gate")
         assert gate.get("accepted") == [ELSEWHERE_HOST], gate
+
+
+async def test_finalize_keeps_a_host_the_target_lost_on_the_source(
+    api: CoolifyClient, settings: Settings, rig: dict[str, Any]
+) -> None:
+    """(D) FINALIZE re-reads the target: a host it lost since CREATE stays on the source.
+
+    A deploy can drop a target's domain after CREATE claimed it — a dockercompose
+    app reloads its compose from git on every deploy and loses the entry of a
+    service renamed there. The rig cannot push to a repository, so the loss is
+    made directly: just before FINALIZE the target's domain is changed to
+    another host. Releasing the source then would leave the real host held by
+    nothing (from 4.4 Coolify deletes a record it manages); it must stay put,
+    and the run must say so.
+    """
+    async with deploy_domained_app(api, settings, rig) as app:
+        real = f"http://{app['host']}"
+        plan = await _plan(api, settings, rig, app, FinalizePolicy.KEEP)
+
+        async def lose_the_host(state: State) -> None:
+            if state is not State.FINALIZE:
+                return
+            target = await _app_on(api, app["app_name"], str(rig["server_b"]["uuid"]))
+            assert target is not None, "no target before FINALIZE"
+            await api.update_resource(
+                "applications",
+                str(target["uuid"]),
+                {"domains": f"http://moved-{app['host']}"},
+            )
+
+        mid = make_migration_id(plan.project, plan.environment)
+        result = await run_migration(
+            api, settings, plan, migration_id=mid, on_state=lose_the_host
+        )
+        assert result.outcome is Outcome.SUCCEEDED, f"migration did not succeed: {result}"
+        assert any(
+            f"no longer holds {app['host']}" in notice for notice in result.notices
+        ), result.notices
+
+        source = await api.get_resource("applications", app["app_uuid"])
+        assert source.get("fqdn") == real, "the source let go of a host no target holds"

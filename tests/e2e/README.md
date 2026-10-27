@@ -148,7 +148,10 @@ typo away from silently copying nothing.
   never a rig server, zone on Cloudflare — the plan warns) blocks as
   `elsewhere`, `--accept-dns` does not pass it, `--accept-dns-host` does. Skips
   when the workstation has no public DNS. Managed-DNS rows are not seeded (the
-  rig cannot reach Cloudflare); the record logic is unit-tested.
+  rig cannot reach Cloudflare); the record logic is unit-tested. And FINALIZE
+  re-reads the target: the target's domain is changed just before FINALIZE (what
+  a compose reload does to a service renamed in git), the run still succeeds,
+  names the lost host, and the source keeps its real host.
 - `test_rollback.py` — injects a fault after the volumes are copied and asserts
   the world is put back: target deleted from server-b, source still running on
   server-a with its data intact. This is what caught finding 15. Its two

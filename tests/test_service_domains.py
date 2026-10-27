@@ -653,6 +653,11 @@ class TestFinalize:
         respx_mock.get(f"{BASE}/services/svc1").mock(
             return_value=httpx.Response(200, json=_source())
         )
+        # The target holds the same hosts: released only then.
+        ctx.target_uuids["svc1"] = "svcT"
+        respx_mock.get(f"{BASE}/services/svcT").mock(
+            return_value=httpx.Response(200, json=_source())
+        )
         patch = respx_mock.patch(f"{BASE}/services/svc1").mock(
             return_value=httpx.Response(200, json={})
         )

@@ -537,7 +537,11 @@ why `domain/domains.py` hands every hostname over make-before-break.
   A deleted record is never recreated.
 - **So holding the hostname is what protects a record.** CREATE never writes
   the source; the target claims the host while the source still holds it;
-  FINALIZE releases the source last (the target holds it); a rollback restores
+  FINALIZE releases the source last, and only once the target is READ to hold
+  every one of those hosts right then (`steps._target_still_holds`): every deploy
+  of a dockercompose app reloads its compose from the branch HEAD and drops the
+  domain of a service renamed there since CREATE (reconcileDockerComposeDomains,
+  v4.5.0:2409-2431), and HEALTHCHECK sees containers, not domains. A rollback restores
   the source first and deletes a host-holding target only once the source holds
   its hosts again (`compensations._source_lacks_its_hosts`), keeping the target
   — stopped, harmless — otherwise. Up to 2.9 CREATE parked the source first,

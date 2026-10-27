@@ -533,6 +533,19 @@ domain live again.
 another resource claims the same domain. We override a conflict only with this
 migration's own sources and targets; anything else is yours to decide.
 
+### `... still holds its custom domains: its target ... no longer holds ...`
+
+FINALIZE re-reads each target before the source lets go of its custom domains,
+and this target no longer holds the ones named. The usual cause is a
+dockercompose app: every deploy reloads its compose from the branch, and a
+service renamed or removed there since the target was created loses its domain.
+Releasing the domain from the source too would leave it held by nothing — and
+from Coolify 4.4 that deletes a DNS record Coolify manages at Cloudflare. So the
+stopped source keeps it, and the run still succeeds. Give the target the domain
+in Coolify (on the service that serves it now), then remove it from the source
+before anyone restarts the source. The same notice with `could not be read`
+means the target's or source's GET failed; check both by hand.
+
 ### `target(s) KEPT, holding custom domains their source does not hold`
 
 A rollback deletes a target that holds custom domains only once its source holds

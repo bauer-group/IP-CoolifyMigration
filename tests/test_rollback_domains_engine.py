@@ -752,6 +752,10 @@ class TestFinalizeReleasesLast:
         respx_mock.get(f"{BASE}/applications/app1").mock(
             return_value=httpx.Response(200, json={"uuid": "app1", "fqdn": SHOP})
         )
+        ctx.target_uuids["app1"] = "appT"
+        respx_mock.get(f"{BASE}/applications/appT").mock(
+            return_value=httpx.Response(200, json={"uuid": "appT", "fqdn": SHOP})
+        )
         respx_mock.patch(f"{BASE}/applications/app1").mock(side_effect=patch)
         return order
 
@@ -788,6 +792,60 @@ class TestFinalizeReleasesLast:
 
         assert result["domains_released"] == []
         assert "still holds its custom domains" in ctx.notices[0]
+
+    async def test_a_host_the_target_lost_since_create_is_not_released(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        # A compose service renamed upstream while the run waited at the DNS
+        # gate: the deploy dropped its domain from the target. Releasing it on
+        # the source too would leave it held by nothing - and from 4.4 Coolify
+        # then deletes the DNS record it manages.
+        ctx.plan = ctx.plan.model_copy(update={"finalize_policy": FinalizePolicy.RENAME})
+        order = self._finalize_routes(ctx, respx_mock)
+        respx_mock.get(f"{BASE}/applications/appT").mock(
+            return_value=httpx.Response(200, json={"uuid": "appT", "fqdn": None})
+        )
+
+        result = await steps.step_finalize(ctx)
+
+        assert order == ["rename"]
+        assert result["domains_released"] == []
+        assert "no longer holds shop.example.com" in ctx.notices[0]
+
+    def test_a_compose_entry_the_target_dropped_is_named(self) -> None:
+        from bg_coolify_migrate.domain import domains
+
+        snapshot = ResourceSnapshot(
+            uuid="app1",
+            name="shop",
+            collection="applications",
+            kind=ResourceKind.APP_GIT_COMPOSE,
+            git_repository="acme/shop",
+            git_branch="main",
+            git_auth=GitAuth.PUBLIC,
+        )
+        api = "https://api.example.com"
+        source = {
+            "docker_compose_domains": json.dumps(
+                {"web": {"domain": SHOP}, "api": {"domain": api}}
+            )
+        }
+        target = {"docker_compose_domains": json.dumps({"api": {"domain": api}})}
+        assert domains.custom_hosts_not_held(
+            snapshot, source, target, source_wildcard=None
+        ) == ["shop.example.com"]
+
+    async def test_a_target_that_cannot_be_read_releases_nothing(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        ctx.plan = ctx.plan.model_copy(update={"finalize_policy": FinalizePolicy.KEEP})
+        order = self._finalize_routes(ctx, respx_mock)
+        respx_mock.get(f"{BASE}/applications/appT").mock(return_value=httpx.Response(500))
+
+        result = await steps.step_finalize(ctx)
+
+        assert order == [] and result["domains_released"] == []
+        assert "could not be read" in ctx.notices[0]
 
     async def test_delete_releases_by_deleting(
         self, ctx: MigrationContext, respx_mock: respx.Router

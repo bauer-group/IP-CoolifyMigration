@@ -265,7 +265,11 @@ A custom domain (`shop.example.com`) always has a live holder of this migration:
 * **FINALIZE releases the source's custom hosts last** — after the rename and
   the key revoke, journalled before it happens — under `keep` and `rename` alike
   (`delete` releases them by deleting). Server-bound and generated hosts stay
-  on the source.
+  on the source. Each source is released only once its target is read to hold
+  every one of them right then: a deploy can drop a compose service's domain
+  (the compose is reloaded from git, and a service renamed there since CREATE
+  loses its entry). Otherwise the stopped source keeps them and the run report
+  says which host the target lost.
 * **A rollback before FINALIZE writes nothing to the source's domains**: it never
   lost them. After FINALIZE the source gets them back BEFORE it is restarted, and
   a target that holds them is deleted only once the source holds them again. If

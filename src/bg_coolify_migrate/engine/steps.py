@@ -2276,11 +2276,13 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
 
     Releasing the source's custom hosts is its LAST source mutation — after the
     rename, the unpin and the key revoke — and journalled before it happens. It
-    is the "break" of make-before-break (domain/domains.py): the target holds
-    every one of those hosts since CREATE, so Coolify only ever re-references a
-    managed DNS record and never deletes one. KEEP releases them too: a kept
-    source still holding them is a second router and ACME requester the moment
-    anyone restarts it. DELETE releases by deleting.
+    is the "break" of make-before-break (domain/domains.py): a source lets go
+    only once its target is read to hold every one of those hosts right then
+    (:func:`_target_still_holds` — CREATE proved it once, a deploy since can
+    undo it), so Coolify only ever re-references a managed DNS record and never
+    deletes one. KEEP releases them too: a kept source still holding them is a
+    second router and ACME requester the moment anyone restarts it. DELETE
+    releases by deleting.
     """
     policy = ctx.plan.finalize_policy
     stamp = ctx.migration_id.split("-")[-1]
@@ -2363,6 +2365,8 @@ async def _release_source_domains(ctx: MigrationContext) -> list[str]:
         snapshot = resource.snapshot
         if snapshot.uuid not in owners:
             continue
+        if not await _target_still_holds(ctx, snapshot, source_wildcard=source_wildcard):
+            continue
         if await api_resources.release_source_domains(
             ctx.api, snapshot, source_wildcard=source_wildcard
         ):
@@ -2374,6 +2378,54 @@ async def _release_source_domains(ctx: MigrationContext) -> list[str]:
             "restarts it, or it requests certificates for them next to the target."
         )
     return released
+
+
+async def _target_still_holds(
+    ctx: MigrationContext, snapshot: ResourceSnapshot, *, source_wildcard: str | None
+) -> bool:
+    """Does the target still hold every custom host its source would release?
+
+    CREATE proved it once, and a deploy can undo that: every deploy of a
+    dockercompose app reloads its compose from the branch HEAD and drops the
+    docker_compose_domains entry of a service the new compose no longer has
+    (Application::reconcileDockerComposeDomains, v4.3.10:2219, v4.5.0:2409-2431)
+    — a rename pushed while the run sat at the DNS gate is enough. HEALTHCHECK
+    sees containers, not domains. Releasing then removes the LAST holder, and
+    from 4.4 Coolify deletes a DNS record it manages. So the source keeps its
+    hosts — stopped, harmless until someone restarts it — and the run says so.
+    A target or source that cannot be read keeps them too.
+    """
+    target_uuid = ctx.target_uuids.get(snapshot.uuid)
+    try:
+        if not target_uuid:
+            raise LookupError("no target was recorded for it")
+        source = await ctx.api.get_resource(snapshot.collection, snapshot.uuid)
+        target = await ctx.api.get_resource(snapshot.collection, target_uuid)
+    except Exception as exc:
+        reason = (str(exc).splitlines() or [type(exc).__name__])[0]
+        log.warning("finalize.target_hosts_unreadable", uuid=snapshot.uuid, error=reason[:200])
+        ctx.notices.append(
+            f"{snapshot.name} (the stopped source) still holds its custom domains: whether "
+            f"its target holds them could not be read ({reason[:120]}), "
+            "and they are released only to a target that does. Check the target's domains "
+            "in Coolify, then remove them from the source before anyone restarts it."
+        )
+        return False
+    lost = domains.custom_hosts_not_held(
+        snapshot, source, target, source_wildcard=source_wildcard
+    )
+    if not lost:
+        return True
+    log.error("finalize.target_lost_hosts", uuid=snapshot.uuid, target=target_uuid, hosts=lost)
+    ctx.notices.append(
+        f"{snapshot.name} (the stopped source) still holds its custom domains: its target "
+        f"{target_uuid} no longer holds {', '.join(lost)} - a deploy reloads a compose from "
+        "git and drops the domain of a service renamed or removed there since CREATE - so "
+        "releasing them would leave them held by nothing (from Coolify 4.4 that deletes a "
+        "DNS record Coolify manages). Give the target its domains back in Coolify, then "
+        "remove them from the source before anyone restarts it."
+    )
+    return False
 
 
 async def _unpin_target(ctx: MigrationContext) -> pins.Release:

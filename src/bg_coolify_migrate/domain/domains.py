@@ -253,6 +253,29 @@ def held_hosts(resource: Mapping[str, Any]) -> set[str]:
     return hosts
 
 
+def custom_hosts_not_held(
+    snapshot: ResourceSnapshot,
+    source: Mapping[str, Any],
+    target: Mapping[str, Any],
+    *,
+    source_wildcard: str | None,
+) -> list[str]:
+    """The custom hosts a source GET holds that its target GET does not. PURE.
+
+    What FINALIZE must not release: the source letting go of a host no target
+    holds leaves it routed by nothing, and from 4.4 Coolify then deletes a DNS
+    record it manages. A service's route-key rows are not compared — no GET of a
+    holder reads them (:func:`held_hosts`), and the target re-parses its own
+    stored compose, so nothing drops them after CREATE.
+    """
+    held = held_hosts(target)
+    return [
+        h
+        for h in source_custom_hosts(snapshot, source, source_wildcard=source_wildcard)
+        if h not in held
+    ]
+
+
 def body_hosts(body: Mapping[str, Any]) -> list[str]:
     """Every host a journalled restore body names, deduplicated, in order."""
     values: list[str] = []
