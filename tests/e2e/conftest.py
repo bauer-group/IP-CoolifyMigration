@@ -110,15 +110,13 @@ async def psql(host: RemoteHost, container: str, sql: str) -> str:
 
     `-v ON_ERROR_STOP=1` plus `.check()`: psql exits 0 on a failed statement by
     default, so without both a broken seed reports success and the assertion
-    fires somewhere far away.
+    fires somewhere far away. Retried only while postgres is still restarting
+    out of its first-boot init server (:func:`db_exec_when_ready`): pg_isready
+    already answers for that temporary server.
     """
-    result = await host.run(
-        f"docker exec -i {container} psql -U {DB_USER} -d {DB_NAME} -tA -v ON_ERROR_STOP=1",
-        input_text=sql,
-        timeout=60,
+    return await db_exec_when_ready(
+        host, container, f"psql -U {DB_USER} -d {DB_NAME} -tA -v ON_ERROR_STOP=1", stdin=sql
     )
-    result.check()
-    return result.stdout.strip()
 
 
 async def wait_for_container(host: RemoteHost, name: str, *, timeout: float = 180) -> None:
@@ -236,7 +234,7 @@ async def seeded_pg(
         db_uuid = str(db["uuid"])
         async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source:
             await wait_until_healthy(source, db_uuid)
-            await db_exec(
+            await db_exec_when_ready(
                 source,
                 db_uuid,
                 "psql -U shop -d shopdb -tA -v ON_ERROR_STOP=1",
