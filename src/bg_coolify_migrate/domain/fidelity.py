@@ -330,10 +330,17 @@ def service_warnings(source: dict[str, Any]) -> list[str]:
     return out
 
 
-def database_warnings(source: dict[str, Any]) -> list[str]:
+def database_warnings(
+    source: dict[str, Any], *, engine: DatabaseEngine | None = None, tls_carried: bool = False
+) -> list[str]:
+    out: list[str] = []
     if source.get("include_coolify_default_variables") is False:
-        return [_DEFAULT_VARIABLES_WARNING]
-    return []
+        out.append(_DEFAULT_VARIABLES_WARNING)
+    if lost := database_tls_lost_warning(source, engine=engine, carried=tls_carried):
+        out.append(lost)
+    if identity := database_tls_identity_warning(source, engine=engine):
+        out.append(identity)
+    return out
 
 
 def unsupported_engine_refusal(source: dict[str, Any]) -> str:
@@ -344,6 +351,242 @@ def unsupported_engine_refusal(source: dict[str, Any]) -> str:
         "data in a volume applications mount directly, and this tool cannot recreate "
         "that pairing through the API. Migrate it by hand."
     )
+
+
+# ── database TLS ─────────────────────────────────────────────────────────────
+#
+# Standalone database TLS is two columns, readable in every GET since
+# v4.0.0-beta.399 (fillable, not $hidden, no cast — StandalonePostgresql
+# v4.5.0:49-50,71-91) and settable through NO create or update $allowedFields and
+# no dedicated route at any tag v4.1.2-v4.5.0. The only API path that carries them
+# is POST /databases/{uuid}/clone (v4.3.0+, routes/api.php:340), a whole-row
+# server-side copy this tool does not create through. Every create helper only
+# fill()s validated request fields (bootstrap/helpers/databases.php v4.5.0:83-95),
+# so a target always gets the column default — false for every engine since
+# beta.400 (migration 2025_03_26_104103). The reverse flip (source off, target on)
+# therefore cannot happen.
+#
+# Read here from enable_ssl / ssl_mode / the engine ONLY — never from file
+# storages: on a TLS source those carry server.key, and the storages GET returns
+# its content to a read:sensitive token (DatabasesController v4.5.0:138-145).
+# The plan is written by runner.save_plan without the journal's secret guard, so
+# how these lines are built is the only thing keeping a secret out of them.
+
+#: The TLS columns. Kept out of api/fields.py on purpose (no array accepts them);
+#: test_database_tls_is_still_unsettable fails the day a release does.
+DATABASE_TLS_FIELDS: frozenset[str] = frozenset({"enable_ssl", "ssl_mode"})
+
+#: Only these engines have an ssl_mode column (migration 2025_01_27_102616).
+_SSL_MODE_ENGINES = frozenset(
+    {DatabaseEngine.POSTGRESQL, DatabaseEngine.MYSQL, DatabaseEngine.MONGODB}
+)
+_SSL_MODE_SHAPE = re.compile(r"[A-Za-z_-]{1,32}")
+
+
+def _tls_on(value: object) -> bool:
+    """No model casts enable_ssl, so accept what PDO may hand back. Absent is off."""
+    return value is True or value in (1, "1", "t", "true")
+
+
+def _ssl_mode(source: dict[str, Any], engine: DatabaseEngine | None) -> str | None:
+    mode = source.get("ssl_mode") if engine in _SSL_MODE_ENGINES else None
+    return mode if isinstance(mode, str) and _SSL_MODE_SHAPE.fullmatch(mode) else None
+
+
+#: What a client of the source sees once the target serves plaintext. Evidence
+#: per engine at v4.5.0: StartMysql:189-197 / StartMariadb:186-193
+#: (--require-secure-transport=1), StartMongodb:205-241 (--tlsMode),
+#: StartRedis:313 / StartKeydb:309 (--tls-port 6380), StartDragonfly:204-213
+#: (--tls on the main port, no plaintext — FlushDatabase:18-19 agrees),
+#: StartPostgresql:192-198 (ssl=on only; the mode is enforced client-side).
+_TLS_LOST_CONSEQUENCE: dict[DatabaseEngine, str] = {
+    DatabaseEngine.POSTGRESQL: (
+        "Clients connecting with sslmode=require, verify-ca or verify-full — Coolify's "
+        "own connection URL carries the mode — fail against it; prefer/allow fall back "
+        "to plaintext unnoticed. If pg_hba.conf in the data directory uses hostssl "
+        "rules, the target refuses EVERY TCP client while its health check still passes."
+    ),
+    DatabaseEngine.MYSQL: (
+        "The source refuses plaintext (require_secure_transport); the target accepts "
+        "it, and clients with ssl-mode=VERIFY_CA/VERIFY_IDENTITY fail."
+    ),
+    DatabaseEngine.MARIADB: (
+        "The source refuses plaintext (require_secure_transport); the target accepts "
+        "it, and clients that require TLS fail."
+    ),
+    DatabaseEngine.MONGODB: (
+        "Clients with tls=true — Coolify's own connection URL carries it — fail to "
+        "connect. Coolify switched TLS on by migration for every MongoDB that existed "
+        "at v4.0.0-beta.399 or was created before beta.400, so it may be on here "
+        "without anyone having chosen it."
+    ),
+    DatabaseEngine.REDIS: (
+        "The source serves TLS on port 6380 next to 6379; rediss://…:6380 clients get "
+        "connection refused."
+    ),
+    DatabaseEngine.KEYDB: (
+        "The source serves TLS on port 6380 next to 6379; rediss://…:6380 clients get "
+        "connection refused."
+    ),
+    DatabaseEngine.DRAGONFLY: (
+        "The source serves TLS on its main port 6379 (no plaintext); the target serves "
+        "plaintext there, so rediss:// clients fail and plaintext clients now connect."
+    ),
+}
+
+
+def database_tls_lost_warning(
+    source: dict[str, Any], *, engine: DatabaseEngine | None, carried: bool
+) -> str | None:
+    """The source serves TLS and the target will not. None when TLS is carried.
+
+    A WARNING, not a refusal: the database deploys and runs fine without TLS, and
+    whether its clients need TLS is the operator's call about their stack. The
+    target is never public either way (create_database forces is_public=False).
+    """
+    if carried or not _tls_on(source.get("enable_ssl")):
+        return None
+    mode = _ssl_mode(source, engine)
+    consequence = (engine is not None and _TLS_LOST_CONSEQUENCE.get(engine)) or (
+        "Clients that require TLS fail to connect."
+    )
+    return (
+        f"TLS is on for this database{f' (ssl_mode={mode!r})' if mode else ''}, but no "
+        "create or update field and no dedicated route carries enable_ssl/ssl_mode "
+        "(Coolify 4.1.2-4.5.0), so the target starts WITHOUT TLS. "
+        f"{consequence} "
+        # HasDatabaseStatusInfo::instantSaveSSL (v4.5.0:105-118) only saves the
+        # column, and StartPostgresql & co. apply it at the next start — so a
+        # toggle on the stopped target before START costs no outage at all.
+        "The target is created stopped before the source is quiesced. Toggle SSL on "
+        f"it in the UI as soon as it appears{f' (same mode, {mode!r})' if mode else ''} "
+        "so its first start already serves TLS; otherwise toggle it and restart it "
+        "right after cutover."
+    )
+
+
+def database_tls_identity_warning(
+    source: dict[str, Any], *, engine: DatabaseEngine | None
+) -> str | None:
+    """The target's certificate identity differs, however TLS gets there.
+
+    Kept apart from the lost warning on purpose: carrying TLS (by hand today, by
+    a clone-based create some day) must not silence this. StartPostgresql
+    v4.5.0:47-87 takes the CA of the DESTINATION server (Server::ensureCaCertificate)
+    and issues CN = the database uuid, SAN = DNS:<uuid> + IP:<that server's IP>
+    (SslHelper v4.5.0:53,76,162); each server's CA lives at
+    /data/coolify/ssl/coolify-ca.crt on that server (SslHelper v4.5.0:243-256).
+    """
+    if not _tls_on(source.get("enable_ssl")):
+        return None
+    mode = _ssl_mode(source, engine)
+    client_certs = (
+        " The source also demands client certificates (ssl_mode='verify-full'): "
+        "clients must present ones signed by the target server's CA instead."
+        if engine is DatabaseEngine.MONGODB and mode == "verify-full"
+        else ""
+    )
+    return (
+        "once TLS is on for the target, its certificate is issued by the TARGET "
+        "server's CA (/data/coolify/ssl/coolify-ca.crt on that server) for the "
+        "target's new uuid and IP — not by the source server's. Clients that verify "
+        "the server (verify-ca/verify-full, ssl-ca, tlsCAFile) or pin the source "
+        "server's CA must be given the target's." + client_certs
+    )
+
+
+#: Directives in a carried engine config that switch TLS on by themselves. Fixed
+#: labels, so a refusal names WHICH directive without echoing the config (whose
+#: other lines may hold a password). Anchored to non-comment lines, and the
+#: explicit-off forms (tls-port 0, require_secure_transport=OFF, mode: disabled)
+#: do not count — those cannot fail the target. Each pattern follows its engine's
+#: own grammar, not the canonical spelling: postgresql.conf makes the ``=``
+#: optional and takes any unambiguous boolean prefix (``t``, ``ye``; never the
+#: ambiguous ``o``), Redis lowercases directive names, my.cnf accepts a
+#: ``loose-`` prefix, and mongod.conf is YAML, so flow style is valid.
+_Directives = tuple[tuple[str, re.Pattern[str]], ...]
+
+_POSTGRES_TLS: _Directives = (
+    (
+        "ssl",
+        re.compile(
+            r"^\s*ssl(?:\s*=\s*|\s+)'?(on|t|tr|tru|true|y|ye|yes|1)'?\s*(#|$)", re.M | re.I
+        ),
+    ),
+)
+#: MySQL and MariaDB read the same my.cnf options.
+_MY_CNF_TLS: _Directives = (
+    ("ssl-cert", re.compile(r"^\s*(?:loose[-_])?ssl[-_]cert\s*=", re.M | re.I)),
+    ("ssl-key", re.compile(r"^\s*(?:loose[-_])?ssl[-_]key\s*=", re.M | re.I)),
+    ("ssl-ca", re.compile(r"^\s*(?:loose[-_])?ssl[-_]ca\s*=", re.M | re.I)),
+    (
+        "require_secure_transport",
+        re.compile(
+            r"^\s*(?:loose[-_])?require[-_]secure[-_]transport\s*(=\s*(on|1|true)\b|$)",
+            re.M | re.I,
+        ),
+    ),
+)
+#: Redis and its fork KeyDB share the keys.
+_REDIS_CONF_TLS: _Directives = (
+    ("tls-port", re.compile(r"^\s*tls-port\s+['\"]?[1-9]", re.M | re.I)),
+    ("tls-cert-file", re.compile(r"^\s*tls-cert-file\s", re.M | re.I)),
+    ("tls-key-file", re.compile(r"^\s*tls-key-file\s", re.M | re.I)),
+)
+#: mongod.conf YAML; the ssl/PEMKeyFile spellings are mongod's pre-4.2 aliases.
+_MONGO_CONF_TLS: _Directives = (
+    (
+        "net.tls.mode",
+        re.compile(r"^[^#\n]*\bmode\s*:\s*['\"]?(require|prefer|allow)(TLS|SSL)\b", re.M),
+    ),
+    ("certificateKeyFile", re.compile(r"^[^#\n]*\b(certificateKeyFile|PEMKeyFile)\s*:", re.M)),
+)
+
+#: Engine -> (the carried config field, its TLS directives). Dragonfly has no
+#: config field and ClickHouse no TLS at all (supportsSsl() is false).
+_TLS_CONFIG_DIRECTIVES: dict[DatabaseEngine, tuple[str, _Directives]] = {
+    DatabaseEngine.POSTGRESQL: ("postgres_conf", _POSTGRES_TLS),
+    DatabaseEngine.MYSQL: ("mysql_conf", _MY_CNF_TLS),
+    DatabaseEngine.MARIADB: ("mariadb_conf", _MY_CNF_TLS),
+    DatabaseEngine.MONGODB: ("mongo_conf", _MONGO_CONF_TLS),
+    DatabaseEngine.REDIS: ("redis_conf", _REDIS_CONF_TLS),
+    DatabaseEngine.KEYDB: ("keydb_conf", _REDIS_CONF_TLS),
+}
+
+
+def database_tls_config_refusals(
+    source: dict[str, Any], *, engine: DatabaseEngine | None
+) -> list[str]:
+    """A TLS source whose carried engine config turns TLS on by itself.
+
+    The *_conf fields are carried verbatim, but the certificate mounts that
+    Coolify's SSL setting adds are not (and the setting itself never arrives), so
+    the target points its engine at certificate files that do not exist there: it
+    fails to start — or refuses every client — after the source is stopped. That
+    is not a judgement, so it refuses. Silent unless the source has TLS on: a
+    config that enables TLS against files in its own data volume works on the
+    target, because the volume is copied.
+    """
+    if engine is None or not _tls_on(source.get("enable_ssl")):
+        return []
+    spec = _TLS_CONFIG_DIRECTIVES.get(engine)
+    if spec is None:
+        return []
+    field, directives = spec
+    config = source.get(field)
+    if not isinstance(config, str) or not config.strip():
+        return []
+    found = [label for label, pattern in directives if pattern.search(config)]
+    if not found:
+        return []
+    return [
+        f"TLS is on for this database and its custom configuration turns TLS on by "
+        f"itself ({field} sets {', '.join(found)}). The target gets that configuration "
+        "verbatim but neither the SSL setting nor the source's certificate files, so "
+        "after the source is stopped it would fail to start or refuse every client. "
+        "Remove the TLS lines from the source's custom configuration — Coolify's SSL "
+        "setting applies TLS on its own — then migrate; or migrate this database by hand."
+    ]
 
 
 # ── compose ──────────────────────────────────────────────────────────────────

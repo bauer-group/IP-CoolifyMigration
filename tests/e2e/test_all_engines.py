@@ -34,7 +34,7 @@ from bg_coolify_migrate.engine.runner import run_migration
 from bg_coolify_migrate.settings.base import Settings
 from bg_coolify_migrate.transfer.ssh import SshError
 
-from .conftest import db_exec, ssh_to, wait_until_healthy
+from .conftest import db_exec, ssh_to, tinker, wait_until_healthy
 
 pytestmark = [pytest.mark.e2e, pytest.mark.asyncio]
 
@@ -339,3 +339,152 @@ async def _target_db(api: CoolifyClient, original_name: str, target_server: str)
         if server_uuid_of(full) == target_server:
             return str(db["uuid"])
     return None
+
+
+# ── database TLS ─────────────────────────────────────────────────────────────
+# enable_ssl/ssl_mode are settable through no API route, so a target always
+# starts plaintext (fidelity.database_tls_lost_warning). Postgres only: the
+# other engines differ in the warning's text, which the unit tests cover. This is
+# also the first TLS source through QUIESCE/DISCOVER, where its certificate bind
+# mounts and file-storage rows could have been refused or half-copied.
+
+TLS_ENGINES = [e for e in ENGINES if e.path == "postgresql"]
+
+
+async def _enable_tls(
+    api: CoolifyClient, settings: Settings, rig: dict[str, Any], db_uuid: str, *, restart: bool
+) -> None:
+    """Switch TLS on for a deployed Postgres, the way the UI's toggle does.
+
+    instantSaveSSL only saves the column (HasDatabaseStatusInfo v4.5.0:105-118)
+    and no API accepts it, so this is a tinker write — test setup, like
+    bootstrap.py's API switch, never tool behaviour.
+    """
+    assert db_uuid.isalnum(), db_uuid  # it is interpolated into PHP source
+    out = tinker(
+        f"\\App\\Models\\StandalonePostgresql::where('uuid','{db_uuid}')->firstOrFail()"
+        "->update(['enable_ssl'=>true,'ssl_mode'=>'require']); echo 'TLS-ON';"
+    )
+    assert "TLS-ON" in out, out[-300:]
+    full = await api.get_resource("databases", db_uuid)
+    assert full.get("enable_ssl") is True, "the GET's wire type is what the rule reads"
+    if not restart:
+        return
+
+    import asyncio
+
+    # /restart only queues the job, so the OLD container answers for a while:
+    # poll for the new one's `ssl`, not for health.
+    await api.restart("databases", db_uuid)
+    async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source:
+        deadline = asyncio.get_running_loop().time() + 240
+        ssl = ""
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                ssl = await db_exec(source, db_uuid, "psql -U shop -d shopdb -tAc 'SHOW ssl'")
+            except SshError:
+                ssl = ""  # between the stop and the start
+            if ssl == "on":
+                break
+            await asyncio.sleep(4)
+        assert ssl == "on", "the source never came back serving TLS"
+        await wait_until_healthy(source, db_uuid)
+
+
+@pytest.mark.parametrize("engine_stack", TLS_ENGINES, ids=["postgresql"], indirect=True)
+async def test_tls_database_warns_and_migrates_plaintext(
+    api: CoolifyClient, settings: Settings, rig: dict[str, Any], engine_stack: dict[str, Any]
+) -> None:
+    """A TLS source warns, migrates, and its target serves plaintext."""
+    from bg_coolify_migrate.domain.manifest import Decision
+    from bg_coolify_migrate.engine.runner import make_migration_id
+    from bg_coolify_migrate.journal.store import Journal
+
+    db_uuid = engine_stack["db_uuid"]
+    await _enable_tls(api, settings, rig, db_uuid, restart=True)
+
+    async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source_host:
+        plan = await build_plan(
+            api,
+            source_host,
+            project=engine_stack["project"],
+            environment="production",
+            target_server="e2e-server-b",
+            finalize_policy=FinalizePolicy.RENAME,
+            transfer_mode=TransferMode.DIRECT,
+        )
+
+    resource = plan.resources[0]
+    assert not plan.is_blocked, resource.blocking_reasons
+    lost = [w for w in resource.warnings if "WITHOUT TLS" in w]
+    assert len(lost) == 1, resource.warnings
+    assert "ssl_mode='require'" in lost[0]
+    assert any("TARGET server's CA" in w for w in resource.warnings), resource.warnings
+
+    # The certificate binds are Coolify's derived config: skipped, never copied.
+    items = resource.manifest.items
+    coolify_dirs = [i for i in items if i.source_path.startswith("/data/coolify/")]
+    assert any("ssl" in i.source_path for i in coolify_dirs), [i.source_path for i in items]
+    assert all(i.decision is Decision.SKIP for i in coolify_dirs), [
+        (i.source_path, i.decision) for i in coolify_dirs
+    ]
+    migrate = [i.source_name for i in resource.manifest.to_migrate]
+    assert len(migrate) == 1 and str(migrate[0]).startswith("postgres-data-"), migrate
+
+    mid = make_migration_id(plan.project, plan.environment)
+    result = await run_migration(api, settings, plan, migration_id=mid, accept_drift=True)
+    assert result.outcome is Outcome.SUCCEEDED, str(result)
+
+    # DISCOVER paired the data volume and nothing else.
+    discovered = Journal.open(settings.resolved_state_dir(), mid).undo_info("discover")
+    paired = discovered["volume_pairs"][db_uuid]
+    assert len(paired) == 1 and str(paired[0]["source"]).startswith("postgres-data-"), paired
+
+    target_uuid = await _target_db(api, engine_stack["db_name"], str(rig["server_b"]["uuid"]))
+    assert target_uuid, "no database landed on server-b"
+    target = await api.get_resource("databases", target_uuid)
+    assert target.get("enable_ssl") in (False, 0), (
+        "Coolify carried enable_ssl to the target — retire fidelity.database_tls_lost_warning"
+    )
+
+    async with ssh_to(api, str(rig["server_b"]["uuid"]), settings) as target_host:
+        await wait_until_healthy(target_host, target_uuid)
+        ssl = await db_exec(target_host, target_uuid, "psql -U shop -d shopdb -tAc 'SHOW ssl'")
+        arrived = await db_exec(target_host, target_uuid, TLS_ENGINES[0].fingerprint_argv)
+    assert ssl == "off"
+    assert arrived == engine_stack["fingerprint"]
+
+
+@pytest.mark.parametrize("engine_stack", TLS_ENGINES, ids=["postgresql"], indirect=True)
+async def test_a_tls_enabling_config_blocks_the_plan(
+    api: CoolifyClient, settings: Settings, rig: dict[str, Any], engine_stack: dict[str, Any]
+) -> None:
+    """A carried postgres_conf with `ssl = on` would fail the target: refused.
+
+    Plan only — no restart, no migration. postgres_conf goes through the API's
+    own update route (base64, DatabasesController v4.5.0:708-726).
+    """
+    import base64
+
+    db_uuid = engine_stack["db_uuid"]
+    await _enable_tls(api, settings, rig, db_uuid, restart=False)
+    await api.patch(
+        f"/databases/{db_uuid}",
+        {"postgres_conf": base64.b64encode(b"ssl = on\n").decode("ascii")},
+    )
+
+    async with ssh_to(api, str(rig["server_a"]["uuid"]), settings) as source_host:
+        plan = await build_plan(
+            api,
+            source_host,
+            project=engine_stack["project"],
+            environment="production",
+            target_server="e2e-server-b",
+            finalize_policy=FinalizePolicy.RENAME,
+            transfer_mode=TransferMode.DIRECT,
+        )
+
+    assert plan.is_blocked
+    assert any("postgres_conf sets ssl" in r for r in plan.resources[0].blocking_reasons), (
+        plan.resources[0].blocking_reasons
+    )

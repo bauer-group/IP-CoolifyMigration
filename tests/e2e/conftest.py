@@ -168,6 +168,30 @@ async def wait_until_healthy(host: RemoteHost, name: str, *, timeout: float = 24
     raise AssertionError(f"{name} never became healthy (last: {last or 'absent'})")
 
 
+def tinker(code: str) -> str:
+    """Run PHP inside the rig's Coolify through artisan tinker. TEST SETUP ONLY.
+
+    The tool never writes to coolify-db (invariant 4), and nothing here changes
+    that. Some states a test needs are settable through NO API at all — database
+    TLS is one — so the fixture emulates the UI's own save through Eloquent, the
+    way bootstrap.py switches the API on. Skips, like the label contract, when the
+    Coolify container cannot be reached; a PHP error fails loudly instead.
+    """
+    import subprocess
+
+    result = subprocess.run(
+        ["docker", "exec", "bgcm_e2e_coolify", "php", "artisan", "tinker", "--execute", code],
+        capture_output=True,
+        text=True,
+        env={"MSYS_NO_PATHCONV": "1", "PATH": os.environ.get("PATH", "")},
+    )
+    unreachable = ("No such container", "Cannot connect", "not found", "permission denied")
+    if result.returncode != 0 and any(s in result.stderr for s in unreachable):
+        pytest.skip(f"cannot reach the rig's Coolify container: {result.stderr[:200]}")
+    assert result.returncode == 0, f"tinker failed: {result.stderr.strip()[:400]}"
+    return result.stdout
+
+
 async def db_exec(host: RemoteHost, container: str, argv: str, *, stdin: str | None = None) -> str:
     """Run a command inside a database container on a rig server, checked.
 

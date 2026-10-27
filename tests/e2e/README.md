@@ -108,7 +108,11 @@ typo away from silently copying nothing.
   differently (mysql bakes auth into the data dir, mongo uses two volumes, redis
   is in-memory with a persistence config, clickhouse is columnar), so "the target
   boots from the copied volume" is proven per engine, not assumed from postgres.
-  Slow on purpose — eight deploys and eight migrations, serial.
+  Slow on purpose — eight deploys and eight migrations, serial. Two more cover
+  database TLS: a Postgres switched to TLS (a tinker write — no API sets it) must
+  warn, migrate its data volume only (the certificate binds are skipped) and
+  arrive plaintext; with a `postgres_conf` that says `ssl = on` it must refuse.
+  `test_label_contract.py` pins the premise: `enable_ssl` defaults to false.
 - `test_drift_gate.py` — a floating-tag image (`eqalpha/keydb:latest`) must block
   at preflight without `--accept-drift` and complete with it. This is the user's
   own requirement, checked against a real `:latest` rather than a mocked one.

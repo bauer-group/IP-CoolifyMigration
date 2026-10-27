@@ -132,3 +132,51 @@ def test_health_check_defaults_match_schema() -> None:
             mismatches.append(f"  {field}: schema={theirs!r} ours={ours!r}")
 
     assert not mismatches, "health-check defaults drifted from Coolify:\n" + "\n".join(mismatches)
+
+
+#: Every engine with TLS, and its table (migration 2025_01_27_102616). ClickHouse
+#: has no TLS at all, so no column.
+_TLS_TABLES = frozenset(
+    {
+        "standalone_postgresqls",
+        "standalone_mysqls",
+        "standalone_mariadbs",
+        "standalone_redis",
+        "standalone_keydbs",
+        "standalone_dragonflies",
+        "standalone_mongodbs",
+    }
+)
+
+
+def test_tls_defaults_match_schema() -> None:
+    """Every TLS-capable engine's enable_ssl defaults to false.
+
+    The premise of fidelity.database_tls_lost_warning: no create path sets the
+    column, so a target always comes up with its default — plaintext. Mongo's was
+    TRUE until beta.400 (migration 2025_03_26_104103). If upstream flips a default
+    again, the one-way warning must become a source/target comparison.
+    """
+    result = subprocess.run(
+        [
+            "docker", "exec", "bgcm_e2e_coolify_db",
+            "psql", "-U", "coolify", "-d", "coolify", "-tAc",
+            "SELECT table_name||'='||COALESCE(column_default,'<none>') "
+            "FROM information_schema.columns WHERE column_name='enable_ssl' "
+            r"AND table_name LIKE 'standalone\_%' ORDER BY table_name",
+        ],
+        capture_output=True,
+        text=True,
+        env={"MSYS_NO_PATHCONV": "1", "PATH": __import__("os").environ.get("PATH", "")},
+    )
+    if result.returncode != 0:
+        pytest.skip(f"cannot reach the rig's Coolify database: {result.stderr[:200]}")
+
+    schema = dict(
+        line.strip().partition("=")[::2]
+        for line in result.stdout.strip().splitlines()
+        if "=" in line
+    )
+    assert set(schema) == _TLS_TABLES, f"tables with enable_ssl changed: {sorted(schema)}"
+    flipped = {table: default for table, default in schema.items() if default != "false"}
+    assert not flipped, f"enable_ssl no longer defaults to false: {flipped}"

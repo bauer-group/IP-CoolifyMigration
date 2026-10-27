@@ -231,6 +231,17 @@ the release it starts in — read that module before adding a rule.
   services pair by compose volume key (`{uuid}_{key}`), like compose apps.
 - **DELETE needs `write` AND `deploy` from 4.5** (rollback deletes targets);
   the token docs say root, or `read:sensitive` + `write` + `deploy`.
+- **Standalone database TLS (`enable_ssl`, `ssl_mode`) is readable in every GET
+  and carried by no create/update field and no dedicated route** (v4.1.2-v4.5.0);
+  only `POST /databases/{uuid}/clone` (v4.3.0+) copies it, as a whole-row
+  server-side copy. A target always starts plaintext (column default false) —
+  `fidelity.database_tls_lost_warning`. Mongo rows that existed at beta.399 (or
+  were created before beta.400) were switched to `enable_ssl=true` by migration;
+  operators may have turned it off since. Re-enabled on the target, TLS gets a
+  certificate from the TARGET server's CA for the new uuid and IP
+  (`database_tls_identity_warning`, which carrying TLS must not silence). Dragonfly
+  serves TLS on 6379 itself, Redis/KeyDB on an extra 6380. A carried `*_conf` that
+  turns TLS on by itself is refused: the target gets the config, not the certs.
 
 ## Verify + ship
 

@@ -870,7 +870,13 @@ async def build_plan(
 
         if collection == "databases":
             warnings.extend(database_health_check_warnings(full))
-            warnings.extend(fidelity.database_warnings(full))
+            # tls_carried: flip to (version >= 4.3.0 and the create path is clone) if
+            # CREATE moves to POST /databases/{uuid}/clone (v4.3.0 routes/api.php:340),
+            # which replicates enable_ssl/ssl_mode. Today no create path carries them.
+            warnings.extend(
+                fidelity.database_warnings(full, engine=snapshot.engine, tls_carried=False)
+            )
+            refusals.extend(fidelity.database_tls_config_refusals(full, engine=snapshot.engine))
             if snapshot.engine is None:
                 refusals.append(fidelity.unsupported_engine_refusal(full))
         elif collection == "applications":

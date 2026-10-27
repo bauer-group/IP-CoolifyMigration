@@ -69,6 +69,13 @@ DATABASE_COMMON: frozenset[str] = frozenset(
         # Unsettable on create is not the same as unimportant, so the planner
         # reports a source whose health check deviates rather than quietly
         # dropping it — see database_health_check_warnings below.
+        #
+        # NOT enable_ssl / ssl_mode. Like health_check_*, readable in every GET —
+        # but worse: no create or update field and no dedicated route carries them
+        # at any tag v4.1.2-v4.5.0, so not even a follow-up PATCH can. Only POST
+        # /databases/{uuid}/clone (v4.3.0+) does, as a whole-row server-side copy.
+        # Adding them here would 422 every create. fidelity.database_tls_lost_warning
+        # reports a TLS source instead.
     }
 )
 

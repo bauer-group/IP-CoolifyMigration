@@ -150,6 +150,46 @@ volumes:
 
 Refusing beats silently starting with an empty volume.
 
+## "TLS is on for this database … the target starts WITHOUT TLS"
+
+A warning, not a refusal. Coolify reports a database's SSL setting in every read
+but accepts it on no create or update call, so the target is created with TLS
+off. The database runs fine either way; whether its clients need TLS is your
+call. The line says what those clients will see — e.g. `sslmode=require`
+clients fail against Postgres, `rediss://…:6380` clients get connection refused.
+
+The target is created **stopped**, before the source is quiesced. Toggle SSL on
+it in the UI (the database's SSL settings, same mode) as soon as it appears in
+the target environment, and its first start already serves TLS. Missed that
+window? Toggle it and restart the target right after cutover.
+
+Postgres with `hostssl` lines in `pg_hba.conf` is the sharp edge: that file lives
+in the copied data directory, so a plaintext target refuses **every** TCP client
+while its health check (over the local socket) still passes. Toggle SSL before
+the first start.
+
+### "once TLS is on for the target, its certificate is issued by the TARGET server's CA"
+
+Also a warning, and it stays even once TLS is back on. Each server has its own
+CA (`/data/coolify/ssl/coolify-ca.crt` on that server), and the certificate names
+the database's uuid and its server's IP — all three change. Clients that verify
+the server (`verify-ca`/`verify-full`, `ssl-ca`, `tlsCAFile`) or pin the source
+server's CA need the target server's CA; a MongoDB with `verify-full` also needs
+new client certificates signed by it.
+
+## "its custom configuration turns TLS on by itself"
+
+Refused. The source has TLS on and its custom engine config (`postgres_conf`,
+`mysql_conf`, `mariadb_conf`, `mongo_conf`, `redis_conf`, `keydb_conf`) enables
+TLS itself — `ssl = on`, `ssl-cert`, `require_secure_transport`, `tls-port`,
+`net.tls.mode`, … The config is carried verbatim, but the certificate files
+Coolify's SSL setting mounts are not, so the target would fail to start (or refuse
+every client) after the source is stopped.
+
+Remove the TLS lines from the source's custom configuration — Coolify's SSL
+setting applies TLS on its own — then migrate, and re-enable SSL on the target as
+described above. Or migrate that database by hand.
+
 ## Verification failed (exit 7)
 
 The copy does not match. The target was **not** started and the migration rolled
