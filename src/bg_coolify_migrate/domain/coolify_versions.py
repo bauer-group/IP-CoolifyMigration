@@ -209,6 +209,12 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         # :412 — absent at v4.5.0). A locked Redis REDIS_PASSWORD is then
         # recoverable from the source server's file alone.
         "locked_db_url_withheld": Gate(since=(4, 5, 1)),
+        # The application and service GETs replace every locked value of 4+
+        # characters in the generated docker_compose — labels included — with
+        # `<locked>` (redactLockedValuesInGeneratedCompose, shared.php
+        # v4.5.1:5812-5868; ApplicationsController :156-159, ServicesController
+        # :82-84). docker_compose_raw is not redacted.
+        "locked_values_redacted_in_compose": Gate(since=(4, 5, 1)),
     }
 )
 

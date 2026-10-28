@@ -425,8 +425,10 @@ def hidden_port_overrides(source: dict[str, Any]) -> list[int]:
 
 
 _COMPOSE_PORTS_UNCHECKED_WARNING = (
-    "the parsed compose (docker_compose) could not be read, so it is unknown whether "
-    "a compose domain routes to an explicit port. Since 4.3.15 Coolify keeps such a "
+    "the parsed compose (docker_compose) could not be read — or Coolify (4.5.1+) "
+    "replaced part of a domain's labels or ports with <locked> because a locked "
+    "variable's value occurs there — so it is unknown whether a compose domain "
+    "routes to an explicit port. Since 4.3.15 Coolify keeps such a "
     "port in a hidden column no API read returns: the target would route the domain to "
     "the service's first exposed port, and releasing the source's custom domains at "
     "finalize would erase the port on the source beyond what a rollback restores. Check "
@@ -461,8 +463,16 @@ def compose_hidden_port_overrides(
     (docker.php :1019-1025), which keeps a port label the operator wrote into the
     compose — and which survives anyway — out of it.
 
+    From 4.5.1 that GET replaces every locked value of 4+ characters, wherever
+    it occurs, with ``<locked>`` (redactLockedValuesInGeneratedCompose,
+    shared.php v4.5.1:5812-5868; ApplicationsController :156-159) — a locked
+    PORT=3000 turns ``...port=3000`` into ``...port=<locked>``, which reads as
+    no port at all. A domain'd service whose labels, expose or ports carry it
+    therefore makes the answer unknown, never "nothing hidden". Elsewhere — an
+    ``environment:`` list, another service — it is ordinary and ignored.
+
     Returns ``{}`` when nothing is hidden, and ``None`` when a compose app has
-    domains but its parsed compose cannot be read.
+    domains but its parsed compose cannot be read, or not for those domains.
     """
     if source.get("build_pack") != "dockercompose":
         return {}
@@ -475,6 +485,10 @@ def compose_hidden_port_overrides(
         return {}
     services = _parsed_compose_services(source.get("docker_compose"))
     if services is None:
+        return None
+    if supports("locked_values_redacted_in_compose", version) and any(
+        _routing_redacted(name, services) for name in domains_by_service
+    ):
         return None
     uuid = re.escape(str(source.get("uuid") or ""))
     generated = re.compile(
@@ -499,6 +513,24 @@ def compose_hidden_port_overrides(
         if hidden:
             out[name] = hidden
     return out
+
+
+#: What Coolify writes in place of a locked value (shared.php v4.5.1:5850-5853).
+_REDACTED = "<locked>"
+
+
+def _routing_redacted(name: str, services: dict[str, dict[str, Any]]) -> bool:
+    """Whether redaction touched what routes the domain'd service ``name``.
+
+    Its labels, expose and ports — or its name itself, when it is missing and
+    some service's name carries the marker.
+    """
+    body = services.get(name)
+    if body is None:
+        return any(_REDACTED in str(other) for other in services)
+    entries = [*(body.get("expose") or []), *(body.get("ports") or [])]
+    text = "\n".join([_compose_label_text(body.get("labels")), *map(str, entries)])
+    return _REDACTED in text
 
 
 def _compose_fallback_port(

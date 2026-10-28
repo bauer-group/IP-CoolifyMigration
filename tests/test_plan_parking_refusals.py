@@ -215,6 +215,50 @@ class TestComposeHiddenPortOverrides:
         assert fidelity.compose_hidden_port_overrides(source) == {"web": [3000]}
 
 
+def _redacted(source: dict[str, Any], value: str) -> dict[str, Any]:
+    """The GET as v4.5.1 serves it when a locked variable's value is ``value``."""
+    return {**source, "docker_compose": source["docker_compose"].replace(value, "<locked>")}
+
+
+class TestRedactedComposeRouting:
+    """REGRESSION (v4.5.1): a locked PORT=3000 turns the label into ...port=<locked>,
+    which read as "no port at all" — the hidden-port refusal was skipped silently,
+    the target routed to the fallback port, and FINALIZE erased the override."""
+
+    def test_a_redacted_port_label_is_unknown_not_clean(self) -> None:
+        source = _redacted(_compose_source(), "3000")
+        assert fidelity.compose_hidden_port_overrides(source, version=(4, 5, 1)) is None
+
+    def test_a_redacted_label_key_is_unknown_too(self) -> None:
+        """strtr replaces substrings: a locked `http` breaks the generated name."""
+        source = _redacted(_compose_source(), "http")
+        assert fidelity.compose_hidden_port_overrides(source, version=(4, 5, 1)) is None
+
+    def test_a_redacted_expose_entry_is_unknown(self) -> None:
+        source = _redacted(_compose_source(expose=["3000", "8080"]), "8080")
+        assert fidelity.compose_hidden_port_overrides(source, version=(4, 5, 1)) is None
+
+    def test_a_redacted_service_name_is_unknown(self) -> None:
+        doc = {"services": {"<locked>": {"image": "x", "labels": []}}}
+        source = _compose_source(compose=json.dumps(doc))
+        assert fidelity.compose_hidden_port_overrides(source, version=(4, 5, 1)) is None
+
+    def test_a_redacted_environment_value_is_ordinary(self) -> None:
+        """Locked values sit in environment lists all the time."""
+        doc = json.loads(_compose_source()["docker_compose"])
+        doc["services"]["web"]["environment"] = ["DB_PASSWORD=<locked>"]
+        source = _compose_source(compose=json.dumps(doc))
+        assert fidelity.compose_hidden_port_overrides(source, version=(4, 5, 1)) == {
+            "web": [3000]
+        }
+
+    def test_the_plan_warns_instead_of_passing(self) -> None:
+        source = _redacted(_compose_source(), "3000")
+        assert fidelity.application_refusals(source, version=(4, 5, 1)) == []
+        warnings = fidelity.application_warnings(source, version=(4, 5, 1))
+        assert any("<locked>" in w for w in warnings)
+
+
 class TestComposePortRules:
     # A UI save hides the port from 4.3.15, an API save from 4.3.18 — on the 4.3
     # line (4.3.24 shipped after 4.4.0) as much as in 4.4+.

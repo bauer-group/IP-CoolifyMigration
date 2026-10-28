@@ -377,7 +377,9 @@ migrate the application by hand.
 
 If the plan instead **warns** that the parsed compose could not be read, the
 check could not run: confirm the compose domains' ports in Coolify before
-migrating.
+migrating. From Coolify 4.5.1 that also happens when a locked variable's value
+(4+ characters, e.g. a locked `PORT=3000`) occurs in a domain's labels or
+ports: Coolify shows `<locked>` there instead, and the port cannot be read.
 
 ## "anonymous volume: its id cannot be reproduced"
 
