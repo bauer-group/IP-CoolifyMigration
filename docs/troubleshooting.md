@@ -750,6 +750,30 @@ and the source keeps serving.
   sources and targets, never from anything else. Free it on the resource the
   message names (by type and uuid), then run again.
 
+## Settings the target gets differently, and what Coolify 4.5.1 carries
+
+The plan lists every setting the target will not share. From Coolify 4.5.1 more
+of them are carried, so these lines disappear from a plan made against 4.5.1:
+
+- the default `COOLIFY_*` variables turned off (applications, services, databases);
+- an application's rolling-update drain time and Dockerfile build target;
+- a database's log drain — only if the target server has a log drain on;
+  otherwise the plan says so;
+- a service sub-application's www/non-www redirect — once the target holds both
+  domains;
+- readonly labels turned off on an application. Only when its labels route
+  nothing but its own custom domains: labels kept verbatim that name a host bound
+  to the source server (or one the DNS gate never checks) would make the target
+  answer for it. Then the plan says **"readonly labels ON instead"**: the target
+  regenerates its labels from its own domains, and hand-made routers,
+  middlewares or headers have to be re-applied by hand.
+
+On every release the plan also warns when an application's Dockerfile has its own
+`HEALTHCHECK` while Coolify's health check is enabled: the target runs Coolify's
+configured check instead, and from 4.5.1 so does the source's next deploy and a
+rollback's restart. Disable Coolify's health check on the source, or redeploy the
+source once to prove the configured check passes, before migrating.
+
 ## "the plan was made against Coolify X, but the instance now runs Y"
 
 A PREFLIGHT refusal; nothing has been changed. The plan records the Coolify

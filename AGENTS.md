@@ -120,8 +120,9 @@ decision, the decision is in the wrong layer.
 ## Verified upstream facts (do not re-derive)
 
 First checked against `coollabsio/coolify@main`; re-checked against the release
-tags v4.1.2 through v4.5.0 (2026-10-26). Read upstream at a **release tag**, never
-`main` — see the 2.5.6 tags regression.
+tags v4.1.2 through v4.5.0 (2026-10-26), and v4.5.1 against v4.5.0 (2026-10-28).
+Read upstream at a **release tag**, never `main` — see the 2.5.6 tags regression.
+What differs between releases lives in `domain/coolify_versions.py`, not here.
 
 - `can_read_sensitive = (token->can('root') || token->can('read:sensitive'))
   && owner->isAdminOfTeam()` — the admin clause since 4.2. Without it, `value`,
@@ -372,6 +373,44 @@ the release it starts in — read that module before adding a rule.
   serves TLS on 6379 itself, Redis/KeyDB on an extra 6380. A carried `*_conf` that
   turns TLS on by itself is refused: the target gets the config, not the certs.
 
+### Learned from the v4.5.0 -> v4.5.1 audit (release tags, not yet a live run)
+
+Every item is a registry row or FEATURE gated on 4.5.1 (`domain/coolify_versions.py`);
+older releases get exactly what they got before.
+
+- **Four create fields, one backup field.** `dockerfile_target_build` joins the
+  shared application create array (carried on every route that builds a
+  Dockerfile); `include_coolify_default_variables`,
+  `is_container_label_readonly_enabled`, `rolling_update_drain_seconds` join
+  APPLICATION_SETTING_FIELDS — the GET nests them under `settings`, the create
+  takes them flat (`read_from="settings"`); `disable_local_backup` joins the
+  backup create array but 422s without `save_s3`.
+- **Readonly labels OFF keeps `custom_labels` verbatim** — create and update
+  stop regenerating them, and the deploy uses them whenever set. Carried only when
+  they route nothing but the app's own custom domains
+  (`fidelity.labels_route_beyond_domains`): a server-bound or generated host in
+  them would make the target route, and request a certificate for, a host that
+  still resolves to the source (invariant 7).
+- **Settings no create takes ride follow-up PATCHes**: a service's and a
+  database's `include_coolify_default_variables`, a database's
+  `is_log_drain_enabled` (422 unless the server has a log drain), and a service
+  sub-application's `redirect` (422 for www/non-www unless the sub-application
+  already holds both hosts — so after the URLs).
+- **A locked credential's connection URL is NULL** (DatabasesController
+  :262-270): a locked Redis REDIS_PASSWORD comes from the compose file alone.
+- **The parsed `docker_compose` is redacted**: every locked value of 4+ characters
+  becomes `<locked>`, labels included. A domain'd service's labels, expose or
+  ports carrying it make the hidden-port check unknown (a warning), never clean.
+  `docker_compose_raw` is not redacted.
+- **An enabled Coolify health check replaces the Dockerfile's HEALTHCHECK** on
+  every deploy — the source's next deploy and a rollback's /restart included.
+  `custom_healthcheck_found` is in no create array: warned about on every release.
+- **No preview twin for a dockercompose app's generated magic variables**, and
+  twins copy `is_shown_once`. The locked twin CREATE sent ahead of a recovered
+  secret is skipped there (only for a KNOWN 4.5.1).
+- **Upstream's list of generated magic variables** (GENERATED_MAGIC_VARIABLE_COMMANDS)
+  is the same switch every release since 4.1.2 runs; `target_regenerates` mirrors it.
+
 ### Service domains (release tags v4.1.2 -> v4.5.0)
 
 - **A service's domains live on its sub-applications** (`applications[].fqdn`);
@@ -487,12 +526,13 @@ the release it starts in — read that module before adding a rule.
 - **The app .env and a database compose are written with `tee`, non-atomically**
   (ADJ.php:2063, StartPostgresql.php:213): read twice in one SSH command, and only
   two identical reads count.
-- **The exception: a Redis `internal_db_url` carries the locked REDIS_PASSWORD.**
-  It is appended and made visible to sensitive callers, and embeds
-  `rawurlencode(connectionPassword())` (v4.5.0 StandaloneRedis.php:309-318,
+- **The exception, up to 4.5.0: a Redis `internal_db_url` carries the locked
+  REDIS_PASSWORD.** It is appended and made visible to sensitive callers, and
+  embeds `rawurlencode(connectionPassword())` (v4.5.0 StandaloneRedis.php:309-318,
   DatabasesController.php:213-234; same at 4.4.0). It is the primary source,
-  cross-checked with the compose. Never log it or put it in a snapshot — `db_url`
-  is a redaction fragment.
+  cross-checked with the compose. From 4.5.1 both URLs are NULL for a locked
+  credential (below) and the compose is the only source. Never log it or put it
+  in a snapshot — `db_url` is a redaction fragment.
 - **`is_shared` is strict only from 4.4.0** (`isSharedReference`); 4.1.2-4.3.x
   call any `{{x.y}}`-wrapped value shared. Shared locked rows are never recovered
   (the file holds the resolved value, not the reference).

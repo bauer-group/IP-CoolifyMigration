@@ -55,7 +55,7 @@ _WEBHOOK_SECRET_FIELDS = (
 _WEBHOOK_SECRET_MIN_LENGTH = 16
 #: ApplicationsController v4.5.0:1354 `'string|nullable|max:72'` (mb_strlen).
 _BASIC_AUTH_MAX_LENGTH = 72
-#: bootstrap/helpers/api.php sharedDataApplications, identical v4.1.2-v4.5.0:
+#: bootstrap/helpers/api.php sharedDataApplications, identical v4.1.2-v4.5.1:
 #: `['nullable', 'string', 'max:1000', 'regex:/^[a-zA-Z0-9 \-_.\/:=@,+]+$/']`.
 _HEALTH_CHECK_COMMAND = re.compile(r"[a-zA-Z0-9 \-_./:=@,+]{1,1000}")
 
@@ -110,7 +110,7 @@ def application_refusals(source: dict[str, Any], *, version: Version | None) -> 
     command = source.get("health_check_command")
     if isinstance(command, str) and command and not _HEALTH_CHECK_COMMAND.fullmatch(command):
         # The UI's "Enable healthcheck" button saves without validating, so a
-        # stored command can fail the API's own rule (identical v4.1.2-v4.5.0).
+        # stored command can fail the API's own rule (identical v4.1.2-v4.5.1).
         out.append(
             f"the health check command ({len(command)} characters) contains characters "
             "Coolify's API refuses on create — it allows only letters, digits, spaces and "
@@ -948,7 +948,7 @@ def unsupported_engine_refusal(source: dict[str, Any]) -> str:
 # Standalone database TLS is two columns, readable in every GET since
 # v4.0.0-beta.399 (fillable, not $hidden, no cast — StandalonePostgresql
 # v4.5.0:49-50,71-91) and settable through NO create or update $allowedFields and
-# no dedicated route at any tag v4.1.2-v4.5.0. The only API path that carries them
+# no dedicated route at any tag v4.1.2-v4.5.1. The only API path that carries them
 # is POST /databases/{uuid}/clone (v4.3.0+, routes/api.php:340), a whole-row
 # server-side copy this tool does not create through. Every create helper only
 # fill()s validated request fields (bootstrap/helpers/databases.php v4.5.0:83-95),
@@ -1043,7 +1043,7 @@ def database_tls_lost_warning(
     return (
         f"TLS is on for this database{f' (ssl_mode={mode!r})' if mode else ''}, but no "
         "create or update field and no dedicated route carries enable_ssl/ssl_mode "
-        "(Coolify 4.1.2-4.5.0), so the target starts WITHOUT TLS. "
+        "(Coolify 4.1.2-4.5.1), so the target starts WITHOUT TLS. "
         f"{consequence} "
         # HasDatabaseStatusInfo::instantSaveSSL (v4.5.0:105-118) only saves the
         # column, and StartPostgresql & co. apply it at the next start — so a

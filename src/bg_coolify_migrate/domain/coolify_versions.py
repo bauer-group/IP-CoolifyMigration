@@ -81,8 +81,23 @@ from bg_coolify_migrate.domain.versions import Version
 #: time — see domain/fidelity.py — and the routes, stop/start/restart guards,
 #: container labels, volume names and mount paths this tool depends on are
 #: unchanged. Audited against release tags, not a live 4.5.0.
+#:
+#: Re-verified 2026-10-28 for v4.5.1, diffed against v4.5.0 at the release tags:
+#: the three API controllers, ServiceApplicationsController, bootstrap/helpers
+#: api.php, shared.php, parsers.php and docker.php, EnvironmentVariable, the
+#: Standalone* models, ApplicationSetting and ApplicationDeploymentJob. Routes,
+#: the Stop* actions' daemon-side behaviour, volume names and mount paths are
+#: unchanged (StopApplication now reports a failed stop; this tool polls the
+#: daemon either way). Added on create: dockerfile_target_build and three
+#: application settings, disable_local_backup; on update: the default COOLIFY_*
+#: variables (services, databases), a database's log drain, a sub-application's
+#: redirect — each a registry row gated on 4.5.1. Changed and answered in code:
+#: a locked credential's connection URL is withheld, locked values are redacted
+#: in the parsed compose, an enabled health check replaces the Dockerfile's, and
+#: a compose app's generated secrets get no preview twin. Audited against
+#: release tags, not a live 4.5.1.
 VALIDATED_MIN: Version = (4, 1, 2)
-VALIDATED_MAX: Version = (4, 5, 0)
+VALIDATED_MAX: Version = (4, 5, 1)
 
 
 def format_version(version: Version) -> str:
