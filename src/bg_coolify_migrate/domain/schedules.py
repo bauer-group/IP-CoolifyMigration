@@ -37,7 +37,7 @@ from collections import Counter
 from collections.abc import Iterable
 from typing import Any
 
-from bg_coolify_migrate.domain.coolify_versions import supports
+from bg_coolify_migrate.domain.coolify_versions import carries, supports
 from bg_coolify_migrate.domain.kinds import DatabaseEngine
 from bg_coolify_migrate.domain.versions import Version
 
@@ -246,6 +246,19 @@ def backup_s3_destinations(row: dict[str, Any]) -> tuple[str, ...] | None:
     return tuple(dict.fromkeys(uuids))
 
 
+def _keeps_no_local(row: dict[str, Any], version: Version | None) -> bool:
+    """Whether the target's copy of ``row`` is created without local dumps too.
+
+    The create takes disable_local_backup from 4.5.1, and only beside save_s3
+    (api/schedules.build_backup_body), so the S3 destination must be carried.
+    """
+    return (
+        carries("backups", "disable_local_backup", version)
+        and bool(row.get("save_s3"))
+        and bool(backup_s3_destinations(row))
+    )
+
+
 def _frequencies(rows: list[dict[str, Any]]) -> list[str]:
     return [str(r.get("frequency") or "?") for r in rows]
 
@@ -256,11 +269,13 @@ def backup_warnings(
     engine: DatabaseEngine | None,
     source_timezone: str | None,
     target_timezone: str | None,
+    version: Version | None = None,
 ) -> list[str]:
     """What a database's backup schedules will not do on the target as on the source.
 
     ``rows`` is the raw GET. Schedules are named by their frequency — a backup
     schedule has no name — and never by anything an execution recorded.
+    ``version`` decides what the create can carry (domain/coolify_versions.py).
     """
     out: list[str] = []
     known = set(_BACKUP_OWNER.values()) | _OTHER_BACKUP_OWNERS
@@ -295,10 +310,13 @@ def backup_warnings(
             f"backup schedule(s) {dangling} are set to upload to S3, but their S3 storage "
             "no longer exists. The target's copy is created local-only."
         )
-    if no_local := _frequencies([r for r in own if r.get("disable_local_backup") is True]):
+    if no_local := _frequencies(
+        [r for r in own if r.get("disable_local_backup") is True and not _keeps_no_local(r, version)]
+    ):
         out.append(
             f"backup schedule(s) {no_local} keep no local dumps on the source "
-            "(disable_local_backup), a setting no API can set. The target keeps local "
+            "(disable_local_backup), which this Coolify cannot set through its API (it can "
+            "from 4.5.1, beside an S3 upload it can name). The target keeps local "
             "dumps on the target server's disk, under the schedule's local retention; "
             "switch it off in the target's Backups tab if disk matters."
         )

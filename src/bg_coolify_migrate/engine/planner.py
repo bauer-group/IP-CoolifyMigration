@@ -902,7 +902,14 @@ async def build_plan(
                 refusals.append(fidelity.unsupported_engine_refusal(full))
         elif collection == "applications":
             warnings.extend(application_settings_warnings(full))
-            warnings.extend(fidelity.application_warnings(full, version=coolify_version))
+            origin_wildcard = source_wildcard or (
+                server_ref(source_server).wildcard_domain if source_server else None
+            )
+            warnings.extend(
+                fidelity.application_warnings(
+                    full, version=coolify_version, source_wildcard=origin_wildcard or None
+                )
+            )
             refusals.extend(fidelity.application_refusals(full, version=coolify_version))
             # Only plain applications POST their storages (resources.copy_storages);
             # compose volumes are materialised by Coolify itself.

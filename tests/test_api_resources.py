@@ -506,6 +506,106 @@ def _git_build_snapshot() -> ResourceSnapshot:
     )
 
 
+class TestCreateApplicationV451:
+    """v4.5.1 takes three settings flat on create (the GET nests them) and the
+    build target on every route; v4.5.0 refuses all four — a 422 for the whole
+    resource — so nothing of it may reach an older release."""
+
+    _GIT = ResourceSnapshot(
+        uuid="a1",
+        name="web",
+        collection="applications",
+        kind=ResourceKind.APP_GIT_BUILD,
+        git_repository="acme/web",
+        git_branch="main",
+        git_auth=GitAuth.PUBLIC,
+    )
+
+    def _source(self, **settings: object) -> dict[str, object]:
+        return {
+            "git_repository": "acme/web",
+            "git_branch": "main",
+            "build_pack": "dockerfile",
+            "dockerfile_target_build": "runtime",
+            "fqdn": "https://shop.example.com",
+            "custom_labels": "traefik.http.routers.r0.rule=Host(`shop.example.com`)",
+            "settings": {
+                "include_coolify_default_variables": False,
+                "is_container_label_readonly_enabled": False,
+                "rolling_update_drain_seconds": 30,
+                **settings,
+            },
+        }
+
+    async def _body(
+        self,
+        api: CoolifyClient,
+        respx_mock: respx.Router,
+        version: tuple[int, ...] | None,
+        source: dict[str, object],
+        placement: Placement | None = None,
+    ) -> dict[str, object]:
+        route = respx_mock.post(f"{BASE}/applications/public").mock(
+            return_value=httpx.Response(201, json={"uuid": "a2"})
+        )
+        await create_resource(api, self._GIT, placement or _placement(), source, version=version)
+        body: dict[str, object] = json.loads(route.calls[0].request.read())
+        return body
+
+    async def test_carried_flat_from_the_nested_settings(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        body = await self._body(api, respx_mock, (4, 5, 1), self._source())
+        assert body["include_coolify_default_variables"] is False
+        assert body["is_container_label_readonly_enabled"] is False
+        assert body["rolling_update_drain_seconds"] == 30
+        assert body["dockerfile_target_build"] == "runtime"
+        assert "settings" not in body
+
+    @pytest.mark.parametrize("version", [(4, 5, 0), (4, 1, 2)])
+    async def test_never_on_an_older_release(
+        self, api: CoolifyClient, respx_mock: respx.Router, version: tuple[int, ...]
+    ) -> None:
+        body = await self._body(api, respx_mock, version, self._source())
+        for field in (
+            "include_coolify_default_variables",
+            "is_container_label_readonly_enabled",
+            "rolling_update_drain_seconds",
+            "dockerfile_target_build",
+        ):
+            assert field not in body
+
+    async def test_an_unknown_release_gets_only_the_column_gated_drain(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        body = await self._body(api, respx_mock, None, self._source())
+        assert body["rolling_update_drain_seconds"] == 30
+        assert "include_coolify_default_variables" not in body
+        assert "dockerfile_target_build" not in body
+
+    @pytest.mark.parametrize(("stored", "sent"), [(999, 300), (-4, 0), (0, 0), ("12", 12)])
+    async def test_the_drain_is_clamped_like_coolify_clamps_it(
+        self, api: CoolifyClient, respx_mock: respx.Router, stored: object, sent: int
+    ) -> None:
+        source = self._source(rolling_update_drain_seconds=stored)
+        assert (await self._body(api, respx_mock, (4, 5, 1), source))[
+            "rolling_update_drain_seconds"
+        ] == sent
+
+    async def test_readonly_off_is_not_kept_when_labels_route_a_source_bound_host(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        """Verbatim labels would route the SOURCE server's host on the target."""
+        placement = _placement_wc()
+        bound = f"shop.{placement.source_wildcard}"
+        source = self._source()
+        source["fqdn"] = f"https://{bound}"
+        source["custom_labels"] = f"traefik.http.routers.r0.rule=Host(`{bound}`)"
+        body = await self._body(api, respx_mock, (4, 5, 1), source, placement)
+        assert "is_container_label_readonly_enabled" not in body
+        assert body["include_coolify_default_variables"] is False
+
+
 class TestCreateApplication:
     async def test_an_image_app_never_sends_its_build_pack(
         self, api: CoolifyClient, respx_mock: respx.Router

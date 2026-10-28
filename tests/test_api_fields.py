@@ -256,6 +256,31 @@ class TestApplicationFields:
         for field in ("custom_network_aliases", "health_check_type", "health_check_command"):
             assert field in APPLICATION_CREATE
 
+    @pytest.mark.parametrize("route", cv.APPLICATION_ROUTES)
+    def test_v4_5_1_create_fields_are_carried_from_that_release(self, route: str) -> None:
+        """v4.5.0 refuses all four on create — a 422 for the whole resource."""
+        settings = {
+            "include_coolify_default_variables",
+            "is_container_label_readonly_enabled",
+            "rolling_update_drain_seconds",
+        }
+        endpoint = f"applications/{route}"
+        assert not settings & cv.fields_for(endpoint, (4, 5, 0))
+        assert settings <= cv.fields_for(endpoint, (4, 5, 1))
+        sources = cv.field_sources(endpoint, (4, 5, 1))
+        assert {sources[f] for f in settings} == {"settings"}, "the GET nests them"
+        build_target = "dockerfile_target_build" in cv.fields_for(endpoint, (4, 5, 1))
+        assert build_target is (route != "dockerimage"), "only where a Dockerfile is built"
+        assert "dockerfile_target_build" not in cv.fields_for(endpoint, (4, 5, 0))
+
+    def test_an_unknown_release_gets_none_of_the_v4_5_1_fields(self) -> None:
+        """...except the drain seconds, whose column ships with its acceptance."""
+        unknown = cv.fields_for("applications/public", None)
+        assert "include_coolify_default_variables" not in unknown
+        assert "is_container_label_readonly_enabled" not in unknown
+        assert "dockerfile_target_build" not in unknown
+        assert "rolling_update_drain_seconds" in unknown
+
     def test_basic_auth_hash_costs_are_carried_but_not_the_algorithm(self) -> None:
         """argon2id 422s the whole create unless the target runs Caddy >= 2.11."""
         for field in (
@@ -562,25 +587,12 @@ async def test_whitelists_match_upstream_openapi() -> None:
 #:     default (true) is at least as protective as any source value.
 #:
 #: EXTENDED 2026-10-28 for Coolify 4.5.1 (the canary went red on the release
-#: pipeline). Four fields join the create arrays at v4.5.1 and are in NONE at
-#: v4.5.0, the newest release we validate (VALIDATED_COOLIFY_MAX) and the one
-#: the fleet runs. Sending any of them there 422s the whole create, so they stay
-#: out until 4.5.1 is audited and the carry can be version-gated:
-#:
-#:   * include_coolify_default_variables, is_container_label_readonly_enabled,
-#:     rolling_update_drain_seconds — application_settings columns
-#:     (ApplicationSetting v4.5.1; drain seconds is new in migration
-#:     2026_10_23_224202), so the GET returns them only under `settings` and
-#:     filter_body could not carry them anyway. The first two are warned about
-#:     at plan time already.
-#:   * dockerfile_target_build — a top-level column the dockerfile route always
-#:     took; v4.5.1 adds it to the git routes' create arrays as well.
+#: pipeline): four fields join the create arrays at v4.5.1 and are in NONE at
+#: v4.5.0. They were gapped here until the release registry could gate them;
+#: now they are CARRIED, from that release only (domain/coolify_versions.py;
+#: pinned by test_v4_5_1_create_fields_are_carried_from_that_release).
 KNOWN_APPLICATION_GAP: frozenset[str] = frozenset(
     {
-        "dockerfile_target_build",
-        "include_coolify_default_variables",
-        "is_container_label_readonly_enabled",
-        "rolling_update_drain_seconds",
         "autogenerate_domain",
         "custom_container_name_prefix",
         "custom_internal_name",

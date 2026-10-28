@@ -503,6 +503,26 @@ class TestBuildPlanFidelity:
         assert plan.is_blocked
         assert plan.coolify_version is None
 
+    async def test_v4_5_1_carries_settings_and_says_what_it_will_not(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        full = {
+            "fqdn": "https://shop.example.com",
+            "custom_labels": "traefik.http.routers.r0.rule=Host(`other.example.com`)",
+            "settings": {
+                "include_coolify_default_variables": False,
+                "is_container_label_readonly_enabled": False,
+            },
+        }
+        old = await _plan_one_app(monkeypatch, full, version="4.5.0")
+        assert any("COOLIFY_SERVER_IP" in w for w in old.resources[0].warnings)
+        new = await _plan_one_app(monkeypatch, full, version="4.5.1")
+        assert not any("COOLIFY_SERVER_IP" in w for w in new.resources[0].warnings)
+        assert any(
+            "readonly labels ON instead" in w and "other.example.com" in w
+            for w in new.resources[0].warnings
+        )
+
     async def test_env_rules_see_the_source_envs(self, monkeypatch: pytest.MonkeyPatch) -> None:
         plan = await _plan_one_app(
             monkeypatch,

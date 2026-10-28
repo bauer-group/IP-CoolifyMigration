@@ -60,6 +60,7 @@ async def plan_schedules(
                 engine=snapshot.engine,
                 source_timezone=schedules.server_timezone(source_server),
                 target_timezone=schedules.server_timezone(target_server),
+                version=version,
             )
         )
     elif snapshot.collection == "services" and source:

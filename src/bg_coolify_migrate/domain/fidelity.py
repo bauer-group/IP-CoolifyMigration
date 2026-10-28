@@ -32,10 +32,15 @@ from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
+from bg_coolify_migrate.dns.extract import normalise_host
 from bg_coolify_migrate.domain import compose as compose_mod
 from bg_coolify_migrate.domain import locked_envs
-from bg_coolify_migrate.domain.coolify_versions import carries, supports
-from bg_coolify_migrate.domain.domains import compose_domains
+from bg_coolify_migrate.domain.coolify_versions import (
+    carries,
+    every_application_route_carries,
+    supports,
+)
+from bg_coolify_migrate.domain.domains import compose_domains, custom_hosts
 from bg_coolify_migrate.domain.kinds import DatabaseEngine
 from bg_coolify_migrate.domain.locked_envs import is_locked
 from bg_coolify_migrate.domain.versions import Version
@@ -229,8 +234,16 @@ def multi_server_refusal(source: dict[str, Any], *, version: Version | None) -> 
     )
 
 
-def application_warnings(source: dict[str, Any], *, version: Version | None) -> list[str]:
-    """Settings the target will not share. Silent on a stock application."""
+def application_warnings(
+    source: dict[str, Any], *, version: Version | None, source_wildcard: str | None = None
+) -> list[str]:
+    """Settings the target will not share. Silent on a stock application.
+
+    A setting the create carries on ``version`` (domain/coolify_versions.py) is
+    not reported: from 4.5.1 that includes the default COOLIFY_* variables and
+    readonly labels. ``source_wildcard`` tells the app's own custom domains from
+    the hosts bound to the source server (:func:`labels_route_beyond_domains`).
+    """
     out: list[str] = []
     settings = _settings(source)
 
@@ -256,15 +269,29 @@ def application_warnings(source: dict[str, Any], *, version: Version | None) -> 
             "HTTP-to-HTTPS and www redirects with temporary 302/307 until you re-enable "
             "it by hand."
         )
-    if settings.get("include_coolify_default_variables") is False:
+    if settings.get("include_coolify_default_variables") is False and not (
+        every_application_route_carries("include_coolify_default_variables", version)
+    ):
         out.append(_DEFAULT_VARIABLES_WARNING)
     if settings.get("is_container_label_readonly_enabled") is False and source.get("custom_labels"):
-        out.append(
-            "the source has readonly labels OFF, so its container labels may be "
-            "hand-edited. The setting cannot be migrated, and a target created with it "
-            "on regenerates its labels from its own domains — hand-made routers, "
-            "middlewares or headers are lost. Re-apply them on the target by hand."
-        )
+        if not every_application_route_carries("is_container_label_readonly_enabled", version):
+            out.append(
+                "the source has readonly labels OFF, so its container labels may be "
+                "hand-edited. The setting cannot be migrated, and a target created with it "
+                "on regenerates its labels from its own domains — hand-made routers, "
+                "middlewares or headers are lost. Re-apply them on the target by hand."
+            )
+        elif beyond := labels_route_beyond_domains(source, source_wildcard=source_wildcard):
+            out.append(
+                "the source has readonly labels OFF, but its labels route "
+                f"{beyond}, which are not among its own custom domains — hosts bound to "
+                "the source server, generated ones, or ones the DNS gate never checks. "
+                "Kept verbatim, they would make the target answer (and request "
+                "certificates) for hosts that still point at the source, so the target is "
+                "created with readonly labels ON instead: it regenerates its labels from "
+                "its own domains, and hand-made routers, middlewares or headers are lost. "
+                "Re-apply them on the target by hand."
+            )
     if settings.get("is_static") is True:
         out.append(
             "the source is a static site, and that setting rides under `settings`, which "
@@ -323,6 +350,46 @@ def _label_text(raw: object) -> str:
 
 _TRAEFIK_PORT = re.compile(r"\.loadbalancer\.server\.port=(\d+)")
 _CADDY_PORT = re.compile(r"\{\{\s*upstreams\s+(\d+)\s*\}\}")
+
+#: A Traefik router rule's host matchers; HostRegexp cannot be enumerated.
+_TRAEFIK_HOST_RULE = re.compile(r"\b(Host|HostSNI|HostRegexp)\(([^)]*)\)")
+_BACKTICKED = re.compile(r"`([^`]*)`")
+#: A Caddy site address label (`caddy_0=https://a.example.com`, docker.php
+#: generateLabelsApplication).
+_CADDY_SITE = re.compile(r"^\s*caddy(?:_\d+)?\s*=\s*(.+?)\s*$", re.MULTILINE)
+
+
+def labels_route_beyond_domains(
+    source: dict[str, Any], *, source_wildcard: str | None
+) -> list[str]:
+    """Hosts the source's custom_labels route that are not its own custom domains.
+
+    Asked before a target keeps those labels VERBATIM (readonly labels off,
+    carried from 4.5.1): the deploy then routes exactly what the labels say
+    (ApplicationDeploymentJob v4.5.1:4393-4399), never regenerating them from the
+    target's domains. A server-bound host is rewritten onto the target's wildcard
+    in its domains but not in hand-kept labels, a generated host names the
+    source's IP, and a host only the labels name is one the DNS gate never
+    checks — each would make the target route, and request a certificate for, a
+    host that still resolves to the source (invariant 7). Empty means only the
+    app's own custom domains are routed, which the DNS gate guards. A HostRegexp
+    rule cannot be enumerated and is reported as such. PURE.
+    """
+    text = _label_text(source.get("custom_labels"))
+    if not text:
+        return []
+    own = set(custom_hosts(source.get("fqdn"), source_wildcard=source_wildcard))
+    routed: list[str] = []
+    for matcher, args in _TRAEFIK_HOST_RULE.findall(text):
+        if matcher == "HostRegexp":
+            routed.append(f"HostRegexp({args.strip()})")
+            continue
+        routed.extend(h for raw in _BACKTICKED.findall(args) if (h := normalise_host(raw)))
+    for site in _CADDY_SITE.findall(text):
+        routed.extend(
+            h for raw in re.split(r"[,\s]+", site.strip("\"'")) if raw and (h := normalise_host(raw))
+        )
+    return sorted({h for h in routed if h not in own})
 
 
 def hidden_port_overrides(source: dict[str, Any]) -> list[int]:

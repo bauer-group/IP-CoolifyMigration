@@ -299,12 +299,12 @@ _APPLICATION: tuple[Field, ...] = (
         "dockerfile",
         "dockerfile_location",
     ),
-    # NOT dockerfile_target_build (up to v4.5.0). It is in the UPDATE list and in
-    # every GET, so it looks like a create field and was transcribed as one — but
-    # it appears in NO create $allowedFields, neither at v4.1.2 (:914) nor at
-    # v4.3.3 (:1194) nor at v4.5.0 (:1340). A source app with a multi-stage build
-    # target set would therefore 422 the whole create, and the resource is never
-    # made.
+    # NOT dockerfile_target_build here: see _BUILD_TARGET. Up to v4.5.0 it is in
+    # the UPDATE list and in every GET, so it looks like a create field and was
+    # once transcribed as one — but it appears in NO create $allowedFields, neither
+    # at v4.1.2 (:914) nor at v4.3.3 (:1194) nor at v4.5.0 (:1340). A source app
+    # with a multi-stage build target set would therefore 422 the whole create,
+    # and the resource is never made.
     #
     # Never triggered in our fleet (0 of 39 apps carry one, measured 2026-08-15
     # against paas.cloud), which is exactly why it survived: a latent whitelist
@@ -402,6 +402,48 @@ _APPLICATION: tuple[Field, ...] = (
     Field("http_basic_auth_bcrypt_cost", Gate(since=(4, 5, 0)), column_gated=True),
     Field("http_basic_auth_argon2id_memory_cost", Gate(since=(4, 5, 0)), column_gated=True),
     Field("http_basic_auth_argon2id_time_cost", Gate(since=(4, 5, 0)), column_gated=True),
+    # Three application_settings columns v4.5.1 adds to APPLICATION_SETTING_FIELDS,
+    # the spread at the end of the shared create array (ApplicationsController
+    # v4.5.1:57,60,66 -> :1372; absent from the v4.5.0 constant :46-72), validated
+    # in sharedDataApplications (bootstrap/helpers/api.php v4.5.1:207,213,231) and
+    # stored by applyApplicationSettings on every route (:239-247, called at
+    # :1686/1946/2175/2323/2458). The GET returns them only under `settings`,
+    # while the create takes them flat — hence read_from.
+    #
+    # Off on the source, the default COOLIFY_* variables stay off on the target.
+    Field("include_coolify_default_variables", Gate(since=(4, 5, 1)), read_from="settings"),
+    # Off on the source, the target keeps the source's custom_labels verbatim
+    # instead of regenerating them (create :1733, update :3814; the deploy uses
+    # custom_labels whenever set, ApplicationDeploymentJob v4.5.1:4393). Only
+    # safe when those labels route nothing but the app's own custom domains:
+    # create_application drops it otherwise (fidelity.labels_route_beyond_domains).
+    Field("is_container_label_readonly_enabled", Gate(since=(4, 5, 1)), read_from="settings"),
+    # A NEW column (migration 2026_10_23_224202, default 5) accepted in the same
+    # release, `integer|min:0|max:300`; create_application clamps it like
+    # ApplicationSetting::rollingUpdateDrainSeconds (v4.5.1:174-177).
+    Field(
+        "rolling_update_drain_seconds",
+        Gate(since=(4, 5, 1)),
+        read_from="settings",
+        column_gated=True,
+    ),
+)
+
+#: The Dockerfile build stage (`--target`). A top-level column every GET returns,
+#: in the UPDATE array at every tag, and in the shared CREATE array only from
+#: v4.5.1 (ApplicationsController v4.5.1:1372; v4.5.0:1340 lacks it). Sent on the
+#: routes that BUILD a Dockerfile — git and inline dockerfile — never on the
+#: image route, which builds nothing.
+_BUILD_TARGET: tuple[Field, ...] = (Field("dockerfile_target_build", Gate(since=(4, 5, 1))),)
+
+_APPLICATION_BY_ROUTE: Mapping[str, tuple[Field, ...]] = MappingProxyType(
+    {
+        "public": _APPLICATION + _BUILD_TARGET,
+        "private-github-app": _APPLICATION + _BUILD_TARGET,
+        "private-deploy-key": _APPLICATION + _BUILD_TARGET,
+        "dockerfile": _APPLICATION + _BUILD_TARGET,
+        "dockerimage": _APPLICATION,
+    }
 )
 
 # ── services ─────────────────────────────────────────────────────────────────
@@ -643,6 +685,11 @@ _BACKUP: tuple[Field, ...] = (
     # Joins in v4.3.18 and v4.4.0 together with its COLUMN (absent at v4.3.0), so
     # a GET row carries the key exactly where create accepts it.
     Field("missing_backup_notification_days", Gate(since=(4, 3, 18)), column_gated=True),
+    # Delete the local dump after the S3 upload. Every GET returns the column; the
+    # create array takes it only from v4.5.1 (DatabasesController v4.5.1:1116),
+    # and refuses it unless save_s3 is true (:1201-1202) — so
+    # api/schedules.build_backup_body sends it only beside save_s3.
+    Field("disable_local_backup", Gate(since=(4, 5, 1))),
 )
 
 # ── the tables ───────────────────────────────────────────────────────────────
@@ -655,7 +702,7 @@ _BACKUP: tuple[Field, ...] = (
 #: ``backups``.
 CREATE_FIELDS: Mapping[str, tuple[Field, ...]] = MappingProxyType(
     {
-        **{f"applications/{route}": _APPLICATION for route in APPLICATION_ROUTES},
+        **{f"applications/{route}": _APPLICATION_BY_ROUTE[route] for route in APPLICATION_ROUTES},
         "services/template": _SERVICE,
         "services/compose": _SERVICE_COMPOSE,
         **{
@@ -709,3 +756,12 @@ def known_fields(endpoint: str) -> frozenset[str]:
 def carries(endpoint: str, field: str, version: Version | None) -> bool:
     """Whether a request to ``endpoint`` on ``version`` may carry ``field``."""
     return field in fields_for(endpoint, version)
+
+
+def every_application_route_carries(field: str, version: Version | None) -> bool:
+    """Whether an application create carries ``field`` whichever route it takes.
+
+    For a plan line about an application setting: it may say "carried" only if
+    the route the target is created through cannot matter.
+    """
+    return all(carries(f"applications/{route}", field, version) for route in APPLICATION_ROUTES)

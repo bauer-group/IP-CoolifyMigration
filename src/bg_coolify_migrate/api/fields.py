@@ -216,11 +216,10 @@ BACKUP_CREATE: frozenset[str] = cv.known_fields("backups")
 #: Accepted too, but never copied off a GET: build_backup_body sets them from the
 #: destinations a 4.5 row discloses. `s3_storage_uuids` exists from v4.5.0 only.
 BACKUP_S3_FIELDS: frozenset[str] = frozenset({"s3_storage_uuid", "s3_storage_uuids"})
-#: Returned by every GET and never sent. disable_local_backup joins the create
-#: array only at v4.5.1 (DatabasesController $backupConfigFields) and 422s on
-#: v4.5.0, the newest release we validate, so the plan reports it instead;
-#: description is in no create array at all.
-BACKUP_UNSETTABLE: frozenset[str] = frozenset({"disable_local_backup", "description"})
+#: Returned by every GET and never sent: description is in no create array at
+#: all. (disable_local_backup left this list when v4.5.1 began accepting it — it
+#: is a registry row gated on that release now.)
+BACKUP_UNSETTABLE: frozenset[str] = frozenset({"description"})
 
 # ── environment variables ────────────────────────────────────────────────────
 

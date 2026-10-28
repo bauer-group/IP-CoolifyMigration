@@ -681,9 +681,10 @@ running. These cases come up as plan warnings, never as blocks:
   and in S3 if they were uploaded. Nothing deletes them, and no retention prunes
   them once the source is stopped. Remove them by hand when you no longer need
   them.
-- **"keep no local dumps on the source (disable_local_backup)"**: no API can set
-  that, so the target keeps local dumps. Switch it off on the target if disk
-  matters.
+- **"keep no local dumps on the source (disable_local_backup)"**: below Coolify
+  4.5.1 no API can set that, so the target keeps local dumps. From 4.5.1 it is
+  carried — unless the copy is created local-only (its S3 storage cannot be
+  named), which must keep its dumps. Switch it off on the target if disk matters.
 - **"service database(s) … can have backup schedules"**: no Coolify API exposes a
   service database's schedules. Check each one's Backups tab on the source and
   recreate them on the target by hand.

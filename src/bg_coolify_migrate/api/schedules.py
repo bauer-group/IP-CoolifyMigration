@@ -251,13 +251,17 @@ _RETENTION_FIELDS = (
 def build_backup_body(row: dict[str, Any], *, version: Version | None = None) -> dict[str, Any]:
     """The create body for one source backup schedule. PURE.
 
-    Values only, through the registry's ``backups`` fields for ``version``; never ``backup_now`` (it dumps at once,
-    and needs ``deploy`` from 4.5). The S3 destinations are set from what the row
-    DISCLOSES (4.5+), primary first, even with save_s3 off — that keeps the
-    storage the operator preselected. A row that uploads to S3 without
-    disclosing where (before 4.5, or a storage since deleted) is created with
-    save_s3 off: sending it on would 422 the whole schedule, and the plan has
-    already said "local-only" out loud.
+    Values only, through the registry's ``backups`` fields for ``version``; never
+    ``backup_now`` (it dumps at once, and needs ``deploy`` from 4.5). The S3
+    destinations are set from what the row DISCLOSES (4.5+), primary first, even
+    with save_s3 off — that keeps the storage the operator preselected. A row
+    that uploads to S3 without disclosing where (before 4.5, or a storage since
+    deleted) is created with save_s3 off: sending it on would 422 the whole
+    schedule, and the plan has already said "local-only" out loud.
+
+    ``disable_local_backup`` (4.5.1+) rides only beside save_s3: the create
+    refuses it otherwise (DatabasesController v4.5.1:1201-1202), and a schedule
+    created local-only must keep its local dumps — they are its only copy.
     """
     body = filter_for(row, "backups", version)
     for field in _RETENTION_FIELDS:
@@ -269,6 +273,8 @@ def build_backup_body(row: dict[str, Any], *, version: Version | None = None) ->
         body["s3_storage_uuid"] = destinations[0]
     elif body.get("save_s3"):
         body["save_s3"] = False
+    if not body.get("save_s3"):
+        body.pop("disable_local_backup", None)
     return body
 
 

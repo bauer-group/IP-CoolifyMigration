@@ -17,9 +17,12 @@ from bg_coolify_migrate.domain import fidelity
 from bg_coolify_migrate.domain.kinds import DatabaseEngine
 from bg_coolify_migrate.domain.versions import at_least, parse_version
 
+V451 = (4, 5, 1)
 V45 = (4, 5, 0)
 V44 = (4, 4, 0)
 V43 = (4, 3, 10)
+#: A source server's wildcard base: hosts under it are bound to that server.
+WILD = "app.0046-20.example.net"
 
 
 class TestVersions:
@@ -215,6 +218,72 @@ class TestApplicationWarnings:
         )
         assert len(out) == 1
         assert "regenerates its labels" in out[0]
+
+    @pytest.mark.parametrize("version", [V45, None])
+    def test_default_variables_off_warns_until_4_5_1(self, version: tuple[int, ...] | None) -> None:
+        """An unknown release gets no field a release in range would refuse — so
+        the setting is not carried there either, and the warning stands."""
+        settings = {"include_coolify_default_variables": False}
+        assert len(fidelity.application_warnings({"settings": settings}, version=version)) == 1
+
+    def test_default_variables_off_is_carried_from_4_5_1(self) -> None:
+        settings = {"include_coolify_default_variables": False}
+        assert fidelity.application_warnings({"settings": settings}, version=V451) == []
+
+    def test_readonly_labels_off_is_carried_from_4_5_1(self) -> None:
+        """The target keeps the source's labels verbatim: they route only the app's
+        own custom domain, which the DNS gate guards."""
+        source = {
+            "settings": {"is_container_label_readonly_enabled": False},
+            "fqdn": "https://shop.example.com",
+            "custom_labels": "traefik.http.routers.r0.rule=Host(`shop.example.com`)\n"
+            "traefik.http.middlewares.gz.compress=true",
+        }
+        assert fidelity.application_warnings(source, version=V451, source_wildcard=WILD) == []
+
+    def test_readonly_labels_routing_a_source_bound_host_are_not_kept(self) -> None:
+        """Kept verbatim they would route — and request a certificate for — a host
+        that still resolves to the source (invariant 7), so the target regenerates
+        them instead, and the plan says which hosts and why."""
+        source = {
+            "settings": {"is_container_label_readonly_enabled": False},
+            "fqdn": f"https://shop.example.com,https://shop.{WILD}",
+            "custom_labels": "traefik.http.routers.r0.rule=Host(`shop.example.com`) || "
+            f"Host(`shop.{WILD}`)\ncaddy_0=https://extra.example.org",
+        }
+        [line] = fidelity.application_warnings(source, version=V451, source_wildcard=WILD)
+        assert f"shop.{WILD}" in line and "extra.example.org" in line
+        assert "readonly labels ON instead" in line
+        assert "shop.example.com'" not in line  # its own custom domain is fine
+
+
+class TestLabelsRouteBeyondDomains:
+    def test_own_custom_domains_only(self) -> None:
+        source = {
+            "fqdn": "https://a.example.com,https://b.example.com:8443",
+            "custom_labels": "traefik.http.routers.x.rule=Host(`a.example.com`,`b.example.com`)",
+        }
+        assert fidelity.labels_route_beyond_domains(source, source_wildcard=WILD) == []
+
+    def test_base64_labels_are_read(self) -> None:
+        labels = "traefik.http.routers.x.rule=Host(`elsewhere.example.com`)"
+        source = {"fqdn": "", "custom_labels": base64.b64encode(labels.encode()).decode()}
+        assert fidelity.labels_route_beyond_domains(source, source_wildcard=None) == [
+            "elsewhere.example.com"
+        ]
+
+    def test_a_generated_host_is_never_own(self) -> None:
+        host = "app-abc.10.0.0.1.sslip.io"
+        source = {"fqdn": f"http://{host}", "custom_labels": f"caddy_0=http://{host}"}
+        assert fidelity.labels_route_beyond_domains(source, source_wildcard=None) == [host]
+
+    def test_a_host_regexp_cannot_be_enumerated(self) -> None:
+        source = {"fqdn": "", "custom_labels": "traefik.http.routers.x.rule=HostRegexp(`{s:.+}`)"}
+        [entry] = fidelity.labels_route_beyond_domains(source, source_wildcard=None)
+        assert entry.startswith("HostRegexp(")
+
+    def test_no_labels(self) -> None:
+        assert fidelity.labels_route_beyond_domains({"fqdn": "https://a.b"}, source_wildcard=None) == []
 
     def test_a_static_site(self) -> None:
         out = fidelity.application_warnings({"settings": {"is_static": True}}, version=V45)

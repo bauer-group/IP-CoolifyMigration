@@ -131,7 +131,7 @@ class TestFields:
         assert "backup_now" not in BACKUP_CREATE | BACKUP_S3_FIELDS
 
     def test_the_whole_create_array(self) -> None:
-        # $backupConfigFields v4.5.0:1057, minus the S3 uuids.
+        # $backupConfigFields v4.5.1:1116, minus the S3 uuids.
         upstream = {
             "save_s3",
             "enabled",
@@ -146,8 +146,15 @@ class TestFields:
             "database_backup_retention_max_storage_s3",
             "timeout",
             "missing_backup_notification_days",
+            "disable_local_backup",
         }
         assert upstream == BACKUP_CREATE
+
+    def test_disable_local_backup_only_from_4_5_1(self) -> None:
+        """v4.5.0 has it in no create array: sending it there 422s the schedule."""
+        assert "disable_local_backup" not in coolify_versions.fields_for("backups", (4, 5, 0))
+        assert "disable_local_backup" in coolify_versions.fields_for("backups", (4, 5, 1))
+        assert "disable_local_backup" not in coolify_versions.fields_for("backups", None)
 
 
 # ── client ───────────────────────────────────────────────────────────────────
@@ -299,6 +306,23 @@ class TestBackupWarnings:
         [line] = self._warn([_row(disable_local_backup=True)])
         assert "disable_local_backup" in line
 
+    def test_disable_local_backup_carried_from_4_5_1_is_silent(self) -> None:
+        row = _row(
+            save_s3=True,
+            s3_storage_uuids=["s3a"],
+            s3_storage_uuid="s3a",
+            disable_local_backup=True,
+        )
+        assert self._warn([row], version=(4, 5, 1)) == []
+        [line] = self._warn([row], version=(4, 5, 0))
+        assert "disable_local_backup" in line
+
+    def test_disable_local_backup_still_warns_when_the_copy_is_local_only(self) -> None:
+        """A schedule created without its S3 upload must keep its local dumps."""
+        row = _pre_4_5(_row(save_s3=True, disable_local_backup=True))
+        lines = self._warn([row], version=(4, 5, 1))
+        assert any("disable_local_backup" in line for line in lines)
+
     def test_a_different_clock_warns_only_for_an_armed_schedule(self) -> None:
         [line] = self._warn([_row()], source_timezone="Europe/Berlin")
         assert "Europe/Berlin" in line and "UTC" in line
@@ -422,6 +446,25 @@ class TestBuildBackupBody:
         )
         older = {k: v for k, v in _row().items() if k != "missing_backup_notification_days"}
         assert "missing_backup_notification_days" not in build_backup_body(older)
+
+    def test_disable_local_backup_rides_beside_save_s3_from_4_5_1(self) -> None:
+        row = _row(
+            save_s3=True,
+            s3_storage_uuids=["s3a"],
+            s3_storage_uuid="s3a",
+            disable_local_backup=True,
+        )
+        assert build_backup_body(row, version=(4, 5, 1))["disable_local_backup"] is True
+        assert "disable_local_backup" not in build_backup_body(row, version=(4, 5, 0))
+        assert "disable_local_backup" not in build_backup_body(row)
+
+    def test_disable_local_backup_never_without_save_s3(self) -> None:
+        """v4.5.1 refuses it then (DatabasesController:1201-1202) — and a copy
+        created local-only must keep its dumps, they are its only copy."""
+        dangling = _row(save_s3=True, s3_storage_uuids=[], disable_local_backup=True)
+        body = build_backup_body(dangling, version=(4, 5, 1))
+        assert body["save_s3"] is False
+        assert "disable_local_backup" not in body
 
     def test_negative_retention_is_sent_as_zero(self) -> None:
         """The UI stores -1; the API refuses it; retention treats both as 'keep all'."""

@@ -50,7 +50,7 @@ from bg_coolify_migrate.dns.extract import (
     normalise_host,
     route_env_keys,
 )
-from bg_coolify_migrate.domain import domains
+from bg_coolify_migrate.domain import domains, fidelity
 from bg_coolify_migrate.domain.kinds import ResourceKind, create_route
 from bg_coolify_migrate.domain.locked_envs import Secrets
 from bg_coolify_migrate.domain.naming import VolumeEndpoint, resource_config_dir
@@ -609,6 +609,23 @@ def _unrewritable_server_bound(
     return out
 
 
+#: ApplicationSetting::rollingUpdateDrainSeconds clamps to 0..MAX (v4.5.1:174-177,
+#: constants.php:66-67), and the create validates `integer|min:0|max:300`.
+_MAX_DRAIN_SECONDS = 300
+
+
+def _drain_seconds(value: object) -> int | None:
+    """The source's rolling-update drain as the create accepts it: what the source
+    effectively waits, clamped like Coolify clamps it. None when not a number."""
+    if isinstance(value, bool) or not isinstance(value, int | str):
+        return None
+    try:
+        seconds = int(value)
+    except ValueError:
+        return None
+    return min(max(seconds, 0), _MAX_DRAIN_SECONDS)
+
+
 async def create_application(
     api: CoolifyClient,
     snapshot: ResourceSnapshot,
@@ -629,6 +646,21 @@ async def create_application(
     body = filter_for({**source, **placement.as_body()}, f"applications/{segment}", version)
     body["name"] = snapshot.name
     body["instant_deploy"] = False
+
+    # Readonly labels OFF (4.5.1+) keeps the source's labels verbatim on the
+    # target. Only when they route nothing but the app's own custom domains —
+    # otherwise the target is created with Coolify's default (ON), regenerating
+    # its labels from its own domains, and the plan said so.
+    if body.get("is_container_label_readonly_enabled") is False and (
+        fidelity.labels_route_beyond_domains(source, source_wildcard=placement.source_wildcard)
+    ):
+        body.pop("is_container_label_readonly_enabled")
+    if "rolling_update_drain_seconds" in body:
+        drain = _drain_seconds(body["rolling_update_drain_seconds"])
+        if drain is None:
+            body.pop("rolling_update_drain_seconds")
+        else:
+            body["rolling_update_drain_seconds"] = drain
 
     # The image route sets the build pack itself, and every create validates a
     # SENT build_pack against BuildPackTypes, which has no 'dockerimage'
