@@ -9,6 +9,7 @@ release where the behaviour starts.
 from __future__ import annotations
 
 import base64
+import re
 from typing import Any
 
 import pytest
@@ -569,6 +570,78 @@ class TestLockedVariables:
     def test_a_readable_locked_variable_is_copied_and_silent(self) -> None:
         envs = [_env("TOKEN", "abc", is_shown_once=True, version="4.5.0")]
         assert fidelity.env_warnings(envs, collection="applications", engine=None, compose=None, version=V45) == []
+
+
+#: EnvironmentVariable::GENERATED_MAGIC_VARIABLE_COMMANDS, transcribed from
+#: v4.5.1:app/Models/EnvironmentVariable.php:68-74. generateEnvValue() has
+#: generated every one of them since v4.1.2 (shared.php:1427-1496).
+UPSTREAM_GENERATED_COMMANDS_V451 = (
+    "PASSWORD", "PASSWORD_64", "PASSWORDWITHSYMBOLS", "PASSWORDWITHSYMBOLS_64",
+    "BASE64", "BASE64_32", "BASE64_64", "BASE64_128",
+    "REALBASE64", "REALBASE64_32", "REALBASE64_64", "REALBASE64_128",
+    "HEX_32", "HEX_64", "HEX_128",
+    "USER", "LOWERCASEUSER", "SUPABASEANON", "SUPABASESERVICE",
+)  # fmt: skip
+
+
+class TestGeneratedMagicVariables:
+    """REGRESSION: a locked SERVICE_HEX_32_X was only "created WITHOUT" — while
+    the target generated its OWN value and the copied data kept the source's."""
+
+    @pytest.mark.parametrize("command", UPSTREAM_GENERATED_COMMANDS_V451)
+    @pytest.mark.parametrize(("collection", "compose_app"), [("services", False), ("applications", True)])
+    def test_every_upstream_command_is_regenerated(
+        self, command: str, collection: str, compose_app: bool
+    ) -> None:
+        assert fidelity.target_regenerates(
+            f"SERVICE_{command}_DB", collection=collection, engine=None, compose_app=compose_app
+        )
+
+    @pytest.mark.parametrize("key", ["SERVICE_USERNAME_DB", "SERVICE_FQDN_APP", "SERVICE_URL_APP", "SERVICE_NAME_DB"])
+    def test_lookalikes_are_not(self, key: str) -> None:
+        assert not fidelity.target_regenerates(key, collection="services", engine=None)
+
+    def test_a_plain_application_generates_nothing(self) -> None:
+        assert not fidelity.target_regenerates(
+            "SERVICE_HEX_32_DB", collection="applications", engine=None, compose_app=False
+        )
+
+    @pytest.mark.parametrize("version", [V43, V45, V451])
+    def test_a_locked_hex_secret_refuses_on_every_release(self, version: tuple[int, ...]) -> None:
+        envs = [_env("SERVICE_HEX_32_APP", _ABSENT, is_shown_once=True)]
+        [line] = fidelity.env_refusals(envs, collection="services", engine=None, version=version)
+        assert "SERVICE_HEX_32_APP" in line
+        assert not any(
+            "SERVICE_HEX_32_APP" in w
+            for w in fidelity.env_warnings(
+                envs, collection="services", engine=None, compose=None, version=version
+            )
+        )
+
+
+@pytest.mark.integration
+async def test_generated_magic_commands_match_upstream() -> None:
+    """Every command the newest release generates is regenerated here too."""
+    import httpx
+
+    from tests.test_api_fields import released_controllers
+
+    tag, _ = await released_controllers()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"https://raw.githubusercontent.com/coollabsio/coolify/{tag}/app/Models/EnvironmentVariable.php"
+        )
+        resp.raise_for_status()
+    match = re.search(r"GENERATED_MAGIC_VARIABLE_COMMANDS\s*=\s*\[(.*?)\];", resp.text, re.S)
+    assert match, f"found no GENERATED_MAGIC_VARIABLE_COMMANDS at {tag}"
+    commands = re.findall(r"'([A-Z0-9_]+)'", match.group(1))
+    assert commands, f"GENERATED_MAGIC_VARIABLE_COMMANDS at {tag} looks empty"
+    missed = [c for c in commands if not fidelity.is_generated_magic(f"SERVICE_{c}_X")]
+    assert not missed, (
+        f"Coolify {tag} generates {missed}, which fidelity.GENERATED_MAGIC_COMMANDS "
+        "does not know: a locked one would be created WITHOUT while the target "
+        "generates its own. Add each to the tuple."
+    )
 
 
 class TestLegacyEscaping:

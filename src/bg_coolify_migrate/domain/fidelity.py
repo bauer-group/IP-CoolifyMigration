@@ -1100,8 +1100,30 @@ def storage_refusals(storages: dict[str, Any] | None, *, version: Version | None
 
 # ── environment variables ────────────────────────────────────────────────────
 
-_GENERATED_SERVICE_SECRET = re.compile(r"^SERVICE_(PASSWORD|USER|BASE64|REALBASE64)")
+#: The magic-variable commands whose value generateEnvValue() GENERATES — upstream's
+#: own list from v4.5.1 (EnvironmentVariable::GENERATED_MAGIC_VARIABLE_COMMANDS,
+#: :68-74), and the same switch at every release in range (shared.php
+#: v4.1.2:1427-1496, v4.5.0:2076-2145). Matched as SERVICE_<COMMAND>, the
+#: <COMMAND> whole or followed by `_` — PASSWORD covers PASSWORD_64, HEX covers
+#: HEX_32/64/128, BASE64 its _32/_64/_128 — so SERVICE_USERNAME_X is not one.
+GENERATED_MAGIC_COMMANDS: tuple[str, ...] = (
+    "PASSWORD",
+    "PASSWORDWITHSYMBOLS",
+    "BASE64",
+    "REALBASE64",
+    "HEX",
+    "USER",
+    "LOWERCASEUSER",
+    "SUPABASEANON",
+    "SUPABASESERVICE",
+)
+_GENERATED_SERVICE_SECRET = re.compile(rf"^SERVICE_({'|'.join(GENERATED_MAGIC_COMMANDS)})(_|$)")
 _CREDENTIAL_KEY = re.compile(r"PASSWORD|PASSWD|SECRET|TOKEN|PRIVATE", re.IGNORECASE)
+
+
+def is_generated_magic(key: str) -> bool:
+    """Whether Coolify generates this SERVICE_* key's value itself. PURE."""
+    return bool(_GENERATED_SERVICE_SECRET.match(key))
 
 
 def target_regenerates(
@@ -1109,8 +1131,12 @@ def target_regenerates(
 ) -> bool:
     """A locked key the target will hold a DIFFERENT value for, not merely lack.
 
-    A new service generates its own SERVICE_PASSWORD_* / SERVICE_USER_* (and the
-    bulk upsert that would overwrite them skips a value it cannot read). So does
+    A new service generates its own generated magic variables — SERVICE_PASSWORD_*,
+    SERVICE_USER_*, SERVICE_HEX_*, SERVICE_SUPABASEANON_* … (:data:`GENERATED_MAGIC_COMMANDS`;
+    until it mirrored upstream's list only four commands were known here, so a
+    locked SERVICE_HEX_32_X was merely "created without" while the target
+    generated a different one) — and the bulk upsert that would overwrite them
+    skips a value it cannot read. So does
     a dockercompose APPLICATION: applicationParser firstOrCreates the same magic
     rows (v4.1.2 parsers.php:630, v4.3.10:668, v4.5.0:1436-1444). A Redis takes
     its server password from REDIS_PASSWORD and gets a random one. NOT
@@ -1118,7 +1144,7 @@ def target_regenerates(
     without the locked one falls back to the carried keydb/dragonfly_password.
     """
     if collection == "services" or (collection == "applications" and compose_app):
-        return bool(_GENERATED_SERVICE_SECRET.match(key))
+        return is_generated_magic(key)
     return engine is DatabaseEngine.REDIS and key == "REDIS_PASSWORD"
 
 

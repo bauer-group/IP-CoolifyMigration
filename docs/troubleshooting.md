@@ -50,9 +50,11 @@ It never guesses. Two consequences worth knowing:
 ### "… could not be read back from the source server (reason)"
 
 A **refusal** when the target would generate its own value for the key — a
-service's or a dockercompose application's `SERVICE_PASSWORD_*` /
-`SERVICE_USER_*`, a Redis `REDIS_PASSWORD` — because the copied data was
-initialised with the source's. A **warning** otherwise: the target is created
+service's or a dockercompose application's generated magic variables
+(`SERVICE_PASSWORD_*`, `SERVICE_USER_*`, `SERVICE_BASE64_*`, `SERVICE_HEX_*`,
+`SERVICE_LOWERCASEUSER_*`, `SERVICE_SUPABASEANON_*` and the rest of Coolify's
+list), a Redis `REDIS_PASSWORD` — because the copied data was initialised with
+the source's. A **warning** otherwise: the target is created
 without the key; set it by hand. The reason says what to do:
 
 | Reason | What to do |
