@@ -1,6 +1,24 @@
 # CHANGELOG
 
 
+## v2.11.0 (2026-10-28)
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`1cbac2b`](https://github.com/bauer-group/IP-CoolifyMigration/commit/1cbac2bf7c40dfadbdbbcef699c29d38ed41842d))
+
+### Features
+
+- **cli**: Offered to stop offline-only stacks
+  ([`b2efb49`](https://github.com/bauer-group/IP-CoolifyMigration/commit/b2efb491bb64cc7f6f5c98c251ae7658bc0f17f6))
+
+### Testing
+
+- **api**: Adjudicated the fields Coolify 4.5.1 adds
+  ([`5238f63`](https://github.com/bauer-group/IP-CoolifyMigration/commit/5238f631de7d1b22d4a091326e1fec65b2030cb2))
+
+
 ## v2.10.0 (2026-10-27)
 
 ### Bug Fixes
