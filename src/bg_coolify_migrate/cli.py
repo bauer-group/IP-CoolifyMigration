@@ -26,7 +26,7 @@ import asyncio
 import contextlib
 import json
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
@@ -966,9 +966,8 @@ async def _run(
     assume_yes: bool,
 ) -> int:
     from bg_coolify_migrate.api.client import CoolifyClient
-    from bg_coolify_migrate.engine.runner import make_migration_id, run_migration
-    from bg_coolify_migrate.ui import dashboard, run_report, wizard
     from bg_coolify_migrate.ui import report as report_mod
+    from bg_coolify_migrate.ui import wizard
 
     console = get_console()
     url, token = settings.require_coolify()
@@ -984,14 +983,20 @@ async def _run(
             return 0
         project_name, jobs = await _resolve_jobs(api, selection)
 
+        async def build(job: tuple[str, str, str | None]) -> MigrationPlan:
+            plan = await _build(
+                api, settings, job[0], job[1], resolved_target,
+                job[2], trust_host_key, source_wildcard, target_wildcard,
+            )
+            return plan.model_copy(update={"finalize_policy": policy})
+
         plans: list[MigrationPlan] = []
-        for job_project, job_environment, job_resource in jobs:
+        plan_jobs: list[tuple[str, str, str | None]] = []
+        for job in jobs:
+            job_environment = job[1]
             try:
-                plan = await _build(
-                    api, settings, job_project, job_environment, resolved_target,
-                    job_resource, trust_host_key, source_wildcard, target_wildcard,
-                )
-                plans.append(plan.model_copy(update={"finalize_policy": policy}))
+                plans.append(await build(job))
+                plan_jobs.append(job)
             except EmptyEnvironment:
                 # Only skip a genuinely empty environment, and only across a whole
                 # project. Anything else (host key, no server) must surface.
@@ -1005,6 +1010,10 @@ async def _run(
             console.print(Text(f"error: nothing to migrate for {project_name}", style="err"))
             return 2
 
+        #: Sources this run stopped up front (offline-only stacks), as (collection,
+        #: uuid, name). Started again unless the migration got as far as stopping them.
+        stopped: list[tuple[str, str, str]] = []
+
         if not assume_yes:
             if not is_interactive():
                 console.print(
@@ -1017,9 +1026,12 @@ async def _run(
             # URLs are rewritten regardless; accept_dns only affects a custom domain
             # that still points at the source, which the gate then warns about.
             try:
+                plans = await _offer_offline(api, settings, plans, plan_jobs, build, stopped)
                 if not await _off_loop(_confirm_plans, plans):
+                    await _restart_stopped(api, stopped)
                     return 0
             except wizard.Cancelled:
+                await _restart_stopped(api, stopped)
                 console.print("aborted", style="muted")
                 return 0
             accept_drift = True
@@ -1031,51 +1043,157 @@ async def _run(
                     console.print(report_mod.plain_plan(migration_plan))
                 return 2
 
-        # Accept the target host key HERE - before the live dashboard, where a
-        # prompt cannot be shown. The source key was recorded while building the plan.
-        await _accept_host_key(api, settings, plans[0].target_server, trust_host_key)
-
-        worst = 0
-        for migration_plan in plans:
-            migration_id = make_migration_id(migration_plan.project, migration_plan.environment)
-            started = time.monotonic()
-            reporter = dashboard.build(
-                title=f"{migration_plan.project}/{migration_plan.environment}"
+        try:
+            return await _execute_plans(
+                api, settings, plans, stopped,
+                accept_drift=accept_drift, accept_dns=accept_dns, accept_hosts=accept_hosts,
+                delete_previews=delete_previews, trust_host_key=trust_host_key,
             )
-            with reporter:
-                result = await run_migration(
-                    api,
-                    settings,
-                    migration_plan,
-                    migration_id=migration_id,
-                    accept_drift=accept_drift,
-                    accept_dns=accept_dns,
-                    accept_hosts=accept_hosts,
-                    delete_previews=delete_previews,
-                    trust_host_key=trust_host_key,
-                    host_key_prompt=None,  # keys pre-accepted; never prompt under Live
-                    on_state=reporter.on_state,
-                )
-            elapsed = time.monotonic() - started
-            if is_interactive():
-                console.print(
-                    run_report.outcome_panel(result, migration_id=migration_id, elapsed=elapsed)
-                )
-            else:
-                console.print(run_report.plain_result(result, migration_id=migration_id))
+        finally:
+            # Whatever the saga never took over (it does at QUIESCE) is still down
+            # because of the up-front stop: bring it back.
+            await _restart_stopped(api, stopped)
 
-            if result.exit_code != 0:
-                worst = result.exit_code
-                if len(plans) > 1:
-                    console.print(
-                        Text(
-                            f"stopping: {migration_plan.environment} failed "
-                            f"(exit {result.exit_code}); later environments were not started.",
-                            style="warn",
-                        )
+
+async def _execute_plans(
+    api: Any,
+    settings: Settings,
+    plans: list[MigrationPlan],
+    stopped: list[tuple[str, str, str]],
+    *,
+    accept_drift: bool,
+    accept_dns: bool,
+    accept_hosts: frozenset[str],
+    delete_previews: bool,
+    trust_host_key: bool,
+) -> int:
+    from bg_coolify_migrate.domain.statemachine import ORDER, State
+    from bg_coolify_migrate.engine.runner import make_migration_id, run_migration
+    from bg_coolify_migrate.ui import dashboard, run_report
+
+    console = get_console()
+    # Accept the target host key HERE - before the live dashboard, where a
+    # prompt cannot be shown. The source key was recorded while building the plan.
+    await _accept_host_key(api, settings, plans[0].target_server, trust_host_key)
+
+    worst = 0
+    for migration_plan in plans:
+        migration_id = make_migration_id(migration_plan.project, migration_plan.environment)
+        started = time.monotonic()
+        reporter = dashboard.build(
+            title=f"{migration_plan.project}/{migration_plan.environment}"
+        )
+        with reporter:
+            result = await run_migration(
+                api,
+                settings,
+                migration_plan,
+                migration_id=migration_id,
+                accept_drift=accept_drift,
+                accept_dns=accept_dns,
+                accept_hosts=accept_hosts,
+                delete_previews=delete_previews,
+                trust_host_key=trust_host_key,
+                host_key_prompt=None,  # keys pre-accepted; never prompt under Live
+                on_state=reporter.on_state,
+            )
+        elapsed = time.monotonic() - started
+        # From QUIESCE on the saga owns the source: it stops it itself, and its
+        # rollback restarts it (stop_requested marker). Before that, a source
+        # stopped up front stays ours to start again.
+        if ORDER.index(result.reached) >= ORDER.index(State.QUIESCE):
+            owned = {r.snapshot.uuid for r in migration_plan.resources}
+            stopped[:] = [s for s in stopped if s[1] not in owned]
+        if is_interactive():
+            console.print(
+                run_report.outcome_panel(result, migration_id=migration_id, elapsed=elapsed)
+            )
+        else:
+            console.print(run_report.plain_result(result, migration_id=migration_id))
+
+        if result.exit_code != 0:
+            worst = result.exit_code
+            if len(plans) > 1:
+                console.print(
+                    Text(
+                        f"stopping: {migration_plan.environment} failed "
+                        f"(exit {result.exit_code}); later environments were not started.",
+                        style="warn",
                     )
-                break
-        return worst
+                )
+            break
+    return worst
+
+
+async def _offer_offline(
+    api: Any,
+    settings: Settings,
+    plans: list[MigrationPlan],
+    jobs: list[tuple[str, str, str | None]],
+    build: Callable[[tuple[str, str, str | None]], Awaitable[MigrationPlan]],
+    stopped: list[tuple[str, str, str]],
+) -> list[MigrationPlan]:
+    """Stop, on the operator's yes, a stack that can only migrate offline.
+
+    A plan blocked by nothing but anonymous volumes of running containers
+    (``ResourcePlan.offline_only``) clears once the stack is stopped: Coolify's
+    stop removes the containers, and the volumes come back empty on every
+    restart anyway. Each stopped resource is recorded in ``stopped`` BEFORE the
+    request, so a failure in between still leads to the restart.
+    """
+    from bg_coolify_migrate.ui import wizard
+
+    out = list(plans)
+    for index, plan in enumerate(out):
+        offline = [r for r in plan.resources if r.offline_only]
+        if not offline or len(offline) != len(plan.blocked_resources):
+            continue  # nothing to offer, or something else blocks it anyway
+        if not await _off_loop(wizard.confirm_offline, plan, offline):
+            continue
+        for resource in offline:
+            snapshot = resource.snapshot
+            stopped.append((snapshot.collection, snapshot.uuid, snapshot.name))
+            await api.stop(snapshot.collection, snapshot.uuid)
+        out[index] = await _await_offline(settings, jobs[index], build)
+    return out
+
+
+async def _await_offline(
+    settings: Settings,
+    job: tuple[str, str, str | None],
+    build: Callable[[tuple[str, str, str | None]], Awaitable[MigrationPlan]],
+) -> MigrationPlan:
+    """Re-plan until the stop landed. Coolify queues every stop, so the first
+    plans can still see the running containers; the daemon, not the API's 200,
+    says when they are gone. Gives up after ``stop_timeout`` and returns the last
+    plan — still blocked, which the confirmation then shows."""
+    console = get_console()
+    console.print(Text("waiting for the stack to stop ...", style="muted"))
+    deadline = time.monotonic() + settings.stop_timeout
+    while True:
+        plan = await build(job)
+        if not any(r.offline_only for r in plan.resources) or time.monotonic() >= deadline:
+            return plan
+        await asyncio.sleep(5)
+
+
+async def _restart_stopped(api: Any, stopped: list[tuple[str, str, str]]) -> None:
+    """Start again what ``_offer_offline`` stopped and no migration took over.
+
+    ``/restart``, not ``/start``: the start endpoint refuses on Coolify's stale
+    status column (AGENTS.md). Failures are reported, never raised — this runs on
+    the way out of an abort or a failure that already has its own message.
+    """
+    console = get_console()
+    while stopped:
+        collection, uuid, name = stopped.pop(0)
+        try:
+            await api.restart(collection, uuid)
+            console.print(Text(f"started {name} again", style="muted"))
+        except Exception as exc:
+            console.print(
+                Text(f"could not start {name} again ({exc}) - start it in Coolify", style="err")
+            )
 
 
 def _confirm_plans(plans: list[MigrationPlan]) -> bool:

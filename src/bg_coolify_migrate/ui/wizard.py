@@ -17,7 +17,7 @@ from rich.console import Group, RenderableType
 from rich.markup import escape
 
 from bg_coolify_migrate.domain import schedules
-from bg_coolify_migrate.domain.plan import MigrationPlan
+from bg_coolify_migrate.domain.plan import MigrationPlan, ResourcePlan
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
 from bg_coolify_migrate.ui import report as report_mod
 from bg_coolify_migrate.ui.console import get_console, human_bytes, natural_key
@@ -241,6 +241,30 @@ def confirm_plan(plan: MigrationPlan) -> bool:
     # Asked last, so the operator has seen the whole plan before adjudicating the
     # compatibility question.
     return confirm_drift(plan)
+
+
+def confirm_offline(plan: MigrationPlan, resources: list[ResourcePlan]) -> bool:
+    """Ask to stop a stack that only migrates offline (``ResourcePlan.offline_only``).
+
+    The downtime starts now instead of at QUIESCE, and what the anonymous
+    volumes hold is not carried — both said before the question, not after.
+    """
+    console = get_console()
+    for resource in resources:
+        console.print(
+            f"\n[warn]{escape(resource.snapshot.name)}[/warn] runs with anonymous volume(s) at "
+            f"{escape(', '.join(resource.anonymous_mount_paths))}. Coolify recreates them empty "
+            "on every restart, so this stack can only be migrated offline; their contents are "
+            "not carried."
+        )
+    console.print(
+        "Stopping it now starts the downtime before the target is created. If the migration "
+        "stops before it would have stopped the source itself, the source is started again."
+    )
+    names = ", ".join(r.snapshot.name for r in resources)
+    return bool(
+        _ask(questionary.confirm(f"Stop {names} now and migrate offline?", default=False))
+    )
 
 
 def confirm_destructive(plan: MigrationPlan) -> bool:

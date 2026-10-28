@@ -378,18 +378,36 @@ migrating.
 
 ## "anonymous volume: its id cannot be reproduced"
 
-Your compose has a mount like `- /data` with no source. Docker names it with a
-random 64-hex id that cannot be recreated on the target, and there is no stable
-key to pair it by.
+A running container mounts a volume with no name: a compose mount like
+`- /data` with no source, or — more often — a `VOLUME` the image declares and
+the compose does not mount (SonarQube's `/opt/sonarqube/extensions` and
+`/opt/sonarqube/temp`). Docker names it with a random 64-hex id that cannot be
+recreated on the target, and there is no stable key to pair it by.
 
-Give it a name in the compose:
+Coolify removes every container on stop and before every deploy (`docker rm
+-f`, then `compose up`), so such a volume already comes back **empty** after
+each restart: its contents are nothing Coolify keeps. Stopped, the stack has no
+container mounting it, and the plan clears. So an interactive `run` asks:
+
+```text
+Stop <name> now and migrate offline?
+```
+
+Yes stops the stack through Coolify, waits until its containers are gone, plans
+again and continues; the downtime starts then instead of at QUIESCE. If the run
+ends before it would have stopped the source itself (an abort, a failure in
+CREATE), the source is started again. Unattended (`--yes`) runs do not stop
+anything: stop the stack in Coolify, then run again.
+
+Not offered for databases — there an anonymous volume can be the data itself
+(an image whose data path moved, like Postgres 18's `/var/lib/postgresql`).
+
+If the contents matter, give the volume a name in the compose before migrating:
 
 ```yaml
 volumes:
   - app-data:/data     # instead of: - /data
 ```
-
-Refusing beats silently starting with an empty volume.
 
 ## "this application also deploys to N additional server(s)"
 

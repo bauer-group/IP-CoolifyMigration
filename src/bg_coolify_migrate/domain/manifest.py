@@ -167,6 +167,18 @@ def _is_coolify_config_dir(host_path: str) -> bool:
     return host_path.startswith(f"{COOLIFY_BASE_DIR}/")
 
 
+#: Appended to an anonymous-volume refusal. Coolify removes every container on
+#: stop AND before every deploy (``docker rm -f``: StopApplication v4.5.0:50,
+#: ApplicationDeploymentJob.stop_running_container ahead of ``compose up``;
+#: StartService runs ``up --force-recreate``), so such a volume — typically an
+#: image ``VOLUME`` the compose does not mount — comes back EMPTY after every
+#: restart. Stopped, the stack has no container mounting it and plans clear.
+_OFFLINE_HINT = (
+    " - stop the stack in Coolify to migrate it offline (Coolify recreates this "
+    "volume empty on every restart anyway; its contents are not carried)"
+)
+
+
 def _classify_docker_mount(m: DockerMount) -> tuple[MountClass, Decision, str]:
     if m.type == "tmpfs":
         return MountClass.TMPFS, Decision.SKIP, "tmpfs is RAM-backed and empty by contract"
@@ -189,7 +201,8 @@ def _classify_docker_mount(m: DockerMount) -> tuple[MountClass, Decision, str]:
             return (
                 MountClass.ANONYMOUS,
                 Decision.REFUSE,
-                "anonymous volume: docker's random id cannot be reproduced on the target",
+                "anonymous volume: docker's random id cannot be reproduced on the target"
+                + _OFFLINE_HINT,
             )
         # Docker generates a 64-hex name for anonymous volumes even though the
         # mount reports a Name. Detect and refuse those too.
@@ -197,7 +210,8 @@ def _classify_docker_mount(m: DockerMount) -> tuple[MountClass, Decision, str]:
             return (
                 MountClass.ANONYMOUS,
                 Decision.REFUSE,
-                f"anonymous volume {m.name[:12]}...: its id cannot be reproduced on the target",
+                f"anonymous volume {m.name[:12]}...: its id cannot be reproduced on the target"
+                + _OFFLINE_HINT,
             )
         return MountClass.NAMED, Decision.MIGRATE, "named volume"
     return (

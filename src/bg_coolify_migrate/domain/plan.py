@@ -20,6 +20,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field
 
 from bg_coolify_migrate.domain import schedules
+from bg_coolify_migrate.domain.compose import MountClass
 from bg_coolify_migrate.domain.drift import RebuildDriftReport
 from bg_coolify_migrate.domain.kinds import BuildPack, DatabaseEngine, GitAuth, ResourceKind
 from bg_coolify_migrate.domain.manifest import VolumeManifest
@@ -235,6 +236,31 @@ class ResourcePlan(BaseModel):
                 "the copy"
             )
         return tuple(out)
+
+    @property
+    def offline_only(self) -> bool:
+        """Blocked by nothing but anonymous volumes of RUNNING containers.
+
+        Coolify removes every container on stop and before every deploy, so an
+        anonymous volume comes back empty after each restart — its contents are
+        no data Coolify keeps (see manifest._OFFLINE_HINT). Stopped, nothing
+        mounts it and the plan clears: such a stack migrates offline.
+
+        Never for a database: there an anonymous volume can be the data itself
+        (an image whose data path moved, Postgres 18's /var/lib/postgresql),
+        and the 4.4+ ClickHouse case is one Coolify deliberately keeps.
+        """
+        if self.snapshot.collection == "databases":
+            return False
+        anonymous = [i for i in self.manifest.refused if i.mount_class is MountClass.ANONYMOUS]
+        return bool(anonymous) and len(self.hard_blocking_reasons) == len(anonymous)
+
+    @property
+    def anonymous_mount_paths(self) -> tuple[str, ...]:
+        """Where the refused anonymous volumes are mounted, for the stop prompt."""
+        return tuple(
+            i.mount_path for i in self.manifest.refused if i.mount_class is MountClass.ANONYMOUS
+        )
 
     @property
     def drift_decisions(self) -> tuple[str, ...]:
