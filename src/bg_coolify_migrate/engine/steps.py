@@ -513,6 +513,17 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                 detail={"target_uuids": dict(created), "parked_domains": dict(parked)},
             )
 
+            # A database's settings no create array takes (4.5.1+): one PATCH,
+            # now the uuid is journaled.
+            if snapshot.collection == "databases":
+                await api_resources.finish_database_target(
+                    ctx.api,
+                    source_full,
+                    target_uuid,
+                    version=version,
+                    target_log_drain=ctx.plan.target_server.log_drain_enabled,
+                )
+
             # A service's domains ride its sub-applications: carried by one PATCH
             # now the uuid is journaled, and before copy_envs (4.5 derives the
             # target's SERVICE_URL_* rows from them in that PATCH).

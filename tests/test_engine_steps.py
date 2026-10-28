@@ -910,6 +910,62 @@ class TestCreateTarget:
         # Journalled before the envs were copied, not after.
         assert any(r.detail.get("target_uuids") == {"db1": "db2"} for r in ctx.journal.read())
 
+    @pytest.mark.parametrize(("version", "patched"), [("4.5.1", True), ("4.5.0", False)])
+    async def test_a_database_gets_its_settings_in_a_follow_up_patch(
+        self, ctx: MigrationContext, respx_mock: respx.Router, version: str, patched: bool
+    ) -> None:
+        """No create array takes them; v4.5.1's update does (v4.5.0 422s it).
+        Sent after the uuid is journaled, so a failure costs only the target."""
+        ctx.plan = ctx.plan.model_copy(
+            update={
+                "coolify_version": version,
+                "target_server": ctx.plan.target_server.model_copy(
+                    update={"log_drain_enabled": True}
+                ),
+            }
+        )
+        respx_mock.get(f"{BASE}/projects").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
+        )
+        respx_mock.get(f"{BASE}/projects/p1").mock(
+            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
+        )
+        respx_mock.get(f"{BASE}/servers/s2/destinations").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "d1", "network": "coolify"}])
+        )
+        respx_mock.get(f"{BASE}/databases/db1/tags").mock(return_value=httpx.Response(200, json=[]))
+        respx_mock.get(f"{BASE}/databases/db1").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "uuid": "db1",
+                    "include_coolify_default_variables": False,
+                    "is_log_drain_enabled": True,
+                },
+            )
+        )
+        create = respx_mock.post(f"{BASE}/databases/postgresql").mock(
+            return_value=httpx.Response(201, json={"uuid": "db2"})
+        )
+        patch = respx_mock.patch(f"{BASE}/databases/db2").mock(
+            return_value=httpx.Response(200, json={"message": "Database updated."})
+        )
+        respx_mock.get(f"{BASE}/databases/db1/envs").mock(return_value=httpx.Response(200, json=[]))
+        respx_mock.get(f"{BASE}/databases/db1/backups").mock(
+            return_value=httpx.Response(200, json=[])
+        )
+
+        await steps.step_create_target(ctx)
+        body = json.loads(create.calls[0].request.read())
+        assert "include_coolify_default_variables" not in body
+        assert "is_log_drain_enabled" not in body
+        assert patch.called is patched
+        if patched:
+            assert json.loads(patch.calls[0].request.read()) == {
+                "include_coolify_default_variables": False,
+                "is_log_drain_enabled": True,
+            }
+
     async def test_compose_target_waits_for_its_compose_before_quiesce(
         self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
     ) -> None:

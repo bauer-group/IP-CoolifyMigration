@@ -259,6 +259,33 @@ async def create_database(
     return str(uuid)
 
 
+async def finish_database_target(
+    api: CoolifyClient,
+    source: dict[str, Any],
+    target_uuid: str,
+    *,
+    version: Version | None,
+    target_log_drain: bool,
+) -> dict[str, Any]:
+    """Give a created database the settings no create array takes. Returns the body.
+
+    One PATCH, sent only after the engine journaled the uuid — a write that
+    fails here costs the target, which the rollback knows about — and only when
+    there is something to carry (fidelity.database_settings_patch: 4.5.1+). It
+    sends no ``instant_deploy`` and no ``is_public``, so it starts nothing.
+    """
+    body = fidelity.database_settings_patch(
+        source, version=version, target_log_drain=target_log_drain
+    )
+    if not body:
+        return body
+    await api.update_resource(
+        "databases", target_uuid, filter_body(body, fields_for("databases.update", version))
+    )
+    log.info("api.database.settings_carried", target=target_uuid, fields=sorted(body))
+    return body
+
+
 async def create_service(
     api: CoolifyClient,
     snapshot: ResourceSnapshot,

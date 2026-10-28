@@ -109,6 +109,7 @@ def server_ref(server: dict[str, Any]) -> ServerRef:
     wildcard = str(settings.get("wildcard_domain") or "") if isinstance(settings, dict) else ""
     prunes, cleanup = fidelity.docker_cleanup(server)
     return ServerRef(
+        log_drain_enabled=fidelity.server_log_drain_enabled(server),
         uuid=str(server.get("uuid", "")),
         name=str(server.get("name", "?")),
         ip=str(server.get("ip", "")),
@@ -895,7 +896,13 @@ async def build_plan(
             # CREATE moves to POST /databases/{uuid}/clone (v4.3.0 routes/api.php:340),
             # which replicates enable_ssl/ssl_mode. Today no create path carries them.
             warnings.extend(
-                fidelity.database_warnings(full, engine=snapshot.engine, tls_carried=False)
+                fidelity.database_warnings(
+                    full,
+                    engine=snapshot.engine,
+                    tls_carried=False,
+                    version=coolify_version,
+                    target_log_drain=fidelity.server_log_drain_enabled(target),
+                )
             )
             refusals.extend(fidelity.database_tls_config_refusals(full, engine=snapshot.engine))
             if snapshot.engine is None:

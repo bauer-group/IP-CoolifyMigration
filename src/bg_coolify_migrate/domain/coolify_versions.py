@@ -749,11 +749,25 @@ CREATE_FIELDS: Mapping[str, tuple[Field, ...]] = MappingProxyType(
     }
 )
 
+#: PATCH /v1/databases/{uuid}, sent right after the create (no create array takes
+#: either field). Both are read before removeUnnecessaryFieldsFromRequest strips
+#: them, so neither is an "extra" field (DatabasesController v4.5.1:688-702,
+#: bootstrap/helpers/api.php :491, :502); on v4.5.0 the update reads neither and
+#: include_coolify_default_variables is not stripped — a 422.
+_DATABASE_UPDATE: tuple[Field, ...] = (
+    # Applied :983-985, behind manageEnvironment :716.
+    Field("include_coolify_default_variables", Gate(since=(4, 5, 1))),
+    # Applied :980-982 — and 422'd (:720-725) unless the database's server has a
+    # log drain on, so api/resources.finish_database_target sends it only then.
+    Field("is_log_drain_enabled", Gate(since=(4, 5, 1))),
+)
+
 #: Per follow-up PATCH, the fields this tool sends. ``services.update``: PATCH
-#: /services/{uuid}.
+#: /services/{uuid}; ``databases.update``: PATCH /databases/{uuid}.
 UPDATE_FIELDS: Mapping[str, tuple[Field, ...]] = MappingProxyType(
     {
         "services.update": _SERVICE_UPDATE,
+        "databases.update": _DATABASE_UPDATE,
     }
 )
 

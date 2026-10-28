@@ -404,6 +404,56 @@ class TestServiceAndDatabaseWarnings:
         assert len(fidelity.database_warnings({"include_coolify_default_variables": False})) == 1
         assert fidelity.database_warnings({"include_coolify_default_variables": True}) == []
 
+    def test_database_default_variables_are_carried_from_4_5_1(self) -> None:
+        source = {"include_coolify_default_variables": False}
+        assert fidelity.database_warnings(source, version=V451) == []
+        assert fidelity.database_settings_patch(source, version=V451, target_log_drain=False) == {
+            "include_coolify_default_variables": False
+        }
+        assert fidelity.database_settings_patch(source, version=V45, target_log_drain=True) == {}
+
+    @pytest.mark.parametrize("version", [V43, V45, None])
+    def test_a_log_drain_was_lost_silently_on_every_release(
+        self, version: tuple[int, ...] | None
+    ) -> None:
+        """REGRESSION: no database route could set it before 4.5.1, and nothing said so."""
+        [line] = fidelity.database_warnings(
+            {"is_log_drain_enabled": True}, version=version, target_log_drain=True
+        )
+        assert "before 4.5.1" in line
+
+    def test_a_log_drain_is_carried_from_4_5_1_where_the_target_has_one(self) -> None:
+        source = {"is_log_drain_enabled": True}
+        assert fidelity.database_warnings(source, version=V451, target_log_drain=True) == []
+        assert fidelity.database_settings_patch(source, version=V451, target_log_drain=True) == {
+            "is_log_drain_enabled": True
+        }
+
+    def test_without_a_target_log_drain_coolify_would_refuse_it(self) -> None:
+        """DatabasesController v4.5.1:720-725: a 422 for the whole PATCH."""
+        source = {"is_log_drain_enabled": True}
+        assert fidelity.database_settings_patch(source, version=V451, target_log_drain=False) == {}
+        [line] = fidelity.database_warnings(source, version=V451, target_log_drain=False)
+        assert "target server has no log drain" in line
+
+    def test_defaults_send_nothing(self) -> None:
+        stock = {"include_coolify_default_variables": True, "is_log_drain_enabled": False}
+        assert fidelity.database_settings_patch(stock, version=V451, target_log_drain=True) == {}
+        assert fidelity.database_warnings(stock, version=V451) == []
+
+    @pytest.mark.parametrize(
+        ("settings", "on"),
+        [
+            ({"is_logdrain_axiom_enabled": True}, True),
+            ({"is_logdrain_cloudwatch_enabled": 1}, True),
+            ({"is_logdrain_newrelic_enabled": False}, False),
+            ({}, False),
+        ],
+    )
+    def test_server_log_drain(self, settings: dict[str, Any], on: bool) -> None:
+        assert fidelity.server_log_drain_enabled({"settings": settings}) is on
+        assert fidelity.server_log_drain_enabled(None) is False
+
     def test_unsupported_engine_names_it(self) -> None:
         refusal = fidelity.unsupported_engine_refusal({"type": "standalone-sqlite"})
         assert "'standalone-sqlite'" in refusal

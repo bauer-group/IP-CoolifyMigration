@@ -90,6 +90,10 @@ class ServerRef(BaseModel):
     and whether the server should prune is the operator's call."""
     docker_cleanup: str = ""
     """When that cleanup runs, in words — e.g. ``cron '0 0 * * *', on every run``."""
+    log_drain_enabled: bool = False
+    """A log drain is on for this server (Server::isLogDrainEnabled: New Relic,
+    Axiom, custom or CloudWatch). From 4.5.1 a database on it can have its own
+    log drain turned on through the API; without it Coolify refuses that."""
 
 
 class HostBaseline(BaseModel):

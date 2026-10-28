@@ -808,12 +808,66 @@ def _duplicate_key(url: str, *, normalised: bool) -> str:
     return key
 
 
+def database_settings_patch(
+    source: dict[str, Any], *, version: Version | None, target_log_drain: bool
+) -> dict[str, Any]:
+    """The follow-up PATCH that gives a created database its source's settings. PURE.
+
+    No create array takes either field; the update does from 4.5.1
+    (coolify_versions ``databases.update``). Only what differs from the target's
+    defaults: default COOLIFY_* variables OFF, and the log drain ON — the latter
+    only where the target server has a log drain, or Coolify refuses it
+    (DatabasesController v4.5.1:720-725). Empty: nothing to send.
+    """
+    body: dict[str, Any] = {}
+    if source.get("include_coolify_default_variables") is False and carries(
+        "databases.update", "include_coolify_default_variables", version
+    ):
+        body["include_coolify_default_variables"] = False
+    if (
+        source.get("is_log_drain_enabled") is True
+        and target_log_drain
+        and carries("databases.update", "is_log_drain_enabled", version)
+    ):
+        body["is_log_drain_enabled"] = True
+    return body
+
+
 def database_warnings(
-    source: dict[str, Any], *, engine: DatabaseEngine | None = None, tls_carried: bool = False
+    source: dict[str, Any],
+    *,
+    engine: DatabaseEngine | None = None,
+    tls_carried: bool = False,
+    version: Version | None = None,
+    target_log_drain: bool = False,
 ) -> list[str]:
+    """Database settings the target will not share. Silent on a stock database.
+
+    What :func:`database_settings_patch` carries for ``version`` (4.5.1+) is not
+    reported; ``target_log_drain`` says whether the target server has a log drain.
+    """
     out: list[str] = []
-    if source.get("include_coolify_default_variables") is False:
+    carried = database_settings_patch(
+        source, version=version, target_log_drain=target_log_drain
+    )
+    if (
+        source.get("include_coolify_default_variables") is False
+        and "include_coolify_default_variables" not in carried
+    ):
         out.append(_DEFAULT_VARIABLES_WARNING)
+    if source.get("is_log_drain_enabled") is True and "is_log_drain_enabled" not in carried:
+        out.append(
+            "the source ships this database's logs to its server's log drain"
+            + (
+                ", but the target server has no log drain on, so Coolify refuses to turn "
+                "it on for the target. Enable a log drain on the target server, then turn "
+                "it on for the database by hand."
+                if carries("databases.update", "is_log_drain_enabled", version)
+                else " (is_log_drain_enabled), which no Coolify API can set before 4.5.1. "
+                "The target ships no logs until you turn it on by hand — on a target "
+                "server that has a log drain."
+            )
+        )
     if lost := database_tls_lost_warning(source, engine=engine, carried=tls_carried):
         out.append(lost)
     if identity := database_tls_identity_warning(source, engine=engine):
@@ -1527,6 +1581,21 @@ def _truthy(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "t")
     return value is True or value == 1
+
+
+#: Server::isLogDrainEnabled (v4.5.1:2207-2218): any of these settings.
+_LOG_DRAIN_SETTINGS = (
+    "is_logdrain_newrelic_enabled",
+    "is_logdrain_axiom_enabled",
+    "is_logdrain_custom_enabled",
+    "is_logdrain_cloudwatch_enabled",
+)
+
+
+def server_log_drain_enabled(server: dict[str, Any] | None) -> bool:
+    """Whether a server GET shows a log drain on. Unknown reads as off. PURE."""
+    settings = _settings(server) if isinstance(server, dict) else {}
+    return any(_truthy(settings.get(key)) for key in _LOG_DRAIN_SETTINGS)
 
 
 def docker_cleanup(server: dict[str, Any]) -> tuple[bool, str]:
