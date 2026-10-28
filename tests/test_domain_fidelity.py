@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import base64
 import re
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -256,6 +256,36 @@ class TestApplicationWarnings:
         assert f"shop.{WILD}" in line and "extra.example.org" in line
         assert "readonly labels ON instead" in line
         assert "shop.example.com'" not in line  # its own custom domain is fine
+
+
+class TestDockerfileHealthcheck:
+    """custom_healthcheck_found is in no create array: the source runs its
+    Dockerfile's HEALTHCHECK, the target Coolify's configured check."""
+
+    SOURCE: ClassVar[dict[str, Any]] = {"custom_healthcheck_found": True, "health_check_enabled": True}
+
+    def test_warns_on_every_release(self) -> None:
+        [line] = fidelity.application_warnings(dict(self.SOURCE), version=V45)
+        assert "Coolify's configured check" in line
+        assert "SOURCE down after a rollback" not in line
+
+    @pytest.mark.parametrize("version", [V451, None])
+    def test_from_4_5_1_the_source_switches_too(self, version: tuple[int, ...] | None) -> None:
+        [line] = fidelity.application_warnings(dict(self.SOURCE), version=version)
+        assert "SOURCE down after a rollback" in line
+        assert "disable Coolify's health check on the source" in line
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            {"custom_healthcheck_found": False, "health_check_enabled": True},
+            {"custom_healthcheck_found": True, "health_check_enabled": False},
+            {"health_check_enabled": True},
+        ],
+    )
+    def test_silent_otherwise(self, source: dict[str, Any]) -> None:
+        """Disabled: the Dockerfile's check applies on both sides."""
+        assert fidelity.application_warnings(source, version=V451) == []
 
 
 class TestLabelsRouteBeyondDomains:

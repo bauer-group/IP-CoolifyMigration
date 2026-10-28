@@ -301,6 +301,8 @@ def application_warnings(
         )
     if source.get("is_maintenance_enabled") is True:
         out.append(_MAINTENANCE_WARNING)
+    if line := dockerfile_healthcheck_warning(source, version=version):
+        out.append(line)
     if supports("compose_port_overrides_hidden", version) and (
         compose_hidden_port_overrides(source, version=version) is None
     ):
@@ -314,6 +316,52 @@ def application_warnings(
             "runs with them; check it behaves as the running source does."
         )
     return out
+
+
+def dockerfile_healthcheck_warning(source: dict[str, Any], *, version: Version | None) -> str | None:
+    """The source runs its Dockerfile's HEALTHCHECK; the target runs Coolify's check.
+
+    ``custom_healthcheck_found`` is in no create array and is set only by a deploy
+    that parses the Dockerfile while Coolify's check is DISABLED, or on init
+    (Application::parseHealthcheckFromDockerfile, v4.5.0:2686-2743, v4.5.1:2737).
+    So a source with it set and Coolify's check enabled runs the Dockerfile's
+    check — up to 4.5.0 Coolify adds its own only when none was found
+    (ApplicationDeploymentJob v4.5.0:4196-4198) — while the target never learns
+    of it and runs Coolify's configured check: path, port and type. From 4.5.1 an
+    enabled Coolify check replaces the Dockerfile's on every deploy (v4.5.1:
+    4471-4486), so the source's own next deploy switches too, and so does a
+    rollback's restart of the source (a full deploy for these build packs,
+    :263); an unhealthy new container is removed and the deploy fails (:5256).
+
+    A warning, not a refusal: whether Coolify's configured check passes in this
+    image cannot be known at plan time.
+    """
+    if source.get("custom_healthcheck_found") is not True:
+        return None
+    if source.get("health_check_enabled") is False:
+        return None
+    line = (
+        "the source's Dockerfile has its own HEALTHCHECK while Coolify's health check "
+        "is enabled. The running source uses the Dockerfile's check, but the target "
+        "cannot know the Dockerfile had one, so it runs Coolify's configured check "
+        "instead (its path, port and type). If that check does not pass in this image "
+        "— a wrong path or port, no curl or wget — the target's deploy fails after the "
+        "source is stopped, and the run rolls back."
+    )
+    if supports("coolify_healthcheck_replaces_dockerfile", version):
+        return (
+            line + " From Coolify 4.5.1 the source switches too: its next deploy, and a "
+            "rollback's restart of it, run Coolify's check — so an unverified check can "
+            "leave the SOURCE down after a rollback. Before migrating, either disable "
+            "Coolify's health check on the source (the Dockerfile HEALTHCHECK then "
+            "applies on both), or redeploy the source once to prove the configured "
+            "check passes."
+        )
+    return (
+        line + " Before migrating, either disable Coolify's health check on the source "
+        "(the Dockerfile HEALTHCHECK then applies on both), or make sure its configured "
+        "check passes in this image."
+    )
 
 
 _DEFAULT_VARIABLES_WARNING = (

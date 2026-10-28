@@ -215,6 +215,11 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         # v4.5.1:5812-5868; ApplicationsController :156-159, ServicesController
         # :82-84). docker_compose_raw is not redacted.
         "locked_values_redacted_in_compose": Gate(since=(4, 5, 1)),
+        # An enabled Coolify health check replaces the Dockerfile's HEALTHCHECK on
+        # every deploy (ApplicationDeploymentJob v4.5.1:4471-4486); up to 4.5.0 it
+        # was added only when none was found (v4.5.0:4196-4198). Upstream commit
+        # e200927ff, issue #10974.
+        "coolify_healthcheck_replaces_dockerfile": Gate(since=(4, 5, 1)),
     }
 )
 
