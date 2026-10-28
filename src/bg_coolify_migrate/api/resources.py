@@ -1004,7 +1004,10 @@ async def finish_service_target(
     own: Collection[str] = (),
     version: Version | None = None,
 ) -> set[str]:
-    """Carry the source's domains, and its network flag, to a created service.
+    """Carry the source's domains and settings to a created service.
+
+    The settings: its network flag, and from 4.5.1 its default COOLIFY_*
+    variables turned off (``version``; domain/coolify_versions.py).
 
     One ``PATCH /services/{target}``, sent only after the engine journaled the
     uuid. Returns the target's sub-application uuids, which the caller adds to
@@ -1065,15 +1068,23 @@ async def finish_service_target(
         )
 
     body: dict[str, Any] = {}
+    allowed = fields_for("services.update", version)
     # Rejected on create before 4.5 (AGENTS.md), settable on update. Only when
     # true: the default is false, and a redundant write is just risk.
     if source.get("connect_to_docker_network"):
         body["connect_to_docker_network"] = True
+    # From 4.5.1 only (the field 422s the whole PATCH before), and only when the
+    # source turned the default COOLIFY_* variables off — on is the default.
+    if (
+        source.get("include_coolify_default_variables") is False
+        and "include_coolify_default_variables" in allowed
+    ):
+        body["include_coolify_default_variables"] = False
     if entries:
         body["urls"] = entries
     if not body:
         return target_apps
-    body = filter_body(body, fields_for("services.update", version))
+    body = filter_body(body, allowed)
 
     holders = {*own, *sub_application_uuids(source), *target_apps, target_uuid}
     try:

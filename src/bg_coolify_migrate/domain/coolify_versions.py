@@ -528,15 +528,23 @@ _SERVICE_COMPOSE: tuple[Field, ...] = _SERVICE
 #: v4.1.2:971, v4.5.0:1259) — any other key is a 422. force_domain_override
 #: reaches a target only when every conflicting holder is the source's own
 #: sub-application (resources.finish_service_target).
-_SERVICE_UPDATE: tuple[Field, ...] = _always(
-    "name",
-    "description",
-    "instant_deploy",
-    "docker_compose_raw",
-    "connect_to_docker_network",
-    "urls",
-    "force_domain_override",
-    "is_container_label_escape_enabled",
+_SERVICE_UPDATE: tuple[Field, ...] = (
+    *_always(
+        "name",
+        "description",
+        "instant_deploy",
+        "docker_compose_raw",
+        "connect_to_docker_network",
+        "urls",
+        "force_domain_override",
+        "is_container_label_escape_enabled",
+    ),
+    # Turns the default COOLIFY_* variables off. In the update $allowedFields
+    # from v4.5.1 (ServicesController v4.5.1:1245, applied :1331-1333, behind
+    # manageEnvironment :1236); v4.5.0:1250 lacks it, a 422 for the whole PATCH —
+    # domains included. In no create array: resources.finish_service_target
+    # carries it in the follow-up PATCH.
+    Field("include_coolify_default_variables", Gate(since=(4, 5, 1))),
 )
 
 # ── databases ────────────────────────────────────────────────────────────────

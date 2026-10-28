@@ -270,6 +270,48 @@ class TestFinishServiceTarget:
             ],
         }
 
+    @pytest.mark.parametrize(
+        ("version", "carried"), [((4, 5, 1), True), ((4, 5, 0), False), (None, False)]
+    )
+    async def test_default_variables_off_rides_the_patch_from_4_5_1(
+        self,
+        api: CoolifyClient,
+        respx_mock: respx.Router,
+        version: tuple[int, ...] | None,
+        carried: bool,
+    ) -> None:
+        """v4.5.0 refuses the field (ServicesController :1250): a 422 for the whole
+        PATCH, domains included — so never below 4.5.1, nor on an unknown release."""
+        respx_mock.get(f"{BASE}/services/tgt1").mock(side_effect=_target_reads())
+        patch = respx_mock.patch(f"{BASE}/services/tgt1").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        await resources.finish_service_target(
+            api,
+            _snapshot(),
+            _placement(),
+            _source(include_coolify_default_variables=False),
+            "tgt1",
+            version=version,
+        )
+        assert ("include_coolify_default_variables" in _body(patch)) is carried
+        if carried:
+            assert _body(patch)["include_coolify_default_variables"] is False
+
+    async def test_default_variables_alone_still_patch(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        """No domains to carry is no reason to drop the setting."""
+        respx_mock.get(f"{BASE}/services/tgt1").mock(side_effect=_target_reads())
+        patch = respx_mock.patch(f"{BASE}/services/tgt1").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        source = {"applications": [], "include_coolify_default_variables": False}
+        await resources.finish_service_target(
+            api, _snapshot(), _placement(), source, "tgt1", version=(4, 5, 1)
+        )
+        assert _body(patch) == {"include_coolify_default_variables": False}
+
     async def test_never_forces_on_the_first_attempt(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:

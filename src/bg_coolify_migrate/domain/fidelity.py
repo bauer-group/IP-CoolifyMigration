@@ -688,10 +688,16 @@ def newly_mapped_run_options(raw: object) -> list[str]:
 # ── services and databases ───────────────────────────────────────────────────
 
 
-def service_warnings(source: dict[str, Any]) -> list[str]:
-    """Service-level and per-sub-application settings the target will not share."""
+def service_warnings(source: dict[str, Any], *, version: Version | None = None) -> list[str]:
+    """Service-level and per-sub-application settings the target will not share.
+
+    The default COOLIFY_* variables turned off are carried from 4.5.1, by the
+    follow-up PATCH (resources.finish_service_target).
+    """
     out: list[str] = []
-    if source.get("include_coolify_default_variables") is False:
+    if source.get("include_coolify_default_variables") is False and not carries(
+        "services.update", "include_coolify_default_variables", version
+    ):
         out.append(_DEFAULT_VARIABLES_WARNING)
     if source.get("is_maintenance_enabled") is True:
         out.append(_MAINTENANCE_WARNING)

@@ -395,6 +395,11 @@ class TestServiceAndDatabaseWarnings:
         )
         assert len(out) == 2
 
+    def test_service_default_variables_are_carried_from_4_5_1(self) -> None:
+        source = {"include_coolify_default_variables": False}
+        assert fidelity.service_warnings(source, version=V451) == []
+        assert len(fidelity.service_warnings(source, version=V45)) == 1
+
     def test_database_default_variables(self) -> None:
         assert len(fidelity.database_warnings({"include_coolify_default_variables": False})) == 1
         assert fidelity.database_warnings({"include_coolify_default_variables": True}) == []

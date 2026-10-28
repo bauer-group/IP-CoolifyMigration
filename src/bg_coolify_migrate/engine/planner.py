@@ -916,7 +916,7 @@ async def build_plan(
             if not compose_backed:
                 refusals.extend(fidelity.storage_refusals(api_storages, version=coolify_version))
         else:
-            warnings.extend(fidelity.service_warnings(full))
+            warnings.extend(fidelity.service_warnings(full, version=coolify_version))
             refusals.extend(fidelity.service_refusals(full, version=coolify_version))
 
         # Env keys are validated by the TARGET's API at copy time, and Coolify
