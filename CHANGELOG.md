@@ -1,6 +1,56 @@
 # CHANGELOG
 
 
+## v2.12.0 (2026-10-28)
+
+### Bug Fixes
+
+- **envs**: Left compose preview secrets to Coolify
+  ([`195c47d`](https://github.com/bauer-group/IP-CoolifyMigration/commit/195c47df1be6e5cbc2866003bb81ae8b9d5c8cd5))
+
+- **envs**: Read a locked Redis password from file
+  ([`c3627b7`](https://github.com/bauer-group/IP-CoolifyMigration/commit/c3627b7ee083b739928ba450dff4f83184b6ed87))
+
+- **fidelity**: Refused every regenerated secret
+  ([`f5a905d`](https://github.com/bauer-group/IP-CoolifyMigration/commit/f5a905da79fcb62f2715127029a740e7da69603d))
+
+- **fidelity**: Treated redacted compose routing as unknown
+  ([`a308ae3`](https://github.com/bauer-group/IP-CoolifyMigration/commit/a308ae3233dc43f8ea838ccb8b96eef5e156b2cf))
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`5ae77ec`](https://github.com/bauer-group/IP-CoolifyMigration/commit/5ae77ec5bb24b4c0f66a50114ded9af100c0c297))
+
+### Features
+
+- **api**: Carried the fields Coolify 4.5.1 adds
+  ([`2caea9b`](https://github.com/bauer-group/IP-CoolifyMigration/commit/2caea9b5035d2bd39e52c641cd954f9224261803))
+
+- **databases**: Carried settings by PATCH from 4.5.1
+  ([`82959b0`](https://github.com/bauer-group/IP-CoolifyMigration/commit/82959b08f7d29e50221638053325aabb79b4f81e))
+
+- **fidelity**: Warned of a Dockerfile health check
+  ([`f795cb6`](https://github.com/bauer-group/IP-CoolifyMigration/commit/f795cb660631f6b49a2f7462d16c190745cb8a83))
+
+- **services**: Carried default variables from 4.5.1
+  ([`cf09ce6`](https://github.com/bauer-group/IP-CoolifyMigration/commit/cf09ce62b2d3a1c1f255e5cb435f5d9358bbd110))
+
+- **services**: Carried sub-application redirects
+  ([`311965c`](https://github.com/bauer-group/IP-CoolifyMigration/commit/311965c1686deff11327b5605776c9c4432f2bde))
+
+- **versions**: Validated Coolify 4.5.1
+  ([`93d6a94`](https://github.com/bauer-group/IP-CoolifyMigration/commit/93d6a94bdf6fee3812818c5447cb3bb475eb4ddc))
+
+- **versions**: Validated Coolify 4.5.2
+  ([`1aa15c6`](https://github.com/bauer-group/IP-CoolifyMigration/commit/1aa15c67788a8f63c0149689cac0ad01402ce312))
+
+### Refactoring
+
+- **versions**: Added a release registry
+  ([`4c1ae1b`](https://github.com/bauer-group/IP-CoolifyMigration/commit/4c1ae1b82e60ecb0cd094db39c7a46121b1cb092))
+
+
 ## v2.11.0 (2026-10-28)
 
 ### Documentation
