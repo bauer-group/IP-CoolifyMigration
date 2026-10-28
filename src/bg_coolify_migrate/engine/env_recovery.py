@@ -35,7 +35,7 @@ from bg_coolify_migrate.domain import fidelity
 from bg_coolify_migrate.domain import locked_envs as le
 from bg_coolify_migrate.domain.kinds import DatabaseEngine, ResourceKind
 from bg_coolify_migrate.domain.plan import ResourcePlan, ResourceSnapshot
-from bg_coolify_migrate.domain.versions import Version, parse_version
+from bg_coolify_migrate.domain.versions import Version
 from bg_coolify_migrate.errors import EnvRecoveryError, MigrationError
 from bg_coolify_migrate.transfer.ssh import RemoteHost
 
@@ -182,29 +182,11 @@ _NOTHING_CHANGED = (
 )
 
 
-class _VersionOnce:
-    """The instance version, read at most once and only if something is locked."""
-
-    def __init__(self, api: CoolifyClient) -> None:
-        self._api = api
-        self._read = False
-        self._value: Version | None = None
-
-    async def get(self) -> Version | None:
-        if not self._read:
-            self._read = True
-            try:
-                self._value = parse_version(await self._api.version())
-            except Exception as exc:  # diagnostics only: unknown applies every rule
-                log.debug("create.version_unavailable", error=type(exc).__name__)
-        return self._value
-
-
 async def _recover_for_create_one(
     api: CoolifyClient,
     source_host: RemoteHost,
     snapshot: ResourceSnapshot,
-    version: _VersionOnce,
+    version: Version | None,
 ) -> le.LockedRecovery | None:
     envs = await api.get_envs(snapshot.collection, snapshot.uuid)
     if not _has_locked(envs):
@@ -212,7 +194,7 @@ async def _recover_for_create_one(
     full = (
         await api.get_resource(snapshot.collection, snapshot.uuid) if _needs_full(snapshot) else {}
     )
-    recovery, _ = await _recover(source_host, snapshot, envs, version=await version.get(), full=full)
+    recovery, _ = await _recover(source_host, snapshot, envs, version=version, full=full)
     return recovery
 
 
@@ -220,7 +202,7 @@ async def _barrier(
     api: CoolifyClient,
     source_host: RemoteHost,
     snapshot: ResourceSnapshot,
-    version: _VersionOnce,
+    version: Version | None,
 ) -> le.LockedRecovery | None:
     """Re-raise anything unexpected as a value-free EnvRecoveryError.
 
@@ -243,16 +225,20 @@ async def _barrier(
 
 
 async def recover_for_create(
-    api: CoolifyClient, source_host: RemoteHost, resources: Sequence[ResourcePlan]
+    api: CoolifyClient,
+    source_host: RemoteHost,
+    resources: Sequence[ResourcePlan],
+    *,
+    version: Version | None = None,
 ) -> dict[str, le.Secrets]:
     """Every resource's recovered locked values, keyed by source uuid.
 
     Refuses — before CREATE's first write — when a key the plan promised can no
     longer be read, or when the target would regenerate an unrecoverable
     credential (the plan may predate a re-lock). Other unrecoverable keys are
-    dropped exactly as the plan warned, and logged by name.
+    dropped exactly as the plan warned, and logged by name. ``version`` is the
+    release the plan was made for; unknown applies every rule.
     """
-    version = _VersionOnce(api)
     out: dict[str, le.Secrets] = {}
     for resource in resources:
         snapshot = resource.snapshot

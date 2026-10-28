@@ -251,8 +251,9 @@ class TestCreateRecheck:
     async def test_a_server_attached_after_the_plan_refuses_before_anything_is_touched(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
+        # The remedy is worded for the release the PLAN was made against.
+        ctx.plan = ctx.plan.model_copy(update={"coolify_version": "4.2.1"})
         _mock_placement(respx_mock)
-        respx_mock.get(f"{BASE}/version").mock(return_value=httpx.Response(200, text="4.2.1"))
         create, park = _mock_multi_server_app(respx_mock)
 
         with pytest.raises(PreflightError, match=r"1 additional server\(s\) \(edge-2\)") as exc:
@@ -273,10 +274,10 @@ class TestCreateRecheck:
             resources=(
                 ResourcePlan(snapshot=_snapshot(), strategy=Strategy.COPY_DATA),
                 _app_resource(),
-            )
+            ),
+            coolify_version="4.5.0",
         )
         _mock_placement(respx_mock)
-        respx_mock.get(f"{BASE}/version").mock(return_value=httpx.Response(200, text="4.5.0"))
         respx_mock.get(f"{BASE}/databases/db1").mock(
             return_value=httpx.Response(200, json={"uuid": "db1"})
         )
@@ -300,21 +301,22 @@ class TestCreateRecheck:
         assert not create.called
         assert not park.called
 
-    async def test_an_unreadable_version_still_refuses_with_the_newest_wording(
+    async def test_an_unknown_version_still_refuses_with_the_newest_wording(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
+        # Neither the plan nor PREFLIGHT's journal knows the release.
+        assert ctx.coolify_version is None
         _mock_placement(respx_mock)
-        respx_mock.get(f"{BASE}/version").mock(return_value=httpx.Response(500, text="boom"))
         create, _ = _mock_multi_server_app(respx_mock)
 
         with pytest.raises(PreflightError, match="one-way"):
             await steps.step_create_target(ctx)
         assert not create.called
 
-    async def test_a_single_server_application_proceeds_without_a_version_read(
+    async def test_create_never_reads_the_version_again(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
-        """The common path costs no extra API call."""
+        """CREATE uses the release the plan saw: one read per run, at PLAN."""
         _mock_placement(respx_mock)
         version = respx_mock.get(f"{BASE}/version").mock(
             return_value=httpx.Response(200, text="4.5.0")

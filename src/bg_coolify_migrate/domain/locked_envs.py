@@ -70,15 +70,12 @@ from urllib.parse import unquote, urlsplit
 import yaml
 
 from bg_coolify_migrate.dns.wildcard import under_wildcard
+from bg_coolify_migrate.domain.coolify_versions import supports
 from bg_coolify_migrate.domain.kinds import DatabaseEngine
-from bg_coolify_migrate.domain.versions import Version, at_least, parse_version
+from bg_coolify_migrate.domain.versions import Version, parse_version
 
-#: New env rows use exact escaping; rows saved before keep the legacy escaping.
-EXACT_ENV_ESCAPING_SINCE: Version = (4, 5, 0)
-#: EnvironmentVariable::RUNTIME_BUILDPACK_CONTROL_VARIABLES (v4.5.0:50-55; absent
-#: at v4.4.7): buildpack control keys the runtime .env carries after all.
-RUNTIME_BUILDPACK_CONTROL_SINCE: Version = (4, 5, 0)
-
+#: The keys behind the ``runtime_buildpack_control`` feature
+#: (EnvironmentVariable::RUNTIME_BUILDPACK_CONTROL_VARIABLES).
 _RUNTIME_BUILDPACK_CONTROL = frozenset(
     {
         "NIXPACKS_PHP_ROOT_DIR",
@@ -248,7 +245,7 @@ def saved_before_exact_escaping(env: Mapping[str, Any]) -> bool:
     later cannot exist on an older instance, so the stamp alone decides.
     """
     stamped = parse_version(str(env["version"])) if env.get("version") else None
-    return stamped is None or stamped < EXACT_ENV_ESCAPING_SINCE
+    return stamped is None or not supports("exact_env_escaping", stamped)
 
 
 def is_json(value: str) -> bool:
@@ -584,7 +581,7 @@ def _app_writes(env: Mapping[str, Any], *, version: Version | None, compose_app:
         return False
     key = str(env.get("key"))
     if _is_buildpack_control(key) and not (
-        at_least(version, RUNTIME_BUILDPACK_CONTROL_SINCE) and key in _RUNTIME_BUILDPACK_CONTROL
+        supports("runtime_buildpack_control", version) and key in _RUNTIME_BUILDPACK_CONTROL
     ):
         return False
     return not (compose_app and key.startswith(_COMPOSE_GENERATED_PREFIXES))

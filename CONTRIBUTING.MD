@@ -66,8 +66,10 @@ encodes a specific, verified way that a predecessor tool destroys data.
 ## Testing expectations
 
 - New logic in `domain/` → table-driven tests covering the edges.
-- New API call → its field whitelist in `api/fields.py` **first**.
-  `$allowedFields` is enforced upstream and unknown fields are a 422 per field.
+- New API call → its fields in the release registry,
+  `domain/coolify_versions.py`, **first**, each gated on the releases that accept
+  it. `$allowedFields` is enforced upstream and unknown fields are a 422 per field.
+- New Coolify release → AGENTS.md, "Supporting a new Coolify release".
 - New IO in `discovery/` or `transfer/` → use the `FakeHost` fixture.
 - New saga step → a chaos test asserting its compensation.
 

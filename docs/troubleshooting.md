@@ -744,10 +744,20 @@ and the source keeps serving.
   sources and targets, never from anything else. Free it on the resource the
   message names (by type and uuid), then run again.
 
+## "the plan was made against Coolify X, but the instance now runs Y"
+
+A PREFLIGHT refusal; nothing has been changed. The plan records the Coolify
+release it was made against, and CREATE builds every request for that release:
+what Coolify accepts, refuses or hides differs between releases. The instance
+was upgraded (or downgraded) since the plan. Plan again, then run — `resume` of
+an interrupted run that has passed PREFLIGHT keeps the plan's release.
+
 ## `422 This field is not allowed`
 
 Our request whitelist has drifted from upstream Coolify. Coolify names the
-offending field in the response.
+offending field in the response. The tool sends only the fields the plan's
+Coolify release accepts, so first check that the instance has not been upgraded
+past the release range `coolify-migrate doctor` reports as validated.
 
 Please open an issue with that field name. A scheduled CI job checks for this
 weekly precisely so it breaks our CI rather than your migration — but Coolify may

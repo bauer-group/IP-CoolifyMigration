@@ -18,6 +18,7 @@ from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.domain.manifest import DockerMount
 from bg_coolify_migrate.domain.naming import VolumeEndpoint, VolumePair
 from bg_coolify_migrate.domain.plan import HostBaseline, MigrationPlan
+from bg_coolify_migrate.domain.versions import Version, parse_version
 from bg_coolify_migrate.journal.store import Journal
 from bg_coolify_migrate.settings.base import Settings
 from bg_coolify_migrate.transfer.ssh import RemoteHost
@@ -137,6 +138,20 @@ class MigrationContext:
     @property
     def known_hosts(self) -> Path:
         return self.settings.resolved_known_hosts()
+
+    @property
+    def coolify_version(self) -> Version | None:
+        """The release this run plans and creates for — read once, at PLAN.
+
+        From the plan; for a plan.json saved before the plan recorded it, the
+        version PREFLIGHT journaled. ``None`` when neither knows, which every
+        rule and every request body answers by its own unknown-version policy
+        (domain/coolify_versions.py).
+        """
+        if self.plan.coolify_version is not None:
+            return self.plan.instance_version
+        raw = self.journal.undo_info("preflight").get("coolify_version")
+        return parse_version(raw if isinstance(raw, str) else None)
 
     def collection_of(self, source_uuid: str) -> str:
         for resource in self.plan.resources:

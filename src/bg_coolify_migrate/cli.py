@@ -36,6 +36,7 @@ from rich.markup import escape
 from rich.text import Text
 
 from bg_coolify_migrate import __version__
+from bg_coolify_migrate.domain.coolify_versions import VALIDATED_MAX, VALIDATED_MIN, format_version
 from bg_coolify_migrate.domain.plan import MigrationPlan, TransferMode
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy, State
 from bg_coolify_migrate.domain.versions import parse_version
@@ -110,45 +111,10 @@ _TRUST_HOST_KEY_HELP = (
 )
 
 #: The Coolify releases this tool's API contract has been validated against, as
-#: an INCLUSIVE range. Coolify's contract (field shapes, container labels, create
-#: validation) shifts between releases, so anything outside is flagged as untested
-#: rather than silently trusted.
-#:
-#: A range, not a single version, because a single one is wrong almost always. The
-#: whitelists in api/fields.py are transcribed from upstream source and match a
-#: SPAN of releases; pinning one value made every run against the 4.3.2 fleet warn
-#: about a version that had in fact been checked. A warning that fires on a
-#: correct setup trains operators to ignore warnings, which costs more than it
-#: ever saves.
-#:
-#: Verified 2026-08-16 by diffing every `$allowedFields` array and every API route
-#: between tags v4.1.2 and v4.3.3: nothing was removed, only added. Extend the
-#: upper bound only after repeating that diff — never because a newer tag exists.
-#:
-#: Re-verified 2026-08-21 for v4.3.10, that diff repeated: ApplicationsController,
-#: ServicesController, DatabasesController and ValidationPatterns are BYTE-IDENTICAL
-#: to v4.3.3, all 29 $allowedFields arrays unchanged, and no route removed since
-#: v4.1.2. The only changes are two added /settings/email routes and one reworded
-#: error string in the server-create path, which this tool never calls.
-#:
-#: Note 4.3.10 > 4.3.3 numerically but LESS lexically — the comparison is on int
-#: tuples for exactly this reason, and test_compares_numerically_not_lexically
-#: pins it. A string compare would have called 4.3.10 out of range.
-#:
-#: Re-verified 2026-10-26 for v4.5.0, and this time the diff was NOT clean —
-#: v4.3.10 -> v4.5.0 is the first span since 4.1.2 that broke the contract, so the
-#: bound moved only together with the code that answers it. Removed: `host_path`
-#: from every storage create array (v4.3.22, backported). Tightened: manual
-#: webhook secrets >= 16 chars (4.4.0), http_basic_auth_password <= 72 (4.5.0).
-#: New and invisible to the API: hidden domain port overrides (4.3.15), secret
-#: manager references (4.4.0), external/driver_opts compose volumes used as
-#: written (4.4.0), server roles (4.4.0), SQLite (4.4.0), and legacy env escaping
-#: that new rows do not inherit (4.5.0). Each is now refused or reported at plan
-#: time — see domain/fidelity.py — and the routes, stop/start/restart guards,
-#: container labels, volume names and mount paths this tool depends on are
-#: unchanged. Audited against release tags, not a live 4.5.0.
-VALIDATED_COOLIFY_MIN = "4.1.2"
-VALIDATED_COOLIFY_MAX = "4.5.0"
+#: an INCLUSIVE range — read from the release registry, where the audit notes of
+#: every extension live (domain/coolify_versions.py).
+VALIDATED_COOLIFY_MIN = format_version(VALIDATED_MIN)
+VALIDATED_COOLIFY_MAX = format_version(VALIDATED_MAX)
 
 
 def coolify_version_warning(raw: str) -> str | None:
@@ -164,13 +130,9 @@ def coolify_version_warning(raw: str) -> str | None:
             f"could not parse the Coolify version {raw.strip()!r}; this tool is "
             f"validated against {VALIDATED_COOLIFY_MIN}-{VALIDATED_COOLIFY_MAX}"
         )
-    # The bounds are module constants and always parse; the fallbacks exist only
-    # so a typo in them degrades to "warn about everything" rather than a crash.
-    low = parse_version(VALIDATED_COOLIFY_MIN) or (0,)
-    high = parse_version(VALIDATED_COOLIFY_MAX) or (0,)
-    if low <= version <= high:
+    if VALIDATED_MIN <= version <= VALIDATED_MAX:
         return None
-    side = "older than" if version < low else "newer than"
+    side = "older than" if version < VALIDATED_MIN else "newer than"
     return (
         f"Coolify {raw.strip()} is {side} the validated range "
         f"{VALIDATED_COOLIFY_MIN}-{VALIDATED_COOLIFY_MAX}. The API contract can "

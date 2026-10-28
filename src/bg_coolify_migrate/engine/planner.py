@@ -801,14 +801,18 @@ async def build_plan(
     if target_uuid:
         target = await api.get_server(target_uuid) or target
 
-    # PREFLIGHT records the version too; it is read here because several
-    # refusals below exist only from a given release on (domain/fidelity.py).
-    # Fail-soft and fail-TOWARD-checking: an unknown version applies every rule.
+    # The ONE read of the instance's release for this run: the plan's rules use
+    # it here, and CREATE builds its bodies for the same release off the plan
+    # (domain/coolify_versions.py). PREFLIGHT re-reads it only to refuse a run
+    # whose instance was upgraded since. Fail-soft and fail-TOWARD-checking: an
+    # unknown version applies every rule and sends only what every release takes.
+    raw_version: str | None
     try:
-        coolify_version = parse_version(await api.version())
+        raw_version = (await api.version()).strip()
     except Exception as exc:  # diagnostics only, never fatal
         log.debug("planner.version_unavailable", error=str(exc)[:120])
-        coolify_version = None
+        raw_version = None
+    coolify_version = parse_version(raw_version)
 
     resources = await environment_resources(api, project_uuid, environment)
     if not resources:
@@ -994,6 +998,7 @@ async def build_plan(
         target_server=target_ref,
         notes=tuple(notes),
         volume_backups_possible=may_hold_volume_backups(coolify_version),
+        coolify_version=raw_version or None,
         resources=tuple(plans),
         finalize_policy=finalize_policy,
         transfer_mode=transfer_mode,

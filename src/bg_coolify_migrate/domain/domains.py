@@ -49,14 +49,10 @@ from typing import Any
 
 from bg_coolify_migrate.dns.extract import is_generated, normalise_host, route_env_keys
 from bg_coolify_migrate.dns.wildcard import under_wildcard
+from bg_coolify_migrate.domain.coolify_versions import supports
 from bg_coolify_migrate.domain.kinds import ResourceKind
 from bg_coolify_migrate.domain.plan import ResourceSnapshot
-from bg_coolify_migrate.domain.versions import Version, at_least
-
-#: ``noindex_domains`` exists, and is in the application UPDATE ``$allowedFields``,
-#: from v4.3.0 (ApplicationsController v4.3.0:2796, applied after the fqdn at
-#: :3115-3120; v4.5.0:3363, :3764-3775).
-NOINDEX_DOMAINS_SINCE: Version = (4, 3, 0)
+from bg_coolify_migrate.domain.versions import Version
 
 
 def parking_tag(project: str, environment: str) -> str:
@@ -345,7 +341,7 @@ def restore_body(
     else:
         return None
     noindex = _noindex_domains(source.get("noindex_domains"))
-    if noindex and at_least(version, NOINDEX_DOMAINS_SINCE):
+    if noindex and supports("noindex_domains", version):
         body["noindex_domains"] = noindex
     return body
 

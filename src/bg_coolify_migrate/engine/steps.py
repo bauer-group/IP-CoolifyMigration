@@ -262,17 +262,29 @@ async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
     await ctx.api.assert_can_read_sensitive()
 
     # ONE Coolify control plane manages both servers, so there is ONE API version
-    # here — not one per side. Read and recorded, never gated: the whitelists in
-    # api/fields.py are transcribed from upstream source and only ever match a
-    # RANGE of releases, and turning that into a hard version wall would be
-    # guesswork about which field landed in which tag.
+    # here — not one per side. Recorded, never gated: the release registry
+    # (domain/coolify_versions.py) answers every release, and an unvalidated one
+    # is a doctor warning, not a wall.
     #
-    # It earns its round trip as diagnostics. "Which Coolify was this?" is the
-    # first question asked of any failed migration, and answering it for the 2.5.6
-    # tags 404 took a bisect of upstream release dates against a merge commit. In
-    # the journal it is one line, available before anything has been touched.
+    # It earns its round trip twice. As diagnostics: "Which Coolify was this?" is
+    # the first question asked of any failed migration, and answering it for the
+    # 2.5.6 tags 404 took a bisect of upstream release dates against a merge
+    # commit. And as a guard: CREATE builds its bodies for the release the PLAN
+    # saw, so an instance upgraded between plan and run must be re-planned, before
+    # anything has been touched.
     coolify_version = await ctx.api.version()
     log.info("preflight.coolify", version=coolify_version)
+    planned = ctx.plan.coolify_version
+    if planned is not None and parse_version(planned) != parse_version(coolify_version):
+        raise PreflightError(
+            f"the plan was made against Coolify {planned}, but the instance now runs "
+            f"{coolify_version.strip()}",
+            hint=(
+                "Requests are built for the release the plan saw, and what Coolify "
+                "accepts or refuses differs between releases. Nothing has been changed "
+                "and the source is untouched. Plan again, then run."
+            ),
+        )
 
     for host, label in ((ctx.source_host, "source"), (ctx.target_host, "target")):
         await rsync.ensure_installed(host, label=label)
@@ -411,7 +423,9 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
     # Before ANY write of this attempt: re-read the locked values the plan
     # promised. A refusal here leaves nothing to undo. The values stay in this
     # frame (env_recovery).
-    recovered = await env_recovery.recover_for_create(ctx.api, ctx.source_host, ctx.plan.resources)
+    recovered = await env_recovery.recover_for_create(
+        ctx.api, ctx.source_host, ctx.plan.resources, version=ctx.coolify_version
+    )
     project_uuid = await api_resources.ensure_project(ctx.api, ctx.plan.project)
     await api_resources.ensure_environment(ctx.api, project_uuid, ctx.plan.environment)
     destination = await api_resources.resolve_destination(ctx.api, ctx.plan.target_server.uuid)
@@ -433,8 +447,8 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
     # older run parked (domains.leftover_parking_refusals refuses them at PLAN).
     tag = domains.parking_tag(ctx.plan.project, ctx.plan.environment)
     source_wildcard = placement.source_wildcard
-    raw_version = ctx.journal.undo_info("preflight").get("coolify_version")
-    version = parse_version(raw_version if isinstance(raw_version, str) else None)
+    # The release the plan was made for: every body below is built for it.
+    version = ctx.coolify_version
     try:
         sources = {
             r.snapshot.uuid: await ctx.api.get_resource(r.snapshot.collection, r.snapshot.uuid)
@@ -484,7 +498,9 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                     detail={"target_uuids": dict(created), "parked_domains": dict(parked)},
                 )
 
-            target_uuid = await api_resources.create_resource(ctx.api, snapshot, placement, source_full)
+            target_uuid = await api_resources.create_resource(
+                ctx.api, snapshot, placement, source_full, version=version
+            )
             created[snapshot.uuid] = target_uuid
             ctx.target_uuids[snapshot.uuid] = target_uuid
             own.add(target_uuid)
@@ -502,7 +518,13 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
             # target's SERVICE_URL_* rows from them in that PATCH).
             if snapshot.collection == "services":
                 own |= await api_resources.finish_service_target(
-                    ctx.api, snapshot, placement, source_full, target_uuid, own=frozenset(own)
+                    ctx.api,
+                    snapshot,
+                    placement,
+                    source_full,
+                    target_uuid,
+                    own=frozenset(own),
+                    version=version,
                 )
 
             await api_resources.copy_envs(
@@ -514,6 +536,7 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                 tag=tag,
                 recovered=recovered.get(snapshot.uuid),
                 route_keys=route_keys,
+                version=version,
             )
             await api_resources.copy_storages(
                 ctx.api,
@@ -521,6 +544,7 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                 source_uuid=snapshot.uuid,
                 target_uuid=target_uuid,
                 kind=snapshot.kind,
+                version=version,
             )
             # Cosmetic metadata: copy_tags never raises, so a missing tag route
             # (Coolify <4.2) or a rejected name degrades to "no tags" instead of
@@ -570,6 +594,7 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                 source_uuid=snapshot.uuid,
                 target_uuid=target_uuid,
                 kind=snapshot.kind,
+                version=version,
             )
             await api_schedules.copy_backup_schedules(
                 ctx.api,
@@ -577,6 +602,7 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                 source_uuid=snapshot.uuid,
                 target_uuid=target_uuid,
                 engine=snapshot.engine,
+                version=version,
             )
 
         # Last, while the source still serves: DNS must still send its custom
@@ -655,12 +681,8 @@ async def _refuse_multi_server(
     """
     if not fidelity.additional_servers(source_full)[0]:
         return
-    # Only now, for the remedy's version-gated wording; unknown reads as newest.
-    try:
-        version = parse_version(await ctx.api.version())
-    except Exception as exc:  # the refusal stands either way
-        log.debug("create.version_unavailable", error=str(exc)[:120])
-        version = None
+    # The remedy's wording is version-gated; unknown reads as newest.
+    version = ctx.coolify_version
     raise PreflightError(
         f"{snapshot.name}: {fidelity.multi_server_refusal(source_full, version=version)}",
         hint=(
@@ -2002,8 +2024,7 @@ def _cloudflare_hosts(ctx: MigrationContext, baseline: dict[str, HostBaseline]) 
     Wording only (dns/managed.py): their checklist line says where the record
     can be changed, since Coolify never re-points one it manages.
     """
-    raw_version = ctx.journal.undo_info(State.PREFLIGHT.value).get("coolify_version")
-    version = parse_version(raw_version if isinstance(raw_version, str) else None)
+    version = ctx.coolify_version
     return {
         host
         for host, entry in baseline.items()

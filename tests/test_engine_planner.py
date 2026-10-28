@@ -488,6 +488,9 @@ class TestBuildPlanFidelity:
             monkeypatch, {"manual_webhook_secret_github": "short"}, version="4.3.10"
         )
         assert not plan.is_blocked
+        # ...and records it: CREATE builds its bodies for the same release.
+        assert plan.coolify_version == "4.3.10"
+        assert plan.instance_version == (4, 3, 10)
 
     async def test_an_unreadable_version_applies_every_rule(
         self, monkeypatch: pytest.MonkeyPatch
@@ -498,6 +501,7 @@ class TestBuildPlanFidelity:
             version=RuntimeError("version endpoint down"),
         )
         assert plan.is_blocked
+        assert plan.coolify_version is None
 
     async def test_env_rules_see_the_source_envs(self, monkeypatch: pytest.MonkeyPatch) -> None:
         plan = await _plan_one_app(

@@ -1617,9 +1617,53 @@ class TestCopyStorages:
             return_value=httpx.Response(201, json={})
         )
         await copy_storages(
-            api, collection="applications", source_uuid="a1", target_uuid="a2", kind=ResourceKind.APP_GIT_BUILD
+            api,
+            collection="applications",
+            source_uuid="a1",
+            target_uuid="a2",
+            kind=ResourceKind.APP_GIT_BUILD,
+            # A release that still takes host_path: only the blank value drops it.
+            version=(4, 3, 21),
         )
         assert "host_path" not in json.loads(route.calls[0].request.read().decode())
+
+    @pytest.mark.parametrize(
+        ("version", "sent"), [((4, 3, 21), True), ((4, 3, 22), False), (None, False)]
+    )
+    async def test_a_host_path_is_sent_only_where_the_release_takes_it(
+        self,
+        api: CoolifyClient,
+        respx_mock: respx.Router,
+        version: tuple[int, ...] | None,
+        sent: bool,
+    ) -> None:
+        """v4.3.22 removed it from every storage create array; an unknown release
+        gets only what every release takes. (The plan refuses such a source
+        wherever it would be dropped — fidelity.storage_refusals.)"""
+        respx_mock.get(f"{BASE}/applications/a1/storages").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "persistent_storages": [
+                        {"name": "a1-data", "mount_path": "/app/storage", "host_path": "/srv/d"}
+                    ],
+                    "file_storages": [],
+                },
+            )
+        )
+        route = respx_mock.post(f"{BASE}/applications/a2/storages").mock(
+            return_value=httpx.Response(201, json={})
+        )
+        await copy_storages(
+            api,
+            collection="applications",
+            source_uuid="a1",
+            target_uuid="a2",
+            kind=ResourceKind.APP_GIT_BUILD,
+            version=version,
+        )
+        body = json.loads(route.calls[0].request.read().decode())
+        assert ("host_path" in body) is sent
 
     async def test_a_host_file_mount_keeps_its_flag_and_sends_no_content(
         self, api: CoolifyClient, respx_mock: respx.Router

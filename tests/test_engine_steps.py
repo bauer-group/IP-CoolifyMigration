@@ -615,6 +615,32 @@ class TestPreflight:
         result = await steps.step_preflight(ctx)
         assert result["coolify_version"] == "4.1.2"
 
+    async def test_the_release_the_plan_saw_passes(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"private_key": "x"}])
+        )
+        ctx.plan = ctx.plan.model_copy(update={"coolify_version": "v4.1.2"})
+        assert (await steps.step_preflight(ctx))["coolify_version"] == "4.1.2"
+
+    async def test_an_instance_upgraded_since_the_plan_is_re_planned(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        """CREATE builds its bodies for the release the PLAN saw.
+
+        An instance upgraded in between would get bodies — and plan verdicts —
+        for the wrong release, so the run stops before anything is touched.
+        """
+        respx_mock.get(f"{BASE}/security/keys").mock(
+            return_value=httpx.Response(200, json=[{"private_key": "x"}])
+        )
+        ctx.plan = ctx.plan.model_copy(update={"coolify_version": "4.0.9"})
+        with pytest.raises(PreflightError, match=r"made against Coolify 4\.0\.9.*now runs 4\.1\.2") as exc:
+            await steps.step_preflight(ctx)
+        assert "Plan again" in (exc.value.hint or "")
+        assert ctx.source_host.commands == []  # type: ignore[attr-defined]
+
     async def test_missing_rsync_fails_before_anything_stops(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:

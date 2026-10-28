@@ -31,11 +31,11 @@ import structlog
 
 from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.api.fields import (
-    BACKUP_CREATE,
     SCHEDULED_TASK_COLLECTIONS,
-    SCHEDULED_TASK_CREATE,
     SCHEDULED_TASK_REQUIRED,
+    fields_for,
     filter_body,
+    filter_for,
     missing_required,
 )
 from bg_coolify_migrate.domain import compose as compose_mod
@@ -47,6 +47,7 @@ from bg_coolify_migrate.domain.schedules import (
     own_backup_schedules,
     task_container_mismatches,
 )
+from bg_coolify_migrate.domain.versions import Version
 from bg_coolify_migrate.errors import CoolifyApiError, InsufficientTokenScope, MigrationError
 
 log = structlog.get_logger(__name__)
@@ -55,7 +56,9 @@ log = structlog.get_logger(__name__)
 # ── scheduled tasks ──────────────────────────────────────────────────────────
 
 
-def build_scheduled_task_body(task: dict[str, Any]) -> dict[str, Any]:
+def build_scheduled_task_body(
+    task: dict[str, Any], *, version: Version | None = None
+) -> dict[str, Any]:
     """The create body for one source task. PURE.
 
     Built field by field, never by filtering the GET dict wholesale: that carries
@@ -92,7 +95,7 @@ def build_scheduled_task_body(task: dict[str, Any]) -> dict[str, Any]:
             "timeout": task.get("timeout"),
             "enabled": task.get("enabled"),
         },
-        SCHEDULED_TASK_CREATE,
+        fields_for("scheduled-tasks", version),
     )
     if missing := missing_required(body, SCHEDULED_TASK_REQUIRED):
         raise MigrationError(
@@ -109,6 +112,7 @@ async def copy_scheduled_tasks(
     source_uuid: str,
     target_uuid: str,
     kind: ResourceKind,
+    version: Version | None = None,
 ) -> int:
     """Recreate the source's scheduled tasks on the target. Returns the count.
 
@@ -127,7 +131,8 @@ async def copy_scheduled_tasks(
     if collection not in SCHEDULED_TASK_COLLECTIONS:
         return 0
     bodies = [
-        build_scheduled_task_body(t) for t in await api.get_scheduled_tasks(collection, source_uuid)
+        build_scheduled_task_body(t, version=version)
+        for t in await api.get_scheduled_tasks(collection, source_uuid)
     ]
     if not bodies:
         return 0
@@ -243,10 +248,10 @@ _RETENTION_FIELDS = (
 )
 
 
-def build_backup_body(row: dict[str, Any]) -> dict[str, Any]:
+def build_backup_body(row: dict[str, Any], *, version: Version | None = None) -> dict[str, Any]:
     """The create body for one source backup schedule. PURE.
 
-    Values only, through BACKUP_CREATE; never ``backup_now`` (it dumps at once,
+    Values only, through the registry's ``backups`` fields for ``version``; never ``backup_now`` (it dumps at once,
     and needs ``deploy`` from 4.5). The S3 destinations are set from what the row
     DISCLOSES (4.5+), primary first, even with save_s3 off — that keeps the
     storage the operator preselected. A row that uploads to S3 without
@@ -254,7 +259,7 @@ def build_backup_body(row: dict[str, Any]) -> dict[str, Any]:
     save_s3 off: sending it on would 422 the whole schedule, and the plan has
     already said "local-only" out loud.
     """
-    body = filter_body(row, BACKUP_CREATE)
+    body = filter_for(row, "backups", version)
     for field in _RETENTION_FIELDS:
         value = body.get(field)
         if isinstance(value, int | float) and not isinstance(value, bool) and value < 0:
@@ -274,6 +279,7 @@ async def copy_backup_schedules(
     source_uuid: str,
     target_uuid: str,
     engine: DatabaseEngine | None,
+    version: Version | None = None,
 ) -> int:
     """Recreate a standalone database's backup schedules on the target. Returns the count.
 
@@ -291,7 +297,7 @@ async def copy_backup_schedules(
     if not rows:
         return 0
 
-    bodies = [build_backup_body(r) for r in rows]
+    bodies = [build_backup_body(r, version=version) for r in rows]
     for row, body in zip(rows, bodies, strict=True):
         if row.get("save_s3") and not body.get("save_s3"):
             # The plan said so when it saw it; a schedule added since has not been

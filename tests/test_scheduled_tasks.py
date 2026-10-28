@@ -31,7 +31,7 @@ from bg_coolify_migrate.api.fields import (
     rejected_keys,
 )
 from bg_coolify_migrate.api.schedules import build_scheduled_task_body, copy_scheduled_tasks
-from bg_coolify_migrate.domain import schedules
+from bg_coolify_migrate.domain import coolify_versions, schedules
 from bg_coolify_migrate.domain.kinds import ResourceKind
 from bg_coolify_migrate.engine import steps
 from bg_coolify_migrate.engine.context import MigrationContext
@@ -1006,9 +1006,10 @@ def test_the_canary_parser_reads_the_create_array() -> None:
 @pytest.mark.integration
 async def test_scheduled_task_whitelist_matches_upstream() -> None:
     """SCHEDULED_TASK_CREATE equals createTask's array at the newest release tag."""
-    from tests.test_api_fields import released_controllers
+    from tests.test_api_fields import released_controllers, tag_version
 
     tag, _ = await released_controllers()
+    sent = coolify_versions.fields_for("scheduled-tasks", tag_version(tag))
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(
             f"https://raw.githubusercontent.com/coollabsio/coolify/{tag}/"
@@ -1017,7 +1018,8 @@ async def test_scheduled_task_whitelist_matches_upstream() -> None:
         resp.raise_for_status()
     accepted = _task_create_fields(resp.text)
     assert accepted, f"found no $allowedFields in ScheduledTasksController at {tag}"
-    assert accepted == set(SCHEDULED_TASK_CREATE), (
-        f"Coolify {tag} createTask accepts {sorted(accepted)}; we send "
-        f"{sorted(SCHEDULED_TASK_CREATE)}. An unlisted field 422s the task — and CREATE."
+    assert accepted == set(sent), (
+        f"Coolify {tag} createTask accepts {sorted(accepted)}; the registry sends "
+        f"{sorted(sent)} there (domain/coolify_versions.py, scheduled-tasks). An "
+        "unlisted field 422s the task — and CREATE."
     )

@@ -14,11 +14,9 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from bg_coolify_migrate.domain.coolify_versions import supports
 from bg_coolify_migrate.domain.plan import HostBaseline
-from bg_coolify_migrate.domain.versions import Version, at_least
-
-#: Managed DNS ships in v4.4.0 (absent at v4.3.24 and v4.4-rc.1).
-MANAGED_DNS_SINCE: Version = (4, 4, 0)
+from bg_coolify_migrate.domain.versions import Version
 
 #: Cloudflare's own nameservers (full setup) and its proxied CNAME target
 #: (partial/CNAME setup) — the two shapes a Cloudflare-hosted host takes in DNS.
@@ -45,7 +43,7 @@ def coolify_may_manage(
 
     An unknown version counts as the newest, toward the warning.
     """
-    return at_least(version, MANAGED_DNS_SINCE) and on_cloudflare(nameservers, cname_chain)
+    return supports("managed_dns", version) and on_cloudflare(nameservers, cname_chain)
 
 
 def cloudflare_note(baseline: Iterable[HostBaseline], *, version: Version | None) -> str | None:

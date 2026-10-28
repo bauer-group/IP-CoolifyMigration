@@ -8,8 +8,9 @@ Why this exists: Coolify 4.3.11-4.5.0 moved state to places the REST API cannot
 reach, or started refusing on create what it had stored for years. The drift
 canary saw eight new create fields; an audit of the release tags (2026-10-26,
 v4.3.10 -> v4.5.0) found the rest. Each rule cites the release it starts in and
-is gated on it, so it never refuses a migration on an instance where it cannot
-fail that way.
+is gated on it through the release registry (domain/coolify_versions.py: a named
+FEATURE, or the gate of the request field it is about), so it never refuses a
+migration on an instance where it cannot fail that way.
 
 Refusal vs warning follows AGENTS.md. Refuse what is not a judgement: a create
 that WILL 422, a deploy that WILL fail after the source is stopped, data that
@@ -33,53 +34,11 @@ from urllib.parse import urlsplit
 
 from bg_coolify_migrate.domain import compose as compose_mod
 from bg_coolify_migrate.domain import locked_envs
+from bg_coolify_migrate.domain.coolify_versions import carries, supports
 from bg_coolify_migrate.domain.domains import compose_domains
 from bg_coolify_migrate.domain.kinds import DatabaseEngine
 from bg_coolify_migrate.domain.locked_envs import is_locked
-from bg_coolify_migrate.domain.versions import Version, at_least
-
-# ── where each rule starts ───────────────────────────────────────────────────
-
-#: applyServiceUrls lowercases scheme and host before its duplicate-URL check
-#: (ValidationPatterns::normalizeApplicationDomains); 4.1.x compares raw strings.
-SERVICE_URLS_NORMALISED_SINCE: Version = (4, 2, 0)
-#: An explicit domain port moves into the hidden applications.domain_port_overrides.
-PORT_OVERRIDES_HIDDEN_SINCE: Version = (4, 3, 15)
-#: ...and a compose service's domain port too: a UI save from 4.3.15 (Livewire
-#: Application/Domains.php v4.3.15:1995-2011), an API save from 4.3.18
-#: (normalizeDockerComposeDomainPorts), on the 4.3 line and in 4.4.0+ alike.
-COMPOSE_PORT_OVERRIDES_HIDDEN_SINCE: Version = (4, 3, 15)
-#: A portless compose domain falls back to its SERVICE's first port, then to
-#: ports_exposes (parsers.php v4.3.16:1361); 4.3.15 routed it to ports_exposes.
-COMPOSE_SERVICE_PORT_FALLBACK_SINCE: Version = (4, 3, 16)
-#: ...the service's first TCP port only, and nothing else (parsers.php v4.3.18:1357).
-COMPOSE_TCP_PORT_FALLBACK_SINCE: Version = (4, 3, 18)
-#: `host_path` leaves every storage create array (backported to the 4.3 line).
-HOST_PATH_REMOVED_SINCE: Version = (4, 3, 22)
-#: ManualWebhookSecret: a new secret must be >= 16 characters.
-WEBHOOK_SECRET_MIN_LENGTH_SINCE: Version = (4, 4, 0)
-#: {{vault.KEY}} references, resolved from a link no GET returns.
-SECRET_MANAGER_SINCE: Version = (4, 4, 0)
-#: External and driver_opts compose volumes are used as written, not renamed.
-COMPOSE_VOLUMES_AS_WRITTEN_SINCE: Version = (4, 4, 0)
-#: Docker compose is stored verbatim instead of Yaml::dump(Yaml::parse()).
-COMPOSE_STORED_VERBATIM_SINCE: Version = (4, 4, 0)
-#: Redis/KeyDB/Dragonfly rows that predate it keep the unquoted --requirepass.
-REDIS_PASSWORD_QUOTING_SINCE: Version = (4, 4, 0)
-#: http_basic_auth_password gains max:72 on create.
-BASIC_AUTH_MAX_LENGTH_SINCE: Version = (4, 5, 0)
-#: New env rows use exact escaping; rows saved before keep the legacy escaping.
-#: Defined beside the encoders in domain/locked_envs.py, which this module uses.
-EXACT_ENV_ESCAPING_SINCE: Version = locked_envs.EXACT_ENV_ESCAPING_SINCE
-#: Both compose parsers refuse `scale` / `deploy.replicas` above 1.
-COMPOSE_SCALE_CHECK_SINCE: Version = (4, 5, 0)
-#: convertDockerRunToCompose maps flags it used to ignore.
-RUN_OPTIONS_PARSER_SINCE: Version = (4, 5, 0)
-#: GET/POST/DELETE /applications/{uuid}/destinations exist (routes/api.php v4.3.0:269-271).
-APPLICATION_DESTINATIONS_API_SINCE: Version = (4, 3, 0)
-#: add_destination refuses compose apps, persistent storage and a proxy mismatch; a
-#: multi-server deploy needs a Docker image (ensureRegistryImageForMultipleServers).
-MULTI_SERVER_RESTRICTIONS_SINCE: Version = (4, 4, 0)
+from bg_coolify_migrate.domain.versions import Version
 
 _WEBHOOK_SECRET_FIELDS = (
     "manual_webhook_secret_github",
@@ -116,7 +75,7 @@ def application_refusals(source: dict[str, Any], *, version: Version | None) -> 
     if multi_server := multi_server_refusal(source, version=version):
         out.append(multi_server)
 
-    if at_least(version, WEBHOOK_SECRET_MIN_LENGTH_SINCE):
+    if supports("webhook_secret_min_length", version):
         short = [
             f"{field} ({len(value)} characters)"
             for field in _WEBHOOK_SECRET_FIELDS
@@ -132,7 +91,7 @@ def application_refusals(source: dict[str, Any], *, version: Version | None) -> 
                 "git host's webhook settings — to 16+ characters, or clear it."
             )
 
-    if at_least(version, BASIC_AUTH_MAX_LENGTH_SINCE):
+    if supports("basic_auth_max_length", version):
         password = source.get("http_basic_auth_password")
         if isinstance(password, str) and len(password) > _BASIC_AUTH_MAX_LENGTH:
             out.append(
@@ -155,7 +114,7 @@ def application_refusals(source: dict[str, Any], *, version: Version | None) -> 
             "in the image), then migrate."
         )
 
-    if at_least(version, PORT_OVERRIDES_HIDDEN_SINCE):
+    if supports("port_overrides_hidden", version):
         hidden = hidden_port_overrides(source)
         if hidden:
             exposed = (
@@ -172,7 +131,7 @@ def application_refusals(source: dict[str, Any], *, version: Version | None) -> 
                 "source; otherwise migrate this application by hand."
             )
 
-    if at_least(version, COMPOSE_PORT_OVERRIDES_HIDDEN_SINCE):
+    if supports("compose_port_overrides_hidden", version):
         out.extend(_compose_port_refusals(source, version=version))
 
     return out
@@ -239,7 +198,7 @@ def multi_server_refusal(source: dict[str, Any], *, version: Version | None) -> 
         return None
     re_add = (
         "in its Servers tab or with POST /applications/{uuid}/destinations"
-        if at_least(version, APPLICATION_DESTINATIONS_API_SINCE)
+        if supports("application_destinations_api", version)
         else "in its Servers tab"
     )
     rules = (
@@ -247,7 +206,7 @@ def multi_server_refusal(source: dict[str, Any], *, version: Version | None) -> 
         "storage or built from docker compose, because Coolify will not add servers back "
         "to such an application. Deploying to several servers also needs a Docker image "
         "set in the General tab."
-        if at_least(version, MULTI_SERVER_RESTRICTIONS_SINCE)
+        if supports("multi_server_restrictions", version)
         else ""
     )
     listed = " (" + ", ".join(names) + ")" if names else ""
@@ -315,11 +274,11 @@ def application_warnings(source: dict[str, Any], *, version: Version | None) -> 
         )
     if source.get("is_maintenance_enabled") is True:
         out.append(_MAINTENANCE_WARNING)
-    if at_least(version, COMPOSE_PORT_OVERRIDES_HIDDEN_SINCE) and (
+    if supports("compose_port_overrides_hidden", version) and (
         compose_hidden_port_overrides(source, version=version) is None
     ):
         out.append(_COMPOSE_PORTS_UNCHECKED_WARNING)
-    if at_least(version, RUN_OPTIONS_PARSER_SINCE) and (
+    if supports("run_options_parser", version) and (
         flags := newly_mapped_run_options(source.get("custom_docker_run_options"))
     ):
         out.append(
@@ -480,9 +439,9 @@ def _compose_fallback_port(
 ) -> int | None:
     """Where the compose parser routes a portless domain on this release."""
     exposed = 80 if _settings(source).get("is_static") else _first_port(source.get("ports_exposes"))
-    if not at_least(version, COMPOSE_SERVICE_PORT_FALLBACK_SINCE):
+    if not supports("compose_service_port_fallback", version):
         return exposed
-    if not at_least(version, COMPOSE_TCP_PORT_FALLBACK_SINCE):
+    if not supports("compose_tcp_port_fallback", version):
         first = _first_compose_port(service, tcp_only=False)
         return first if first is not None else exposed
     return _first_compose_port(service)
@@ -634,7 +593,7 @@ def service_refusals(source: dict[str, Any], *, version: Version | None) -> list
     # containers (ServicesController v4.1.2:73-76, v4.5.0:166-169) — before any
     # conflict check, so no retry helps. From 4.2.0 it compares the URLs with
     # scheme and host lowercased; 4.1.x compares the trimmed strings.
-    normalised = at_least(version, SERVICE_URLS_NORMALISED_SINCE)
+    normalised = supports("service_urls_normalised", version)
     owners: dict[str, set[str]] = {}
     for name, url in parts:
         if name not in with_credentials:
@@ -971,7 +930,7 @@ def compose_refusals(raw: str | None, *, version: Version | None) -> list[str]:
 
     out: list[str] = []
     volumes = doc.get("volumes")
-    if at_least(version, COMPOSE_VOLUMES_AS_WRITTEN_SINCE) and isinstance(volumes, dict):
+    if supports("compose_volumes_as_written", version) and isinstance(volumes, dict):
         for key in sorted(volumes, key=str):
             decl = volumes[key]
             if not isinstance(decl, dict):
@@ -1000,7 +959,7 @@ def compose_refusals(raw: str | None, *, version: Version | None) -> list[str]:
                     "empty directories and pass. Migrate it by hand."
                 )
 
-    if at_least(version, COMPOSE_SCALE_CHECK_SINCE):
+    if supports("compose_scale_check", version):
         for name, service in sorted(compose_mod.services(doc).items()):
             deploy = service.get("deploy")
             for label, value in (
@@ -1035,7 +994,7 @@ def _int_above_one(value: object) -> bool:
 
 def compose_redump_warning(*, version: Version | None) -> list[str]:
     """Only true before 4.4: from then on the compose is stored verbatim."""
-    if at_least(version, COMPOSE_STORED_VERBATIM_SINCE):
+    if supports("compose_stored_verbatim", version):
         return []
     return [
         "Coolify re-dumps compose through Yaml::dump(Yaml::parse(...)); "
@@ -1050,9 +1009,11 @@ def storage_refusals(storages: dict[str, Any] | None, *, version: Version | None
     """Persistent storages this Coolify can no longer create through its API.
 
     Only for resources whose storages are POSTed (plain applications) — compose
-    and database volumes are materialised by Coolify itself.
+    and database volumes are materialised by Coolify itself. Refuses exactly
+    where the registry's ``host_path`` row is closed (v4.3.22 on, and an
+    unknown release): the field CREATE would have to drop.
     """
-    if not storages or not at_least(version, HOST_PATH_REMOVED_SINCE):
+    if not storages or carries("storages", "host_path", version):
         return []
     out: list[str] = []
     for entry in storages.get("persistent_storages") or []:
@@ -1122,7 +1083,7 @@ def env_refusals(
     """
     out: list[str] = []
 
-    if at_least(version, SECRET_MANAGER_SINCE):
+    if supports("secret_manager", version):
         referencing = sorted(
             str(e["key"])
             for e in envs
@@ -1205,7 +1166,7 @@ def env_warnings(
             "without them until you set them by hand."
         )
 
-    if at_least(version, SECRET_MANAGER_SINCE):
+    if supports("secret_manager", version):
         literal = sorted(
             str(e["key"])
             for e in envs
@@ -1221,7 +1182,7 @@ def env_warnings(
                 "link and passes the reference text through as the value."
             )
 
-    if at_least(version, EXACT_ENV_ESCAPING_SINCE):
+    if supports("exact_env_escaping", version):
         changed = sorted(
             str(e["key"])
             for e in envs
@@ -1245,10 +1206,10 @@ def env_warnings(
                 )
             )
 
-    if at_least(version, REDIS_PASSWORD_QUOTING_SINCE) and engine in _REDIS_FAMILY:
+    if supports("redis_password_quoting", version) and engine in _REDIS_FAMILY:
         out.extend(_redis_password_warnings(envs, engine=engine))
 
-    if compose and at_least(version, EXACT_ENV_ESCAPING_SINCE):
+    if compose and supports("exact_env_escaping", version):
         empty = sorted(
             str(e["key"])
             for e in envs

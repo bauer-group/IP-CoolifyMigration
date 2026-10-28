@@ -25,6 +25,7 @@ from bg_coolify_migrate.domain.drift import RebuildDriftReport
 from bg_coolify_migrate.domain.kinds import BuildPack, DatabaseEngine, GitAuth, ResourceKind
 from bg_coolify_migrate.domain.manifest import VolumeManifest
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
+from bg_coolify_migrate.domain.versions import Version, parse_version
 
 
 class Strategy(StrEnum):
@@ -331,10 +332,21 @@ class MigrationPlan(BaseModel):
     version), which no API reads (domain/schedules.py). A flag rather than a
     note: what a DELETE finalize does to them depends on ``finalize_policy``,
     which is swapped onto a built plan."""
+    coolify_version: str | None = None
+    """The Coolify release the plan was made against, as GET /version answered
+    (``None``: unreadable, or a plan.json from before this field). CREATE builds
+    its request bodies for this release (domain/coolify_versions.py), so the
+    plan's rules and the bodies always speak about the same one; PREFLIGHT
+    refuses a run whose instance has changed release since."""
 
     @property
     def is_resource_scoped(self) -> bool:
         return bool(self.selected_resources)
+
+    @property
+    def instance_version(self) -> Version | None:
+        """:attr:`coolify_version` parsed; ``None`` when unknown."""
+        return parse_version(self.coolify_version)
 
     @property
     def volume_backup_resources(self) -> tuple[str, ...]:

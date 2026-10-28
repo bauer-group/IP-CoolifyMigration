@@ -37,17 +37,9 @@ from collections import Counter
 from collections.abc import Iterable
 from typing import Any
 
+from bg_coolify_migrate.domain.coolify_versions import supports
 from bg_coolify_migrate.domain.kinds import DatabaseEngine
-from bg_coolify_migrate.domain.versions import Version, at_least
-
-# ── where each rule starts ───────────────────────────────────────────────────
-
-#: Task timeout gains max:36000 on create and update (ScheduledTasksController
-#: v4.4.0:73, v4.5.0:88; plain integer|min:1 up to v4.3.24).
-TASK_TIMEOUT_MAX_SINCE: Version = (4, 4, 0)
-#: ScheduledTaskJob also matches a task's container by its exact FULL name
-#: (commit 5ae125ad3, first released in v4.5.0:190; prefix-only at v4.4.7:174).
-TASK_CONTAINER_EXACT_NAME_SINCE: Version = (4, 5, 0)
+from bg_coolify_migrate.domain.versions import Version
 
 #: The UI has always capped a task timeout at 60..36000 (Add.php v4.1.2:44), so
 #: only a task created through the API before 4.4 can hold more.
@@ -81,7 +73,7 @@ def server_timezone(server: dict[str, Any] | None) -> str | None:
 
 def scheduled_task_refusals(tasks: list[dict[str, Any]], *, version: Version | None) -> list[str]:
     """Tasks whose create on the target WILL 422."""
-    if not at_least(version, TASK_TIMEOUT_MAX_SINCE):
+    if not supports("task_timeout_max", version):
         return []
     too_long = [
         f"{_name(t)!r} ({timeout}s)"
@@ -112,7 +104,7 @@ def scheduled_task_warnings(
     """Tasks that are carried but will not behave on the target as on the source."""
     out: list[str] = []
 
-    if at_least(version, TASK_CONTAINER_EXACT_NAME_SINCE) and source_uuid:
+    if supports("task_container_exact_name", version) and source_uuid:
         # A container field holding the FULL name embeds the source uuid, and the
         # target's containers are named after its own. Carried verbatim and
         # reported, never rewritten: deriving a name by string-replacing a uuid is
@@ -388,16 +380,14 @@ def _service_database_backs_up(db: dict[str, Any]) -> bool:
 
 # ── volume backups ───────────────────────────────────────────────────────────
 
-#: A volume's own backup schedule (ScheduledVolumeBackup, local and S3) exists
-#: from v4.3.0, on application, database and service storages. Its only routes
-#: are PUT, POST run and DELETE on ``.../storages/{storage_uuid}/backups`` — no
-#: GET on any release, and no storages GET loads one — so no plan can see it.
-VOLUME_BACKUPS_SINCE: Version = (4, 3, 0)
-
 
 def may_hold_volume_backups(version: Version | None) -> bool:
-    """Whether this instance can hold volume-backup schedules nobody can read."""
-    return at_least(version, VOLUME_BACKUPS_SINCE)
+    """Whether this instance can hold volume-backup schedules nobody can read.
+
+    The ``volume_backups`` feature (4.3.0+): such a schedule has PUT, run and
+    DELETE routes, but no GET on any release, so no plan can see it.
+    """
+    return supports("volume_backups", version)
 
 
 def volume_backup_notes(resources: Iterable[str], *, deletes_source: bool) -> list[str]:

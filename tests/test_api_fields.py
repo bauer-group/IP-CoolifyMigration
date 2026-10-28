@@ -37,7 +37,9 @@ from bg_coolify_migrate.api.fields import (
     missing_required,
     rejected_keys,
 )
+from bg_coolify_migrate.domain import coolify_versions as cv
 from bg_coolify_migrate.domain.kinds import DatabaseEngine
+from bg_coolify_migrate.domain.versions import Version, parse_version
 
 
 class TestFilterBody:
@@ -400,6 +402,7 @@ async def test_whitelists_match_upstream_openapi() -> None:
     deliberately exclude (documented in api/fields.py).
     """
     tag, spec = await released_openapi()
+    newest = tag_version(tag)
 
     def body_props(path: str, method: str) -> set[str]:
         op = spec.get("paths", {}).get(path, {}).get(method, {})
@@ -423,13 +426,13 @@ async def test_whitelists_match_upstream_openapi() -> None:
         openapi_only = {"connect_to_docker_network"}
         missing = (
             documented
-            - SERVICE_CREATE_CUSTOM_COMPOSE
+            - cv.fields_for("services/compose", newest)
             - openapi_only
             - KNOWN_TAGS_GAP
             - KNOWN_SERVICE_GAP
         )
         if missing:
-            drift["POST /services"] = sorted(missing)
+            drift["services/compose"] = [registry_line("services/compose", f, tag) for f in sorted(missing)]
 
     # Databases carry one create route per engine and they drifted together when
     # upstream added `tags` — checking only /services would have caught one of
@@ -440,13 +443,16 @@ async def test_whitelists_match_upstream_openapi() -> None:
         documented = body_props(path, "post")
         if not documented:
             continue
-        missing = documented - database_allowed(engine) - KNOWN_TAGS_GAP
+        missing = documented - database_allowed(engine, newest) - KNOWN_TAGS_GAP
         if missing:
-            drift[f"POST {path}"] = sorted(missing)
+            drift[f"databases/{engine}"] = [
+                registry_line(f"databases/{engine}", f, tag) for f in sorted(missing)
+            ]
 
     assert not drift, (
-        f"Coolify {tag} documents fields we do not whitelist: {drift}. "
-        f"Upstream may have added fields; review api/fields.py. Adjudicate each "
+        f"Coolify {tag} documents fields the registry does not send: {drift}. "
+        f"Upstream may have added fields; each is a row in domain/coolify_versions.py "
+        f"(or a KNOWN_*_GAP here with the reason). Adjudicate each "
         f"against the controller's $allowedFields AT THIS TAG before whitelisting — "
         f"the schema documents fields the controller rejects (see "
         f"connect_to_docker_network), and reading the controller on `main` instead "
@@ -645,10 +651,10 @@ async def test_application_gap_does_not_grow() -> None:
     triaged do not cry every week.
     """
     tag, spec = await released_openapi()
+    newest = tag_version(tag)
 
-    routes = ("public", "private-github-app", "private-deploy-key", "dockerfile", "dockerimage")
     new: dict[str, list[str]] = {}
-    for route in routes:
+    for route in cv.APPLICATION_ROUTES:
         op = spec.get("paths", {}).get(f"/applications/{route}", {}).get("post", {})
         documented = set(
             op.get("requestBody", {})
@@ -659,15 +665,19 @@ async def test_application_gap_does_not_grow() -> None:
         )
         if not documented:
             continue
-        missing = documented - APPLICATION_CREATE - KNOWN_APPLICATION_GAP - KNOWN_TAGS_GAP
+        sent = cv.fields_for(f"applications/{route}", newest)
+        missing = documented - sent - KNOWN_APPLICATION_GAP - KNOWN_TAGS_GAP
         if missing:
-            new[route] = sorted(missing)
+            new[route] = [
+                registry_line(f"applications/{route}", f, tag) for f in sorted(missing)
+            ]
 
     assert not new, (
         f"NEW fields documented for POST /applications/* in Coolify {tag}: {new}. "
         f"Adjudicate against ApplicationsController's $allowedFields at that tag, "
-        f"then either whitelist in APPLICATION_CREATE or add to "
-        f"KNOWN_APPLICATION_GAP with a reason."
+        f"then either add the registry row (domain/coolify_versions.py; read_from="
+        f'"settings" if the GET nests it) or add it to KNOWN_APPLICATION_GAP with a '
+        f"reason."
     )
 
 
@@ -969,15 +979,27 @@ def create_allowed_fields(php: str) -> list[set[str]]:
     return out
 
 
+#: Where the registry keeps the rows a canary may ask for, by controller.
+_REGISTRY_HOME = {
+    "applications": "_APPLICATION (shared by every applications/<route> endpoint)",
+    "services": "_SERVICE (services/template and services/compose)",
+    "databases": "_DATABASE_COMMON, or _DATABASE_ENGINE[<engine>] for one engine",
+}
+
+
 @pytest.mark.integration
 async def test_we_never_send_a_field_upstream_rejects() -> None:
-    """No whitelist may contain a field the released controller would 422.
+    """No registry row may send a field the newest released controller would 422.
 
     THE canary that matters. A field we are missing costs a feature; a field
     upstream removed costs the whole resource, because the extra-field check
-    rejects the request wholesale before anything is created.
+    rejects the request wholesale before anything is created. Checked per
+    endpoint for the NEWEST release, so a field that left a create array needs an
+    ``until=`` on its row (as host_path has) rather than a deletion — the older
+    releases still take it.
     """
     tag, sources = await released_controllers()
+    newest = tag_version(tag)
 
     # All five application create routes share one array (ApplicationsController),
     # so there is exactly one create array to match against.
@@ -995,20 +1017,26 @@ async def test_we_never_send_a_field_upstream_rejects() -> None:
     assert db_arrays, f"found no database create $allowedFields at {tag}"
     db_allowed: set[str] = set().union(*db_arrays)
 
+    endpoints = [
+        *((f"applications/{route}", app_allowed) for route in cv.APPLICATION_ROUTES),
+        ("services/template", svc_allowed),
+        ("services/compose", svc_allowed),
+        *((f"databases/{engine}", db_allowed) for engine in cv.DATABASE_ENGINES),
+    ]
     rejected: dict[str, list[str]] = {}
-    if extra := sorted(APPLICATION_CREATE - app_allowed):
-        rejected["APPLICATION_CREATE"] = extra
-    if extra := sorted(SERVICE_CREATE - svc_allowed):
-        rejected["SERVICE_CREATE"] = extra
-    for engine in sorted(DATABASE_ENGINE_FIELDS):
-        if extra := sorted(database_allowed(engine) - db_allowed):
-            rejected[f"database_allowed({engine!r})"] = extra
+    for endpoint, accepted in endpoints:
+        if extra := sorted(cv.fields_for(endpoint, newest) - accepted):
+            rejected[endpoint] = [
+                f'Field("{f}", Gate(until={newest})) - or drop the row if no release '
+                "ever took it"
+                for f in extra
+            ]
 
     assert not rejected, (
-        f"Coolify {tag} would 422 these fields, which we still send: {rejected}. "
-        f"An unlisted field is rejected wholesale — the resource is NOT created. "
-        f"Remove them from api/fields.py, or confirm against the controller at this "
-        f"tag that the extraction missed a branch."
+        f"Coolify {tag} would 422 these fields, which the registry still sends there: "
+        f"{rejected}. An unlisted field is rejected wholesale — the resource is NOT "
+        f"created. Close each row's gate in domain/coolify_versions.py, or confirm "
+        f"against the controller at this tag that the extraction missed a branch."
     )
 
 
@@ -1040,28 +1068,81 @@ async def test_controller_arrays_are_adjudicated() -> None:
     never documents still fails here until someone decides about it.
     """
     tag, sources = await released_controllers()
+    newest = tag_version(tag)
+
+    def sent(*endpoints: str) -> frozenset[str]:
+        return frozenset().union(*(cv.fields_for(e, newest) for e in endpoints))
 
     adjudicated = {
-        "applications": APPLICATION_CREATE | KNOWN_APPLICATION_GAP | KNOWN_TAGS_GAP,
-        "services": SERVICE_CREATE | KNOWN_SERVICE_GAP | KNOWN_TAGS_GAP,
-        "databases": frozenset().union(*(database_allowed(e) for e in DATABASE_ENGINE_FIELDS))
+        "applications": sent(*(f"applications/{r}" for r in cv.APPLICATION_ROUTES))
+        | KNOWN_APPLICATION_GAP
         | KNOWN_TAGS_GAP,
+        "services": sent("services/template", "services/compose")
+        | KNOWN_SERVICE_GAP
+        | KNOWN_TAGS_GAP,
+        "databases": sent(*(f"databases/{e}" for e in cv.DATABASE_ENGINES)) | KNOWN_TAGS_GAP,
     }
     undecided: dict[str, list[str]] = {}
     for key, php in sources.items():
         arrays = create_allowed_fields(php)
         assert arrays, f"found no {key} create $allowedFields at {tag}"
         accepted: set[str] = set().union(*arrays)
+        # A field the array takes through the APPLICATION_SETTING_FIELDS spread is
+        # an application_settings column: the GET returns it under `settings`.
+        nested = _resolve_spread(php, "APPLICATION_SETTING_FIELDS")
         if extra := sorted(accepted - adjudicated[key] - _NOT_SENT_BY_DESIGN[key]):
-            undecided[key] = extra
+            undecided[_REGISTRY_HOME[key]] = [
+                registry_line(f"{key}/*", f, tag, nested="settings" if f in nested else None)
+                for f in extra
+            ]
 
     assert not undecided, (
         f"Coolify {tag} accepts these create fields that we neither send nor have "
         f"adjudicated: {undecided}. Read each at {tag}: where is it stored, does the "
         f"GET return it flat or under `settings`, and since which tag is it accepted? "
-        f"Then whitelist it in api/fields.py or record it in a KNOWN_*_GAP with the "
-        f"reason. The openapi canary cannot see these — upstream did not document them."
+        f"Then add the row shown to domain/coolify_versions.py, or record it in a "
+        f"KNOWN_*_GAP here with the reason. The openapi canary cannot see these — "
+        f"upstream did not document them."
     )
+
+
+def tag_version(tag: str) -> Version:
+    """A release tag (``v4.5.1``) as the registry compares it."""
+    version = parse_version(tag)
+    assert version is not None, f"cannot parse the release tag {tag!r}"
+    return version
+
+
+def registry_line(endpoint: str, field: str, tag: str, *, nested: str | None = None) -> str:
+    """The row a canary asks for: ``CREATE_FIELDS[...]: Field(...)``, ready to paste.
+
+    ``since`` is the tag the canary ran against — the canary runs on every
+    release, so a field it has not seen before is new in that tag. Check it
+    against the previous tag before committing the row.
+    """
+    read_from = f', read_from="{nested}"' if nested else ""
+    return (
+        f'CREATE_FIELDS["{endpoint}"]: Field("{field}", Gate(since={tag_version(tag)})'
+        f"{read_from})"
+    )
+
+
+class TestRegistryLine:
+    """What a red canary tells the next person to add — tested, because it is the
+    instruction a release upgrade follows."""
+
+    def test_names_endpoint_field_and_tag(self) -> None:
+        assert registry_line("backups", "foo", "v4.5.2") == (
+            'CREATE_FIELDS["backups"]: Field("foo", Gate(since=(4, 5, 2)))'
+        )
+
+    def test_a_nested_field_says_where_the_get_keeps_it(self) -> None:
+        line = registry_line("applications/*", "bar", "v4.6.0", nested="settings")
+        assert line.endswith('Gate(since=(4, 6, 0)), read_from="settings")')
+
+    def test_an_unparseable_tag_fails_loudly(self) -> None:
+        with pytest.raises(AssertionError):
+            tag_version("latest")
 
 
 class TestCreateAllowedFieldsExtraction:

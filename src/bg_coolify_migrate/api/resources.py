@@ -36,16 +36,11 @@ import structlog
 
 from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.api.fields import (
-    APPLICATION_CREATE,
     APPLICATION_ROUTE_REQUIRED,
     ENV_FIELDS,
-    SERVICE_CREATE,
-    SERVICE_CREATE_CUSTOM_COMPOSE,
-    SERVICE_UPDATE,
-    STORAGE_CREATE,
-    STORAGE_CREATE_SERVICE,
-    database_allowed,
+    fields_for,
     filter_body,
+    filter_for,
     missing_required,
 )
 from bg_coolify_migrate.dns import wildcard as dns_wildcard
@@ -220,7 +215,12 @@ async def ensure_environment(api: CoolifyClient, project_uuid: str, name: str) -
 
 
 async def create_database(
-    api: CoolifyClient, snapshot: ResourceSnapshot, placement: Placement, source: dict[str, Any]
+    api: CoolifyClient,
+    snapshot: ResourceSnapshot,
+    placement: Placement,
+    source: dict[str, Any],
+    *,
+    version: Version | None = None,
 ) -> str:
     """Create a standalone database. Returns the new uuid.
 
@@ -228,12 +228,16 @@ async def create_database(
     ``created`` hook parses the tag (``/:(?:pg)?(\\d+)/i``) to decide between
     ``/var/lib/postgresql`` (>=18) and ``/var/lib/postgresql/data``. An unpinned
     image can put the mount path somewhere the mirrored bytes are not.
+
+    ``version`` is the instance's release: the body carries what IT accepts
+    (domain/coolify_versions.py), and nothing an unknown one might refuse.
     """
     if snapshot.engine is None:
         raise UnsupportedResource(f"database {snapshot.name!r} has no engine")
 
-    allowed = database_allowed(snapshot.engine.value)
-    body = filter_body({**source, **placement.as_body()}, allowed)
+    body = filter_for(
+        {**source, **placement.as_body()}, f"databases/{snapshot.engine.value}", version
+    )
     body["name"] = snapshot.name
     body["instant_deploy"] = False
     # The GET returns the stored plaintext config; the create validates base64.
@@ -255,7 +259,12 @@ async def create_database(
 
 
 async def create_service(
-    api: CoolifyClient, snapshot: ResourceSnapshot, placement: Placement, source: dict[str, Any]
+    api: CoolifyClient,
+    snapshot: ResourceSnapshot,
+    placement: Placement,
+    source: dict[str, Any],
+    *,
+    version: Version | None = None,
 ) -> str:
     """Create a service, from a template or from raw compose. Returns the new uuid.
 
@@ -263,9 +272,9 @@ async def create_service(
     both is a 422.
     """
     is_custom = snapshot.kind is ResourceKind.SERVICE_COMPOSE
-    allowed = SERVICE_CREATE_CUSTOM_COMPOSE if is_custom else SERVICE_CREATE
+    endpoint = "services/compose" if is_custom else "services/template"
 
-    body = filter_body({**source, **placement.as_body()}, allowed)
+    body = filter_for({**source, **placement.as_body()}, endpoint, version)
     body["name"] = snapshot.name
     body["instant_deploy"] = False
 
@@ -601,13 +610,23 @@ def _unrewritable_server_bound(
 
 
 async def create_application(
-    api: CoolifyClient, snapshot: ResourceSnapshot, placement: Placement, source: dict[str, Any]
+    api: CoolifyClient,
+    snapshot: ResourceSnapshot,
+    placement: Placement,
+    source: dict[str, Any],
+    *,
+    version: Version | None = None,
 ) -> str:
-    """Create an application. Returns the new uuid."""
+    """Create an application. Returns the new uuid.
+
+    The body carries what the route accepts on ``version``, including the
+    settings a release takes flat while its GET nests them under ``settings``
+    (domain/coolify_versions.py).
+    """
     route = create_route(snapshot.kind, auth=snapshot.git_auth)
     segment = route.rsplit("/", 1)[1]
 
-    body = filter_body({**source, **placement.as_body()}, APPLICATION_CREATE)
+    body = filter_for({**source, **placement.as_body()}, f"applications/{segment}", version)
     body["name"] = snapshot.name
     body["instant_deploy"] = False
 
@@ -723,14 +742,23 @@ async def create_application(
 
 
 async def create_resource(
-    api: CoolifyClient, snapshot: ResourceSnapshot, placement: Placement, source: dict[str, Any]
+    api: CoolifyClient,
+    snapshot: ResourceSnapshot,
+    placement: Placement,
+    source: dict[str, Any],
+    *,
+    version: Version | None = None,
 ) -> str:
-    """Dispatch to the right create call for this kind. Returns the new uuid."""
+    """Dispatch to the right create call for this kind. Returns the new uuid.
+
+    ``version`` is the release the plan was made for; ``None`` (unknown) sends
+    only what every validated release accepts.
+    """
     if snapshot.kind is ResourceKind.DATABASE:
-        return await create_database(api, snapshot, placement, source)
+        return await create_database(api, snapshot, placement, source, version=version)
     if snapshot.kind in (ResourceKind.SERVICE_TEMPLATE, ResourceKind.SERVICE_COMPOSE):
-        return await create_service(api, snapshot, placement, source)
-    return await create_application(api, snapshot, placement, source)
+        return await create_service(api, snapshot, placement, source, version=version)
+    return await create_application(api, snapshot, placement, source, version=version)
 
 
 # ── service domains ──────────────────────────────────────────────────────────
@@ -941,6 +969,7 @@ async def finish_service_target(
     target_uuid: str,
     *,
     own: Collection[str] = (),
+    version: Version | None = None,
 ) -> set[str]:
     """Carry the source's domains, and its network flag, to a created service.
 
@@ -1011,7 +1040,7 @@ async def finish_service_target(
         body["urls"] = entries
     if not body:
         return target_apps
-    body = filter_body(body, SERVICE_UPDATE)
+    body = filter_body(body, fields_for("services.update", version))
 
     holders = {*own, *sub_application_uuids(source), *target_apps, target_uuid}
     try:
@@ -1082,7 +1111,8 @@ async def restore_service_urls(api: CoolifyClient, uuid: str, body: dict[str, An
     patch: dict[str, Any] = {"urls": diff}
     if body.get("force_domain_override"):
         patch["force_domain_override"] = True
-    await api.update_resource("services", uuid, filter_body(patch, SERVICE_UPDATE))
+    # urls and force_domain_override: accepted by every release in the table.
+    await api.update_resource("services", uuid, filter_body(patch, fields_for("services.update", None)))
     log.info("api.service.urls_restored", uuid=uuid, count=len(diff))
     return True
 
@@ -1247,6 +1277,7 @@ def build_env_entries(
     tag: str | None = None,
     lock_preview_twins: bool = False,
     route_keys: Collection[str] = (),
+    version: Version | None = None,
 ) -> list[dict[str, Any]]:
     """Prepare env vars for the target. PURE.
 
@@ -1287,14 +1318,15 @@ def build_env_entries(
     images are routed from (``dns_extract.route_env_keys``) — any other row of
     those names is a plain variable and copied verbatim.
     """
+    allowed = fields_for("envs", version)
     entries: list[dict[str, Any]] = []
     filled: set[str] = set()
     for env in source_envs:
         key = str(env.get("key") or "")
         if "value" in env:
-            entry = filter_body(env, ENV_FIELDS)
+            entry = filter_body(env, allowed)
         elif recovered is not None and not env.get("is_preview") and key in recovered:
-            entry = filter_body({**env, "value": recovered.get(key)}, ENV_FIELDS)
+            entry = filter_body({**env, "value": recovered.get(key)}, allowed)
             filled.add(key)
         else:
             continue
@@ -1401,6 +1433,7 @@ async def copy_envs(
     tag: str | None = None,
     recovered: Secrets | None = None,
     route_keys: Collection[str] = (),
+    version: Version | None = None,
 ) -> int:
     """Copy environment variables source -> target. Returns the count.
 
@@ -1421,6 +1454,7 @@ async def copy_envs(
         tag=tag,
         lock_preview_twins=collection == "applications",
         route_keys=route_keys,
+        version=version,
     )
     if not entries:
         log.info("api.envs.none", source=source_uuid)
@@ -1515,6 +1549,7 @@ async def copy_storages(
     source_uuid: str,
     target_uuid: str,
     kind: ResourceKind,
+    version: Version | None = None,
 ) -> int:
     """Recreate user-defined storages on the target. Returns the count created.
 
@@ -1537,7 +1572,9 @@ async def copy_storages(
         return 0
 
     source = await api.get_storages(collection, source_uuid)
-    allowed = STORAGE_CREATE_SERVICE if collection == "services" else STORAGE_CREATE
+    # host_path only where the release still takes it (the plan refuses a source
+    # holding one elsewhere), is_host_file only where it exists.
+    allowed = fields_for("storages/services" if collection == "services" else "storages", version)
     created = 0
 
     for entry in source.get("persistent_storages") or []:

@@ -32,7 +32,7 @@ from bg_coolify_migrate.api.fields import (
     rejected_keys,
 )
 from bg_coolify_migrate.api.schedules import build_backup_body, copy_backup_schedules
-from bg_coolify_migrate.domain import schedules
+from bg_coolify_migrate.domain import coolify_versions, schedules
 from bg_coolify_migrate.domain.compose import MountClass
 from bg_coolify_migrate.domain.kinds import DatabaseEngine, ResourceKind
 from bg_coolify_migrate.domain.manifest import Decision, VolumeItem, VolumeManifest
@@ -902,17 +902,20 @@ class TestBackupFieldsExtraction:
 
 @pytest.mark.integration
 async def test_backup_fields_match_released_controller() -> None:
-    """BACKUP_CREATE is accepted by, and adjudicates, create_backup at the newest tag."""
-    from tests.test_api_fields import released_controllers
+    """The registry's ``backups`` rows for the newest tag: accepted, and complete."""
+    from tests.test_api_fields import registry_line, released_controllers, tag_version
 
     tag, sources = await released_controllers()
+    sent = coolify_versions.fields_for("backups", tag_version(tag))
     accepted = backup_create_fields(sources["databases"])
     assert accepted, f"found no create_backup $backupConfigFields at {tag}"
-    assert accepted >= BACKUP_CREATE, (
-        f"Coolify {tag} would 422 {sorted(BACKUP_CREATE - accepted)}, which we still send"
+    assert accepted >= sent, (
+        f"Coolify {tag} would 422 {sorted(sent - accepted)}, which the registry still "
+        "sends there: close each row's gate with until= in domain/coolify_versions.py"
     )
-    undecided = accepted - BACKUP_CREATE - BACKUP_S3_FIELDS - BACKUP_UNSETTABLE
+    undecided = accepted - sent - BACKUP_S3_FIELDS - BACKUP_UNSETTABLE
     assert undecided == set(), (
-        f"Coolify {tag} accepts backup fields we neither send nor adjudicated: "
-        f"{sorted(undecided)}"
+        f"Coolify {tag} accepts backup fields we neither send nor adjudicated. Add "
+        f"{[registry_line('backups', f, tag) for f in sorted(undecided)]} to "
+        "domain/coolify_versions.py, or BACKUP_UNSETTABLE with the reason."
     )

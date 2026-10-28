@@ -81,9 +81,18 @@ decision, the decision is in the wrong layer.
 
 ## Decision tree
 
-- **Adding a Coolify API call?** Add its field whitelist to `api/fields.py` first.
-  `$allowedFields` is enforced; unknown fields are a 422 per field. **Never**
-  round-trip a GET response into a POST body.
+- **Adding a Coolify API call?** Add its fields to the release registry,
+  `domain/coolify_versions.py` (`CREATE_FIELDS` / `UPDATE_FIELDS`), first — each
+  with the `Gate` of releases that accept it — and build the body with
+  `api/fields.filter_for(source, endpoint, version)`. `$allowedFields` is
+  enforced; unknown fields are a 422 per field. **Never** round-trip a GET
+  response into a POST body.
+- **A rule that holds only from (or until) some release?** Ask
+  `coolify_versions.supports("name", version)` and add the name to `FEATURES`
+  with its tag evidence. Never compare a version anywhere else. The version is
+  the plan's (`MigrationPlan.coolify_version`, `ctx.coolify_version` at run
+  time): read ONCE, at PLAN, so the plan's verdicts and CREATE's bodies always
+  speak about the same release.
 - **Handling a new resource shape?** Extend `domain/kinds.py`. Remember "does it
   build?" is NOT a property of the kind — read it from the compose (`build:` vs
   `image:`) via `domain/compose.py`.
@@ -663,6 +672,37 @@ why `domain/domains.py` hands every hostname over make-before-break.
   Unit tests never touch the real resolver: `tests/conftest.py::_offline_dns`
   answers "offline" (not definitive) unless a test patches resolution itself.
 
+## Supporting a new Coolify release
+
+A release that only ADDS fields is a data change in `domain/coolify_versions.py`
+and nothing else. The steps, in order:
+
+1. **Run the canaries** — they read the NEWEST release tag, never `main`:
+   `GITHUB_TOKEN=$(gh auth token) pytest -m integration tests/test_api_fields.py
+   tests/test_backup_schedules.py tests/test_database_tls.py
+   tests/test_scheduled_tasks.py`. A red one prints the exact registry row to
+   add (`CREATE_FIELDS["..."]: Field("x", Gate(since=(4, 5, 2)),
+   read_from="settings")`). `since` is the tag the canary ran against: confirm
+   at the previous tag that the field really is new there.
+2. **Read every new field at the release tag** (blobless clone, `git show
+   vX:path`): where it is stored, whether the GET returns it flat or nested,
+   and what its validation refuses. Then add the `Field` row with that tag
+   evidence in a comment — or record it in a `KNOWN_*_GAP` in the tests with
+   the reason it is not carried. A field that LEFT an array gets `until=`, not
+   a deletion: older releases still take it.
+3. **Behaviour changes** (a validator, a hidden value, a new guard): add a
+   `FEATURES` row with the tag and file:line evidence, and gate the rule on
+   `supports(...)`. Where a field is now carried, the plan warning about it
+   must stop firing from that release on (`carries(endpoint, field, version)`).
+4. **Diff the release against the previous one** for the controllers,
+   `bootstrap/helpers/api.php`, the models the tool reads and the jobs it relies
+   on (stop/start/restart guards, labels, volume names, mount paths). Record
+   what you found in a "Learned from the vA -> vB audit" section below.
+5. **Raise `VALIDATED_MAX`** in `domain/coolify_versions.py` with an audit note
+   like the existing ones, and the boundary test in `tests/test_cli.py`.
+6. **Run the e2e rig** (`make e2e`; it pulls `coolify:latest`) before
+   releasing.
+
 ## Verify + ship
 
 ```bash
@@ -684,7 +724,8 @@ Conventional Commits, **past-tense** subject (`added`, `fixed`, `updated`), max
 | What happens on failure? | `domain/statemachine.py`, `engine/executor.py` |
 | Is it safe to start the target? | `dns/gate.py` |
 | Is the stack really stopped? | `discovery/quiesce.py` |
-| Which fields may we send? | `api/fields.py` |
+| Which fields may we send, on which release? | `domain/coolify_versions.py` (views: `api/fields.py`) |
+| Which release does this behaviour start in? | `domain/coolify_versions.py` (`FEATURES`) |
 | What can the target NOT reproduce? | `domain/fidelity.py` |
 | Who holds a domain, and when may we force it? | `domain/domains.py` |
 | Could Coolify manage this DNS record? | `dns/managed.py` (wording only, never a gate) |
