@@ -688,11 +688,42 @@ def newly_mapped_run_options(raw: object) -> list[str]:
 # ── services and databases ───────────────────────────────────────────────────
 
 
+#: The sub-application redirects that are not Coolify's default ('both'): one
+#: of a www/non-www pair redirects to the other (RedirectTypes, column since
+#: v4.5.0 migration 2026_07_29_100747, default 'both').
+_SUB_APP_REDIRECTS = frozenset({"www", "non-www"})
+
+
+def sub_application_redirects(source: dict[str, Any]) -> dict[str, str]:
+    """``{sub-application name: redirect}`` for those not on the default. PURE."""
+    return {
+        str(app["name"]): str(app["redirect"])
+        for app in source.get("applications") or []
+        if isinstance(app, dict) and app.get("name") and app.get("redirect") in _SUB_APP_REDIRECTS
+    }
+
+
+def has_www_pair(urls: object) -> bool:
+    """Whether a URL list holds both a www and a non-www host. PURE.
+
+    UpdateServiceApplicationFromApi::hasWwwAndNonWwwDomains (v4.5.1:84-92): the
+    sub-application PATCH refuses redirect www/non-www (422) without one.
+    """
+    if not isinstance(urls, str):
+        return False
+    hosts = [h for part in urls.split(",") if (h := normalise_host(part))]
+    return any(h.startswith("www.") for h in hosts) and any(
+        not h.startswith("www.") for h in hosts
+    )
+
+
 def service_warnings(source: dict[str, Any], *, version: Version | None = None) -> list[str]:
     """Service-level and per-sub-application settings the target will not share.
 
-    The default COOLIFY_* variables turned off are carried from 4.5.1, by the
-    follow-up PATCH (resources.finish_service_target).
+    Carried from 4.5.1, and then not reported: the default COOLIFY_* variables
+    turned off (the follow-up PATCH, resources.finish_service_target) and a
+    sub-application's www/non-www redirect (its own PATCH, once the target holds
+    the www/non-www pair).
     """
     out: list[str] = []
     if source.get("include_coolify_default_variables") is False and not carries(
@@ -714,7 +745,34 @@ def service_warnings(source: dict[str, Any], *, version: Version | None = None) 
             "migrated: the target uses its server's default resolver and temporary "
             "redirects until you re-apply them by hand."
         )
+    redirects = sub_application_redirects(source)
+    carried = carries("service-applications.update", "redirect", version)
+    lost = sorted(
+        f"{name} -> {redirect}"
+        for name, redirect in redirects.items()
+        if not carried or not has_www_pair(_sub_application_url(source, name))
+    )
+    if lost:
+        out.append(
+            f"sub-application(s) [{', '.join(lost)}] redirect between their www and non-www "
+            "domains, which "
+            + (
+                "Coolify sets only together with both domains — and their URLs do not "
+                "hold such a pair"
+                if carried
+                else "no Coolify API can set before 4.5.1"
+            )
+            + ". The target answers on both without redirecting (Coolify's default, "
+            "'both') until you re-select the redirect by hand."
+        )
     return out
+
+
+def _sub_application_url(source: dict[str, Any], name: str) -> object:
+    for app in source.get("applications") or []:
+        if isinstance(app, dict) and app.get("name") == name:
+            return app.get("url") or app.get("fqdn")
+    return None
 
 
 def service_refusals(source: dict[str, Any], *, version: Version | None) -> list[str]:

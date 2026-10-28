@@ -762,12 +762,27 @@ _DATABASE_UPDATE: tuple[Field, ...] = (
     Field("is_log_drain_enabled", Gate(since=(4, 5, 1))),
 )
 
+#: PATCH /v1/services/{uuid}/applications/{app_uuid}, one sub-application. The
+#: route exists from 4.2.0; this tool sends it only what the services PATCH
+#: cannot carry.
+_SERVICE_APPLICATION_UPDATE: tuple[Field, ...] = (
+    # www / non-www / both (Rule::enum RedirectTypes): in the allowed list from
+    # v4.5.1 (ServiceApplicationsController v4.5.1:345, :363); the column exists
+    # from v4.5.0 but only the UI could set it. www/non-www 422 unless the
+    # sub-application's url already holds a www and a non-www host
+    # (UpdateServiceApplicationFromApi v4.5.1:70-77) — so it is sent after the
+    # services PATCH carried the URLs.
+    Field("redirect", Gate(since=(4, 5, 1))),
+)
+
 #: Per follow-up PATCH, the fields this tool sends. ``services.update``: PATCH
-#: /services/{uuid}; ``databases.update``: PATCH /databases/{uuid}.
+#: /services/{uuid}; ``databases.update``: PATCH /databases/{uuid};
+#: ``service-applications.update``: PATCH /services/{uuid}/applications/{app_uuid}.
 UPDATE_FIELDS: Mapping[str, tuple[Field, ...]] = MappingProxyType(
     {
         "services.update": _SERVICE_UPDATE,
         "databases.update": _DATABASE_UPDATE,
+        "service-applications.update": _SERVICE_APPLICATION_UPDATE,
     }
 )
 

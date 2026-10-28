@@ -19,6 +19,7 @@ import respx
 from bg_coolify_migrate.api import resources
 from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.api.resources import Placement
+from bg_coolify_migrate.domain import fidelity
 from bg_coolify_migrate.domain.kinds import ResourceKind
 from bg_coolify_migrate.domain.plan import ResourcePlan, ResourceSnapshot, ServerRef, Strategy
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
@@ -243,6 +244,105 @@ class TestSourceRestoreBodyForServices:
     def test_a_service_body_holds_its_custom_sub_application_urls(self) -> None:
         restore = resources.source_restore_body(_snapshot(), _source(), source_wildcard=SRC_WC)
         assert restore == {"urls": [{"name": "web", "url": "https://shop.example.com:8443"}]}
+
+
+class TestSubApplicationRedirects:
+    """A www/non-www redirect silently became 'both' on the target (4.5.0 has the
+    column, but only its UI can set it); v4.5.1's sub-application PATCH carries it
+    — once the target holds the www/non-www pair, or it 422s."""
+
+    PAIR = "https://shop.example.com,https://www.shop.example.com"
+
+    def _source(self, redirect: str = "www") -> dict[str, Any]:
+        return {
+            "uuid": "svc1",
+            "applications": [
+                {"uuid": "sa-web", "name": "web", "fqdn": self.PAIR, "redirect": redirect},
+                {"uuid": "sa-db", "name": "db", "fqdn": None, "redirect": "both"},
+            ],
+        }
+
+    def _reads(self, url: str | None) -> Any:
+        calls: list[int] = []
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return _target_get(("web", "db"), urls=None if len(calls) == 1 else {"web": url or ""})
+
+        return handler
+
+    async def _finish(
+        self, api: CoolifyClient, respx_mock: respx.Router, version: tuple[int, ...] | None, url: str | None
+    ) -> respx.Route:
+        respx_mock.get(f"{BASE}/services/tgt1").mock(side_effect=self._reads(url))
+        respx_mock.patch(f"{BASE}/services/tgt1").mock(return_value=httpx.Response(200, json={}))
+        sub = respx_mock.patch(f"{BASE}/services/tgt1/applications/t-web").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        await resources.finish_service_target(
+            api, _snapshot(), _placement(), self._source(), "tgt1", version=version
+        )
+        return sub
+
+    async def test_carried_after_the_urls_from_4_5_1(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        sub = await self._finish(api, respx_mock, (4, 5, 1), self.PAIR)
+        assert _body(sub) == {"redirect": "www"}
+        patches = [c.request.url.path for c in respx_mock.calls if c.request.method == "PATCH"]
+        assert patches == ["/api/v1/services/tgt1", "/api/v1/services/tgt1/applications/t-web"]
+
+    @pytest.mark.parametrize("version", [(4, 5, 0), None])
+    async def test_never_below_4_5_1(
+        self, api: CoolifyClient, respx_mock: respx.Router, version: tuple[int, ...] | None
+    ) -> None:
+        sub = await self._finish(api, respx_mock, version, self.PAIR)
+        assert not sub.called
+
+    async def test_not_sent_where_the_target_lacks_the_pair(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        """A server-bound pair with no target wildcard to land on is not carried —
+        the redirect would 422; the default 'both' still serves what the target has."""
+        source = self._source()
+        source["applications"][0]["fqdn"] = f"https://shop.{SRC_WC},https://www.shop.{SRC_WC}"
+        source["connect_to_docker_network"] = True  # something else to PATCH
+        respx_mock.get(f"{BASE}/services/tgt1").mock(side_effect=self._reads(None))
+        respx_mock.patch(f"{BASE}/services/tgt1").mock(return_value=httpx.Response(200, json={}))
+        sub = respx_mock.patch(f"{BASE}/services/tgt1/applications/t-web").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        no_target_wildcard = Placement(
+            project_uuid="p1", environment_name="production", server_uuid="s2", source_wildcard=SRC_WC
+        )
+        await resources.finish_service_target(
+            api, _snapshot(), no_target_wildcard, source, "tgt1", version=(4, 5, 1)
+        )
+        assert not sub.called
+
+    def test_the_plan_warns_where_it_is_not_carried(self) -> None:
+        [line] = fidelity.service_warnings(self._source(), version=(4, 5, 0))
+        assert "web -> www" in line and "before 4.5.1" in line
+        assert fidelity.service_warnings(self._source(), version=(4, 5, 1)) == []
+        assert fidelity.service_warnings(self._source("both"), version=(4, 5, 0)) == []
+
+    def test_the_plan_warns_where_coolify_would_refuse_it(self) -> None:
+        source = self._source()
+        source["applications"][0]["fqdn"] = "https://shop.example.com"
+        [line] = fidelity.service_warnings(source, version=(4, 5, 1))
+        assert "do not hold such a pair" in line
+
+    @pytest.mark.parametrize(
+        ("urls", "pair"),
+        [
+            ("https://a.example.com,https://www.a.example.com:8443/x", True),
+            ("https://www.a.example.com", False),
+            ("https://a.example.com,https://b.example.com", False),
+            (None, False),
+        ],
+    )
+    def test_has_www_pair(self, urls: object, pair: bool) -> None:
+        assert fidelity.has_www_pair(urls) is pair
 
 
 class TestFinishServiceTarget:

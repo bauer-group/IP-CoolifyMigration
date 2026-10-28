@@ -1143,7 +1143,47 @@ async def finish_service_target(
                 ),
             )
     log.info("api.service.urls_carried", name=snapshot.name, target=target_uuid, count=len(entries))
+    if (redirects := fidelity.sub_application_redirects(source)) and "redirect" in fields_for(
+        "service-applications.update", version
+    ):
+        await _carry_redirects(api, snapshot, target_uuid, redirects)
     return target_apps
+
+
+async def _carry_redirects(
+    api: CoolifyClient, snapshot: ResourceSnapshot, target_uuid: str, redirects: dict[str, str]
+) -> None:
+    """Give each target sub-application its source's www/non-www redirect (4.5.1+).
+
+    After the URLs: Coolify refuses the redirect unless the sub-application
+    already holds a www and a non-www host (fidelity.has_www_pair), so the target
+    is read back first. One whose pair did not survive the carry (a server-bound
+    host with no target wildcard to land on) is skipped and logged: the default
+    'both' still serves both hosts.
+    """
+    target = await api.get_resource("services", target_uuid)
+    by_name = {
+        str(app["name"]): app
+        for app in target.get("applications") or []
+        if isinstance(app, dict) and app.get("name") and app.get("uuid")
+    }
+    for name, redirect in sorted(redirects.items()):
+        app = by_name.get(name)
+        if app is None or not fidelity.has_www_pair(app.get("url") or app.get("fqdn")):
+            log.warning(
+                "api.service.redirect_not_carried",
+                name=snapshot.name,
+                sub_application=name,
+                redirect=redirect,
+                hint="the target lacks the www/non-www pair; re-select the redirect by hand",
+            )
+            continue
+        await api.patch(
+            f"/services/{target_uuid}/applications/{app['uuid']}", {"redirect": redirect}
+        )
+        log.info(
+            "api.service.redirect_carried", name=snapshot.name, sub_application=name, redirect=redirect
+        )
 
 
 async def restore_service_urls(api: CoolifyClient, uuid: str, body: dict[str, Any]) -> bool:
