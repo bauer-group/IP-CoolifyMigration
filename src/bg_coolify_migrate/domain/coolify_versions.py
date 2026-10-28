@@ -202,6 +202,13 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         "noindex_domains": Gate(since=(4, 3, 0)),
         # Managed DNS ships in v4.4.0 (absent at v4.3.24 and v4.4-rc.1).
         "managed_dns": Gate(since=(4, 4, 0)),
+        # GET /databases/{uuid} nulls internal_db_url and external_db_url for a
+        # sensitive caller when the credential variable is locked
+        # (DatabasesController v4.5.1:262-270; isCredentialLocked in
+        # StandaloneRedis :421-424, StandaloneKeydb :413, StandaloneDragonfly
+        # :412 — absent at v4.5.0). A locked Redis REDIS_PASSWORD is then
+        # recoverable from the source server's file alone.
+        "locked_db_url_withheld": Gate(since=(4, 5, 1)),
     }
 )
 

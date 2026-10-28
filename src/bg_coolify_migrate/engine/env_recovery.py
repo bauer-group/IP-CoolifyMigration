@@ -82,7 +82,11 @@ async def _recover(
 
 
 def _db_url(full: dict[str, Any], snapshot: ResourceSnapshot) -> str | None:
-    """internal_db_url — only for the one engine that needs it, never stored."""
+    """internal_db_url — only for the one engine that needs it, never stored.
+
+    ``None`` for a locked credential from 4.5.1, which withholds the URL
+    (locked_envs.redis_password_from_url): the file is the only source then.
+    """
     url = full.get("internal_db_url") if snapshot.engine is DatabaseEngine.REDIS else None
     return url if isinstance(url, str) else None
 

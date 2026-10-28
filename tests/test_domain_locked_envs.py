@@ -724,6 +724,45 @@ class TestRedisRecovery:
         assert rec.recovered.get("REDIS_PASSWORD") == "file$pw"
         assert rec.from_api == ()
 
+    def test_from_4_5_1_the_withheld_url_is_expected_and_the_file_answers(self) -> None:
+        """v4.5.1 nulls the URL of a locked credential (DatabasesController
+        :262-270): the file is the only source — not a disagreement."""
+        rec = le.recover(
+            [row("REDIS_PASSWORD")],
+            SourceConfig(
+                path=DB_COMPOSE,
+                kind=FileKind.COMPOSE,
+                text=compose_file("db1", [("REDIS_PASSWORD", "file$pw")]),
+            ),
+            collection="databases",
+            uuid="db1",
+            engine=DatabaseEngine.REDIS,
+            internal_db_url=None,
+            version=(4, 5, 1),
+        )
+        assert rec.recovered.get("REDIS_PASSWORD") == "file$pw"
+        assert rec.from_api == ()
+        assert rec.unrecoverable == {}
+
+    @pytest.mark.parametrize(
+        ("version", "says_withheld"), [((4, 5, 1), True), ((4, 5, 0), False), (None, False)]
+    )
+    def test_an_unreadable_file_says_why_the_url_cannot_help(
+        self, version: tuple[int, ...] | None, says_withheld: bool
+    ) -> None:
+        rec = le.recover(
+            [row("REDIS_PASSWORD")],
+            SourceConfig(path=DB_COMPOSE, kind=FileKind.COMPOSE, unavailable="gone"),
+            collection="databases",
+            uuid="db1",
+            engine=DatabaseEngine.REDIS,
+            internal_db_url=None,
+            version=version,
+        )
+        reason = rec.unrecoverable["REDIS_PASSWORD"]
+        assert reason.endswith("gone")
+        assert ("withholds the connection URL" in reason) is says_withheld
+
     def test_keydb_does_not_read_the_url(self) -> None:
         rec = le.recover(
             [row("REDIS_PASSWORD")],

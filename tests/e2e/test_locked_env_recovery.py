@@ -14,7 +14,8 @@ prove the three things that matter here:
 * no secret reaches plan.json, the journal or the log output.
 
 Plus Redis, whose locked REDIS_PASSWORD comes from the API's internal_db_url and
-needs no file at all, and the two refusals: a file that does not exist, and a
+needs no file at all up to 4.5.0 — from 4.5.1 the API withholds that URL and the
+file is the only source — and the two refusals: a file that does not exist, and a
 file that no longer matches the resource (a variable changed without a restart).
 """
 
@@ -31,8 +32,10 @@ import pytest
 import pytest_asyncio
 
 from bg_coolify_migrate.api.client import CoolifyClient
+from bg_coolify_migrate.domain.coolify_versions import supports
 from bg_coolify_migrate.domain.plan import TransferMode
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy, Outcome
+from bg_coolify_migrate.domain.versions import parse_version
 from bg_coolify_migrate.engine.planner import build_plan, server_uuid_of
 from bg_coolify_migrate.engine.runner import run_migration
 from bg_coolify_migrate.settings.base import Settings
@@ -320,14 +323,20 @@ async def locked_redis(
             await db_exec(source, uuid, 'redis-cli -a rootpw SET greeting "Grüße GmbH"')
             await db_exec(source, uuid, "redis-cli -a rootpw SAVE")
             await _lock(api, "databases", uuid, "REDIS_PASSWORD", "rootpw")
-            # The API URL must be enough on its own: take the file away.
-            (await source.run(f"rm -f /data/coolify/databases/{uuid}/docker-compose.yml")).check()
-        yield {"project": project_name, "name": name, "uuid": uuid}
+            # From 4.5.1 the API withholds the URL of a locked credential and the
+            # file is the only source. Before, the URL must be enough on its own:
+            # take the file away.
+            withheld = supports(
+                "locked_db_url_withheld", parse_version(await api.version()), if_unknown=False
+            )
+            if not withheld:
+                (await source.run(f"rm -f /data/coolify/databases/{uuid}/docker-compose.yml")).check()
+        yield {"project": project_name, "name": name, "uuid": uuid, "url_withheld": withheld}
     finally:
         await _cleanup(api, suffix, project_uuid)
 
 
-async def test_a_locked_redis_password_comes_from_the_api(
+async def test_a_locked_redis_password_is_carried(
     api: CoolifyClient, settings: Settings, rig: dict[str, Any], locked_redis: dict[str, Any]
 ) -> None:
     envs = await _envs_by_key(api, "databases", locked_redis["uuid"])
@@ -346,6 +355,8 @@ async def test_a_locked_redis_password_comes_from_the_api(
     assert not plan.is_blocked, plan.resources[0].blocking_reasons
     assert plan.resources[0].recover_env_keys == ("REDIS_PASSWORD",)
     assert "rootpw" not in plan.model_dump_json()
+    source_line = "will be read from" if locked_redis["url_withheld"] else "connection URL"
+    assert any(source_line in w for w in plan.resources[0].warnings), plan.resources[0].warnings
 
     # accept_drift: floating minor tags are not what this test is about.
     result = await run_migration(api, settings, plan, accept_drift=True)

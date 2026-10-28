@@ -865,14 +865,19 @@ def _from_file(
 def redis_password_from_url(url: object) -> str | None:
     """The server password inside a Redis ``internal_db_url``, or None.
 
-    The one API path to a locked value: StandaloneRedis appends internal_db_url,
-    the controller makes it visible to sensitive callers, and it embeds
-    ``rawurlencode(connectionPassword())`` (v4.5.0 StandaloneRedis.php:59,
-    309-318, 402-436; DatabasesController.php:213-234; same at v4.4.0). rawurlencode
-    is exact RFC 3986, so ``unquote`` (never ``unquote_plus``) inverts it. The
-    username part exists for redis >= 6 and is itself encoded, so the first ``:``
-    of the userinfo is the separator. A ``{{...}}`` is a secret-manager or shared
-    reference shown instead of the password — not the password.
+    The one API path to a locked value — up to 4.5.0: StandaloneRedis appends
+    internal_db_url, the controller makes it visible to sensitive callers, and it
+    embeds ``rawurlencode(connectionPassword())`` (v4.5.0 StandaloneRedis.php:59,
+    309-318, 402-436; DatabasesController.php:213-234; same at v4.4.0). From
+    4.5.1 the controller nulls both connection URLs for a sensitive caller when
+    the credential is locked (DatabasesController v4.5.1:262-270,
+    StandaloneRedis::isCredentialLocked :421-424; the ``locked_db_url_withheld``
+    feature), so a locked REDIS_PASSWORD then comes from the file alone, with
+    nothing to cross-check it against. rawurlencode is exact RFC 3986, so
+    ``unquote`` (never ``unquote_plus``) inverts it. The username part exists for
+    redis >= 6 and is itself encoded, so the first ``:`` of the userinfo is the
+    separator. A ``{{...}}`` is a secret-manager or shared reference shown instead
+    of the password — not the password.
     """
     if not isinstance(url, str) or "@" not in url:
         return None
@@ -907,7 +912,8 @@ def recover(
     the FILE must be trusted as a whole (readable, parseable, not a preview's,
     not stale); then the row's own record must exist once, be delimited exactly
     and decode exactly. A Redis REDIS_PASSWORD comes from the API URL first,
-    cross-checked with the file.
+    cross-checked with the file — up to 4.5.0; from 4.5.1 the API withholds that
+    URL (:func:`redis_password_from_url`) and the file is the only source.
 
     ``ports_exposes`` (applications) is the resource's own; a known one makes
     the generated PORT line certain, so a record before it can be delimited.
@@ -949,11 +955,18 @@ def recover(
         for env in pending:
             key = str(env["key"])
             value, reason = _from_file(env, verdict, source)
-            api_value = (
-                redis_password_from_url(internal_db_url)
-                if engine is DatabaseEngine.REDIS and key == "REDIS_PASSWORD"
-                else None
-            )
+            from_url = engine is DatabaseEngine.REDIS and key == "REDIS_PASSWORD"
+            api_value = redis_password_from_url(internal_db_url) if from_url else None
+            if from_url and api_value is None and supports(
+                "locked_db_url_withheld", version, if_unknown=False
+            ):
+                # Not a disagreement and not a token problem: this release never
+                # shows the URL of a locked credential. Say so, or the reason
+                # reads as if the file had merely been unlucky.
+                reason = (
+                    "Coolify >= 4.5.1 withholds the connection URL of a locked "
+                    f"credential, so {source.path} is the only source, and {reason}"
+                )
             if api_value is not None:
                 if value is not None and value != api_value:
                     unrecoverable[key] = (

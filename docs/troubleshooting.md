@@ -67,6 +67,7 @@ without the key; set it by hand. The reason says what to do:
 | `a {{...}} shared-variable reference` | The file holds the resolved value, not the reference. Unlock it on the source, or set it on the target. |
 | `… cannot be delimited exactly` / `… is ambiguous` / `… is not in the encoding Coolify uses …` | A value saved before Coolify 4.5 whose end the file cannot prove (a multi-line one, or one followed by a line Coolify writes only sometimes, such as `PORT=` or `COOLIFY_*=`), or a secret-manager value. Delete and re-add the variable unlocked (or save it again on 4.5 and redeploy), then migrate. |
 | `the source database's API connection URL and … disagree` | The Redis password in the database record and the running compose differ. Restart the source database once. |
+| `Coolify >= 4.5.1 withholds the connection URL of a locked credential, so … is the only source, and …` | From 4.5.1 the API no longer shows a locked Redis password inside the connection URL, so the database's compose file on the source server is the only place to read it. Fix what the rest of the reason names (usually: restart the source database once so Coolify rewrites the file), or unlock `REDIS_PASSWORD` on the source. |
 
 A locked **build-time** variable of an application the target rebuilds gets an
 extra warning: the target's build runs after the source is stopped, without the

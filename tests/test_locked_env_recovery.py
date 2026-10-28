@@ -307,14 +307,15 @@ class TestCopyEnvs:
 
 
 class _PlanApi:
-    def __init__(self, envs: list[dict[str, Any]]) -> None:
+    def __init__(self, envs: list[dict[str, Any]], version: str = "4.5.0") -> None:
         self._envs = envs
+        self._version = version
 
     async def get_server(self, uuid: str) -> dict[str, Any]:
         return {"uuid": uuid, "name": uuid, "ip": "10.0.0.2", "settings": {"server_role": "both"}}
 
     async def version(self) -> str:
-        return "4.5.0"
+        return self._version
 
     async def get_storages(self, collection: str, uuid: str) -> dict[str, Any]:
         return {"persistent_storages": [], "file_storages": []}
@@ -356,6 +357,7 @@ async def _plan(
     host: Any,
     shape: dict[str, Any] = _SERVICE,
     full: dict[str, Any] | None = None,
+    version: str = "4.5.0",
 ) -> MigrationPlan:
     from bg_coolify_migrate.engine import planner
 
@@ -397,7 +399,7 @@ async def _plan(
     monkeypatch.setattr(planner, "assess_drift", nothing)
     monkeypatch.setattr(planner, "inspect_all_mounts", no_mounts)
     return await planner.build_plan(
-        _PlanApi(envs),  # type: ignore[arg-type]
+        _PlanApi(envs, version),  # type: ignore[arg-type]
         host,
         project="shop",
         environment="production",
@@ -506,6 +508,42 @@ class TestPlan:
         assert any("connection URL" in w for w in resource.warnings)
         assert SENTINEL not in plan.model_dump_json()
 
+    async def test_from_4_5_1_a_locked_redis_password_comes_from_the_file(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """v4.5.1 withholds the URL of a locked credential: the file is the only
+        source, and the plan says that is where the value comes from."""
+        plan = await _plan(
+            monkeypatch,
+            envs=[locked("REDIS_PASSWORD")],
+            host=serving(DB_COMPOSE, _db_compose([f"REDIS_PASSWORD=pw{SENTINEL}"])),
+            shape=_REDIS,
+            full={"uuid": "db1", "internal_db_url": None},
+            version="4.5.1",
+        )
+        resource = plan.resources[0]
+        assert not plan.is_blocked, resource.blocking_reasons
+        assert resource.recover_env_keys == ("REDIS_PASSWORD",)
+        assert any(f"will be read from {DB_COMPOSE}" in w for w in resource.warnings)
+        assert not any("connection URL" in w for w in resource.warnings)
+        assert SENTINEL not in plan.model_dump_json()
+
+    async def test_from_4_5_1_without_the_file_the_refusal_says_why(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        host = FakeHost()
+        host.on(r"^cat -- ", exit_status=1)
+        plan = await _plan(
+            monkeypatch,
+            envs=[locked("REDIS_PASSWORD")],
+            host=host,
+            shape=_REDIS,
+            full={"uuid": "db1", "internal_db_url": None},
+            version="4.5.1",
+        )
+        assert plan.is_blocked
+        assert "withholds the connection URL" in plan.resources[0].refusals[0]
+
     async def test_a_crashing_recovery_degrades_to_unrecovered(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -611,6 +649,48 @@ def _ctx(tmp_path: Path, api: _CreateApi, plan: MigrationPlan, host: FakeHost) -
         source_host=host,  # type: ignore[arg-type]
         target_host=FakeHost(),  # type: ignore[arg-type]
     )
+
+
+class TestWithheldRedisUrl:
+    """v4.5.1 nulls internal_db_url for a locked credential — through the real
+    client, as the API answers it (DatabasesController v4.5.1:262-270)."""
+
+    def _mock(self, respx_mock: respx.Router) -> None:
+        respx_mock.get(f"{BASE}/databases/db1/envs").mock(
+            return_value=httpx.Response(200, json=[locked("REDIS_PASSWORD")])
+        )
+        respx_mock.get(f"{BASE}/databases/db1").mock(
+            return_value=httpx.Response(
+                200, json={"uuid": "db1", "internal_db_url": None, "external_db_url": None}
+            )
+        )
+
+    async def test_the_file_answers_alone(self, respx_mock: respx.Router) -> None:
+        self._mock(respx_mock)
+        host = serving(DB_COMPOSE, _db_compose(["REDIS_PASSWORD=file-pw"]))
+        async with CoolifyClient(HOST, "tok", max_retries=0) as api:
+            out = await env_recovery.recover_for_create(
+                api,
+                host,  # type: ignore[arg-type]
+                _db_plan(engine=DatabaseEngine.REDIS).resources,
+                version=(4, 5, 1),
+            )
+        assert out["db1"].get("REDIS_PASSWORD") == "file-pw"
+
+    async def test_without_the_file_create_refuses_and_says_why(
+        self, respx_mock: respx.Router
+    ) -> None:
+        self._mock(respx_mock)
+        host = FakeHost()
+        host.on(r"^cat -- ", exit_status=1)
+        async with CoolifyClient(HOST, "tok", max_retries=0) as api:
+            with pytest.raises(EnvRecoveryError, match="withholds the connection URL"):
+                await env_recovery.recover_for_create(
+                    api,
+                    host,  # type: ignore[arg-type]
+                    _db_plan(engine=DatabaseEngine.REDIS).resources,
+                    version=(4, 5, 1),
+                )
 
 
 class TestCreate:
