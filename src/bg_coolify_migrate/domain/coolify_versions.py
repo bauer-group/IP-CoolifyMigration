@@ -96,8 +96,19 @@ from bg_coolify_migrate.domain.versions import Version
 #: in the parsed compose, an enabled health check replaces the Dockerfile's, and
 #: a compose app's generated secrets get no preview twin. Audited against
 #: release tags, not a live 4.5.1.
+#:
+#: Re-verified 2026-10-28 for v4.5.2, diffed against v4.5.1 at the release tags
+#: (24 files, ~200 lines in the paths this tool depends on). Nothing to answer:
+#: the free-form command and configuration attributes (build/start/health-check
+#: commands, custom_docker_run_options, custom_nginx_configuration, *_conf) are
+#: now readable only with read:sensitive (Application/Standalone*
+#: COMMAND_AND_CONFIGURATION_ATTRIBUTES), which the client already asserts at
+#: startup; the deploy-ability check on manual webhook secrets is gone; the proxy
+#: retry middleware labels were removed; previews from before 4.5.1 keep the
+#: production values. Routes, create/update arrays, stop/start, labels, volume
+#: names and the files Coolify writes on the server are unchanged.
 VALIDATED_MIN: Version = (4, 1, 2)
-VALIDATED_MAX: Version = (4, 5, 1)
+VALIDATED_MAX: Version = (4, 5, 2)
 
 
 def format_version(version: Version) -> str:

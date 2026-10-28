@@ -373,6 +373,17 @@ the release it starts in — read that module before adding a rule.
   serves TLS on 6379 itself, Redis/KeyDB on an extra 6380. A carried `*_conf` that
   turns TLS on by itself is refused: the target gets the config, not the certs.
 
+### v4.5.1 -> v4.5.2 (release tags): nothing to answer
+
+The free-form command and configuration attributes of applications and
+databases (build/start/health-check commands, `custom_docker_run_options`,
+`custom_nginx_configuration`, `*_conf`) are readable only with `read:sensitive`
+from 4.5.2 — like `value` before them, they would VANISH (HTTP 200) for a token
+without it, and filter_body would silently drop them. The client asserts the
+scope at startup, so a migrating token always sees them. Everything else in the
+release (proxy retry labels removed, preview production values, webhook secret
+permission) does not touch this tool. `VALIDATED_MAX` = 4.5.2.
+
 ### Learned from the v4.5.0 -> v4.5.1 audit (release tags, not yet a live run)
 
 Every item is a registry row or FEATURE gated on 4.5.1 (`domain/coolify_versions.py`);
