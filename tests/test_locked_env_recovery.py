@@ -165,6 +165,40 @@ class TestBuildEnvEntries:
             ("LATER", False, None, "x"),
         ]
 
+    @pytest.mark.parametrize(
+        ("version", "twin"), [((4, 5, 1), False), ((4, 5, 0), True), (None, True)]
+    )
+    def test_a_compose_apps_generated_secret_gets_no_twin_from_4_5_1(
+        self, version: tuple[int, ...] | None, twin: bool
+    ) -> None:
+        """v4.5.1 makes no preview twin for it: each PR preview generates its own
+        (EnvironmentVariable v4.5.1:147-157). A twin with the recovered production
+        secret would hand the target's previews a credential the source's never had.
+        Older (or unknown) releases make an UNLOCKED twin, which only ours prevents."""
+        entries = build_env_entries(
+            [locked("SERVICE_PASSWORD_DB")],
+            Secrets({"SERVICE_PASSWORD_DB": "prod"}),
+            lock_preview_twins=True,
+            compose_app=True,
+            version=version,
+        )
+        previews = [e for e in entries if e.get("is_preview")]
+        assert bool(previews) is twin
+        assert [e["value"] for e in entries if not e.get("is_preview")] == ["prod"]
+
+    def test_a_plain_apps_recovered_secret_keeps_its_locked_twin_on_4_5_1(self) -> None:
+        entries = build_env_entries(
+            [locked("SERVICE_PASSWORD_DB")],
+            Secrets({"SERVICE_PASSWORD_DB": "prod"}),
+            lock_preview_twins=True,
+            compose_app=False,
+            version=(4, 5, 1),
+        )
+        assert [(e["is_preview"], e["is_shown_once"]) for e in entries] == [
+            (True, True),
+            (False, True),
+        ]
+
     def test_a_readable_source_preview_row_goes_first_and_is_not_doubled(self) -> None:
         envs = [locked("API_SECRET"), {"key": "API_SECRET", "value": "pv", "is_preview": True}]
         entries = build_env_entries(envs, Secrets({"API_SECRET": "v"}), lock_preview_twins=True)

@@ -51,6 +51,7 @@ from bg_coolify_migrate.dns.extract import (
     route_env_keys,
 )
 from bg_coolify_migrate.domain import domains, fidelity
+from bg_coolify_migrate.domain.coolify_versions import supports
 from bg_coolify_migrate.domain.kinds import ResourceKind, create_route
 from bg_coolify_migrate.domain.locked_envs import Secrets
 from bg_coolify_migrate.domain.naming import VolumeEndpoint, resource_config_dir
@@ -1310,6 +1311,7 @@ def build_env_entries(
     lock_preview_twins: bool = False,
     route_keys: Collection[str] = (),
     version: Version | None = None,
+    compose_app: bool = False,
 ) -> list[dict[str, Any]]:
     """Prepare env vars for the target. PURE.
 
@@ -1342,7 +1344,9 @@ def build_env_entries(
     v4.1.2:3127, v4.3.10:3591), so a twin made after that load is invisible to a
     later preview item, which would create a second preview row. Never for
     services/databases: their bulk upserts by key alone, and an is_preview entry
-    would REPLACE the row.
+    would REPLACE the row. From 4.5.1 the hook copies is_shown_once into the
+    twin, and makes none for a dockercompose app's generated magic variables
+    (``compose_app``; v4.5.1:147-157) — see :func:`_preview_for`.
 
     For a service (``collection="services"``) a row that names where the stack
     lives is also dropped when it names the SOURCE: see
@@ -1382,7 +1386,14 @@ def build_env_entries(
         key = str(entry["key"])
         if key in sent:
             continue
-        preview = _preview_for(entry, source_previews.get(key), filled=key in filled)
+        preview = _preview_for(
+            entry,
+            source_previews.get(key),
+            filled=key in filled,
+            own_preview_secret=compose_app
+            and fidelity.is_generated_magic(key)
+            and supports("compose_previews_generate_magic", version, if_unknown=False),
+        )
         if preview is not None:
             previews.append(preview)
             sent.add(key)
@@ -1390,7 +1401,11 @@ def build_env_entries(
 
 
 def _preview_for(
-    entry: dict[str, Any], source_preview: dict[str, Any] | None, *, filled: bool
+    entry: dict[str, Any],
+    source_preview: dict[str, Any] | None,
+    *,
+    filled: bool,
+    own_preview_secret: bool = False,
 ) -> dict[str, Any] | None:
     """The preview entry an application's production ``entry`` needs, if any. PURE.
 
@@ -1399,7 +1414,15 @@ def _preview_for(
       deployments run without it; the hook's twin would instead hand them the
       PRODUCTION value where the source deliberately used another one.
     * the production value was recovered and the source has no preview row:
-      Coolify's own twin, locked (a locked copy of the recovered value).
+      Coolify's own twin, locked (a locked copy of the recovered value) —
+      except where Coolify makes NO twin (``own_preview_secret``): from 4.5.1 a
+      dockercompose app's generated magic variable (SERVICE_PASSWORD_* and the
+      rest) gets none, and each pull-request preview generates its own
+      (EnvironmentVariable v4.5.1:147-157). A twin carrying the production
+      secret there would hand the target's — possibly public — previews a
+      credential the source's previews never had. Only for a KNOWN 4.5.1+:
+      on an older or unknown release the hook still makes an unlocked twin,
+      which only the locked one sent first prevents.
 
     Otherwise None: a readable preview row is sent as itself, and a readable
     production row's twin is what Coolify makes on the source too.
@@ -1407,7 +1430,7 @@ def _preview_for(
     if source_preview is not None and "value" not in source_preview:
         locked = filter_body(source_preview, ENV_FIELDS)
         return {**locked, "value": None, "is_preview": True, "is_shown_once": True}
-    if filled and source_preview is None:
+    if filled and source_preview is None and not own_preview_secret:
         return {**entry, "is_preview": True, "is_shown_once": True}
     return None
 
@@ -1466,6 +1489,7 @@ async def copy_envs(
     recovered: Secrets | None = None,
     route_keys: Collection[str] = (),
     version: Version | None = None,
+    compose_app: bool = False,
 ) -> int:
     """Copy environment variables source -> target. Returns the count.
 
@@ -1487,6 +1511,7 @@ async def copy_envs(
         lock_preview_twins=collection == "applications",
         route_keys=route_keys,
         version=version,
+        compose_app=compose_app,
     )
     if not entries:
         log.info("api.envs.none", source=source_uuid)

@@ -537,6 +537,7 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                 recovered=recovered.get(snapshot.uuid),
                 route_keys=route_keys,
                 version=version,
+                compose_app=snapshot.kind is ResourceKind.APP_GIT_COMPOSE,
             )
             await api_resources.copy_storages(
                 ctx.api,

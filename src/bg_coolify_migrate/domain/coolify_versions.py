@@ -220,6 +220,12 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         # was added only when none was found (v4.5.0:4196-4198). Upstream commit
         # e200927ff, issue #10974.
         "coolify_healthcheck_replaces_dockerfile": Gate(since=(4, 5, 1)),
+        # The EnvironmentVariable created hook makes NO preview twin for a
+        # dockercompose app's generated magic variable — each pull-request
+        # preview generates its own — and copies is_shown_once into the twins it
+        # does make (EnvironmentVariable v4.5.1:147-157, isGeneratedMagicVariable
+        # :179-183; v4.5.0:118-148 copied every row, unlocked).
+        "compose_previews_generate_magic": Gate(since=(4, 5, 1)),
     }
 )
 
