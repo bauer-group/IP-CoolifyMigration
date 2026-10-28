@@ -527,8 +527,10 @@ BACKUP_CREATE: frozenset[str] = frozenset(
 #: Accepted too, but never copied off a GET: build_backup_body sets them from the
 #: destinations a 4.5 row discloses. `s3_storage_uuids` exists from v4.5.0 only.
 BACKUP_S3_FIELDS: frozenset[str] = frozenset({"s3_storage_uuid", "s3_storage_uuids"})
-#: Returned by every GET, in no create or update array on any release: the API
-#: cannot set them, so the plan reports disable_local_backup instead.
+#: Returned by every GET and never sent. disable_local_backup joins the create
+#: array only at v4.5.1 (DatabasesController $backupConfigFields) and 422s on
+#: v4.5.0, the newest release we validate, so the plan reports it instead;
+#: description is in no create array at all.
 BACKUP_UNSETTABLE: frozenset[str] = frozenset({"disable_local_backup", "description"})
 
 # ── Environment variables ────────────────────────────────────────────────────

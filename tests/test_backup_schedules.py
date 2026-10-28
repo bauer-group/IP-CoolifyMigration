@@ -911,7 +911,8 @@ async def test_backup_fields_match_released_controller() -> None:
     assert accepted >= BACKUP_CREATE, (
         f"Coolify {tag} would 422 {sorted(BACKUP_CREATE - accepted)}, which we still send"
     )
-    assert accepted - BACKUP_CREATE - BACKUP_S3_FIELDS == set(), (
+    undecided = accepted - BACKUP_CREATE - BACKUP_S3_FIELDS - BACKUP_UNSETTABLE
+    assert undecided == set(), (
         f"Coolify {tag} accepts backup fields we neither send nor adjudicated: "
-        f"{sorted(accepted - BACKUP_CREATE - BACKUP_S3_FIELDS)}"
+        f"{sorted(undecided)}"
     )
