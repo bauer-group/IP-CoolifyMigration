@@ -9,7 +9,7 @@ for the fully commented reference.
 | Variable | Notes |
 | --- | --- |
 | `COOLIFY_URL` | e.g. `https://coolify.example.com` (with or without `/api/v1`) |
-| `COOLIFY_TOKEN` | **Must** carry `root`, or `read:sensitive` + `write` + `deploy` — owned by a team admin |
+| `COOLIFY_TOKEN` | **Must** carry `root`, or `read` + `read:sensitive` + `write` + `deploy` (plus `delete` from Coolify 4.6) — owned by a team admin |
 
 !!! danger "Why the token scope is not optional"
     Coolify's `ApiSensitiveData` middleware computes

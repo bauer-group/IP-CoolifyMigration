@@ -356,8 +356,10 @@ the release it starts in — read that module before adding a rule.
   rehearses the volume pairing for services while the source still serves, and
   services pair by compose volume key (`{uuid}_{key}`), like compose apps.
 - **DELETE needs `write` AND `deploy` on 4.5, and its own `delete` from 4.6**
-  (rollback deletes targets); the token docs say root, or `read:sensitive` +
-  `write` + `deploy` + `delete`.
+  (rollback deletes targets); the token docs say root, or `read` +
+  `read:sensitive` + `write` + `deploy` + `delete`. `read:sensitive` does not imply
+  `read` (`tokenCan` matches exactly, and 110 routes need `read`, routes/api.php
+  v4.6.0).
 - **Before 4.3.11 a DELETE only queues DeleteResourceJob** (`delete_by_uuid`,
   v4.1.2-v4.3.10): the row — and every host it holds — lives on until the job's
   SSH cleanup is done, so a claim seconds later 409s on it. From 4.3.11 the row

@@ -3,7 +3,8 @@
 ## `doctor` says the token cannot read sensitive data (exit 10)
 
 Create a new token in Coolify under **Keys & Tokens > API tokens** with `root`, or
-`read:sensitive` + `write` + `deploy` — as an admin or owner of the team. Since
+`read` + `read:sensitive` + `write` + `deploy` (plus `delete` from Coolify 4.6) —
+as an admin or owner of the team. Since
 4.2 a token held by a plain member is treated as unable to read sensitive data
 whatever its abilities, and its 403 says `Missing required team role.`
 
