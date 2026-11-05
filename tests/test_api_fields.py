@@ -591,6 +591,12 @@ async def test_whitelists_match_upstream_openapi() -> None:
 #: v4.5.0. They were gapped here until the release registry could gate them;
 #: now they are CARRIED, from that release only (domain/coolify_versions.py;
 #: pinned by test_v4_5_1_create_fields_are_carried_from_that_release).
+#:
+#: EXTENDED 2026-11-05 for Coolify 4.6.0: git_https_username, git_https_password
+#: (ApplicationsController v4.6.0:1367, public route only, :1402). The password is
+#: hidden from the resource GET (:128-143) and the username 422s without it (:1687),
+#: so neither can be carried; fidelity.application_refusals stops a source with a
+#: username, and application_warnings names one that could hold only a password.
 KNOWN_APPLICATION_GAP: frozenset[str] = frozenset(
     {
         "autogenerate_domain",
@@ -602,6 +608,8 @@ KNOWN_APPLICATION_GAP: frozenset[str] = frozenset(
         "gpu_count",
         "gpu_device_ids",
         "gpu_driver",
+        "git_https_password",
+        "git_https_username",
         "gpu_options",
         "http_basic_auth_hash_algorithm",
         "include_source_commit_in_build",

@@ -73,12 +73,87 @@ def _settings(source: dict[str, Any]) -> dict[str, Any]:
 # ── applications ─────────────────────────────────────────────────────────────
 
 
+#: Build packs that push no image of their own: Application v4.6.0:1125.
+_BUILD_PACKS_WITHOUT_PUSHED_IMAGE = ("dockerimage", "dockercompose")
+
+
+def _pushed_image_name(app: dict[str, Any]) -> str | None:
+    """The image name this application builds and pushes, or None."""
+    name = app.get("docker_registry_image_name")
+    if app.get("build_pack") in _BUILD_PACKS_WITHOUT_PUSHED_IMAGE or not isinstance(name, str):
+        return None
+    return name or None
+
+
+def unshareable_image_name(source: dict[str, Any], *, version: Version | None) -> str | None:
+    """The source's image name, where a second application of the team cannot take it.
+
+    An unknown version counts as the newest: sending the name there can 422 the
+    whole create, leaving it out only costs the registry push the plan reports.
+    """
+    return _pushed_image_name(source) if supports("registry_image_name_unique", version) else None
+
+
+def shared_image_refusals(
+    source: dict[str, Any], team_applications: list[Any], *, version: Version | None
+) -> list[str]:
+    """Refuse a source whose image name another application of the team also builds.
+
+    Such a source cannot deploy at all from 4.6, /restart included, so a rollback
+    would be accepted and leave it down. ``name`` and ``uuid`` of the others are
+    not secret.
+    """
+    name = unshareable_image_name(source, version=version)
+    if name is None:
+        return []
+    others = sorted(
+        str(app.get("name") or app.get("uuid"))
+        for app in team_applications
+        if isinstance(app, dict)
+        and app.get("uuid") != source.get("uuid")
+        and _pushed_image_name(app) == name
+    )
+    if not others:
+        return []
+    return [
+        f"this application builds the image {name!r}, and so does {', '.join(others)}. "
+        "Coolify >= 4.6 fails every deploy of such an application, restarts included, so "
+        "a rollback could not bring the source back. Give each application its own image "
+        "name first."
+    ]
+
+
+def _may_hold_hidden_git_password(source: dict[str, Any], *, version: Version | None) -> bool:
+    """A clone that could carry a password no API shows (Application v4.6.0:1867-1872).
+
+    A username is a refusal of its own. The URL itself never goes into a message:
+    it can embed a credential.
+    """
+    repository = source.get("git_repository")
+    return (
+        supports("git_https_credentials", version)
+        and isinstance(repository, str)
+        and repository.lower().startswith(("http://", "https://"))
+        and not source.get("git_https_username")
+        and not source.get("source_type")
+        and source.get("private_key_id") is None
+    )
+
+
 def application_refusals(source: dict[str, Any], *, version: Version | None) -> list[str]:
     """What makes this application's create 422, or its routing silently wrong."""
     out: list[str] = []
 
     if multi_server := multi_server_refusal(source, version=version):
         out.append(multi_server)
+
+    if source.get("git_https_username"):
+        out.append(
+            "the source clones its repository with an HTTPS username and password or "
+            "token. No API returns the password, so the target's deploy would fail after "
+            "the source is stopped. Move the source to a deploy key or a Git source "
+            "first, or migrate this application by hand."
+        )
 
     if supports("webhook_secret_min_length", version):
         short = [
@@ -247,6 +322,22 @@ def application_warnings(
     out: list[str] = []
     settings = _settings(source)
 
+    if name := unshareable_image_name(source, version=version):
+        out.append(
+            f"docker_registry_image_name={name!r} is not carried: Coolify >= 4.6 refuses "
+            "a second application of the team that builds the same image, and the source "
+            "still holds it. The target is created without it, builds its image locally "
+            "and pushes nothing to the registry. If something pulls that image, set a "
+            "name on the target by hand; this one is free once the source no longer has it."
+        )
+    if _may_hold_hidden_git_password(source, version=version):
+        out.append(
+            "this application clones over HTTP(S) from a custom Git host, with no Git "
+            "source or deploy key. From Coolify 4.6 it can hold an HTTPS password or token "
+            "without a username, and no API shows that. If it does, the target's deploy "
+            "fails after the source is stopped and the run rolls back. A public repository "
+            "is fine."
+        )
     if source.get("is_http_basic_auth_enabled") and (
         source.get("http_basic_auth_hash_algorithm") == "argon2id"
     ):
@@ -1609,7 +1700,11 @@ def _compose_distinguishes_unset(key: str, compose: str) -> bool:
 
 
 def server_refusals(
-    target_server: dict[str, Any], *, collection: str, source: dict[str, Any]
+    target_server: dict[str, Any],
+    *,
+    collection: str,
+    source: dict[str, Any],
+    version: Version | None,
 ) -> list[str]:
     """Server roles (Coolify >= 4.4) that make the target's deploy impossible."""
     role = _settings(target_server).get("server_role")
@@ -1620,16 +1715,24 @@ def server_refusals(
             "resources on one. Pick a server whose role is 'deployment' or 'both'."
         ]
     if (
-        role == "deployment"
-        and collection == "applications"
-        and source.get("build_pack") not in ("dockerimage", "dockercompose", None)
-        and not source.get("docker_registry_image_name")
+        role != "deployment"
+        or collection != "applications"
+        or source.get("build_pack") in (*_BUILD_PACKS_WITHOUT_PUSHED_IMAGE, None)
     ):
+        return []
+    if not source.get("docker_registry_image_name"):
         return [
             f"target server {name!r} is set to deployments only, so this application "
             "must be built on a build server and pulled by image name — and it has no "
             "docker_registry_image_name. Its deploy would fail after the source is "
             "stopped. Set an image name on the source first, or pick another server."
+        ]
+    if unshareable_image_name(source, version=version):
+        return [
+            f"target server {name!r} is set to deployments only, so this application "
+            "needs an image name there — and Coolify >= 4.6 refuses the source's on a "
+            "second application of the team. Pick a server that can build, or migrate "
+            "this application by hand."
         ]
     return []
 

@@ -631,8 +631,21 @@ def _to_error(method: str, path: str, response: httpx.Response) -> CoolifyApiErr
                 "under Settings > API > Allowed IPs (or set 0.0.0.0 to allow all).\n"
                 "Your token is fine — no token change can get past this check."
             )
-        elif "team role" in message or "current role" in message:
-            # ApiAbility: an elevated token held by a mere team MEMBER.
+        elif "limited to selected projects" in message:
+            # ApiAbility v4.6.0:27: a token scoped to projects, environments or
+            # resources reaches no team-level route (servers, keys, ...).
+            hint = (
+                "The token is limited to selected projects, environments or resources, "
+                "and this tool needs team-level routes such as /servers. Create a token "
+                "for the whole team."
+            )
+        elif (
+            "team role" in message
+            or "current role" in message
+            or "more access than you have" in message
+        ):
+            # ApiAbility, and from 4.6 EnsureTokenBelongsToCurrentTeamMember: an
+            # elevated token held by a mere team MEMBER.
             hint = (
                 "The token's OWNER is not an admin of its team, and Coolify (4.2+) "
                 "refuses elevated tokens held by members. Have a team admin or owner "
@@ -641,8 +654,8 @@ def _to_error(method: str, path: str, response: httpx.Response) -> CoolifyApiErr
         else:
             hint = (
                 "The token lacks the ability for this call. This tool needs root, or "
-                "read + read:sensitive + write + deploy (DELETE needs write AND deploy "
-                "from Coolify 4.5)"
+                "read + read:sensitive + write + deploy, plus delete from Coolify 4.6: "
+                "DELETE needs its own `delete` ability there, and write AND deploy on 4.5"
                 + (f" — Coolify says: {message}" if "permissions" in message else "")
                 + "."
             )

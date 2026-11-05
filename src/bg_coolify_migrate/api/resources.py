@@ -697,6 +697,13 @@ async def create_application(
     if segment == "dockerimage":
         body.pop("build_pack", None)
 
+    # From 4.6.0 the source's image name 422s this create (the name is unique in
+    # the team for a building application, and the source still holds it). The plan
+    # reported this, and refused a target that could not deploy without a name.
+    if fidelity.unshareable_image_name(source, version=version):
+        body.pop("docker_registry_image_name", None)
+        body.pop("docker_registry_image_tag", None)
+
     # The GET never carries these — it serialises source_type/source_id and
     # private_key_id, which the PLANNER resolved into the uuids the private
     # create routes require. Without them the filtered body cannot satisfy

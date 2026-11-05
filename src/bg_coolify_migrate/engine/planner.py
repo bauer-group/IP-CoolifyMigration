@@ -39,6 +39,7 @@ from bg_coolify_migrate.dns import managed as dns_managed
 from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.domain import compose as compose_mod
 from bg_coolify_migrate.domain import domains, fidelity
+from bg_coolify_migrate.domain.coolify_versions import supports
 from bg_coolify_migrate.domain.drift import RebuildDriftReport, assess_rebuild_drift
 from bg_coolify_migrate.domain.kinds import (
     BuildPack,
@@ -68,7 +69,7 @@ from bg_coolify_migrate.domain.plan import (
 )
 from bg_coolify_migrate.domain.schedules import may_hold_volume_backups
 from bg_coolify_migrate.domain.statemachine import FinalizePolicy
-from bg_coolify_migrate.domain.versions import parse_version
+from bg_coolify_migrate.domain.versions import Version, parse_version
 from bg_coolify_migrate.engine import env_recovery
 from bg_coolify_migrate.engine.schedules import plan_schedules
 from bg_coolify_migrate.errors import (
@@ -838,6 +839,8 @@ async def build_plan(
     source_server: dict[str, Any] | None = None
     # (snapshot, GET, envs) of each source, for the DNS baseline after the loop.
     served: list[tuple[ResourceSnapshot, dict[str, Any], list[dict[str, Any]]]] = []
+    # GET /applications, read once and only if an image name makes it matter.
+    team_applications: list[Any] | None = None
 
     for collection, resource in resources:
         snapshot, containers, full = await snapshot_resource(
@@ -883,7 +886,11 @@ async def build_plan(
             refusals.extend(
                 fidelity.compose_refusals(snapshot.docker_compose_raw, version=coolify_version)
             )
-        refusals.extend(fidelity.server_refusals(target, collection=collection, source=full))
+        refusals.extend(
+            fidelity.server_refusals(
+                target, collection=collection, source=full, version=coolify_version
+            )
+        )
         refusals.extend(
             domains.leftover_parking_refusals(
                 full, name=snapshot.name, tag=domains.parking_tag(project_name, environment)
@@ -918,6 +925,12 @@ async def build_plan(
                 )
             )
             refusals.extend(fidelity.application_refusals(full, version=coolify_version))
+            if fidelity.unshareable_image_name(full, version=coolify_version):
+                if team_applications is None:
+                    team_applications = await _team_applications(api)
+                refusals.extend(
+                    fidelity.shared_image_refusals(full, team_applications, version=coolify_version)
+                )
             # Only plain applications POST their storages (resources.copy_storages);
             # compose volumes are materialised by Coolify itself.
             if not compose_backed:
@@ -1004,6 +1017,10 @@ async def build_plan(
         api, served, source_wildcard=source_ref.wildcard_domain or None
     ):
         notes.append(shared)
+    if automatic := await automatic_dns_note(
+        api, served, source_wildcard=source_ref.wildcard_domain or None, version=coolify_version
+    ):
+        notes.append(automatic)
 
     return MigrationPlan(
         project=project_name,
@@ -1093,6 +1110,43 @@ async def shared_hostname_note(
     return domains.outside_holder_note(
         domains.outside_holders(owners, resources, exclude=own)
     )
+
+
+async def _team_applications(api: CoolifyClient) -> list[Any]:
+    """Every application of the team. Fail-soft: unreadable is a plan without the check."""
+    try:
+        applications = await api.get("/applications")
+    except Exception as exc:  # diagnostics only, never fatal
+        log.debug("planner.team_applications_unavailable", error=str(exc)[:120])
+        return []
+    return applications if isinstance(applications, list) else []
+
+
+async def automatic_dns_note(
+    api: CoolifyClient,
+    served: list[tuple[ResourceSnapshot, dict[str, Any], list[dict[str, Any]]]],
+    *,
+    source_wildcard: str | None,
+    version: Version | None,
+) -> str | None:
+    """Warn when the target's domain claim can make Coolify create a DNS record.
+
+    Reads ``GET /{collection}/{uuid}/dns`` (4.6.0+, database only) of each source
+    with a custom host. Only for a version KNOWN to have the route. Fail-soft, like
+    the other notes: the end of CREATE still re-checks where each host points.
+    """
+    if not supports("automatic_dns_on_api_save", version, if_unknown=False):
+        return None
+    owners = _custom_host_owners(served, source_wildcard=source_wildcard)
+    statuses: list[Any] = []
+    try:
+        for snapshot, _, _ in served:
+            if snapshot.name in owners.values() and snapshot.collection != "databases":
+                statuses.append(await api.get(f"/{snapshot.collection}/{snapshot.uuid}/dns"))
+    except Exception as exc:  # diagnostics only, never fatal
+        log.debug("planner.dns_status_unavailable", error=str(exc)[:120])
+        return None
+    return dns_managed.automatic_dns_note(statuses, hosts=owners)
 
 
 async def dns_baseline(

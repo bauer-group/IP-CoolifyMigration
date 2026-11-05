@@ -633,6 +633,87 @@ class TestSharedHostnameNote:
         assert note is None
 
 
+def _dns_status(host: str, *, automatic: bool = True, providers: int = 1, records: int = 0) -> object:
+    provider = {"zone": "example.com", "automatic_dns": automatic}
+    return {
+        "hostnames": [
+            {
+                "hostname": host,
+                "providers": [provider] * providers,
+                "records": [{"uuid": "r"}] * records,
+            }
+        ]
+    }
+
+
+class TestAutomaticDnsFrom46:
+    @pytest.mark.parametrize(
+        ("status", "named"),
+        [
+            (_dns_status("shop.example.com"), True),
+            (_dns_status("SHOP.example.com"), True),
+            (_dns_status("shop.example.com", automatic=False), False),
+            # Several zones: Coolify does not guess (ResourceDnsRecords v4.6.0:168).
+            (_dns_status("shop.example.com", providers=2), False),
+            (_dns_status("shop.example.com", providers=0), False),
+            # A tracked record makes the create a conflict or an adoption.
+            (_dns_status("shop.example.com", records=1), False),
+            (_dns_status("other.example.com"), False),
+            ({"hostnames": ["junk"]}, False),
+            ("junk", False),
+        ],
+    )
+    def test_which_hosts_a_claim_can_create_a_record_for(self, status: object, named: bool) -> None:
+        found = managed.automatic_dns_hosts([status], hosts={"shop.example.com"})
+        assert found == (["shop.example.com"] if named else [])
+
+    async def test_the_planner_reads_the_source_of_each_custom_host(self) -> None:
+        read: list[str] = []
+
+        class Api:
+            async def get(self, path: str, **_params: object) -> object:
+                read.append(path)
+                return _dns_status("shop.example.com")
+
+        note = await planner.automatic_dns_note(
+            Api(),  # type: ignore[arg-type]
+            [(_app(), {"uuid": "app1", "fqdn": SHOP}, [])],
+            source_wildcard=None,
+            version=(4, 6, 0),
+        )
+        assert note is not None and "shop.example.com" in note and "wildcard" in note
+        assert read == ["/applications/app1/dns"]
+
+    @pytest.mark.parametrize("version", [(4, 5, 2), None])
+    async def test_no_read_where_the_route_may_not_exist(
+        self, version: tuple[int, ...] | None
+    ) -> None:
+        class Api:
+            async def get(self, path: str, **_params: object) -> object:
+                raise AssertionError(path)
+
+        note = await planner.automatic_dns_note(
+            Api(),  # type: ignore[arg-type]
+            [(_app(), {"uuid": "app1", "fqdn": SHOP}, [])],
+            source_wildcard=None,
+            version=version,
+        )
+        assert note is None
+
+    async def test_an_unreadable_status_is_no_warning(self) -> None:
+        class Api:
+            async def get(self, path: str, **_params: object) -> object:
+                raise RuntimeError("403")
+
+        note = await planner.automatic_dns_note(
+            Api(),  # type: ignore[arg-type]
+            [(_app(), {"uuid": "app1", "fqdn": SHOP}, [])],
+            source_wildcard=None,
+            version=(4, 6, 0),
+        )
+        assert note is None
+
+
 class TestElsewhereHeadsUp:
     def test_hosts_on_neither_server_are_named(self) -> None:
         from bg_coolify_migrate.dns.gate import elsewhere_note

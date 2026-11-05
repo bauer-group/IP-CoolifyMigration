@@ -120,7 +120,8 @@ decision, the decision is in the wrong layer.
 ## Verified upstream facts (do not re-derive)
 
 First checked against `coollabsio/coolify@main`; re-checked against the release
-tags v4.1.2 through v4.5.0 (2026-10-26), and v4.5.1 against v4.5.0 (2026-10-28).
+tags v4.1.2 through v4.5.0 (2026-10-26), v4.5.1 against v4.5.0 (2026-10-28), and
+v4.6.0 against v4.5.2 (2026-11-05).
 Read upstream at a **release tag**, never `main` — see the 2.5.6 tags regression.
 What differs between releases lives in `domain/coolify_versions.py`, not here.
 
@@ -354,8 +355,9 @@ the release it starts in — read that module before adding a rule.
   compose — 95 templates changed between 4.3.10 and 4.5.0. CREATE therefore
   rehearses the volume pairing for services while the source still serves, and
   services pair by compose volume key (`{uuid}_{key}`), like compose apps.
-- **DELETE needs `write` AND `deploy` from 4.5** (rollback deletes targets);
-  the token docs say root, or `read:sensitive` + `write` + `deploy`.
+- **DELETE needs `write` AND `deploy` on 4.5, and its own `delete` from 4.6**
+  (rollback deletes targets); the token docs say root, or `read:sensitive` +
+  `write` + `deploy` + `delete`.
 - **Before 4.3.11 a DELETE only queues DeleteResourceJob** (`delete_by_uuid`,
   v4.1.2-v4.3.10): the row — and every host it holds — lives on until the job's
   SSH cleanup is done, so a claim seconds later 409s on it. From 4.3.11 the row
@@ -372,6 +374,53 @@ the release it starts in — read that module before adding a rule.
   (`database_tls_identity_warning`, which carrying TLS must not silence). Dragonfly
   serves TLS on 6379 itself, Redis/KeyDB on an extra 6380. A carried `*_conf` that
   turns TLS on by itself is refused: the target gets the config, not the certs.
+
+### Learned from the v4.5.2 -> v4.6.0 audit (release tags; e2e green on a live 4.6.0)
+
+The canary went red on two create fields. Reading the release found what it cannot
+see. v4.5.3 changed nothing this tool depends on. Stop/start/restart, labels, volume
+names, DeleteResourceJob and the release of DNS records are unchanged.
+`tests/e2e/test_v4_6_contract.py` asks the real thing about the image name, the DNS
+route and the hidden password.
+
+- **A building application's `docker_registry_image_name` is unique in the team**
+  (`otherApplicationBuildingSameImage`, Application v4.6.0:1123-1137; dockerimage
+  and dockercompose are exempt). Every create 422s on it (ApplicationsController
+  :1699,1962,2194,2345) and every deploy fails, `/restart` included
+  (ApplicationDeploymentJob :380,:2588-2594). The source still holds the name, so
+  CREATE leaves it and the tag out and the plan reports that: the target builds
+  locally and pushes nothing. Two cases are refused, because they cannot deploy: a
+  deployment-only target (`server_refusals`, it needs a name), and a source whose
+  name another application already builds (`shared_image_refusals`: a rollback's
+  `/restart` would be accepted and leave the source down).
+- **`git_https_username`/`git_https_password` cannot be carried.** The password
+  is hidden from the resource GET (`removeSensitiveData` :128-143 does not make it
+  visible), and the username 422s without it (:1687). A username refuses, because
+  the deploy fails after the stop; a custom-host clone without one warns, because
+  a password alone is allowed and invisible. Do NOT read the password off
+  `/resources` or `/projects/{uuid}/{env}`, though both return it in clear (seen on a
+  live 4.6.0): `serializeApiResource` makes every hidden attribute visible there
+  (api.php :173-177), against the field's own "never returned". That is a bug to
+  expect a fix for, not a contract. `environment_resources` reads that second route,
+  so its rows are used for uuid, name and type only and never kept; the resource
+  itself always comes from `GET /{collection}/{uuid}`.
+- **An API domain save can now CREATE a DNS record** (next section).
+- **A legacy env row can be written exact** (`useExactEscaping`, HasSecretManager
+  :153-171): a compose reference like `FOO=${FOO:-}`, or a literal holding a quote.
+  Its `real_value` is then the resolved value (EnvironmentVariable :310-314), and
+  the file holds `"value"`. `locked_envs._stale` accepts that form. A LOCKED legacy
+  row in that state still fails the round trip and stays unrecoverable: closed.
+- **DELETE routes need `api.ability:delete`** (routes/api.php). The migration
+  2026_10_25_100000 gives it to every token that has `write`; a NEW token must
+  select it. Stop, start, restart and the writes this tool uses keep their abilities.
+- **Tokens can be limited to projects** (`scopes`, ApiAbility :11-27): such a token
+  gets a 403 on every team-level route, `/servers` and `/security/keys` included,
+  so this tool cannot run with one, and the 403 hint says so. A conflict with a
+  resource it cannot see has `resource_uuid: null`, which is never "ours".
+- **Nothing to answer:** `ports_mappings` validation only got wider; `is_preview`
+  left the service env docs, not the arrays; a new service's null row takes its
+  compose default when a bare reference exists (`fillDockerComposeDefaultsForBareReferences`),
+  and `copy_envs` overwrites any row with a value.
 
 ### v4.5.1 -> v4.5.2 (release tags): nothing to answer
 
@@ -641,12 +690,29 @@ why `domain/domains.py` hands every hostname over make-before-break.
   only from Livewire UI flows (InteractsWithDnsProviders v4.5.0:47 create, :164
   replace); no API controller, deploy, start or stop calls them. Created records
   carry ttl 1 and `proxied` false (v4.4.0:156); from 4.4.4 `proxied` follows the
-  token's setting (v4.5.0:190).
-- **The REST API shows nothing of it.** No zone/record route, and the
+  token's setting (v4.5.0:190). From v4.6.0 the API creates them too (below).
+- **Up to 4.5.x the REST API shows nothing of it.** No zone/record route, and the
   resources' `domain_dns_statuses` is hidden. Only `GET /audit-events`
   (admin-only, 90 days) names managed hostnames — so safety must never depend
-  on detecting a managed record.
-- **Coolify's only provider write we can trigger is a DELETE.** Removing a
+  on detecting a managed record. From 4.6.0 `GET /{applications,services}/{uuid}/dns`
+  reads what Coolify tracks (the database, not Cloudflare; ResourceDnsRecords
+  v4.6.0:60-86), which still says nothing about a record that lives only at
+  Cloudflare. `GET /dns/zones` carries no `automatic_dns`.
+- **From 4.6.0 a domain save can CREATE a record.** Any PATCH that adds a hostname
+  queues ConfigureDnsRecordJob with the resource's server address, when exactly one
+  team zone holds the host and its token has automatic DNS on, the default
+  (ResourceDnsRecords :158-184, IntegrationToken :129-132; ApplicationsController
+  :3871, ServicesController :1341; a create does not). So OUR CLAIM triggers it.
+  A host with its own record is left alone: conflict, nothing written
+  (CloudflareDnsProvider :183-185), which is why this does not re-point a live
+  record. A host that resolves only through a WILDCARD record gets a new record
+  pointing at the not-yet-running target, and a rollback leaves it (the source holds
+  the host, so the release only re-references it). The end-of-CREATE re-check may
+  catch the move, and the rollback's flip-back list names the host; the plan warns
+  (`dns/managed.automatic_dns_note`). A warning, because the API cannot tell a wildcard
+  from a record of its own. Never flip the token's setting from here, for the
+  reason the Docker cleanup setting stays unflipped.
+- **Up to 4.5.x, Coolify's only provider write we can trigger is a DELETE.** Removing a
   hostname from a resource (any domain PATCH: ApplicationsController
   v4.4.0:3252/3595, v4.5.0:3361/3784) or deleting a resource that references a
   record (Traits/ReleasesManagedDnsRecords v4.5.0:21-27, afterCommit) queues a
@@ -672,8 +738,10 @@ why `domain/domains.py` hands every hostname over make-before-break.
   could be deleted before QUIESCE), and a rollback deleted the target before the
   restore. Both orders are races, not certainties — never write a test that
   expects a deletion from them.
-- **Coolify never re-points a record.** Its value is written only on create or
-  a confirmed replace. The UI offers no create/replace for a hostname that
+- **Coolify never re-points a record on its own.** Its value is written only on
+  create or a confirmed replace (from 4.6.0 also `POST .../dns/replace`, which
+  needs the record id and current content from a conflict and points only at the
+  resource's own server). The UI offers no create/replace for a hostname that
   already has a managed row ("Managed by Coolify" badge only,
   dns-provider-management.blade.php v4.4.0:28-29); for a Cloudflare record it
   does not manage, the target's Domains -> Configure DNS -> "Replace record"
@@ -706,9 +774,10 @@ why `domain/domains.py` hands every hostname over make-before-break.
   plan warnings — never gate on it (vanity nameservers, partial setups and every
   other CDN would slip through). Each server's address set includes its wildcard
   base (and a probe label under it), the public address custom records point at.
-- **Two plan warnings, never refusals.** A custom host whose zone is on
+- **Three plan warnings, never refusals.** A custom host whose zone is on
   Cloudflare (authoritative NS `*.ns.cloudflare.com` or a CNAME into
-  `*.cdn.cloudflare.net`) from 4.4.0 (`dns/managed.cloudflare_note`), and a
+  `*.cdn.cloudflare.net`) from 4.4.0 (`dns/managed.cloudflare_note`), a claim
+  that can create a record from 4.6.0 (`dns/managed.automatic_dns_note`), and a
   hostname also held by a resource outside the plan
   (`domains.outside_holders`). REST only: `GET /applications` carries every
   application's `fqdn`/`docker_compose_domains`, but `GET /services` does not

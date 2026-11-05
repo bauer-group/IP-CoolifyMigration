@@ -676,19 +676,26 @@ def _open_ended(parsed: _Parsed, starts_a_record: Callable[[str, _Record], bool]
     }
 
 
-def _expected_raw(env: Mapping[str, Any], real_value: str, kind: FileKind) -> str:
-    """What Coolify writes for an UNLOCKED row, predicted from the API's real_value.
+def _expected_raws(env: Mapping[str, Any], real_value: str, kind: FileKind) -> tuple[str, ...]:
+    """What Coolify may write for an UNLOCKED row, predicted from the API's real_value.
 
     For a legacy row ``real_value`` IS Coolify's own legacy-formatted resolved
     value (v4.5.0 EnvironmentVariable.php:265-283; v4.1.2:171-209); for an exact
     row it is the resolved value, which the writer then escapes.
+
+    From 4.6.0 a legacy row of an application or service can be written exact after
+    all (HasSecretManager::useExactEscaping v4.6.0:153-171: a compose reference like
+    ``FOO=${FOO:-}``, a literal holding a quote). Its real_value is then the resolved
+    value too (EnvironmentVariable v4.6.0:310-314). This only judges whether the file
+    is current: a LOCKED value still has to round-trip through :func:`decode`.
     """
-    if saved_before_exact_escaping(env):
-        return real_value
     allow = allows_interpolation(env, real_value)
     if kind is FileKind.DOTENV:
-        return escape_compose_env_file_value(real_value, allow)
-    return real_value if allow else escape_dollar_sign(real_value)
+        exact = escape_compose_env_file_value(real_value, allow)
+        return (real_value, exact) if saved_before_exact_escaping(env) else (exact,)
+    if saved_before_exact_escaping(env):
+        return (real_value,)
+    return (real_value if allow else escape_dollar_sign(real_value),)
 
 
 def _stale(written: Sequence[Mapping[str, Any]], parsed: _Parsed, kind: FileKind) -> bool:
@@ -717,7 +724,7 @@ def _stale(written: Sequence[Mapping[str, Any]], parsed: _Parsed, kind: FileKind
             return True
         if len(records) > 1 or (parsed.anomaly and not records[0].closed):
             continue  # unreliable here; the anomaly itself already fails closed
-        if records[0].raw != _expected_raw(env, real, kind):
+        if records[0].raw not in _expected_raws(env, real, kind):
             return True
     return False
 

@@ -107,8 +107,17 @@ from bg_coolify_migrate.domain.versions import Version
 #: retry middleware labels were removed; previews from before 4.5.1 keep the
 #: production values. Routes, create/update arrays, stop/start, labels, volume
 #: names and the files Coolify writes on the server are unchanged.
+#:
+#: Re-verified 2026-11-05 for v4.6.0 (and v4.5.3 on the way), diffed against v4.5.2
+#: at the release tags. Answered in code: a building application's image name is
+#: unique in the team (create 422, every deploy fails), HTTPS git credentials no
+#: API returns, an API domain save creates a missing DNS record, legacy env rows
+#: written with exact escaping, DELETE needs the new `delete` ability, and tokens
+#: limited to projects. Stop/start/restart, labels, volume names, DeleteResourceJob
+#: and the release of DNS records are unchanged. Audited against release tags; the
+#: e2e rig is green on a live 4.6.0 (tests/e2e/test_v4_6_contract.py).
 VALIDATED_MIN: Version = (4, 1, 2)
-VALIDATED_MAX: Version = (4, 5, 2)
+VALIDATED_MAX: Version = (4, 6, 0)
 
 
 def format_version(version: Version) -> str:
@@ -252,6 +261,22 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         # does make (EnvironmentVariable v4.5.1:147-157, isGeneratedMagicVariable
         # :179-183; v4.5.0:118-148 copied every row, unlocked).
         "compose_previews_generate_magic": Gate(since=(4, 5, 1)),
+        # A building application's docker_registry_image_name is unique in the team
+        # (Application::otherApplicationBuildingSameImage v4.6.0:1123-1137;
+        # dockerimage and dockercompose are exempt). Every create 422s on it
+        # (ApplicationsController v4.6.0:1699,1962,2194,2345), and every deploy
+        # fails, /restart included (ApplicationDeploymentJob v4.6.0:380,:2588-2594).
+        "registry_image_name_unique": Gate(since=(4, 6, 0)),
+        # An application without a Git source or deploy key can hold HTTPS git
+        # credentials. The password is hidden from the resource GET
+        # (ApplicationsController v4.6.0:128-143 does not make it visible); the
+        # username is a plain column.
+        "git_https_credentials": Gate(since=(4, 6, 0)),
+        # A PATCH that adds a hostname queues a DNS record for it, when exactly one
+        # zone of the team holds it and its token has automatic DNS on — the default
+        # (ResourceDnsRecords v4.6.0:158-184, IntegrationToken :129-132). A host
+        # that already has a record is left alone (CloudflareDnsProvider :183-185).
+        "automatic_dns_on_api_save": Gate(since=(4, 6, 0)),
     }
 )
 

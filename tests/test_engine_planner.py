@@ -376,11 +376,22 @@ class _PlanApi:
         envs: list[dict[str, Any]],
         storages: dict[str, Any] | None = None,
         server_role: str = "both",
+        applications: list[dict[str, Any]] | None = None,
+        dns: dict[str, Any] | None = None,
     ) -> None:
         self._version = version
         self._envs = envs
         self._storages = storages or {"persistent_storages": [], "file_storages": []}
         self._role = server_role
+        self._applications = applications or []
+        self._dns = dns or {}
+
+    async def get(self, path: str, **_params: object) -> Any:
+        if path == "/applications":
+            return self._applications
+        if path.endswith("/dns"):
+            return self._dns
+        raise AssertionError(path)
 
     async def get_server(self, uuid: str) -> dict[str, Any]:
         return {
@@ -411,6 +422,8 @@ async def _plan_one_app(
     storages: dict[str, Any] | None = None,
     server_role: str = "both",
     snapshot: dict[str, Any] | None = None,
+    applications: list[dict[str, Any]] | None = None,
+    dns: dict[str, Any] | None = None,
 ) -> Any:
     from bg_coolify_migrate.domain.kinds import BuildPack, ResourceKind
     from bg_coolify_migrate.domain.manifest import VolumeManifest
@@ -463,7 +476,12 @@ async def _plan_one_app(
 
     return await planner.build_plan(
         _PlanApi(  # type: ignore[arg-type]
-            version=version, envs=envs or [], storages=storages, server_role=server_role
+            version=version,
+            envs=envs or [],
+            storages=storages,
+            server_role=server_role,
+            applications=applications,
+            dns=dns,
         ),
         object(),  # type: ignore[arg-type]
         project="shop",
@@ -522,6 +540,42 @@ class TestBuildPlanFidelity:
             "readonly labels ON instead" in w and "other.example.com" in w
             for w in new.resources[0].warnings
         )
+
+    async def test_v4_6_0_image_name_warns_and_a_shared_one_blocks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        image = "ghcr.io/acme/api"
+        full = {"uuid": "a1", "build_pack": "nixpacks", "docker_registry_image_name": image}
+        alone = await _plan_one_app(monkeypatch, full, version="4.6.0", applications=[full])
+        assert not alone.is_blocked
+        assert any("is not carried" in w for w in alone.resources[0].warnings)
+
+        twin = {"uuid": "a9", "name": "twin", "build_pack": "static", "docker_registry_image_name": image}
+        shared = await _plan_one_app(monkeypatch, full, version="4.6.0", applications=[full, twin])
+        assert shared.is_blocked
+        assert any("twin" in r for r in shared.resources[0].refusals)
+
+        # A release without the rule never reads the list, so nothing can block.
+        old = await _plan_one_app(monkeypatch, full, version="4.5.2", applications=[full, twin])
+        assert not old.is_blocked
+
+    async def test_v4_6_0_warns_of_the_record_a_claim_can_create(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        status = {
+            "hostnames": [
+                {
+                    "hostname": "shop.example.com",
+                    "providers": [{"zone": "example.com", "automatic_dns": True}],
+                    "records": [],
+                }
+            ]
+        }
+        full = {"fqdn": "https://shop.example.com"}
+        plan = await _plan_one_app(monkeypatch, full, version="4.6.0", dns=status)
+        assert any("automatic DNS is on" in note for note in plan.notes)
+        old = await _plan_one_app(monkeypatch, full, version="4.5.2", dns=status)
+        assert not any("automatic DNS is on" in note for note in old.notes)
 
     async def test_env_rules_see_the_source_envs(self, monkeypatch: pytest.MonkeyPatch) -> None:
         plan = await _plan_one_app(

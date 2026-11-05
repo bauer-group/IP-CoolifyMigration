@@ -75,7 +75,7 @@ external orchestrator has none of those constraints. That is what this is.
 pip install bg-coolify-migrate
 
 export COOLIFY_URL="https://coolify.example.com"
-export COOLIFY_TOKEN="..."          # root, or read:sensitive + write + deploy
+export COOLIFY_TOKEN="..."          # root, or read:sensitive + write + deploy + delete
 
 coolify-migrate doctor                 # verify token scope + server reachability
 coolify-migrate list                   # everything: server -> project -> env -> resource

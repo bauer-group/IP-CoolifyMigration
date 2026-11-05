@@ -562,6 +562,25 @@ class TestCreateApplicationV451:
         assert body["dockerfile_target_build"] == "runtime"
         assert "settings" not in body
 
+    @pytest.mark.parametrize(
+        ("version", "carried"), [((4, 6, 0), False), (None, False), ((4, 5, 2), True)]
+    )
+    async def test_the_sources_image_name_would_422_the_create_from_4_6(
+        self,
+        api: CoolifyClient,
+        respx_mock: respx.Router,
+        version: tuple[int, ...] | None,
+        carried: bool,
+    ) -> None:
+        source = {
+            **self._source(),
+            "docker_registry_image_name": "ghcr.io/acme/web",
+            "docker_registry_image_tag": "stable",
+        }
+        body = await self._body(api, respx_mock, version, source)
+        assert ("docker_registry_image_name" in body) is carried
+        assert ("docker_registry_image_tag" in body) is carried
+
     @pytest.mark.parametrize("version", [(4, 5, 0), (4, 1, 2)])
     async def test_never_on_an_older_release(
         self, api: CoolifyClient, respx_mock: respx.Router, version: tuple[int, ...]

@@ -175,11 +175,21 @@ timed out never triggers this.)
 Not a problem by itself. From 4.4 Coolify can manage DNS records at Cloudflare,
 and it deletes one it manages when the hostname loses its last holder. The
 migration hands every hostname over make-before-break, so that never happens.
-What Coolify cannot do is re-point a record it manages — there is no API or UI
-path — so the cutover is yours: after the DNS gate, change the record at
-Cloudflare to the target's address. For a Cloudflare record Coolify does *not*
-manage, the target's **Domains > Configure DNS > Replace record** does it from
-Coolify's UI.
+Coolify does not re-point a record on its own, so the cutover is yours: after the
+DNS gate, change the record at Cloudflare to the target's address. For a Cloudflare
+record Coolify does *not* manage, the target's
+**Domains > Configure DNS > Replace record** does it from Coolify's UI.
+
+### Plan warning: "automatic DNS is on for the zone's integration token"
+
+From 4.6, Coolify creates a DNS record when an API save adds a hostname to a
+resource, and the target claims its hostnames while the source still serves. A host
+with its own record at Cloudflare is safe: Coolify reports a conflict and writes
+nothing. A host that resolves only through a wildcard record is not: it gets a new
+record pointing at the target before the target runs, and a rollback does not
+remove it. Give such a host its own record first, or turn automatic DNS off on that
+integration token for the migration and back on afterwards. Coolify's API cannot
+tell the two cases apart, so the plan warns for both.
 
 ### Plan warning: "… resolve(s) to neither server today"
 
@@ -773,6 +783,35 @@ On every release the plan also warns when an application's Dockerfile has its ow
 configured check instead, and from 4.5.1 so does the source's next deploy and a
 rollback's restart. Disable Coolify's health check on the source, or redeploy the
 source once to prove the configured check passes, before migrating.
+
+## Coolify 4.6: image names and HTTPS git credentials
+
+**"docker_registry_image_name=… is not carried".** From 4.6 Coolify refuses a second
+application of a team that builds the same image, and the source still holds the
+name. The target comes up without it, builds its image locally and pushes nothing to
+the registry. If something pulls that image, set a name on the target by hand; the
+source's name is free once the source no longer has it.
+
+**"this application builds the image …, and so does …".** Coolify 4.6 fails every
+deploy of such an application, so a rollback could not bring the source back. Give
+each application its own image name, then plan again.
+
+**"target server … needs an image name there".** A deployments-only server pulls what
+a build server pushed, and the target cannot take the source's name. Pick a target
+that can build.
+
+**"the source clones its repository with an HTTPS username and password or token".**
+No API returns the password, so the target could not clone. Move the source to a
+deploy key or a Git source, then plan again.
+
+**"this application clones over HTTP(S) from a custom Git host".** The same credential
+can exist without a username, and then nothing shows it. A public repository is
+fine. If it is private, the target's deploy fails after the source is stopped and the
+run rolls back, so move it to a deploy key first.
+
+**A rollback or `DELETE` fails with "Missing required permissions: delete".** From 4.6
+DELETE has its own ability. Tokens that had `write` got it during the upgrade; a token
+created later has to select it.
 
 ## "the plan was made against Coolify X, but the instance now runs Y"
 

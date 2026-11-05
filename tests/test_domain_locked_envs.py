@@ -889,6 +889,30 @@ class TestNoValuesInText:
             assert SENTINEL not in blob
 
 
+# ── 4.6.0: a legacy row written with exact escaping ──────────────────────────
+
+
+class TestLegacyRowWrittenExact:
+    """HasSecretManager::useExactEscaping v4.6.0:153-171, e.g. ``FOO=${FOO:-}``."""
+
+    @staticmethod
+    def _sibling(value: str) -> dict[str, Any]:
+        env = row("REFERENCED", value, version="4.3.0")
+        env["real_value"] = value  # resolved, not legacy-formatted: EnvironmentVariable :314
+        return env
+
+    def test_the_file_is_not_stale(self) -> None:
+        envs = [row("TOKEN"), self._sibling("plain")]
+        text = dotenv([("TOKEN", f'"{SENTINEL}"'), ("REFERENCED", '"plain"')])
+        assert recover_service(envs, text).recovered.get("TOKEN") == SENTINEL
+
+    def test_a_different_value_still_is(self) -> None:
+        envs = [row("TOKEN"), self._sibling("new")]
+        rec = recover_service(envs, dotenv([("TOKEN", f'"{SENTINEL}"'), ("REFERENCED", '"old"')]))
+        assert rec.recovered.get("TOKEN") is None
+        assert "TOKEN" in rec.unrecoverable
+
+
 # ── fidelity, fed the recovery ───────────────────────────────────────────────
 
 

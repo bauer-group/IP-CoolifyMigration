@@ -18,6 +18,8 @@ from bg_coolify_migrate.domain import fidelity
 from bg_coolify_migrate.domain.kinds import DatabaseEngine
 from bg_coolify_migrate.domain.versions import at_least, parse_version
 
+V46 = (4, 6, 0)
+V452 = (4, 5, 2)
 V451 = (4, 5, 1)
 V45 = (4, 5, 0)
 V44 = (4, 4, 0)
@@ -849,20 +851,99 @@ class TestEmptyComposeVariables:
         assert fidelity.env_warnings(envs, collection="applications", engine=None, compose=None, version=V45) == []
 
 
+# ── Coolify 4.6: image names and HTTPS git credentials ───────────────────────
+
+
+class TestImageNameUniqueFrom46:
+    PUSHING: ClassVar[dict[str, Any]] = {
+        "uuid": "app1",
+        "build_pack": "nixpacks",
+        "docker_registry_image_name": "ghcr.io/acme/app",
+    }
+
+    @pytest.mark.parametrize(
+        ("version", "expected"),
+        [(V46, "ghcr.io/acme/app"), (None, "ghcr.io/acme/app"), (V452, None)],
+    )
+    def test_gated_on_the_release(self, version: Any, expected: str | None) -> None:
+        assert fidelity.unshareable_image_name(self.PUSHING, version=version) == expected
+
+    @pytest.mark.parametrize("pack", ["dockerimage", "dockercompose"])
+    def test_a_build_pack_that_pushes_nothing_is_exempt(self, pack: str) -> None:
+        source = {**self.PUSHING, "build_pack": pack}
+        assert fidelity.unshareable_image_name(source, version=V46) is None
+
+    def test_the_plan_reports_the_dropped_name(self) -> None:
+        assert any(
+            "ghcr.io/acme/app" in line
+            for line in fidelity.application_warnings(self.PUSHING, version=V46)
+        )
+        assert fidelity.application_warnings(self.PUSHING, version=V452) == []
+
+    def test_a_name_another_application_builds_refuses_the_rollback_path(self) -> None:
+        image = "ghcr.io/acme/app"
+        team = [
+            self.PUSHING,  # the source itself is in the list and does not count
+            {"name": "other", "build_pack": "dockerfile", "docker_registry_image_name": image},
+            {"name": "puller", "build_pack": "dockerimage", "docker_registry_image_name": image},
+            "junk",
+        ]
+        out = fidelity.shared_image_refusals(self.PUSHING, team, version=V46)
+        assert len(out) == 1
+        assert "other" in out[0] and "puller" not in out[0]
+        assert fidelity.shared_image_refusals(self.PUSHING, team, version=V452) == []
+        assert fidelity.shared_image_refusals(self.PUSHING, [self.PUSHING], version=V46) == []
+
+
+class TestHttpsGitCredentials:
+    CUSTOM_HOST: ClassVar[dict[str, Any]] = {
+        "git_repository": "https://git.example.com/acme/app.git",
+        "private_key_id": None,
+    }
+
+    def test_a_username_refuses_because_no_api_returns_the_password(self) -> None:
+        source = {**self.CUSTOM_HOST, "git_https_username": "deploy"}
+        out = fidelity.application_refusals(source, version=V46)
+        assert len(out) == 1
+        assert "No API returns the password" in out[0]
+
+    def test_a_custom_host_without_a_username_warns_of_a_password_nobody_can_see(self) -> None:
+        out = fidelity.application_warnings(self.CUSTOM_HOST, version=V46)
+        assert len(out) == 1
+        assert "git.example.com" not in out[0]  # the URL can embed a credential
+        assert fidelity.application_warnings(self.CUSTOM_HOST, version=V452) == []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            {"git_repository": "acme/app", "private_key_id": None},
+            {"git_repository": "https://git.example.com/a.git", "private_key_id": 5},
+            {"git_repository": "https://github.com/a/b", "source_type": "App\\Models\\GithubApp"},
+        ],
+    )
+    def test_a_clone_that_cannot_hold_one_is_silent(self, source: dict[str, Any]) -> None:
+        assert fidelity.application_warnings(source, version=V46) == []
+
+
 # ── servers ──────────────────────────────────────────────────────────────────
 
 
 class TestServers:
     def test_a_build_server_target_refuses_every_resource(self) -> None:
         out = fidelity.server_refusals(
-            {"name": "builder", "settings": {"server_role": "build"}}, collection="databases", source={}
+            {"name": "builder", "settings": {"server_role": "build"}},
+            collection="databases",
+            source={},
+            version=V45,
         )
         assert len(out) == 1
         assert "build server" in out[0]
 
     def test_a_deployment_only_target_refuses_a_building_app_without_an_image(self) -> None:
         target = {"name": "edge", "settings": {"server_role": "deployment"}}
-        out = fidelity.server_refusals(target, collection="applications", source={"build_pack": "nixpacks"})
+        out = fidelity.server_refusals(
+            target, collection="applications", source={"build_pack": "nixpacks"}, version=V45
+        )
         assert len(out) == 1
         assert "deployments only" in out[0]
 
@@ -876,12 +957,26 @@ class TestServers:
     )
     def test_a_deployment_only_target_takes_what_it_can_run(self, source: dict[str, Any]) -> None:
         target = {"settings": {"server_role": "deployment"}}
-        assert fidelity.server_refusals(target, collection="applications", source=source) == []
+        assert (
+            fidelity.server_refusals(target, collection="applications", source=source, version=V45)
+            == []
+        )
+
+    def test_a_deployment_only_target_cannot_take_the_sources_image_name_from_4_6(self) -> None:
+        """It needs a name there, and 4.6 refuses this one: no way to deploy it."""
+        target = {"name": "edge", "settings": {"server_role": "deployment"}}
+        source = {"build_pack": "nixpacks", "docker_registry_image_name": "ghcr.io/acme/app"}
+        out = fidelity.server_refusals(target, collection="applications", source=source, version=V46)
+        assert len(out) == 1
+        assert ">= 4.6" in out[0]
 
     def test_roles_both_and_absent_are_silent(self) -> None:
         for settings in ({"server_role": "both"}, {}):
             assert fidelity.server_refusals(
-                {"settings": settings}, collection="applications", source={"build_pack": "nixpacks"}
+                {"settings": settings},
+                collection="applications",
+                source={"build_pack": "nixpacks"},
+                version=V45,
             ) == []
 
     def test_differing_certificate_resolvers(self) -> None:

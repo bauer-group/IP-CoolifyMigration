@@ -303,8 +303,8 @@ A custom domain (`shop.example.com`) always has a live holder of this migration:
 Why: from Coolify 4.4.0, a DNS record Coolify manages at Cloudflare is DELETED
 when a hostname is removed from its last live holder, and never recreated. A
 hand-over in this order leaves Coolify nothing to do but re-reference the
-record. Coolify never re-points a record either, so the DNS cutover stays yours
-— see the plan warning for Cloudflare-hosted domains.
+record. Coolify never re-points a record on its own either, so the DNS cutover
+stays yours — see the plan warning for Cloudflare-hosted domains.
 
 **Rollback is cheap because the source is never destroyed until FINALIZE.** That
 is the one thing Geczy's script gets right, and it is the backbone of the whole

@@ -244,17 +244,19 @@ class TestCoolifyVersionWarning:
         assert coolify_version_warning("4.3.10") is None
         assert coolify_version_warning("4.3.9") is None
 
-    def test_the_upper_bound_is_4_5_2_and_nothing_past_it(self) -> None:
-        """4.5.1 and 4.5.2 were audited at their release tags (2026-10-28); 4.5.3 was not.
+    def test_the_upper_bound_is_4_6_0_and_nothing_past_it(self) -> None:
+        """4.5.3 and 4.6.0 were audited at their release tags (2026-11-05); 4.6.1 was not.
 
-        4.5.0 and the 4.4.x line before it stay in range: the registry answers
+        4.5.x and the 4.4.x line before it stay in range: the registry answers
         each release with its own fields and rules.
         """
+        assert coolify_version_warning("4.6.0") is None
+        assert coolify_version_warning("4.5.3") is None
         assert coolify_version_warning("4.5.2") is None
         assert coolify_version_warning("4.5.1") is None
         assert coolify_version_warning("4.5.0") is None
         assert coolify_version_warning("4.4.7") is None
-        assert coolify_version_warning("4.5.3") is not None
+        assert coolify_version_warning("4.6.1") is not None
 
     def test_tolerates_a_prerelease_suffix(self) -> None:
         assert coolify_version_warning("4.3.0-beta.1") is None

@@ -190,6 +190,43 @@ class TestErrorMapping:
         with pytest.raises(CoolifyApiError, match="Missing required permissions: deploy"):
             await api.list_servers()
 
+    async def test_403_names_the_delete_ability_of_coolify_4_6(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.get(f"{BASE}/servers").mock(
+            return_value=httpx.Response(403, json={"message": "Missing required permissions: delete"})
+        )
+        with pytest.raises(CoolifyApiError, match="`delete` ability"):
+            await api.list_servers()
+
+    async def test_403_for_a_project_scoped_token_asks_for_a_team_wide_one(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # ApiAbility v4.6.0:27. A new ability would not help this token.
+        message = (
+            "This API token is limited to selected projects, environments, or resources, "
+            "so it cannot use this endpoint."
+        )
+        respx_mock.get(f"{BASE}/servers").mock(
+            return_value=httpx.Response(403, json={"message": message})
+        )
+        with pytest.raises(CoolifyApiError, match="for the whole team"):
+            await api.list_servers()
+
+    async def test_403_for_a_token_beyond_its_owner_points_at_the_role(
+        self, api: CoolifyClient, respx_mock: respx.Router
+    ) -> None:
+        # EnsureTokenBelongsToCurrentTeamMember::EXCEEDS_ACCESS_MESSAGE, 4.6.0.
+        message = (
+            "This API token has more access than you have in this team. "
+            "Revoke it and create a new token."
+        )
+        respx_mock.get(f"{BASE}/servers").mock(
+            return_value=httpx.Response(403, json={"message": message})
+        )
+        with pytest.raises(CoolifyApiError, match="not an admin of its team"):
+            await api.list_servers()
+
     async def test_403_for_a_member_owned_token_points_at_the_role_not_the_token(
         self, api: CoolifyClient, respx_mock: respx.Router
     ) -> None:
