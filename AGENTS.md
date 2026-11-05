@@ -400,10 +400,11 @@ route and the hidden password.
   visible), and the username 422s without it (:1687). A username refuses, because
   the deploy fails after the stop; a custom-host clone without one warns, because
   a password alone is allowed and invisible. Do NOT read the password off
-  `/resources` or `/projects/{uuid}/{env}`, though both return it in clear (seen on a
-  live 4.6.0): `serializeApiResource` makes every hidden attribute visible there
-  (api.php :173-177), against the field's own "never returned". That is a bug to
-  expect a fix for, not a contract. `environment_resources` reads that second route,
+  `/resources` or `/projects/{uuid}/{env}`, though both return it in clear to a token
+  that can read sensitive data (seen on a live 4.6.0): `exposeSensitiveFields` makes
+  every hidden attribute visible there, on purpose (api.php :173-177), against the
+  field's own "never returned". Such a token reads every env value anyway, so this
+  is no hole, and no contract to build on either. `environment_resources` reads that second route,
   so its rows are used for uuid, name and type only and never kept; the resource
   itself always comes from `GET /{collection}/{uuid}`.
 - **An API domain save can now CREATE a DNS record** (next section).
