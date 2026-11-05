@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v2.13.0 (2026-11-05)
+
+### Documentation
+
+- Update README.MD [automated]
+  ([`af1fb31`](https://github.com/bauer-group/IP-CoolifyMigration/commit/af1fb31a619340f4277f087de9eb858658b41156))
+
+### Features
+
+- **versions**: Validated Coolify 4.6.0
+  ([`1d139b7`](https://github.com/bauer-group/IP-CoolifyMigration/commit/1d139b7a88dce5f749a36b311d5e69b1d82f1301))
+
+
 ## v2.12.0 (2026-10-28)
 
 ### Bug Fixes
