@@ -76,12 +76,6 @@ def current_branch() -> str:
         return "main"
 
 
-def supported_versions_table(version: str) -> str:
-    """The SECURITY.MD support matrix: current minor supported, older not."""
-    major_minor = ".".join(version.split(".")[:2])
-    return f"| {major_minor}.x   | :white_check_mark: |\n| < {major_minor} | :x:                |"
-
-
 def render(template_name: str, version: str) -> str:
     src = DOCS / template_name
     if not src.exists():
@@ -98,7 +92,6 @@ def render(template_name: str, version: str) -> str:
         "{{REPO_URL}}": REPO_URL,
         "{{REPO_FULL_NAME}}": REPO_FULL_NAME,
         "{{CURRENT_BRANCH}}": current_branch(),
-        "{{SUPPORTED_VERSIONS_TABLE}}": supported_versions_table(version),
     }
     for marker, value in replacements.items():
         body = body.replace(marker, value)
