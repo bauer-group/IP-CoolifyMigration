@@ -44,11 +44,13 @@ htmlcov/
 !.env.template
 .pypirc
 
-# Runtime state. Migration journals contain resource UUIDs and host addresses;
-# they belong in the user state dir (platformdirs), never in the repo. This entry
-# only catches accidental --state-dir=. runs.
+# Runtime state. Migration journals contain resource UUIDs and host addresses,
+# saved plans also each resource's compose file, credentials written into it
+# included; they belong in the user state dir (platformdirs), never in the repo.
+# This entry only catches accidental --state-dir=. runs.
 /state/
 *.journal.jsonl
+*.plan.json
 
 # Integration rig: throwaway keys, generated on demand by
 # tests/integration/prepare.py. They authorise nothing but two local containers,
