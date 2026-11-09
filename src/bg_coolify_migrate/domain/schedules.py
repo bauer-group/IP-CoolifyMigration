@@ -327,8 +327,9 @@ def backup_warnings(
         )
     if dangling := _frequencies([r for r in s3 if backup_s3_destinations(r) == ()]):
         out.append(
-            f"backup schedule(s) {dangling} are set to upload to S3, but their S3 storage "
-            "no longer exists. The target's copy is created local-only."
+            f"backup schedule(s) {dangling} are set to upload their dumps, but the backup "
+            "storage they upload to (S3, or from Coolify 4.7 also SFTP, FTPS or WebDAV) no "
+            "longer exists. The target's copy is created local-only."
         )
     if no_local := _frequencies(
         [r for r in own if r.get("disable_local_backup") is True and not _keeps_no_local(r, version)]
@@ -354,7 +355,8 @@ def backup_warnings(
         out.append(
             f"the source has {len(runs)} backup run(s) on record. They are not migrated, "
             "and the target starts a fresh history. The dumps stay where they are, on "
-            f"the source server under {_dump_directory(runs)} (and in S3 if uploaded). "
+            f"the source server under {_dump_directory(runs)} (and in every backup storage "
+            "they were uploaded to). "
             "Once the source stops running, no retention prunes them and no finalize "
             "policy removes them."
         )
@@ -453,13 +455,18 @@ def volume_backup_delete_caveat(resources: Iterable[str]) -> str:
     """The cost of ``--finalize delete`` to those volume backups. PURE.
 
     Deleting a resource runs DeleteScheduledVolumeBackup for every schedule on
-    its storages, with local and S3 archive deletion on (DeleteResourceJob,
-    v4.3.0:49,123-137 .. v4.5.0:125,188-209) — unlike a database's dumps, which a
-    delete leaves where they are.
+    its storages, with local and remote archive deletion on (DeleteResourceJob,
+    v4.3.0:49,123-137 .. v4.5.0:125,188-209, unchanged to v4.7.1) — unlike a
+    database's dumps, which a delete leaves where they are. From 4.7.0 a backup
+    storage is S3, SFTP, FTPS or WebDAV (migration 2026_10_31_161621), and the
+    deletion reaches each: HasS3Replicas::deleteS3Copies (v4.7.0:26-47) calls
+    deleteBackupsS3, which hands a non-S3 storage to deleteBackupsFromFileStorage
+    (bootstrap/helpers/databases.php v4.7.0:282-286).
     """
     return (
         f"--finalize delete also makes Coolify delete every archive the volume backups "
-        f"of {sorted(set(resources))} made, on the source server and in S3. The target "
-        "starts without them. Keep a copy of any archive you need before finalizing, "
-        "or finalize with rename."
+        f"of {sorted(set(resources))} made, on the source server and in every backup "
+        "storage they were uploaded to (S3, or from Coolify 4.7 also SFTP, FTPS or "
+        "WebDAV). The target starts without them. Keep a copy of any archive you need "
+        "before finalizing, or finalize with rename."
     )

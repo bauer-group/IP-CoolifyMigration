@@ -309,4 +309,4 @@ class TestConfirmDestructive:
 
         assert confirm_destructive(plan) is True
         said = " ".join(out.getvalue().split())
-        assert ("volume backups of ['postgres']" in said and "in S3" in said) is possible
+        assert ("volume backups of ['postgres']" in said and "backup storage" in said) is possible

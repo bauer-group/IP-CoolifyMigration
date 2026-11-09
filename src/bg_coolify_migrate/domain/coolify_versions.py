@@ -264,8 +264,9 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         # ScheduledTaskJob also matches a task's container by its exact FULL name
         # (commit 5ae125ad3, first released in v4.5.0:190; prefix-only at v4.4.7:174).
         "task_container_exact_name": Gate(since=(4, 5, 0)),
-        # A volume's own backup schedule (ScheduledVolumeBackup, local and S3)
-        # exists from v4.3.0, on application, database and service storages. Its
+        # A volume's own backup schedule (ScheduledVolumeBackup, local and on a
+        # backup storage: S3, from v4.7.0 also SFTP, FTPS or WebDAV) exists from
+        # v4.3.0, on application, database and service storages. Its
         # only routes are PUT, POST run and DELETE on
         # `.../storages/{storage_uuid}/backups` — no GET on any release, and no
         # storages GET loads one — so no plan can see it.

@@ -9,11 +9,15 @@ where the rule lives.
 from __future__ import annotations
 
 import base64
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from bg_coolify_migrate.domain import fidelity, schedules
+from bg_coolify_migrate.domain.kinds import DatabaseEngine
+from bg_coolify_migrate.engine import steps
+from bg_coolify_migrate.errors import TransferError
 
 V47 = (4, 7, 0)
 V471 = (4, 7, 1)
@@ -211,6 +215,29 @@ class TestGitKnownHosts:
         assert fidelity.known_host_fingerprint(f"h ssh-rsa {rsa_ish.rstrip('=')}") == padded
 
 
+# ── maintenance mode: what the source keeps after a keep/rename finalize ─────
+
+
+class TestMaintenanceRoute:
+    def test_applications_and_services_say_to_turn_it_off_on_the_source(self) -> None:
+        app = fidelity.application_warnings({"is_maintenance_enabled": True}, version=V47)
+        svc = fidelity.service_warnings({"is_maintenance_enabled": True}, version=V47)
+        for out in (app, svc):
+            [line] = [w for w in out if "maintenance" in w]
+            assert "--finalize keep or rename" in line
+            assert "turn maintenance mode off on the source" in line
+            assert "neither the stop nor the release of its domains" in line
+
+    def test_it_is_named_a_route_never_a_holder(self) -> None:
+        """It is not a Coolify domain holder: the conflict check and the DNS
+        release read fqdn and docker_compose_domains only."""
+        [line] = fidelity.application_warnings({"is_maintenance_enabled": True}, version=V46)
+        assert "holder" not in line and "router" not in line
+
+    def test_off_is_silent(self) -> None:
+        assert fidelity.application_warnings({"is_maintenance_enabled": False}, version=V47) == []
+
+
 # ── scheduled tasks Coolify switched off itself (4.7.0) ──────────────────────
 
 REASON = "Disabled automatically after 10 failed runs in a row since 2026-11-01 02:00:00 UTC."
@@ -255,6 +282,40 @@ class TestAutoDisabledTasks:
             assert len(out) == 1
 
 
+# ── backup storages are not only S3 (4.7.0) ──────────────────────────────────
+
+
+class TestBackupStorageWording:
+    def test_the_delete_caveat_names_every_storage_type(self) -> None:
+        line = schedules.volume_backup_delete_caveat(["postgres"])
+        assert "every backup storage" in line
+        assert all(kind in line for kind in ("S3", "SFTP", "FTPS", "WebDAV"))
+
+    def test_a_dangling_storage_is_any_backup_storage(self) -> None:
+        row = {
+            "database_type": "App\\Models\\StandalonePostgresql",
+            "frequency": "0 2 * * *",
+            "save_s3": True,
+            "s3_storage_uuids": [],
+        }
+        [line] = schedules.backup_warnings(
+            [row], engine=DatabaseEngine.POSTGRESQL, source_timezone=None, target_timezone=None
+        )
+        assert "backup storage" in line and "no longer exists" in line
+
+    def test_old_dumps_stay_in_every_storage_they_reached(self) -> None:
+        row = {
+            "database_type": "App\\Models\\StandalonePostgresql",
+            "frequency": "0 2 * * *",
+            "executions": [{"filename": "/data/coolify/backups/databases/t/db/x.dmp"}],
+        }
+        [line] = schedules.backup_warnings(
+            [row], engine=DatabaseEngine.POSTGRESQL, source_timezone=None, target_timezone=None
+        )
+        assert "every backup storage they were uploaded to" in line
+        assert "in S3 if uploaded" not in line
+
+
 # ── shared image names: a 4.7.0 restart skips the check ──────────────────────
 
 IMAGE = "ghcr.io/acme/app"
@@ -294,3 +355,47 @@ class TestSharedImageRestarts:
     def test_the_create_still_drops_the_name_on_4_7(self) -> None:
         """The create 422 is unchanged (ApplicationsController v4.7.0:235-242)."""
         assert fidelity.unshareable_image_name(_pushing("nixpacks"), version=V47) == IMAGE
+
+
+# ── the compose-load timeout names the 4.7 host-key cause ────────────────────
+
+
+class _Api:
+    async def get_resource(self, collection: str, uuid: str) -> dict[str, Any]:
+        return {"uuid": uuid, "docker_compose_raw": None}
+
+
+def _ctx() -> Any:
+    return SimpleNamespace(
+        api=_Api(),
+        settings=SimpleNamespace(target_storage_timeout=0.0),
+        plan=SimpleNamespace(target_server=SimpleNamespace(name="new")),
+    )
+
+
+class TestComposeLoadHint:
+    async def test_create_names_old_openssh_and_its_remedies(self) -> None:
+        resource = SimpleNamespace(snapshot=SimpleNamespace(collection="applications", name="shop"))
+        with pytest.raises(TransferError, match="never loaded its compose") as exc_info:
+            await steps._assert_compose_target_ready(_ctx(), resource, target_uuid="t")  # type: ignore[arg-type]
+        hint = exc_info.value.hint or ""
+        assert "OpenSSH is older than 7.6" in hint
+        assert "/etc/ssh/ssh_known_hosts" in hint
+        assert hint.index("OpenSSH") < hint.index("never stopped")
+
+    async def test_discover_names_it_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def no_endpoints(api: object, *, collection: str, uuid: str) -> list[object]:
+            return []
+
+        monkeypatch.setattr("bg_coolify_migrate.api.resources.read_volume_endpoints", no_endpoints)
+        with pytest.raises(TransferError, match="never loaded its compose from git") as exc_info:
+            await steps._await_target_volumes(
+                _ctx(),
+                collection="applications",
+                target_uuid="t",
+                expected={"/data"},
+                compose_from_git=True,
+            )
+        hint = exc_info.value.hint or ""
+        assert "OpenSSH is older than 7.6" in hint
+        assert hint.endswith("The source will be restarted and the target deleted.")

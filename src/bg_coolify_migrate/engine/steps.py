@@ -777,6 +777,28 @@ async def _undo_interrupted_attempt(ctx: MigrationContext) -> frozenset[str]:
     return holders
 
 
+#: A cause of an empty compose that only Coolify 4.7.0+ has. Server-side git of an
+#: app reaching its repository over SSH (a deploy key, or an SSH URL without a
+#: GitHub App or a connected GitLab/Gitea source: Application::gitUsesSsh
+#: v4.7.0:2111-2127) checks host keys strictly where the server's ssh has no
+#: accept-new, i.e. OpenSSH < 7.6 (gitSshSetupCommand, bootstrap/helpers/
+#: applications.php v4.7.0:923-955), against the pinned keys and the app's saved
+#: git_ssh_known_hosts — which a new target lacks and no API sets. That config
+#: still reads the system's GlobalKnownHostsFile, never root's ~/.ssh/known_hosts.
+#: The failed job's reason names it (Application::gitFailureReason v4.7.0:2623-2624).
+#: Text only: naming the release compares no version.
+_STRICT_GIT_HOST_KEY_CAUSE = (
+    "From Coolify 4.7.0 a repository reached over SSH (a deploy key, or an SSH URL "
+    "without a GitHub App) on a self-hosted git host also fails here when the target "
+    "server's OpenSSH is older than 7.6: Coolify then checks host keys strictly on that "
+    "server, and a new application has no saved key (the failed job says 'No SSH host "
+    "key is saved for this Git host'). 'Fetch current host key' in the UI cannot help, "
+    "because this target is deleted. Add the git host's key to /etc/ssh/ssh_known_hosts "
+    "on the target server (root's ~/.ssh/known_hosts is not read), update its OpenSSH "
+    "to 7.6 or newer, or switch the application to HTTPS or a GitHub App.\n"
+)
+
+
 async def _assert_compose_target_ready(
     ctx: MigrationContext, resource: ResourcePlan, *, target_uuid: str
 ) -> None:
@@ -820,7 +842,8 @@ async def _assert_compose_target_ready(
                     "the git host reproduces this exactly.\n"
                     f"Try on {ctx.plan.target_server.name}: git ls-remote <repo url>. "
                     "Coolify's failed-jobs list has the original error.\n"
-                    "The source was never stopped and keeps serving; the created "
+                    + _STRICT_GIT_HOST_KEY_CAUSE
+                    + "The source was never stopped and keeps serving; the created "
                     "target will be deleted."
                 ),
             )
@@ -1459,7 +1482,8 @@ async def _await_target_volumes(
                         f"On {ctx.plan.target_server.name}, try: git ls-remote <repo url> — "
                         "a missing git binary or blocked egress to the git host reproduces "
                         "this exactly. Coolify's failed-jobs list has the original error.\n"
-                        "The source will be restarted and the target deleted."
+                        + _STRICT_GIT_HOST_KEY_CAUSE
+                        + "The source will be restarted and the target deleted."
                     ),
                 )
     else:

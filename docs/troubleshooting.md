@@ -694,7 +694,8 @@ running. These cases come up as plan warnings, never as blocks:
   **Backups** tab after the move, or off-site backups stop.
 - **"the source has N backup run(s) on record"**: history is not migrated. The
   old dumps stay on the source server under the directory named in the warning,
-  and in S3 if they were uploaded. Nothing deletes them, and no retention prunes
+  and in every backup storage they were uploaded to (S3, or from Coolify 4.7
+  also SFTP, FTPS or WebDAV). Nothing deletes them, and no retention prunes
   them once the source is stopped. Remove them by hand when you no longer need
   them.
 - **"keep no local dumps on the source (disable_local_backup)"**: below Coolify
@@ -714,9 +715,10 @@ schedules"). If you use them, set them up on the target again.
 
 With `--finalize delete` it is worse than "not carried": deleting the source
 makes Coolify delete every archive its volume backups made, on the server and in
-S3. The plan and the typed confirmation both say so. Download any archive you
-still need before the run, or finalize with `rename`. Database dumps are not
-affected; a delete leaves them where they are.
+every backup storage they were uploaded to (S3, or from Coolify 4.7 also SFTP,
+FTPS or WebDAV). The plan and the typed confirmation both say so. Download any
+archive you still need before the run, or finalize with `rename`. Database dumps
+are not affected; a delete leaves them where they are.
 
 ### "the target database holds N backup schedule(s) where M were created"
 

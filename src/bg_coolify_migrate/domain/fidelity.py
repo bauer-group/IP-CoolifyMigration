@@ -749,10 +749,28 @@ _DEFAULT_VARIABLES_WARNING = (
     "COOLIFY_ENVIRONMENT_NAME and COOLIFY_SERVER_IP until you turn it off by hand."
 )
 
+#: Maintenance mode (4.5.0+) is a UI toggle only. Its routes are a file in the
+#: server's proxy configuration (dynamic/coolify-maintenance.yaml, for Caddy
+#: dynamic/Caddyfile) that Server::setupMaintenancePages writes for every
+#: resource with the flag set, running or not (Server v4.7.0:920-928,
+#: :984-1019). Only a start, a production deploy, a delete, a proxy start or the
+#: toggle rewrite it (syncMaintenancePage callers, v4.7.0: StartService:94,
+#: ADJ:754, DeleteResourceJob:141, Maintenance.php:50;
+#: ProxyStatusChangedNotification:38) — never a stop or a domain PATCH, so a kept
+#: source's route outlives both. From 4.7.1 a readonly-labels-off app's routes
+#: come from its custom_labels (Application::maintenanceProxyLabels v4.7.1:649),
+#: which the release does not touch either. Turning maintenance off rewrites the
+#: file without it, on every release. It is no domain holder: the conflict check
+#: and the managed-DNS release read fqdn and docker_compose_domains only.
 _MAINTENANCE_WARNING = (
     "the source is in maintenance mode, which cannot be migrated: the target comes up "
     "serving the real application instead of the maintenance page. Re-enable it on the "
-    "target by hand before switching traffic if that is not what you want."
+    "target by hand before switching traffic if that is not what you want. With "
+    "--finalize keep or rename, turn maintenance mode off on the source once the run "
+    "has finalized: its maintenance route is a file in the source server's proxy "
+    "configuration that neither the stop nor the release of its domains removes, so "
+    "that proxy keeps answering 503 for the moved hosts and keeps their certificates "
+    "in use."
 )
 
 
