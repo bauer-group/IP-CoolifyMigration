@@ -33,6 +33,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from bg_coolify_migrate.domain.coolify_versions import supports
+from bg_coolify_migrate.domain.versions import Version
+
 #: ApplicationDeploymentStatus. ``cancelled-by-user`` is also what a newer API or
 #: webhook deployment that supersedes a queued one writes (applications.php
 #: v4.7.0:190-239); restarts are never superseded.
@@ -219,3 +222,39 @@ def restart_blocked_notice(name: str, deployment_uuid: str, *, migration_id: str
         f"then coolify-migrate rollback {migration_id}."
     )
 
+
+def image_scan_gate_warnings(*, version: Version | None) -> list[str]:
+    """Warn every application source that Coolify's image-scan gate can stop it moving.
+
+    A WARNING, never a refusal: the gate is off by default (the instance policy
+    is seeded off/deploy, migration 2026_10_29_100000:35-44) and its mode, its
+    ignores and app-level policies are in no API — only GET/PATCH
+    /servers/{uuid}/image-scanning, which says whether scans run, not whether
+    deploys are blocked (routes/api.php v4.7.0:189-190). Whether to relax it for
+    a run is the operator's call; this tool never writes it, for the reason it
+    never flips the Docker cleanup setting.
+
+    The rollback's ``/restart`` of the source is gated as well, and not only under
+    Strict: a dockerimage, dockerfile or dockercompose restart runs a full deploy
+    (ApplicationDeploymentJob v4.7.0:320-323), a dockerimage app re-pulls its tag
+    before the gate (DeploymentImageScan v4.7.0:150-156) and a git build moves to
+    the branch HEAD (``check_git_if_build_needed``). A changed image's new
+    exploit-signal findings block under On as well (SecurityGate v4.7.0:85-92).
+    The most specific level that sets a mode wins (ImageScanPolicyResolver
+    v4.7.0:175-195), so Off on the team alone does nothing under a server's On.
+    """
+    if not supports("deploy_image_scan_gate", version):
+        return []
+    return [
+        "Coolify 4.7+ runs every application deploy through its image-scan gate, and "
+        "no API shows whether 'Block deploys' is on. The target is a FIRST deploy with "
+        "no running image to compare with: under On, every finding attackers use or "
+        "are likely to use blocks START even though the source runs the same image. "
+        "The rollback's restart of the stopped source is a deploy too: under On it is "
+        "blocked when its image changed (a Docker image app re-pulls its tag, a git "
+        "build moves to the branch HEAD) and brings such a finding; under Strict, or "
+        "'If the scan cannot run: Block' (a server with scanning off counts), it can "
+        "be blocked either way. If the gate is on anywhere (team, server or this app), "
+        "set it to Off for the run at the most specific level that sets it, or add "
+        "team-wide ignores first."
+    ]

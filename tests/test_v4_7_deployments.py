@@ -19,6 +19,7 @@ import respx
 from rich.console import Console
 
 from bg_coolify_migrate.api.client import CoolifyClient
+from bg_coolify_migrate.domain import coolify_versions as cv
 from bg_coolify_migrate.domain import deployments as d
 from bg_coolify_migrate.domain.kinds import DatabaseEngine, ResourceKind
 from bg_coolify_migrate.domain.manifest import VolumeManifest
@@ -131,6 +132,13 @@ def _deployment(status: str, **gate: Any) -> d.Deployment:
 
 
 # ── the pure core ────────────────────────────────────────────────────────────
+
+
+class TestRelease:
+    def test_the_gate_starts_in_4_7_0(self) -> None:
+        assert not cv.supports("deploy_image_scan_gate", (4, 6, 0))
+        assert cv.supports("deploy_image_scan_gate", (4, 7, 0))
+        assert cv.supports("deploy_image_scan_gate", (4, 7, 1))
 
 
 class TestReadDeployment:
@@ -248,6 +256,32 @@ class TestDeploymentUuidOf:
     )
     def test_nothing_to_watch(self, answer: Any) -> None:
         assert d.deployment_uuid_of(answer) is None
+
+
+class TestPlanWarning:
+    def test_none_before_4_7(self) -> None:
+        assert d.image_scan_gate_warnings(version=(4, 6, 0)) == []
+
+    @pytest.mark.parametrize("version", [(4, 7, 0), (4, 7, 1), None])
+    def test_from_4_7_and_on_an_unknown_release(self, version: Any) -> None:
+        (warning,) = d.image_scan_gate_warnings(version=version)
+        assert "Block deploys" in warning
+        assert "FIRST deploy" in warning
+        assert "rollback's restart" in warning
+        # Not only Strict: a restart re-pulls or rebuilds, and On compares the image.
+        assert "under On it is blocked when its image changed" in warning
+        assert "most specific level that sets it" in warning
+
+    async def test_the_planner_asks_for_every_application(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tests.test_engine_planner import _plan_one_app
+
+        plan = await _plan_one_app(monkeypatch, {}, version="4.7.0")
+        assert any("Block deploys" in w for w in plan.resources[0].warnings)
+        assert not plan.is_blocked, "a warning, never a refusal"
+        older = await _plan_one_app(monkeypatch, {}, version="4.6.0")
+        assert not any("Block deploys" in w for w in older.resources[0].warnings)
 
 
 # ── the client boundary ──────────────────────────────────────────────────────

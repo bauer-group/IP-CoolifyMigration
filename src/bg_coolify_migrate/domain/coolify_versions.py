@@ -345,6 +345,21 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         # (ResourceDnsRecords v4.6.0:158-184, IntegrationToken :129-132). A host
         # that already has a record is left alone (CloudflareDnsProvider :183-185).
         "automatic_dns_on_api_save": Gate(since=(4, 6, 0)),
+        # Every application deploy passes Coolify's image-scan gate before it
+        # touches a container — the target's first /start and a rollback's
+        # /restart alike (ApplicationDeploymentJob v4.7.0:3040-3043 rolling_update,
+        # :994 compose; restarts reach it via :1730-1784). A block fails the
+        # deployment with no container started (DeploymentImageScan v4.7.0:890-892);
+        # only the UI's "Deploy anyway" and Coolify's own rollback skip it
+        # (:704-722). Off by default (instance policy seeded off/deploy, migration
+        # 2026_10_29_100000:35-44); the mode resolves instance -> team -> server ->
+        # app (ImageScanPolicyResolver v4.7.0:112-127) and no API reads it. A new
+        # app has no baseline, so under On every exploit-signal finding is new
+        # (SecurityGate v4.7.0:15-19, :85-92); Strict compares nothing (:77-83). On
+        # a self-hosted v4.7.0 every scan fails — ScannerCommands :651 reads a
+        # template the image lacks, which v4.7.1's Dockerfile adds — so there "If
+        # the scan cannot run" alone decides (SecurityGate :52-62).
+        "deploy_image_scan_gate": Gate(since=(4, 7, 0)),
     }
 )
 

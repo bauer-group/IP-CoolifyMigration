@@ -40,6 +40,7 @@ from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.domain import compose as compose_mod
 from bg_coolify_migrate.domain import domains, fidelity
 from bg_coolify_migrate.domain.coolify_versions import supports
+from bg_coolify_migrate.domain.deployments import image_scan_gate_warnings
 from bg_coolify_migrate.domain.drift import RebuildDriftReport, assess_rebuild_drift
 from bg_coolify_migrate.domain.kinds import (
     BuildPack,
@@ -942,6 +943,7 @@ async def build_plan(
                 )
             )
             refusals.extend(fidelity.application_refusals(full, version=coolify_version))
+            warnings.extend(image_scan_gate_warnings(version=coolify_version))
             if fidelity.unshareable_image_name(full, version=coolify_version):
                 if team_applications is None:
                     team_applications = await _team_applications(api)
