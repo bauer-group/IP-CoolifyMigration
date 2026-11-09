@@ -62,6 +62,8 @@ _HEALTH_CHECK_COMMAND = re.compile(r"[a-zA-Z0-9 \-_./:=@,+]{1,1000}")
 
 #: app/Support/RemoteSecretReferences.php::PATTERN (v4.4.0+).
 _VAULT_REFERENCE = locked_envs.VAULT_REFERENCE
+#: A {{server.X}} shared-variable reference (locked_envs.SERVER_REFERENCE).
+_SERVER_REFERENCE = locked_envs.SERVER_REFERENCE
 
 _REDIS_FAMILY = frozenset({DatabaseEngine.REDIS, DatabaseEngine.KEYDB, DatabaseEngine.DRAGONFLY})
 
@@ -1805,7 +1807,8 @@ def env_warnings(
                 f"{build_only} are build-time variables of an application the target "
                 "rebuilds from source. That build runs AFTER the source is stopped and "
                 "without them: a build that needs them fails, and the run rolls back. "
-                "Unlock them on the source, or make sure the build does not need them."
+                "Delete and re-add them unlocked on the source with the same value (a "
+                "lock cannot be lifted), or make sure the build does not need them."
             )
     previews = sorted(str(e["key"]) for e in envs if is_locked(e) and e.get("is_preview"))
     if previews:
@@ -1830,6 +1833,8 @@ def env_warnings(
                 "the source links a secret manager it resolves them; the target has no "
                 "link and passes the reference text through as the value."
             )
+
+    out.extend(_server_reference_warnings(envs, compose=compose, version=version))
 
     if supports("exact_env_escaping", version):
         changed = sorted(
@@ -1988,6 +1993,70 @@ def _redis_password_warnings(
         "server password. If the two differ, clients of the target authenticate "
         "differently — make them equal on the source first."
     ]
+
+
+def _server_reference_warnings(
+    envs: list[dict[str, Any]], *, compose: str | None, version: Version | None
+) -> list[str]:
+    """{{server.X}} references: they read the shared variables of the server the
+    resource RUNS on, so the target reads the target server's. Keys and names only.
+
+    An env row's reference has resolved that way on every release (EnvironmentVariable
+    v4.1.2:323-330, v4.7.0:851-858: the application .env against the deploy's server,
+    ApplicationDeploymentJob v4.7.0:2215-2235; services and databases against their
+    own, HasSecretManager v4.7.0:317-324), literal rows included. From 4.7.0 a
+    compose's own environment/build.args values do too
+    (``compose_resolves_server_shared_vars``); up to 4.6 they stayed literal on every
+    server. A server without X leaves the reference text in place (v4.7.0:872-873).
+    Locked rows are left alone: a whole reference is ``is_shared`` and unrecoverable,
+    and a partial one arrives resolved to the source's value.
+    """
+    keys: set[str] = set()
+    names: set[str] = set()
+    for env in envs:
+        value = env.get("value")
+        if not env.get("key") or env.get("is_shown_once") or not isinstance(value, str):
+            continue
+        if found := _SERVER_REFERENCE.findall(value):
+            keys.add(str(env["key"]))
+            names.update(found)
+    if compose and supports("compose_resolves_server_shared_vars", version):
+        for key, value in _compose_environment_values(compose):
+            if found := _SERVER_REFERENCE.findall(value):
+                keys.add(key)
+                names.update(found)
+    if not keys:
+        return []
+    references = sorted(f"server.{name}" for name in names)
+    return [
+        f"variable(s) {sorted(keys)} reference server-scoped shared variable(s) "
+        f"{references}. Coolify resolves them against the server the resource runs on, "
+        "so on the target they read the TARGET server's shared variables — or stay the "
+        "literal {{server.X}} text where it has none. Create them on the target server "
+        "before START."
+    ]
+
+
+def _compose_environment_values(compose: str) -> list[tuple[str, str]]:
+    """``(key, value)`` of every service's ``environment`` and ``build.args``.
+
+    Both list (``KEY=value``) and mapping forms; the parsers merge the build args
+    into the environment (parsers.php v4.7.0:1532-1533, :2942-2943).
+    """
+    services = _parsed_compose_services(compose) or {}
+    out: list[tuple[str, str]] = []
+    for service in services.values():
+        build = service.get("build")
+        args = build.get("args") if isinstance(build, dict) else None
+        for section in (service.get("environment"), args):
+            if isinstance(section, dict):
+                out.extend((str(k), str(v)) for k, v in section.items() if v is not None)
+            elif isinstance(section, list):
+                for item in section:
+                    key, sep, value = str(item).partition("=")
+                    if sep:
+                        out.append((key, value))
+    return out
 
 
 def _compose_distinguishes_unset(key: str, compose: str) -> bool:

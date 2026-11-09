@@ -226,7 +226,11 @@ class TestRules:
         envs = [row("DB_URL", is_shared=True)]
         rec = recover_service(envs, dotenv([("DB_URL", '"resolved"')]))
         assert rec.unrecoverable["DB_URL"] == le.SHARED_REFERENCE
-        assert "unlock it on the source" in le.SHARED_REFERENCE
+        # A lock cannot be lifted from 4.7.0 (EnvironmentVariable v4.7.0:182-186).
+        assert "delete it on the source and add the same reference again unlocked" in (
+            le.SHARED_REFERENCE
+        )
+        assert "unlock it" not in le.SHARED_REFERENCE
 
     def test_service_fqdn_and_url_are_left_to_the_target(self) -> None:
         envs = [row("SERVICE_FQDN_APP"), row("SERVICE_URL_APP")]

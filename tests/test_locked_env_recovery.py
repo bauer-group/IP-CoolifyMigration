@@ -758,6 +758,7 @@ class TestCreate:
         message = str(exc_info.value)
         assert "['POSTGRES_PASSWORD'] can no longer be read back" in message
         assert f"POSTGRES_PASSWORD: not in {DB_COMPOSE}" in message
+        assert "delete and re-add them unlocked with the same value" in message  # 4.7: no unlock
         assert "Nothing has been changed" in message
         assert exc_info.value.exit_code == 2
 

@@ -91,6 +91,14 @@ _RUNTIME_BUILDPACK_CONTROL = frozenset(
 #: app/Support/RemoteSecretReferences.php::PATTERN (v4.4.0+).
 VAULT_REFERENCE = re.compile(r"\{\{\s*vault\.([A-Za-z0-9_]+)\s*\}\}")
 
+#: A ``{{server.X}}`` shared-variable reference: upstream matches ``/{{(.*?)}}/``,
+#: trims it and takes the type before the first ``.`` (EnvironmentVariable
+#: v4.7.0:834-843, shared.php v4.7.0:5994-6003; ``server`` is in
+#: SHARED_VARIABLE_TYPES since v4.1.2 constants.php:106). The name is held to key
+#: characters: a reference to a name no shared variable can have resolves on no
+#: server, and the group is all that is ever shown of the value.
+SERVER_REFERENCE = re.compile(r"\{\{\s*server\.([A-Za-z0-9_.-]+)\s*\}\}")
+
 #: Keys the deploy job MAY write into an application's .env itself, in addition
 #: to the rows (generate_coolify_env_variables + coolifyDefaultEnvironmentVariables,
 #: v4.5.0 ApplicationDeploymentJob.php:3941-4040 and shared.php:4546-4562; PORT
@@ -129,10 +137,15 @@ _PHP_WHITESPACE = " \t\n\r\0\x0b"
 
 BUILD_TIME_ONLY = "build-time only: Coolify never writes it to the server"
 PREVIEW_ONLY = "a preview variable: production deploys never write it"
+#: The remedy is delete-and-re-add, never "unlock": a lock is permanent from 4.7.0
+#: (the saving hook re-locks, EnvironmentVariable v4.7.0:182-186) and the UI kept
+#: it from 4.5.1 (Show.php v4.5.1:230-234), while a delete has no lock check
+#: (forceDelete, ApplicationsController v4.7.0:4832-4859) on every release.
 SHARED_REFERENCE = (
     "a {{...}} shared-variable reference: the server file holds only its resolved "
-    "value; unlock it on the source (the reference text is not the secret) or set "
-    "it on the target by hand"
+    "value; delete it on the source and add the same reference again unlocked (the "
+    "reference text is not the secret, and from Coolify 4.7 a lock cannot be lifted) "
+    "or set it on the target by hand"
 )
 
 

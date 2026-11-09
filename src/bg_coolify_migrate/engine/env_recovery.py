@@ -266,7 +266,8 @@ async def recover_for_create(
                 hint=(
                     "The plan promised to carry them, or the target would generate its own "
                     "value while the copied data keeps the source's. Fix the cause named "
-                    "above (or unlock them on the source), then run again.\n" + _NOTHING_CHANGED
+                    "above (or delete and re-add them unlocked with the same value), then "
+                    "run again.\n" + _NOTHING_CHANGED
                 ),
             )
         if dropped := sorted(set(recovery.unrecoverable) | set(recovery.previews)):

@@ -338,3 +338,119 @@ class TestLegacyEscapingFalsePositives:
             envs, collection="services", engine=None, compose=None, version=V46
         )
         assert "['CONFIG', 'DB_PASSWORD']" in older[0]
+
+
+# ── 4.7.0: a lock is permanent ───────────────────────────────────────────────
+
+
+class TestLockRemedies:
+    """The saving hook re-locks every locked row (EnvironmentVariable v4.7.0:182-186,
+    SharedEnvironmentVariable :54-62); a delete has no lock check on any release."""
+
+    def test_the_shared_reference_reason_keeps_its_lead(self) -> None:
+        """docs/troubleshooting.md and the plan key on the leading text."""
+        assert le.SHARED_REFERENCE.startswith(
+            "a {{...}} shared-variable reference: the server file holds only its resolved "
+            "value;"
+        )
+
+    def test_no_remedy_says_unlock(self) -> None:
+        envs = [_env("BUILD_TOKEN", _ABSENT, is_shown_once=True, is_preview=False)]
+        out = fidelity.env_warnings(
+            envs,
+            collection="applications",
+            engine=None,
+            compose=None,
+            version=V47,
+            unrecovered={"BUILD_TOKEN": le.BUILD_TIME_ONLY},
+            builds=True,
+        )
+        build = next(w for w in out if "build-time variables" in w)
+        assert "Delete and re-add them unlocked on the source with the same value" in build
+        assert "Unlock" not in build
+        assert "unlock it" not in le.SHARED_REFERENCE
+
+
+# ── {{server.X}}: resolved against the server the resource runs on ───────────
+
+
+def _server_warning(out: list[str]) -> str | None:
+    return next((w for w in out if "server-scoped shared variable" in w), None)
+
+
+class TestServerSharedReferences:
+    COMPOSE = (
+        "services:\n"
+        "  web:\n"
+        "    image: x\n"
+        "    environment:\n"
+        '      API: "https://{{server.API_HOST}}/v1"\n'
+        "    build:\n"
+        "      context: .\n"
+        "      args:\n"
+        "        - MIRROR={{ server.MIRROR }}\n"
+    )
+
+    @pytest.mark.parametrize("version", [(4, 1, 2), V46, V47, None])
+    @pytest.mark.parametrize("flags", [{}, {"is_literal": True}, {"is_preview": True}])
+    def test_a_row_warns_on_every_release(
+        self, version: tuple[int, int, int] | None, flags: dict[str, bool]
+    ) -> None:
+        """Row resolution has had a server branch since v4.1.2 (EnvironmentVariable
+        v4.1.2:323-330); is_literal changes the quoting, not the resolution."""
+        envs = [_env("API_URL", "https://{{server.API_HOST}}/v1", **flags)]
+        out = fidelity.env_warnings(
+            envs, collection="applications", engine=None, compose=None, version=version
+        )
+        warning = _server_warning(out)
+        assert warning is not None
+        assert "['API_URL']" in warning and "['server.API_HOST']" in warning
+        assert "https://" not in warning  # names only, never the value
+        assert "before START" in warning
+
+    @pytest.mark.parametrize("scope", ["team", "project", "environment"])
+    def test_other_scopes_resolve_alike_on_the_target(self, scope: str) -> None:
+        """The target is created in the same team, project and environment."""
+        envs = [_env("X", "{{" + scope + ".API_HOST}}")]
+        out = fidelity.env_warnings(
+            envs, collection="services", engine=None, compose=None, version=V47
+        )
+        assert _server_warning(out) is None
+
+    def test_compose_values_warn_from_4_7(self) -> None:
+        """resolveSharedEnvironmentVariables has a server branch from v4.7.0
+        (shared.php v4.7.0:6011-6012); up to 4.6 the text stayed literal everywhere."""
+        out = fidelity.env_warnings(
+            [], collection="services", engine=None, compose=self.COMPOSE, version=V47
+        )
+        warning = _server_warning(out)
+        assert warning is not None
+        assert "['API', 'MIRROR']" in warning
+        assert "['server.API_HOST', 'server.MIRROR']" in warning
+        for version in (V46, (4, 5, 0)):
+            assert _server_warning(
+                fidelity.env_warnings(
+                    [], collection="services", engine=None, compose=self.COMPOSE, version=version
+                )
+            ) is None
+
+    def test_an_unknown_release_checks_the_compose(self) -> None:
+        out = fidelity.env_warnings(
+            [], collection="services", engine=None, compose=self.COMPOSE, version=None
+        )
+        assert _server_warning(out) is not None
+
+    def test_locked_rows_are_left_alone(self) -> None:
+        """A recovered locked value is resolved already — and never shown in part."""
+        envs = [_env("TOKEN", "pw{{server.SALT}}", is_shown_once=True)]
+        out = fidelity.env_warnings(
+            envs, collection="services", engine=None, compose=None, version=V47
+        )
+        assert _server_warning(out) is None
+
+    def test_a_name_no_shared_variable_can_have_is_not_shown(self) -> None:
+        envs = [_env("X", "{{server.not a key}}")]
+        out = fidelity.env_warnings(
+            envs, collection="services", engine=None, compose=None, version=V47
+        )
+        assert _server_warning(out) is None

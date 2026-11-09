@@ -236,6 +236,14 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         # :880-887). ConvertEmptyStringsToNull still nulls '' (Kernel v4.7.0:66),
         # so ' ' is the one body that arrives and is stored as ''.
         "env_value_untrimmed": Gate(since=(4, 7, 0)),
+        # resolveSharedEnvironmentVariables resolves {{server.X}} against the
+        # resource's server (shared.php v4.7.0:6011-6012; no server branch at
+        # v4.6.0:5880-5886, so the text stayed literal on every server). Both compose
+        # parsers apply it to every environment/build.args value of the compose
+        # (parsers.php v4.7.0:2164, :3512; build.args merged :1532-1533, :2942-2943).
+        # An env ROW's {{server.X}} has resolved per server since v4.1.2
+        # (EnvironmentVariable v4.1.2:323-330), so rows need no gate.
+        "compose_resolves_server_shared_vars": Gate(since=(4, 7, 0)),
         # EnvironmentVariable::RUNTIME_BUILDPACK_CONTROL_VARIABLES (v4.5.0:50-55;
         # absent at v4.4.7): buildpack control keys the runtime .env carries after all.
         "runtime_buildpack_control": Gate(since=(4, 5, 0)),
