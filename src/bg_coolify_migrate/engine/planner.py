@@ -472,8 +472,11 @@ async def _resolve_git_auth(
     the failure being prevented.
 
     Raises:
-        UnsupportedResource: For a GitLab-App source — v4.1.2 has no create
-            route that can reproduce it — or a source id the token cannot see.
+        UnsupportedResource: For a GitLab-App source — no release up to 4.7.1
+            has a create route that can reproduce it — or a Gitea-App source:
+            its route (``private-gitea-app``, routes/api.php v4.7.0:266) is not
+            wired here, so it is refused on every release rather than created
+            as public. Also for a source id the token cannot see.
     """
     if not full.get("git_repository"):
         return None, None
@@ -491,9 +494,11 @@ async def _resolve_git_auth(
             raise UnsupportedResource(
                 f"{name}: git source {source_type!r} cannot be recreated",
                 hint=(
-                    "The v4.1.2 API offers create routes for public, GitHub-App and "
-                    "deploy-key sources only. Recreate the application with one of "
-                    "those sources, then migrate."
+                    "This tool recreates public, GitHub-App and deploy-key sources "
+                    "only. Gitea-App sources are not supported yet (Coolify's create "
+                    "route for them is new in 4.7.0), and Coolify has none for "
+                    "GitLab-App sources. Recreate the application with one of those "
+                    "sources, then migrate."
                 ),
             )
         apps = await api.get("/github-apps")

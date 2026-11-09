@@ -597,6 +597,18 @@ async def test_whitelists_match_upstream_openapi() -> None:
 #: hidden from the resource GET (:128-143) and the username 422s without it (:1687),
 #: so neither can be carried; fidelity.application_refusals stops a source with a
 #: username, and application_warnings names one that could hold only a password.
+#:
+#: EXTENDED 2026-11-09 for Coolify 4.7.0: gitea_app_uuid. The request field of
+#: the new POST /applications/private-gitea-app (routes/api.php v4.7.0:266,
+#: required there, ApplicationsController v4.7.0:2040-2046), and in the shared
+#: create array (:1613) and the update array (:3662); absent from both at v4.6.0
+#: (:1367, :3428). It is no column — removeUnnecessaryFieldsFromRequest unsets it
+#: (bootstrap/helpers/api.php v4.7.0:522) — so no GET ever serialises it, exactly
+#: like github_app_uuid. Not sent because no route this tool uses needs it: a
+#: Gitea-App source is refused at plan time on every release
+#: (planner._resolve_git_auth), never created as public. The four new settings
+#: of the same release (include_network_hosts_in_build, the two auto-cancel
+#: flags, is_image_scan_enabled) are CARRIED instead, from 4.7.0 only.
 KNOWN_APPLICATION_GAP: frozenset[str] = frozenset(
     {
         "autogenerate_domain",
@@ -610,6 +622,7 @@ KNOWN_APPLICATION_GAP: frozenset[str] = frozenset(
         "gpu_driver",
         "git_https_password",
         "git_https_username",
+        "gitea_app_uuid",
         "gpu_options",
         "http_basic_auth_hash_algorithm",
         "include_source_commit_in_build",

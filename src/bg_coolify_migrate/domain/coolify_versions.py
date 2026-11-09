@@ -502,6 +502,56 @@ _APPLICATION: tuple[Field, ...] = (
         read_from="settings",
         column_gated=True,
     ),
+    # Four application_settings columns v4.7.0 adds to APPLICATION_SETTING_FIELDS
+    # (ApplicationsController v4.7.0:55-56,60,83; absent from the v4.6.0 constant
+    # :49-78), spread into the shared create array (:1613) and the update array
+    # (:3662), validated 'boolean' (bootstrap/helpers/api.php v4.7.0:249-250,254,
+    # 276) and stored by applyApplicationSettings on every route (:246, called at
+    # :1949/2189/2423/2575/2711). Each column ships in the same release as its
+    # acceptance, and the GET returns it only under `settings` (:2848, which hides
+    # only the ids and timestamps there, :167) — hence read_from and column_gated.
+    #
+    # Off on the source, a build keeps its BuildKit cache when containers join or
+    # leave the network: no --add-host per network container (ApplicationDeploymentJob
+    # v4.7.0:389). Migration 2026_11_05_163404, default true.
+    Field(
+        "include_network_hosts_in_build",
+        Gate(since=(4, 7, 0)),
+        read_from="settings",
+        column_gated=True,
+    ),
+    # Whether a newer webhook push cancels an older queued (default true) or still
+    # building (default false) deployment; migration 2026_11_03_072701. Webhook
+    # deploys only — a /restart never cancels or gets cancelled, an API deploy
+    # only when it asks (bootstrap/helpers/applications.php v4.7.0:193,199-201),
+    # so this tool's own deploys are unaffected either way; carried for the
+    # target's later pushes.
+    Field(
+        "is_auto_cancel_queued_deployments_enabled",
+        Gate(since=(4, 7, 0)),
+        read_from="settings",
+        column_gated=True,
+    ),
+    Field(
+        "is_auto_cancel_building_deployments_enabled",
+        Gate(since=(4, 7, 0)),
+        read_from="settings",
+        column_gated=True,
+    ),
+    # Migration 2026_10_29_100000:129, default true (ApplicationSetting v4.7.0:71
+    # too). Not cosmetic: the same flag decides whether 4.7's deploy scan gate
+    # applies at all (DeploymentImageScan v4.7.0:303-308, ImageScanPolicyResolver
+    # ::isAllowedFor :235-238). Off on the source keeps the target out of that
+    # gate; dropped, the target would be gated with no earlier scan to compare
+    # with (:181-186), and an operator's "Block deploys" policy (the default is
+    # off, ImageScanPolicyResolver :178-179) could fail START after the source is
+    # stopped. So it is carried, never gapped as "the default is as protective".
+    Field(
+        "is_image_scan_enabled",
+        Gate(since=(4, 7, 0)),
+        read_from="settings",
+        column_gated=True,
+    ),
 )
 
 #: The Dockerfile build stage (`--target`). A top-level column every GET returns,
