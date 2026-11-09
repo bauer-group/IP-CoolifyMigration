@@ -1859,11 +1859,18 @@ def env_warnings(
         out.extend(_redis_password_warnings(envs, engine=engine))
 
     if compose and supports("exact_env_escaping", version):
+        # From a KNOWN 4.7 an empty value is carried as itself
+        # (api/resources.build_env_entries, the same predicate); a preserved null
+        # is not, there is no value to send.
+        empty_carried = supports("env_value_untrimmed", version, if_unknown=False)
         empty = sorted(
             str(e["key"])
             for e in envs
             if e.get("key")
-            and (e.get("value") == "" or (e.get("value") is None and e.get("preserve_compose_null")))
+            and (
+                (e.get("value") == "" and not empty_carried)
+                or (e.get("value") is None and e.get("preserve_compose_null"))
+            )
             and _compose_distinguishes_unset(str(e["key"]), compose)
         )
         if empty:

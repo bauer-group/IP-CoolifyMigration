@@ -219,6 +219,12 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         # escaping. Asked of an env row's own `version` stamp as well as of the
         # instance (locked_envs.saved_before_exact_escaping).
         "exact_env_escaping": Gate(since=(4, 5, 0)),
+        # TrimStrings no longer trims an env `value` / `data.*.value`
+        # (TrimStrings v4.7.0:18-20); the model trims a single-line value itself
+        # (withoutEdgeWhitespace, EnvironmentVariable v4.7.0:894-899, set :907, get
+        # :880-887). ConvertEmptyStringsToNull still nulls '' (Kernel v4.7.0:66),
+        # so ' ' is the one body that arrives and is stored as ''.
+        "env_value_untrimmed": Gate(since=(4, 7, 0)),
         # EnvironmentVariable::RUNTIME_BUILDPACK_CONTROL_VARIABLES (v4.5.0:50-55;
         # absent at v4.4.7): buildpack control keys the runtime .env carries after all.
         "runtime_buildpack_control": Gate(since=(4, 5, 0)),

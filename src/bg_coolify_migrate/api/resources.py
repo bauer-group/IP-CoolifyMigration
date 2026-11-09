@@ -1451,8 +1451,20 @@ def build_env_entries(
     :func:`_names_the_source`. ``route_keys`` are the keys the service's own
     images are routed from (``dns_extract.route_env_keys``) — any other row of
     those names is a plain variable and copied verbatim.
+
+    An EMPTY value is sent as ``" "`` on a known 4.7+ (``env_value_untrimmed``):
+    ConvertEmptyStringsToNull turns ``""`` into null — a row the target leaves
+    out where its compose reads it, while the source writes ``KEY=`` — and from
+    4.7.0 TrimStrings passes ``" "`` through to the model, which trims a
+    single-line value itself and stores ``""`` (EnvironmentVariable
+    v4.7.0:894-908), on the bulk (ApplicationsController :4537, :4560;
+    ServicesController :1730; DatabasesController :4170) and single create alike.
+    Older or unknown releases trim ``" "`` back to null, so they get ``""`` as
+    before and the plan's warning about it (fidelity.env_warnings, same
+    predicate). A value-less row — locked, or null — is never turned into one.
     """
     allowed = fields_for("envs", version)
+    keeps_empty = supports("env_value_untrimmed", version, if_unknown=False)
     entries: list[dict[str, Any]] = []
     filled: set[str] = set()
     for env in source_envs:
@@ -1466,6 +1478,8 @@ def build_env_entries(
             continue
         if not entry.get("key"):
             continue
+        if keeps_empty and entry.get("value") == "":
+            entry["value"] = " "
         if collection == "services" and _names_the_source(
             entry, source_wildcard=source_wildcard, tag=tag, route_keys=route_keys
         ):
