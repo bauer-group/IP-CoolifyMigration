@@ -734,13 +734,21 @@ _ENV: tuple[Field, ...] = _always(
 
 # ── scheduled tasks ──────────────────────────────────────────────────────────
 # POST /v1/{applications|services}/{uuid}/scheduled-tasks
-# (ScheduledTasksController::createTask). The same six fields at every release,
-# v4.1.2:57 through v4.5.0:81. An ABSENT `timeout` becomes 300 and an absent
+# (ScheduledTasksController::createTask). The same six fields through 4.6.x,
+# v4.1.2:57 through v4.6.0:81. An ABSENT `timeout` becomes 300 and an absent
 # `enabled` becomes TRUE (v4.5.0:126-127), so a disabled task must be sent with
 # enabled=false explicitly or it comes back armed on the target.
 
-_SCHEDULED_TASK: tuple[Field, ...] = _always(
-    "name", "command", "frequency", "container", "timeout", "enabled"
+_SCHEDULED_TASK: tuple[Field, ...] = (
+    *_always("name", "command", "frequency", "container", "timeout", "enabled"),
+    # Run the command without `sh -c` — for distroless and scratch images, which
+    # have no shell (ScheduledTask::containerCommand, v4.7.0:136-148). Joins the
+    # create array in v4.7.0 (v4.7.0:81, 'boolean' :89) together with its column
+    # (migration 2026_11_03_202635, default true), so only a 4.7+ GET carries the
+    # key. ABSENT means TRUE (:128), like `enabled`: a no-shell task must be sent
+    # use_shell=false, or every run on the target becomes `sh -c` — failing where
+    # there is no sh, and turning a literal `$X`, `|` or `;` into shell syntax.
+    Field("use_shell", Gate(since=(4, 7, 0)), column_gated=True),
 )
 
 # ── database backup schedules ────────────────────────────────────────────────

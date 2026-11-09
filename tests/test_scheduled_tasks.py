@@ -117,10 +117,12 @@ def logs(monkeypatch: pytest.MonkeyPatch) -> _Recorder:
 
 
 class TestFields:
-    def test_the_create_whitelist_is_the_six_upstream_fields(self) -> None:
-        # ScheduledTasksController::createTask, identical v4.1.2:57 .. v4.5.0:81.
+    def test_the_create_whitelist_is_the_seven_upstream_fields(self) -> None:
+        # ScheduledTasksController::createTask: six fields v4.1.2:57 .. v4.6.0:81,
+        # use_shell joins at v4.7.0:81. The union of every release.
         upstream = {"name", "command", "frequency", "container", "timeout", "enabled"}
-        assert upstream == SCHEDULED_TASK_CREATE
+        assert upstream | {"use_shell"} == SCHEDULED_TASK_CREATE
+        assert coolify_versions.fields_for("scheduled-tasks", (4, 6, 0)) == upstream
 
     def test_required_fields_are_whitelisted(self) -> None:
         assert SCHEDULED_TASK_REQUIRED <= SCHEDULED_TASK_CREATE
@@ -996,7 +998,8 @@ def test_the_canary_parser_reads_the_create_array() -> None:
     """A silently empty extraction would make the canary pass forever."""
     php = (
         "private function createTask() {\n"
-        "  $allowedFields = ['name', 'command', 'frequency', 'container', 'timeout', 'enabled'];\n"
+        "  $allowedFields = ['name', 'command', 'frequency', 'container', 'timeout', "
+        "'use_shell', 'enabled'];\n"
         "}\nprivate function updateTask() { $allowedFields = ['name']; }"
     )
     assert _task_create_fields(php) == set(SCHEDULED_TASK_CREATE)

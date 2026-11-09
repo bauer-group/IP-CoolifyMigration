@@ -65,6 +65,9 @@ def build_scheduled_task_body(
     uuid and timestamps, and the create route 422s per unknown field. ``enabled``
     False survives (filter_body drops only None) — it has to, because upstream
     defaults an ABSENT enabled to true and a disabled task would come back armed.
+    ``use_shell`` (4.7.0+) is the same: absent means true, so a no-shell task is
+    sent False or it runs under ``sh -c`` on the target. A row from before 4.7
+    has no such key, and nothing is sent for it.
 
     Raises:
         InsufficientTokenScope: The ``command`` key is absent. From 4.4 Coolify
@@ -93,6 +96,7 @@ def build_scheduled_task_body(
             # the server as null anyway (ConvertEmptyStringsToNull).
             "container": task.get("container") or None,
             "timeout": task.get("timeout"),
+            "use_shell": task.get("use_shell"),
             "enabled": task.get("enabled"),
         },
         fields_for("scheduled-tasks", version),
