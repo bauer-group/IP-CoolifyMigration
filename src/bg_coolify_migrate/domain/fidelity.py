@@ -28,6 +28,7 @@ import base64
 import binascii
 import re
 import shlex
+import unicodedata
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
@@ -68,6 +69,251 @@ _REDIS_FAMILY = frozenset({DatabaseEngine.REDIS, DatabaseEngine.KEYDB, DatabaseE
 def _settings(source: dict[str, Any]) -> dict[str, Any]:
     settings = source.get("settings")
     return settings if isinstance(settings, dict) else {}
+
+
+# ── names and descriptions (every kind) ──────────────────────────────────────
+# From 4.7.0 every application, service and database create and update applies
+# the UI's ValidationPatterns rules to `name` and `description`
+# (FEATURES["api_name_rules"]). CREATE replays the source's values verbatim, and
+# one written through the API before 4.7 can fail them: a 422 for the whole
+# create. The rules judge what the validator receives — after TrimStrings and
+# ConvertEmptyStringsToNull (Kernel.php v4.7.0:65-66) — so the mirror trims
+# first, exactly as Str::trim of the Laravel that v4.7.0 pins (laravel/framework
+# v12.70.1, composer.lock v4.7.0:1906) does. Checked code point by code point
+# against PHP 8.4.27 (v4.7.0's base image), PCRE2 10.44 with Unicode 15.0 tables:
+# identical, except the 5,055 letters, marks and digits Unicode 15.1/16.0 added,
+# which PHP calls unassigned and refuses while a newer Python accepts them. Such
+# a name gets its 422 at CREATE, before anything is stopped.
+
+#: nameRules / descriptionRules (ValidationPatterns v4.7.0:496-512, :517-532).
+#: Laravel's min/max count a string with mb_strlen: code points, like len().
+_NAME_MIN_LENGTH = 3
+_NAME_MAX_LENGTH = 255
+_DESCRIPTION_MAX_LENGTH = 255
+
+#: What NAME_PATTERN (v4.7.0:13, `[\p{L}\p{M}\p{N}\s\-_.@\/&()#,:+]`) and
+#: DESCRIPTION_PATTERN (:18, `[\p{L}\p{M}\p{N}\s\-_.,!?()\'\"+=*@\/&]` in a PHP
+#: single-quoted string, so `'` and `"`) allow besides letters, marks, numbers
+#: and whitespace. A name takes no ' ! ? = *, a description no : # — so a
+#: description holding a URL fails.
+_NAME_PUNCTUATION = frozenset("-_.@/&()#,:+")
+_DESCRIPTION_PUNCTUATION = frozenset("-_.,!?()'\"+=*@/&")
+
+#: `\s` in both patterns. PHP's /u sets PCRE2_UCP next to PCRE2_UTF
+#: (ext/pcre/php_pcre.c, case 'u'), and under UCP `\s` is \p{Z}, \h or \v —
+#: these 26 code points. Not str.isspace(): that adds U+001C-U+001F and lacks
+#: U+180E. Code points rather than characters, because most are invisible.
+_PCRE_SPACE = frozenset(
+    map(
+        chr,
+        (
+            *range(0x09, 0x0E),
+            0x20,
+            0x85,
+            0xA0,
+            0x1680,
+            0x180E,
+            *range(0x2000, 0x200B),
+            0x2028,
+            0x2029,
+            0x202F,
+            0x205F,
+            0x3000,
+        ),
+    )
+)
+
+#: Str::INVISIBLE_CHARACTERS (Laravel v12.70.1 Str.php:32), in upstream's order.
+#: Str::trim strips these at both ends too, with `\s` and PHP's " \n\r\t\v\0"
+#: (:1608-1616). Some are letters or marks (U+115F, U+1160, U+3164 and U+FFA0
+#: are Lo, U+034F is Mn): the pattern allows them inside a name, the trim
+#: removes them from its edges first.
+_LARAVEL_INVISIBLE = frozenset(
+    map(
+        chr,
+        (
+            0x0009,
+            0x0020,
+            0x00A0,
+            0x00AD,
+            0x034F,
+            0x061C,
+            0x115F,
+            0x1160,
+            0x17B4,
+            0x17B5,
+            0x180E,
+            *range(0x2000, 0x2010),
+            0x202F,
+            0x205F,
+            *range(0x2060, 0x2066),
+            *range(0x206A, 0x2070),
+            0x3000,
+            0x2800,
+            0x3164,
+            0xFEFF,
+            0xFFA0,
+            0x1D159,
+            *range(0x1D173, 0x1D17B),
+            0xE0020,
+        ),
+    )
+)
+_TRIMMED = _PCRE_SPACE | _LARAVEL_INVISIBLE | {chr(0)}
+
+#: How many refused characters a message lists before it only counts the rest.
+_SHOWN_CHARACTERS = 5
+
+
+def _trim_bounds(value: str) -> tuple[int, int]:
+    """``(start, end)`` of what TrimStrings leaves of ``value``. PURE."""
+    start, end = 0, len(value)
+    while start < end and value[start] in _TRIMMED:
+        start += 1
+    while end > start and value[end - 1] in _TRIMMED:
+        end -= 1
+    return start, end
+
+
+def _in_pattern(char: str, punctuation: frozenset[str]) -> bool:
+    """One code point against a pattern's class: L, M or N, `\\s`, or its punctuation."""
+    return (
+        char in punctuation
+        or char in _PCRE_SPACE
+        or unicodedata.category(char)[0] in ("L", "M", "N")
+    )
+
+
+def _shown(char: str) -> str:
+    """A character as a message may print it: no raw control or format character
+    reaches a terminal or a log. Printable ASCII as itself, anything else as its
+    code point and Unicode name."""
+    if char.isascii() and char.isprintable():
+        return repr(char)
+    name = unicodedata.name(char, "")
+    return f"U+{ord(char):04X} {name}".rstrip()
+
+
+def _refused_characters(
+    value: str, start: int, end: int, punctuation: frozenset[str]
+) -> str | None:
+    """The characters of ``value[start:end]`` the pattern refuses, or None.
+
+    Each once, at its first 1-based position in the STORED value — the one the
+    operator edits. Never the value itself: a description is free text.
+    """
+    first: dict[str, int] = {}
+    for index in range(start, end):
+        char = value[index]
+        if char not in first and not _in_pattern(char, punctuation):
+            first[char] = index + 1
+    if not first:
+        return None
+    listed = [f"{_shown(c)} at position {p}" for c, p in list(first.items())[:_SHOWN_CHARACTERS]]
+    rest = len(first) - len(listed)
+    return ", ".join(listed) + (f" and {rest} more" if rest else "")
+
+
+def name_rule_problem(name: object) -> str | None:
+    """Why the 4.7.0 name rule refuses ``name``, or None. Not version-gated. PURE.
+
+    ``string|min:3|max:255|regex:NAME_PATTERN`` WITHOUT ``nullable``
+    (``nameRules(required: false, nullable: false)``), on the trimmed value: a
+    blank name arrives as null, and a non-nullable ``string`` refuses null.
+    """
+    if not isinstance(name, str):
+        return "is not text"
+    start, end = _trim_bounds(name)
+    length = end - start
+    if not length:
+        return "is blank, and Coolify trims a blank name to no name at all"
+    problems: list[str] = []
+    if not _NAME_MIN_LENGTH <= length <= _NAME_MAX_LENGTH:
+        trimmed = " once Coolify trims its surrounding whitespace" if end - start < len(name) else ""
+        problems.append(f"is {length} character(s) long{trimmed}")
+    if refused := _refused_characters(name, start, end, _NAME_PUNCTUATION):
+        problems.append(f"contains {refused}")
+    return " and ".join(problems) or None
+
+
+def description_rule_problem(description: object) -> str | None:
+    """Why the 4.7.0 description rule refuses ``description``, or None. PURE.
+
+    ``nullable|string|max:255|regex:DESCRIPTION_PATTERN`` on the trimmed value:
+    an absent, empty or blank description arrives as null and passes.
+    """
+    if description is None:
+        return None
+    if not isinstance(description, str):
+        return "is not text"
+    start, end = _trim_bounds(description)
+    length = end - start
+    if not length:
+        return None
+    problems: list[str] = []
+    if length > _DESCRIPTION_MAX_LENGTH:
+        problems.append(f"is {length} characters long")
+    if refused := _refused_characters(description, start, end, _DESCRIPTION_PUNCTUATION):
+        problems.append(f"contains {refused}")
+    return " and ".join(problems) or None
+
+
+def name_refusals(name: str, *, version: Version | None) -> list[str]:
+    """Refuse a resource of any kind whose name the 4.7.0 create would 422.
+
+    Never answered by sending another name: PREFLIGHT, HEALTHCHECK and container
+    discovery find the target's containers by the slug of the SOURCE's name
+    (planner.resource_labels), so a target under another name would look like
+    one without containers. The UI has applied the same pattern since 4.1.2, but
+    to the UNTRIMMED value (Livewire skips TrimStrings), so a rename there fits
+    once it has 3 characters besides its surrounding spaces — the remedy says
+    so, since the UI would save 'ab '. Coolify writes coolify.resourceName
+    only when it deploys, though, and PREFLIGHT refuses a container that still
+    carries the old one (steps._assert_containers_are_discoverable) — hence the
+    restart in the remedy. An unknown version refuses: the name cannot be
+    changed at CREATE, and the check is free.
+    """
+    if not supports("api_name_rules", version):
+        return []
+    problem = name_rule_problem(name)
+    if problem is None:
+        return []
+    return [
+        f"the resource's name {problem}. Coolify >= 4.7 takes only 3-{_NAME_MAX_LENGTH} "
+        "letters (any script), numbers, spaces and - _ . @ / & ( ) # , : + on create, so "
+        "the target would be rejected outright, and it cannot be created under another "
+        "name: the migration finds its containers by the source's name. Rename the "
+        "resource in Coolify's UI to a name with at least 3 characters besides any "
+        "leading or trailing spaces (the UI counts those, the API trims them), then "
+        "restart or redeploy it so its containers carry the new name (until then the "
+        "run refuses the ones that still carry the old name), then plan again."
+    ]
+
+
+def unsendable_description(source: dict[str, Any], *, version: Version | None) -> str | None:
+    """Why the source's description cannot go into the create, or None.
+
+    A description routes nothing, so it is left out of the body (api/resources
+    create_application, create_service, create_database) and the plan warns,
+    rather than refusing a cutover over prose. An unknown version leaves it out
+    too: a field is sent only where it cannot 422 the resource.
+    """
+    if not supports("api_name_rules", version):
+        return None
+    return description_rule_problem(source.get("description"))
+
+
+def description_warning(source: dict[str, Any], *, version: Version | None) -> str | None:
+    """The plan line for a description CREATE leaves out (:func:`unsendable_description`)."""
+    problem = unsendable_description(source, version=version)
+    if problem is None:
+        return None
+    return (
+        f"the description {problem}. Coolify >= 4.7 takes at most "
+        f"{_DESCRIPTION_MAX_LENGTH} letters (any script), numbers, spaces and "
+        "- _ . , ! ? ( ) ' \" + = * @ / & on create, so the target is created without a "
+        "description. Give it one that fits in the UI if it matters."
+    )
 
 
 # ── applications ─────────────────────────────────────────────────────────────

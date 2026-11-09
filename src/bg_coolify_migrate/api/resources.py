@@ -215,6 +215,16 @@ async def ensure_environment(api: CoolifyClient, project_uuid: str, name: str) -
 # ── create ───────────────────────────────────────────────────────────────────
 
 
+def _drop_unsendable_description(
+    body: dict[str, Any], source: dict[str, Any], *, version: Version | None
+) -> None:
+    """Leave out a description the 4.7.0 create would refuse — a 422 for the WHOLE
+    resource over prose. The decision is fidelity.unsendable_description's; the
+    plan said so (fidelity.description_warning)."""
+    if fidelity.unsendable_description(source, version=version):
+        body.pop("description", None)
+
+
 async def create_database(
     api: CoolifyClient,
     snapshot: ResourceSnapshot,
@@ -241,6 +251,7 @@ async def create_database(
     )
     body["name"] = snapshot.name
     body["instant_deploy"] = False
+    _drop_unsendable_description(body, source, version=version)
     # The GET returns the stored plaintext config; the create validates base64.
     _encode_base64_fields(body, _BASE64_DATABASE_FIELDS)
     if snapshot.image:
@@ -305,6 +316,7 @@ async def create_service(
     body = filter_for({**source, **placement.as_body()}, endpoint, version)
     body["name"] = snapshot.name
     body["instant_deploy"] = False
+    _drop_unsendable_description(body, source, version=version)
 
     if is_custom:
         if not snapshot.docker_compose_raw:
@@ -674,6 +686,7 @@ async def create_application(
     body = filter_for({**source, **placement.as_body()}, f"applications/{segment}", version)
     body["name"] = snapshot.name
     body["instant_deploy"] = False
+    _drop_unsendable_description(body, source, version=version)
 
     # Readonly labels OFF (4.5.1+) keeps the source's labels verbatim on the
     # target. Only when they route nothing but the app's own custom domains —

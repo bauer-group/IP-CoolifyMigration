@@ -901,6 +901,12 @@ async def build_plan(
                 full, name=snapshot.name, tag=domains.parking_tag(project_name, environment)
             )
         )
+        # Every kind's create takes name and description only within the UI's rules
+        # from 4.7.0. The name CREATE sends is the snapshot's; a bad description is
+        # left out of the body rather than refused (fidelity.unsendable_description).
+        refusals.extend(fidelity.name_refusals(snapshot.name, version=coolify_version))
+        if description := fidelity.description_warning(full, version=coolify_version):
+            warnings.append(description)
 
         if collection == "databases":
             warnings.extend(database_health_check_warnings(full))

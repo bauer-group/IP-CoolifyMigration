@@ -201,6 +201,20 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         "redis_password_quoting": Gate(since=(4, 4, 0)),
         # http_basic_auth_password gains max:72 on create.
         "basic_auth_max_length": Gate(since=(4, 5, 0)),
+        # Application, service and database create AND update validate `name` and
+        # `description` with the UI's ValidationPatterns rules (commit 32541a32c):
+        # ApplicationsController v4.7.0:1616-1617 (the create every route shares)
+        # and :3665/:3669, ServicesController :421-422/:647-648/:1253-1254,
+        # DatabasesController :2252-2253/:664-665, rules ValidationPatterns
+        # :13,18,496-532. Up to v4.6.0 they were 'string|max:255' and
+        # 'string|nullable' (ApplicationsController v4.6.0:1370-1371). The UI has
+        # applied the same patterns since v4.1.2 (ValidationPatterns v4.1.2:13,18;
+        # Application/General.php v4.1.2:144-145), but to the untrimmed value:
+        # Livewire skips TrimStrings and ConvertEmptyStringsToNull (livewire
+        # v3.8.10 HandleRequests.php:70-79, composer.lock v4.7.0:3764). So a value
+        # written through the API can fail, and so can a UI-saved name that is
+        # under 3 characters once trimmed ('ab '). Unchanged in v4.7.1.
+        "api_name_rules": Gate(since=(4, 7, 0)),
         # New env rows use exact escaping; rows saved before keep the legacy
         # escaping. Asked of an env row's own `version` stamp as well as of the
         # instance (locked_envs.saved_before_exact_escaping).

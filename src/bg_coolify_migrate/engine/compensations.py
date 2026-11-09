@@ -500,6 +500,13 @@ async def undo_restore_source_name(ctx: MigrationContext, undo_info: dict[str, A
 
     Nothing to do for DELETE: that is the one irreversible step, which is why it
     requires typed confirmation.
+
+    From 4.7.0 the update applies Coolify's name rule as well. The restored name
+    is the one CREATE sent, and the plan refused it unless it passed on the PLAN's
+    release (fidelity.name_refusals). An instance upgraded to 4.7 after a FINALIZE
+    on 4.6 can 422 it. It is raised like any other failure: the executor runs the
+    remaining compensations and ends ROLLBACK_FAILED, and the source keeps its
+    ``-old-`` name until the operator renames it in the UI.
     """
     policy = undo_info.get("policy")
     if policy != "rename":
