@@ -12,6 +12,19 @@ the next invocation rather than leaving a credential behind forever.
 Note the tunnel solves *reachability*, not *authentication*: the source still has
 to prove who it is, whether it dials the target directly or through a forwarded
 port. So the key is needed in both modes.
+
+**Both edits of authorized_keys take Coolify's own lock** (:func:`_locked`). From
+4.7.0 Coolify edits the same file — the tool connects as the server's user, and
+Coolify edits that user's ``$HOME`` (``no_sudo``) — when an operator rotates a
+server's key and, an hour or more later, when it removes the old one
+(AuthorizedKeys v4.7.0:27-39 appends; :46-67 and :127-148 rewrite the file with
+``mv``; RemoveRotatedAuthorizedKeyJob :26,44-71). Unlocked, a collision of
+milliseconds loses a line: ours (COPY then fails after the stop), Coolify's new
+key (its rotation fails safe), or Coolify's REMOVAL of the old key, which our
+``sed -i`` rename would bring back while Coolify reports it removed. The lock
+does no harm where nobody else takes it, so it is not gated on a version. Its
+path is an upstream implementation detail, not a contract: if it moves, this
+falls back to the old millisecond exposure, never to anything worse.
 """
 
 from __future__ import annotations
@@ -35,6 +48,55 @@ KEY_COMMENT_PREFIX = "bg-coolify-migrate"
 #: while still permitting the command execution rsync needs. A forced command is
 #: not usable here: rsync's server-side argv varies per invocation.
 KEY_OPTIONS = "restrict"
+
+#: Coolify's lock on the SSH user's authorized_keys: a directory, because mkdir is
+#: atomic and needs no flock (AuthorizedKeys::runLocked v4.7.0:160-182). Unquoted
+#: ``$HOME`` on purpose: the remote shell expands it, as it does for Coolify.
+AUTHORIZED_KEYS_LOCK = "$HOME/.ssh/.coolify-authorized-keys.lock"
+
+#: One-second attempts to take it — Coolify's own bound (:174), so neither side
+#: waits longer for the other than it would for itself.
+LOCK_ATTEMPTS = 30
+
+#: The exit status of an edit that never got the lock (EX_TEMPFAIL), so the error
+#: can say "busy" instead of "failed". Coolify exits 1 there; nothing else in our
+#: two commands can exit 75.
+LOCK_BUSY_EXIT = 75
+
+
+def _locked(command: str) -> str:
+    """``command`` run under Coolify's authorized_keys lock, released however it exits.
+
+    A transcription of AuthorizedKeys::runLocked (v4.7.0:164-182), kept POSIX so
+    it runs in whatever shell the login gives us: create ``~/.ssh`` if it is
+    missing; remove a lock older than 10 minutes, which an edit that crashed left
+    behind (edits take seconds); take the lock with ``mkdir`` in up to 30
+    one-second attempts; release it with an EXIT trap, which a HUP/INT/TERM reaches
+    through ``exit 1``. The trap does not change the edit's own exit status.
+    """
+    return (
+        'if [ ! -d "$HOME/.ssh" ]; then mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"; fi; '
+        f'lock="{AUTHORIZED_KEYS_LOCK}"; attempt=0; '
+        'find "$lock" -maxdepth 0 -type d -mmin +10 -exec rmdir {} \\; 2>/dev/null || true; '
+        'until mkdir "$lock" 2>/dev/null; do '
+        "attempt=$((attempt + 1)); "
+        f'if [ "$attempt" -ge {LOCK_ATTEMPTS} ]; then '
+        'echo "$lock is held by another edit" >&2; '
+        f"exit {LOCK_BUSY_EXIT}; fi; "
+        "sleep 1; done; "
+        "trap 'rmdir \"$lock\"' EXIT; trap 'exit 1' HUP INT TERM; "
+        f"{command}"
+    )
+
+
+def _lock_busy_hint(host: str) -> str:
+    return (
+        f"Another edit held ~/.ssh/.coolify-authorized-keys.lock on {host} for "
+        f"{LOCK_ATTEMPTS}s. Coolify (4.7+) takes it to rotate a server key, which "
+        "takes seconds; try again shortly. A lock older than 10 minutes is removed "
+        "as stale by Coolify and by this tool, so if nothing is editing the file, "
+        "removing that directory by hand is safe."
+    )
 
 
 def generate(migration_id: str) -> tuple[str, str, str, str]:
@@ -69,12 +131,20 @@ async def install(
     """
     private_pem, public_line, fingerprint, comment = generate(migration_id)
 
-    # 1. Authorise on the target.
+    # 1. Authorise on the target, under Coolify's lock (module docstring).
     await target.run_checked("mkdir -p ~/.ssh && chmod 700 ~/.ssh")
     result = await target.run(
-        f"printf '%s\\n' {shlex.quote(f'{KEY_OPTIONS} {public_line}')} >> ~/.ssh/authorized_keys "
-        "&& chmod 600 ~/.ssh/authorized_keys"
+        _locked(
+            f"printf '%s\\n' {shlex.quote(f'{KEY_OPTIONS} {public_line}')} "
+            ">> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+        )
     )
+    if result.exit_status == LOCK_BUSY_EXIT:
+        raise TransferError(
+            f"could not authorise the transfer key on the target ({target.target.host}): "
+            "its authorized_keys stayed locked",
+            hint=_lock_busy_hint(target.target.host),
+        )
     if not result.ok:
         raise TransferError(
             f"could not authorise the transfer key on the target ({target.target.host})",
@@ -116,12 +186,23 @@ async def _revoke_on_target(target: RemoteHost, comment: str) -> bool:
     """Remove exactly our line from authorized_keys.
 
     Matched by our comment marker so we can never delete someone else's key.
+    ``sed -i`` renames a rewritten copy over the file, which is safe only under
+    Coolify's lock: outside it, the rename can undo an edit Coolify made between
+    sed's read and the rename (module docstring).
     """
     escaped = comment.replace("/", r"\/")
     result = await target.run(
-        "test -f ~/.ssh/authorized_keys && "
-        f"sed -i.bak '/{escaped}/d' ~/.ssh/authorized_keys && rm -f ~/.ssh/authorized_keys.bak"
+        _locked(
+            "test -f ~/.ssh/authorized_keys && "
+            f"sed -i.bak '/{escaped}/d' ~/.ssh/authorized_keys && rm -f ~/.ssh/authorized_keys.bak"
+        )
     )
+    if result.exit_status == LOCK_BUSY_EXIT:
+        log.warning(
+            "keys.revoke_lock_busy",
+            target=target.target.host,
+            hint=_lock_busy_hint(target.target.host),
+        )
     return result.ok
 
 
