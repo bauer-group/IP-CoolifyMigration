@@ -30,7 +30,7 @@ import hashlib
 import re
 import shlex
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -1379,11 +1379,14 @@ def service_refusals(source: dict[str, Any], *, version: Version | None) -> list
     # applyServiceUrls rejects the WHOLE request when one URL is set on two
     # containers (ServicesController v4.1.2:73-76, v4.5.0:166-169) — before any
     # conflict check, so no retry helps. From 4.2.0 it compares the URLs with
-    # scheme and host lowercased; 4.1.x compares the trimmed strings.
+    # scheme and host lowercased; 4.1.x compares the trimmed strings. A part
+    # removed from the compose (4.7.0+) is never in that request: it shares a
+    # URL with its renamed successor without anything to refuse.
+    removed = removed_part_names(source)
     normalised = supports("service_urls_normalised", version)
     owners: dict[str, set[str]] = {}
     for name, url in parts:
-        if name not in with_credentials:
+        if name not in with_credentials and name not in removed:
             owners.setdefault(_duplicate_key(url, normalised=normalised), set()).add(name)
     for key, names in sorted(owners.items()):
         if len(names) > 1:
@@ -1393,6 +1396,100 @@ def service_refusals(source: dict[str, Any], *, version: Version | None) -> list
                 "so none of this service's domains could be carried. Give each "
                 "sub-application its own URL on the source, then migrate."
             )
+    return out
+
+
+def removed_part_names(source: Mapping[str, Any]) -> frozenset[str]:
+    """The names of a service GET's parts that left its compose (4.7.0+). PURE.
+
+    Applications and databases alike (kinds.removed_from_compose). Empty before
+    4.7.0, where no part carries the flag.
+    """
+    return frozenset(
+        str(part["name"])
+        for key in ("applications", "databases")
+        for part in source.get(key) or []
+        if removed_from_compose(part) and part.get("name")
+    )
+
+
+def removed_part_refusals(
+    source: Mapping[str, Any],
+    *,
+    storages: Mapping[str, Any] | None,
+    migrating: Collection[str],
+    source_wildcard: str | None,
+) -> list[str]:
+    """Parts that left the compose but still hold what only a running part can. PURE.
+
+    The target is built from the source's compose, so it has no such part
+    (kinds.removed_from_compose). Two things cannot be left with nothing:
+
+    * a CUSTOM host. Nothing on the target would hold it, FINALIZE would still
+      have to release it on the source, and once no live resource holds a
+      hostname Coolify (4.4+) deletes the managed DNS record of it — the hand-over
+      is make-before-break or nothing (domains.py). A generated or server-bound
+      host is simply not carried.
+    * a volume the plan migrates (``migrating``: the manifest's source names) that
+      no LIVE part also declares: copied, it would be mounted by nothing, so
+      CREATE's pairing refuses it — but only after a target was made. /storages tags
+      every row with its part's ``resource_uuid`` (ServicesController
+      v4.7.0:2458-2470), which is the only way to tell whose it is.
+
+    Each line names the part only. Before 4.7.0 nothing is flagged and this says
+    nothing — such a part's URL still meets CREATE's missing-part refusal there.
+    """
+    removed = {
+        str(part.get("uuid") or ""): str(part["name"])
+        for key in ("applications", "databases")
+        for part in source.get(key) or []
+        if removed_from_compose(part) and part.get("name")
+    }
+    if not removed:
+        return []
+    out: list[str] = []
+    hosting = sorted(
+        str(app["name"])
+        for app in source.get("applications") or []
+        if removed_from_compose(app)
+        and app.get("name")
+        and any(
+            custom_hosts(str(app.get(k) or ""), source_wildcard=source_wildcard)
+            for k in ("url", "fqdn")
+        )
+    )
+    if hosting:
+        out.append(
+            f"sub-application(s) {hosting} were removed from the service's compose "
+            "(Coolify keeps the part, flagged is_removed_from_compose) but still hold a "
+            "custom domain. The target runs only what the compose declares, so nothing "
+            "there would hold that domain, and releasing it at FINALIZE could make "
+            "Coolify delete its managed DNS record. Clear the part's domain or delete "
+            "the part in Coolify, then plan again."
+        )
+    rows = [
+        s
+        for s in (storages or {}).get("persistent_storages") or []
+        if isinstance(s, dict) and s.get("name")
+    ]
+    live = {str(s["name"]) for s in rows if str(s.get("resource_uuid") or "") not in removed}
+    holding = sorted(
+        {
+            removed[owner]
+            for s in rows
+            if (owner := str(s.get("resource_uuid") or "")) in removed
+            and str(s["name"]) in migrating
+            and str(s["name"]) not in live
+        }
+    )
+    if holding:
+        out.append(
+            f"service part(s) {holding} were removed from the service's compose (Coolify "
+            "keeps the part, flagged is_removed_from_compose) but a volume of theirs "
+            "holds data. The target runs only what the compose declares, so no part "
+            "there would mount it. Delete the part in Coolify (or put it back into the "
+            "compose while its data is still needed), then plan again."
+        )
     return out
 
 

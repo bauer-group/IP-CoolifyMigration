@@ -955,6 +955,18 @@ async def build_plan(
         else:
             warnings.extend(fidelity.service_warnings(full, version=coolify_version))
             refusals.extend(fidelity.service_refusals(full, version=coolify_version))
+            # A part that left the compose (4.7.0+) is not on the target: refused
+            # while it holds a custom host or a migrated volume.
+            refusals.extend(
+                fidelity.removed_part_refusals(
+                    full,
+                    storages=api_storages,
+                    migrating={i.source_name for i in manifest.to_migrate if i.source_name},
+                    source_wildcard=source_wildcard
+                    or (server_ref(source_server).wildcard_domain if source_server else None)
+                    or None,
+                )
+            )
 
         # Env keys are validated by the TARGET's API at copy time, and Coolify
         # >=4.2 rejects shapes its own older versions happily stored. Catching that

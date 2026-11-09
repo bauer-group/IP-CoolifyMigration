@@ -1117,10 +1117,18 @@ def service_urls_body(
     the target keeps the URL its own parse generated. A name the target does not
     have lands in ``missing``: Coolify answers it with a 422 ("Service container
     with '{name}' not found.", ServicesController v4.1.2:94, v4.5.0:187).
+
+    A part removed from the compose (4.7.0+, kinds.removed_from_compose) is
+    skipped first: the target is built from that compose and has no such part,
+    and the plan refused one that still holds a custom host
+    (fidelity.removed_part_refusals), so what is left of it is not carried.
     """
     entries: list[dict[str, str]] = []
     missing: list[str] = []
+    removed = fidelity.removed_part_names(source)
     for name, value in service_app_urls(source).items():
+        if name in removed:
+            continue
         url = _remap_domains(
             _drop_generated(value), source_wildcard=source_wildcard, target_wildcard=target_wildcard
         )
@@ -1193,11 +1201,12 @@ async def finish_service_target(
         source_wildcard=placement.source_wildcard,
         target_wildcard=placement.target_wildcard,
     )
+    removed = fidelity.removed_part_names(source)
     for name, value in service_app_urls(source).items():
         dropped = _unrewritable_server_bound(
             value, source_wildcard=placement.source_wildcard, target_wildcard=placement.target_wildcard
         )
-        if dropped:
+        if dropped and name not in removed:
             log.warning(
                 "api.service.wildcard_unresolved",
                 name=snapshot.name,

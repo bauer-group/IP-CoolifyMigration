@@ -1,12 +1,15 @@
-"""Services against Coolify 4.7: the source's own compose.
+"""Services against Coolify 4.7: the source's own compose, removed parts.
 
-One finding of the v4.6.0 -> v4.7.0 audit:
+Two findings of the v4.6.0 -> v4.7.0 audit, one module:
 
 * A template service's target was built from the instance's CURRENT catalog,
   which the CDN refreshes for every release: v4.7.0's moved getoutline from
   postgres:12 to 16 on the same volume key and mount, so the copy verified and
   the target's database refused its data after the stop. The target now runs
   the source's own compose, carried by one PATCH right after the create.
+* A part that left the compose stays in the GET (4.7.0 flags it
+  ``is_removed_from_compose``): never carried, refused while it holds a custom
+  host or a migrated volume.
 """
 
 from __future__ import annotations
@@ -24,9 +27,10 @@ from bg_coolify_migrate.api import resources
 from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.domain import fidelity
 from bg_coolify_migrate.domain.compose import MountClass
-from bg_coolify_migrate.domain.kinds import ResourceKind
+from bg_coolify_migrate.domain.kinds import ResourceKind, removed_from_compose
 from bg_coolify_migrate.domain.manifest import Decision, VolumeItem, VolumeManifest
 from bg_coolify_migrate.domain.plan import MigrationPlan, ResourcePlan, ResourceSnapshot, Strategy
+from bg_coolify_migrate.domain.schedules import service_backup_warnings
 from bg_coolify_migrate.engine import steps
 from bg_coolify_migrate.engine.context import MigrationContext
 from bg_coolify_migrate.errors import CoolifyApiError, UnsupportedResource
@@ -528,3 +532,202 @@ class TestPlanForTemplates:
             snapshot={**_TEMPLATE, "docker_compose_raw": SOURCE_COMPOSE},
         )
         assert any("re-dumps compose" in w for w in plan.resources[0].warnings)
+
+
+# ── B: parts removed from the compose (4.7.0) ────────────────────────────────
+
+
+def _removed(name: str, **kw: Any) -> dict[str, Any]:
+    return {"uuid": f"sa-{name}", "name": name, "is_removed_from_compose": True, **kw}
+
+
+class TestRemovedFromCompose:
+    @pytest.mark.parametrize(
+        ("part", "removed"),
+        [
+            ({"name": "web", "is_removed_from_compose": True}, True),
+            ({"name": "web", "is_removed_from_compose": False}, False),
+            # Before 4.7.0 the key is absent: such a part looks live, as it did.
+            ({"name": "web"}, False),
+            ({"name": "web", "is_removed_from_compose": "true"}, False),
+            ("junk", False),
+            (None, False),
+        ],
+    )
+    def test_read_by_key_presence(self, part: object, removed: bool) -> None:
+        assert removed_from_compose(part) is removed
+
+    def test_names_cover_applications_and_databases(self) -> None:
+        source = {
+            "applications": [{"name": "web"}, _removed("old-web")],
+            "databases": [_removed("old-db")],
+        }
+        assert fidelity.removed_part_names(source) == {"old-web", "old-db"}
+
+
+class TestRemovedPartsAreNotCarried:
+    def test_a_removed_part_never_reaches_the_urls_body_nor_missing(self) -> None:
+        # The renamed successor `web` carries its URL; the removed `old-web`
+        # keeps a server-bound one the target has no part for.
+        source = {
+            "applications": [
+                {"name": "web", "fqdn": f"https://web.{SRC_WC}"},
+                _removed("old-web", fqdn=f"https://old.{SRC_WC}"),
+            ]
+        }
+        entries, missing = resources.service_urls_body(
+            source,
+            target_names={"web"},
+            source_wildcard=SRC_WC,
+            target_wildcard="app.0047-20.cloud.bauer-group.com",
+        )
+        assert entries == [{"name": "web", "url": "https://web.app.0047-20.cloud.bauer-group.com"}]
+        assert missing == []
+
+    def test_without_the_flag_the_orphan_is_still_missing(self) -> None:
+        # Before 4.7.0 nothing tells them apart: CREATE refuses before the stop.
+        source = {"applications": [{"name": "old-web", "fqdn": "https://docs.example.com"}]}
+        _, missing = resources.service_urls_body(
+            source, target_names=set(), source_wildcard=SRC_WC, target_wildcard=None
+        )
+        assert missing == ["old-web"]
+
+    def test_a_removed_part_shares_no_url_with_its_successor(self) -> None:
+        source = {
+            "applications": [
+                {"name": "web", "fqdn": "https://shop.example.com"},
+                _removed("old-web", fqdn="https://shop.example.com"),
+            ]
+        }
+        assert fidelity.service_refusals(source, version=(4, 7, 0)) == []
+        # The same two live parts still refuse.
+        del source["applications"][1]["is_removed_from_compose"]
+        assert fidelity.service_refusals(source, version=(4, 7, 0))
+
+    async def test_a_removed_part_s_unplaceable_host_is_no_warning(
+        self, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No target wildcard: the live part's server-bound host falls back to
+        # sslip.io, worth a warning; the removed part's is simply not carried.
+        logs = _Logs()
+        monkeypatch.setattr(resources, "log", logs)
+        respx_mock.get(f"{BASE}/services/tgt1").mock(
+            return_value=httpx.Response(
+                200, json={"uuid": "tgt1", "applications": [{"uuid": "t-web", "name": "web"}]}
+            )
+        )
+        source = {
+            "uuid": "svc1",
+            "applications": [
+                {"uuid": "sa-web", "name": "web", "fqdn": f"https://web.{SRC_WC}"},
+                _removed("old-web", fqdn=f"https://old.{SRC_WC}"),
+            ],
+        }
+        placement = resources.Placement(
+            project_uuid="p1",
+            environment_name="production",
+            server_uuid="s2",
+            source_wildcard=SRC_WC,
+            target_wildcard=None,
+        )
+        snapshot = ResourceSnapshot(
+            uuid="svc1",
+            name="wiki",
+            collection="services",
+            kind=ResourceKind.SERVICE_COMPOSE,
+            docker_compose_raw=SOURCE_COMPOSE,
+        )
+        async with CoolifyClient(HOST, "tok", max_retries=0) as api:
+            await resources.finish_service_target(api, snapshot, placement, source, "tgt1")
+
+        warned = logs.named("api.service.wildcard_unresolved")
+        assert [w["sub_application"] for w in warned] == ["web"]
+
+    def test_a_removed_database_gets_no_backup_warning(self) -> None:
+        source = {"databases": [_removed("old-pg", image="postgres:12")]}
+        assert service_backup_warnings(source) == []
+        assert service_backup_warnings({"databases": [{"name": "pg", "image": "postgres:16"}]})
+
+    def test_its_hosts_still_count_as_ours(self) -> None:
+        # Coolify's conflict check does not read the flag: a 409 can name it.
+        source = {"applications": [{"uuid": "sa-web"}, _removed("old-web")]}
+        assert resources.sub_application_uuids(source) == {"sa-web", "sa-old-web"}
+
+
+class TestRemovedPartRefusals:
+    def _refuse(
+        self,
+        source: dict[str, Any],
+        *,
+        storages: list[dict[str, str]] | None = None,
+        migrating: set[str] = frozenset(),  # type: ignore[assignment]
+    ) -> list[str]:
+        return fidelity.removed_part_refusals(
+            source,
+            storages={"persistent_storages": storages or []},
+            migrating=migrating,
+            source_wildcard=SRC_WC,
+        )
+
+    def test_a_custom_host_is_refused_naming_only_the_part(self) -> None:
+        (line,) = self._refuse({"applications": [_removed("docs", url="https://docs.example.com")]})
+        assert "['docs']" in line
+        assert "docs.example.com" not in line
+        assert "plan again" in line
+
+    @pytest.mark.parametrize(
+        "fqdn", [f"https://docs.{SRC_WC}", "http://docs-svc1.10.0.0.1.sslip.io", "", None]
+    )
+    def test_a_bound_generated_or_absent_host_is_simply_not_carried(self, fqdn: object) -> None:
+        assert self._refuse({"applications": [_removed("docs", fqdn=fqdn)]}) == []
+
+    def test_a_migrated_volume_only_a_removed_part_declares_is_refused(self) -> None:
+        source = {"applications": [{"uuid": "sa-web", "name": "web"}], "databases": [_removed("old-pg")]}
+        (line,) = self._refuse(
+            source,
+            storages=[
+                {"name": "svc1_web-data", "resource_uuid": "sa-web"},
+                {"name": "svc1_pg-data", "resource_uuid": "sa-old-pg"},
+            ],
+            migrating={"svc1_web-data", "svc1_pg-data"},
+        )
+        assert "['old-pg']" in line
+        assert "svc1_pg-data" not in line
+
+    def test_a_volume_a_live_part_also_declares_is_mounted_on_the_target(self) -> None:
+        source = {"applications": [{"uuid": "sa-web", "name": "web"}, _removed("old-web")]}
+        assert (
+            self._refuse(
+                source,
+                storages=[
+                    {"name": "svc1_shared", "resource_uuid": "sa-web"},
+                    {"name": "svc1_shared", "resource_uuid": "sa-old-web"},
+                ],
+                migrating={"svc1_shared"},
+            )
+            == []
+        )
+
+    def test_a_volume_that_does_not_migrate_loses_nothing(self) -> None:
+        source = {"databases": [_removed("old-pg")]}
+        storages = [{"name": "svc1_pg-data", "resource_uuid": "sa-old-pg"}]
+        assert self._refuse(source, storages=storages, migrating=set()) == []
+
+    def test_before_4_7_nothing_is_flagged_and_nothing_refused(self) -> None:
+        source = {"applications": [{"uuid": "sa-docs", "name": "docs", "url": "https://docs.example.com"}]}
+        storages = [{"name": "svc1_d", "resource_uuid": "sa-docs"}]
+        assert self._refuse(source, storages=storages, migrating={"svc1_d"}) == []
+
+    async def test_the_plan_refuses_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        plan = await _plan_one_app(
+            monkeypatch,
+            {"applications": [_removed("docs", fqdn="https://docs.example.com")]},
+            version="4.7.0",
+            snapshot={
+                "collection": "services",
+                "kind": ResourceKind.SERVICE_COMPOSE,
+                "docker_compose_raw": SOURCE_COMPOSE,
+            },
+        )
+        assert plan.is_blocked
+        assert any("['docs']" in r and "removed" in r for r in plan.resources[0].refusals)

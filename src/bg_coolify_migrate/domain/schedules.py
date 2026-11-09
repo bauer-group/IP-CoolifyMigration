@@ -38,7 +38,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from bg_coolify_migrate.domain.coolify_versions import carries, supports
-from bg_coolify_migrate.domain.kinds import DatabaseEngine
+from bg_coolify_migrate.domain.kinds import DatabaseEngine, removed_from_compose
 from bg_coolify_migrate.domain.versions import Version
 
 #: The UI has always capped a task timeout at 60..36000 (Add.php v4.1.2:44), so
@@ -401,7 +401,8 @@ def service_backup_warnings(service: dict[str, Any]) -> list[str]:
     capable = sorted(
         str(db.get("name") or "?")
         for db in service.get("databases") or []
-        if isinstance(db, dict) and _service_database_backs_up(db)
+        # A part removed from the compose (4.7.0+) has no target counterpart.
+        if isinstance(db, dict) and _service_database_backs_up(db) and not removed_from_compose(db)
     )
     if not capable:
         return []
