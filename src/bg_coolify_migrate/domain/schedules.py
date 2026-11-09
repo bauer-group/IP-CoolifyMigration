@@ -50,6 +50,16 @@ def _name(task: dict[str, Any]) -> str:
     return str(task.get("name") or "?")
 
 
+def armed_task_names(tasks: list[dict[str, Any]]) -> list[str]:
+    """The tasks Coolify would run: every one not explicitly ``enabled: false``. PURE.
+
+    An ABSENT ``enabled`` is stored as TRUE (ScheduledTasksController
+    v4.5.0:126-127), so only an explicit False counts as off. Names only — a
+    task's command never leaves api/schedules.
+    """
+    return sorted(_name(t) for t in tasks if isinstance(t, dict) and t.get("enabled") is not False)
+
+
 def server_timezone(server: dict[str, Any] | None) -> str | None:
     """The clock a server's schedules fire on, or ``None`` when the GET does not say.
 

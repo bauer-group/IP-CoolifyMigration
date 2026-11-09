@@ -46,6 +46,7 @@ from bg_coolify_migrate.domain.naming import (
     pair_by_name_suffix,
 )
 from bg_coolify_migrate.domain.plan import HostBaseline, ResourcePlan, ResourceSnapshot, ServerRef
+from bg_coolify_migrate.domain.schedules import armed_task_names
 from bg_coolify_migrate.domain.statemachine import STOP_REQUESTED, FinalizePolicy, State
 from bg_coolify_migrate.domain.versions import parse_version
 from bg_coolify_migrate.engine import compensations, env_recovery, keys
@@ -538,6 +539,32 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                     ctx.api, snapshot, target_uuid, version=version
                 )
             ):
+                # Before 4.7.0 such a part keeps the started target from ever
+                # reading 'running', and the scheduler then skips every task of
+                # it with no error anywhere (the notice after this loop says
+                # why). A cron that silently stops after cutover is exactly what
+                # schedules are FATAL for (api/schedules.py): refuse now, while
+                # the source still serves, instead of carrying tasks that never
+                # run. Without an armed task the notice is enough.
+                armed = armed_task_names(
+                    await ctx.api.get_scheduled_tasks(snapshot.collection, snapshot.uuid)
+                )
+                if armed:
+                    raise TransferError(
+                        f"{snapshot.name}: its target keeps template part(s) {left} the "
+                        f"source's compose does not declare, and the source has scheduled "
+                        f"task(s) {armed} that Coolify would then never run",
+                        hint=(
+                            "Coolify before 4.7.0 cannot remove a template part: it counts "
+                            "it as exited, the started target reads degraded, and the "
+                            "scheduler skips every task of a resource that is not "
+                            "'running' (ScheduledJobManager v4.6.0:677-678). Upgrade "
+                            "Coolify to 4.7.0 or newer, which flags such parts and ignores "
+                            "them, or update the source service to its current template "
+                            "so both declare the same parts, then plan again. The source "
+                            "was never stopped; the created target will be deleted."
+                        ),
+                    )
                 leftovers[snapshot.name] = left
 
             # A service's domains ride its sub-applications: carried by one PATCH

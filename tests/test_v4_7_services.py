@@ -32,10 +32,10 @@ from bg_coolify_migrate.domain.compose import MountClass
 from bg_coolify_migrate.domain.kinds import ResourceKind, removed_from_compose
 from bg_coolify_migrate.domain.manifest import Decision, VolumeItem, VolumeManifest
 from bg_coolify_migrate.domain.plan import MigrationPlan, ResourcePlan, ResourceSnapshot, Strategy
-from bg_coolify_migrate.domain.schedules import service_backup_warnings
+from bg_coolify_migrate.domain.schedules import armed_task_names, service_backup_warnings
 from bg_coolify_migrate.engine import steps
 from bg_coolify_migrate.engine.context import MigrationContext
-from bg_coolify_migrate.errors import CoolifyApiError, UnsupportedResource
+from bg_coolify_migrate.errors import CoolifyApiError, TransferError, UnsupportedResource
 from bg_coolify_migrate.journal.store import Journal
 from bg_coolify_migrate.settings.base import Settings
 from tests.test_engine_planner import _plan_one_app
@@ -129,6 +129,7 @@ def _mock_create(
     target_get: dict[str, Any] | None = None,
     source_envs: list[dict[str, Any]] | None = None,
     target_envs: list[dict[str, Any]] | None = None,
+    source_tasks: list[dict[str, Any]] | None = None,
 ) -> list[tuple[str, str, Any]]:
     """CREATE for the wiki plan. Returns every request as (method, path, body)."""
     seen: list[tuple[str, str, Any]] = []
@@ -186,7 +187,7 @@ def _mock_create(
     )
     respx_mock.get(f"{BASE}/services/svc1/tags").mock(return_value=httpx.Response(200, json=[]))
     respx_mock.get(f"{BASE}/services/svc1/scheduled-tasks").mock(
-        return_value=httpx.Response(200, json=[])
+        return_value=httpx.Response(200, json=source_tasks or [])
     )
     respx_mock.get(f"{BASE}/services/svc1/storages").mock(
         return_value=httpx.Response(
@@ -497,6 +498,72 @@ class TestLeftoverPartsNotice:
         _mock_create(respx_mock)
         await steps.step_create_target(ctx)
         assert ctx.notices == []
+
+    async def test_an_armed_task_refuses_before_the_stop(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        # Before 4.7.0 the leftover part keeps the target from reading 'running',
+        # so Coolify would skip the carried cron forever, with no error anywhere.
+        _mock_create(
+            respx_mock,
+            target_get={
+                **TARGET_PARTS,
+                "applications": [*TARGET_PARTS["applications"], {"name": "albums"}],
+            },
+            source_tasks=[{"uuid": "t1", "name": "nightly", "command": "secret-cmd"}],
+        )
+        undo = respx_mock.delete(url__startswith=f"{BASE}/services/tgt1").mock(
+            return_value=httpx.Response(200, json={})
+        )
+
+        with pytest.raises(TransferError, match=r"\['albums'\].*\['nightly'\]") as exc_info:
+            await steps.step_create_target(ctx)
+
+        hint = exc_info.value.hint or ""
+        assert "4.7.0" in hint and "never stopped" in hint
+        assert "secret-cmd" not in str(exc_info.value) + hint
+        assert [c.request.url.path for c in undo.calls] == ["/api/v1/services/tgt1"]
+
+    async def test_only_disabled_tasks_get_the_notice(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        _mock_create(
+            respx_mock,
+            target_get={
+                **TARGET_PARTS,
+                "applications": [*TARGET_PARTS["applications"], {"name": "albums"}],
+            },
+            source_tasks=[
+                {"uuid": "t1", "name": "nightly", "command": "x", "frequency": "@daily", "enabled": False}
+            ],
+        )
+        respx_mock.post(f"{BASE}/services/tgt1/scheduled-tasks").mock(
+            return_value=httpx.Response(201, json={"uuid": "t-new"})
+        )
+        respx_mock.get(f"{BASE}/services/tgt1/scheduled-tasks").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "t-new", "name": "nightly"}])
+        )
+
+        await steps.step_create_target(ctx)
+
+        (notice,) = ctx.notices
+        assert "['albums']" in notice
+
+
+class TestArmedTaskNames:
+    def test_only_an_explicit_false_is_off(self) -> None:
+        # An absent `enabled` is stored as TRUE upstream (v4.5.0:126-127).
+        tasks: list[dict[str, Any]] = [
+            {"name": "b", "enabled": True},
+            {"name": "a"},
+            {"name": "off", "enabled": False},
+            {"enabled": None},
+        ]
+        assert armed_task_names(tasks) == ["?", "a", "b"]
+
+    def test_none_armed(self) -> None:
+        assert armed_task_names([]) == []
+        assert armed_task_names([{"name": "x", "enabled": False}]) == []
 
 
 #: The planner harness's snapshot shape for a template service.
