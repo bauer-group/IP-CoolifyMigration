@@ -308,10 +308,22 @@ async def create_service(
     """Create a service, from a template or from raw compose. Returns the new uuid.
 
     ``type`` and ``docker_compose_raw`` are mutually exclusive upstream: sending
-    both is a 422.
+    both is a 422. A template service is still created from ``type`` — that is
+    what keeps its ``service_type``, and with it the template's identity — and
+    then given the source's compose (:func:`carry_source_compose`), so both kinds
+    need that compose before anything is created.
     """
     is_custom = snapshot.kind is ResourceKind.SERVICE_COMPOSE
     endpoint = "services/compose" if is_custom else "services/template"
+
+    if not snapshot.docker_compose_raw:
+        raise UnsupportedResource(
+            f"service {snapshot.name!r} has no compose to copy",
+            hint=(
+                "This usually means the API token lacks read:sensitive, which makes "
+                "Coolify omit docker_compose_raw with no error."
+            ),
+        )
 
     body = filter_for({**source, **placement.as_body()}, endpoint, version)
     body["name"] = snapshot.name
@@ -319,14 +331,6 @@ async def create_service(
     _drop_unsendable_description(body, source, version=version)
 
     if is_custom:
-        if not snapshot.docker_compose_raw:
-            raise UnsupportedResource(
-                f"service {snapshot.name!r} has no compose to copy",
-                hint=(
-                    "This usually means the API token lacks read:sensitive, which makes "
-                    "Coolify omit docker_compose_raw with no error."
-                ),
-            )
         body.pop("type", None)
         body["docker_compose_raw"] = _encode_compose(snapshot.docker_compose_raw)
     else:
@@ -346,6 +350,109 @@ async def create_service(
     # target no rollback knows about.
     log.info("api.service.created", name=snapshot.name, uuid=uuid, custom_compose=is_custom)
     return str(uuid)
+
+
+async def carry_source_compose(
+    api: CoolifyClient,
+    snapshot: ResourceSnapshot,
+    target_uuid: str,
+    *,
+    version: Version | None = None,
+) -> list[str]:
+    """Give a template service's target the SOURCE's compose. Returns leftover parts.
+
+    The ``type`` create builds the target from the instance's CURRENT catalog,
+    which the CDN refreshes for every instance whatever its release: v4.7.0's sync
+    moved getoutline from postgres:12 to 16 on the same volume key and mount
+    (templates/compose/getoutline.yaml v4.6.0:91 vs v4.7.0:91) and rewired
+    litellm's and ente's secrets. Our pairing and mount checks pass such a target
+    and it fails after the stop — or comes up with other credentials. The
+    source's own compose is what its data belongs to, so the target runs that.
+
+    One ``PATCH /services/{target}`` with only ``docker_compose_raw``, base64
+    like the compose create (``services.update`` takes it on every release),
+    sent once the engine journaled the uuid, before anything reads the target's
+    part names. The update validates and saves it, then re-parses
+    (ServicesController v4.1.2:996-1046, v4.4.0:1263-1313, v4.5.0:1285-1338,
+    v4.6.0:1277-1333, v4.7.0:1287-1343). A part of the same name keeps its row and
+    file contents, and its volume row takes the source's mount path (the
+    LocalPersistentVolume updateOrCreate is keyed by name and part, parsers.php
+    v4.7.0:3139-3150). Without ``urls`` no updateCompose runs (only
+    applyServiceUrls calls it, v4.5.0:214), so 4.5-4.6's dotted-path image write
+    never sees this PATCH. Before 4.4 the update re-dumps the compose
+    (v4.1.2:1014-1015), as the compose create does.
+
+    The env rows the template generated stay through the re-parse. copy_envs
+    overwrites those the source has too; the others would reach every container
+    through the .env, so they are deleted here (:func:`_drop_template_envs`) —
+    before finish_service_target's urls PATCH, whose rows (4.5+) the target's
+    own URLs derive and which therefore stay.
+
+    Idempotent and resume-safe as a whole: a resumed CREATE deletes every target
+    the journal names before it starts over (steps._undo_interrupted_attempt).
+
+    Returns the target's parts the source's compose lacks and Coolify does not
+    flag (fidelity.leftover_template_parts: before 4.7.0 only), logged by name.
+    """
+    raw = snapshot.docker_compose_raw
+    if not raw:
+        # create_service refused this before creating anything.
+        raise UnsupportedResource(f"service {snapshot.name!r} has no compose to copy")
+    body = filter_body(
+        {"docker_compose_raw": _encode_compose(raw)}, fields_for("services.update", version)
+    )
+    await api.update_resource("services", target_uuid, body)
+    left = fidelity.leftover_template_parts(await api.get_resource("services", target_uuid), raw)
+    if left:
+        log.warning(
+            "api.service.template_parts_left",
+            name=snapshot.name,
+            target=target_uuid,
+            parts=left,
+            hint=(
+                "the current template has parts the source's compose does not. They "
+                "run nothing, but Coolify before 4.7.0 counts them in the status: the "
+                "started target reads degraded, and its scheduled tasks are skipped "
+                "while it is not 'running'. Coolify 4.7.0+ flags and ignores them."
+            ),
+        )
+    await _drop_template_envs(api, snapshot, target_uuid)
+    log.info("api.service.compose_carried", name=snapshot.name, target=target_uuid)
+    return left
+
+
+async def _drop_template_envs(
+    api: CoolifyClient, snapshot: ResourceSnapshot, target_uuid: str
+) -> list[str]:
+    """Delete a template target's env rows whose key the source has none of. Returns the keys.
+
+    What decides it is fidelity.leftover_template_envs; this only reads both lists
+    and deletes, logging key names, never a value. A row without a uuid cannot
+    be deleted and would reach every container, so it refuses — inside CREATE,
+    before the stop, and the created target is deleted.
+    """
+    rows = fidelity.leftover_template_envs(
+        await api.get_envs("services", target_uuid),
+        await api.get_envs("services", snapshot.uuid),
+    )
+    if undeletable := [key for key, env_uuid in rows if not env_uuid]:
+        raise UnsupportedResource(
+            f"service {snapshot.name!r}: the target has template variable(s) "
+            f"{undeletable} the source does not, and Coolify gave them no uuid to delete",
+            hint=(
+                "Every variable of a service reaches all its containers, so these "
+                "would change what the target runs. The source was never stopped and "
+                "keeps serving; the created target will be deleted."
+            ),
+        )
+    for _, env_uuid in rows:
+        await api.delete_env("services", target_uuid, env_uuid)
+    keys = [key for key, _ in rows]
+    if keys:
+        log.info(
+            "api.service.template_envs_dropped", name=snapshot.name, target=target_uuid, keys=keys
+        )
+    return keys
 
 
 _GIT_URL_PREFIXES = ("https://", "http://", "git://", "git@")
@@ -1106,11 +1213,13 @@ async def finish_service_target(
             f"service {snapshot.name!r}: the target has no sub-application(s) {sorted(missing)} "
             "to carry the source's domains to",
             hint=(
-                "The target was created from this instance's CURRENT template catalog, "
-                "which names these containers differently, so their domains would be "
-                "served by nothing. The source was never stopped and keeps serving; the "
-                "created target will be deleted. Migrate this service by hand, or "
-                "re-create the source from the current template first."
+                "The target is built from the source's own compose, which does not "
+                "declare these sub-applications: Coolify keeps a part whose name left "
+                "the compose, with its domain (4.7.0+ flags it, older releases do not), "
+                "so on the target that domain would be served by nothing. Clear the "
+                "part's domain or delete the part in Coolify, then plan again. The "
+                "source was never stopped and keeps serving; the created target will "
+                "be deleted."
             ),
         )
 

@@ -364,16 +364,18 @@ class TestServiceGate:
         with pytest.raises(DnsGateBlocked, match=r"docs\.example\.com"):
             await steps.step_dns_gate(ctx)
 
-    async def test_a_template_service_compose_is_not_read(
+    async def test_a_template_service_compose_is_gated_too(
         self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # Its target runs the SOURCE's compose (resources.carry_source_compose),
+        # so a Host() label the operator added to the template is served there.
         ctx.plan = _plan(
             resources=(
                 ResourcePlan(
                     snapshot=_service_snapshot(
                         kind=ResourceKind.SERVICE_TEMPLATE,
                         service_type="minio",
-                        docker_compose_raw=None,
+                        docker_compose_raw="services:\n  minio:\n    image: minio/minio\n",
                     ),
                     strategy=Strategy.COPY_DATA,
                 ),
@@ -384,8 +386,9 @@ class TestServiceGate:
             applications=[],
             compose="labels:\n  - traefik.http.routers.d.rule=Host(`docs.example.com`)\n",
         )
-        result = await steps.step_dns_gate(ctx)
-        assert result["hostnames"] == 0
+        _resolver(monkeypatch, {"docs.example.com": SOURCE_IP})
+        with pytest.raises(DnsGateBlocked, match=r"docs\.example\.com"):
+            await steps.step_dns_gate(ctx)
 
     async def test_a_host_bound_to_the_source_blocks_even_with_accept_dns(
         self, ctx: MigrationContext, respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch

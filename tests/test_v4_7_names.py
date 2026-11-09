@@ -311,6 +311,8 @@ _SHAPES: dict[str, dict[str, Any]] = {
         "collection": "services",
         "kind": ResourceKind.SERVICE_TEMPLATE,
         "service_type": "minio",
+        # PLAN refuses a service whose GET returned no compose.
+        "docker_compose_raw": "services:\n  minio:\n    image: minio/minio\n",
     },
     "databases": {
         "collection": "databases",

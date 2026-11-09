@@ -1104,6 +1104,12 @@ class TestCreateTarget:
                         engine=None,
                         image=None,
                         service_type="budibase",
+                        # The target is given the source's compose (carry_source_compose).
+                        docker_compose_raw=(
+                            "services:\n"
+                            "  minio:\n    image: minio/minio\n    volumes: ['minio-data:/data']\n"
+                            "  redis:\n    image: redis\n    volumes: ['redis-data:/data']\n"
+                        ),
                     ),
                     strategy=Strategy.COPY_DATA,
                     manifest=VolumeManifest(items=(item("svc1_minio-data"), item("svc1_redis-data"))),
@@ -1132,12 +1138,16 @@ class TestCreateTarget:
             return_value=httpx.Response(200, json={"uuid": "svc1", "name": "budibase"})
         )
         respx_mock.post(f"{BASE}/services").mock(return_value=httpx.Response(201, json={"uuid": "tgt1"}))
+        # A template target is given the source's compose: one PATCH.
+        respx_mock.patch(f"{BASE}/services/tgt1").mock(return_value=httpx.Response(200, json={}))
         # finish_service_target reads the target's sub-applications; the source
-        # above has no domains, so nothing is PATCHed.
+        # above has no domains, so it PATCHes nothing more.
         respx_mock.get(f"{BASE}/services/tgt1").mock(
             return_value=httpx.Response(200, json={"uuid": "tgt1", "applications": []})
         )
         respx_mock.get(f"{BASE}/services/svc1/envs").mock(return_value=httpx.Response(200, json=[]))
+        # ...and loses the env rows only the template has: none here.
+        respx_mock.get(f"{BASE}/services/tgt1/envs").mock(return_value=httpx.Response(200, json=[]))
         respx_mock.get(f"{BASE}/services/svc1/tags").mock(return_value=httpx.Response(200, json=[]))
         respx_mock.get(f"{BASE}/services/svc1/scheduled-tasks").mock(
             return_value=httpx.Response(200, json=[])
@@ -1207,7 +1217,7 @@ class TestCreateTarget:
             await steps.step_create_target(ctx)
         hint = exc_info.value.hint or ""
         assert "never stopped" in hint
-        assert "template catalog" in hint
+        assert "source's stored compose" in hint
         assert delete.called, "the half-made target must not be stranded"
 
     async def test_a_template_that_moved_a_mount_refuses_before_the_stop(

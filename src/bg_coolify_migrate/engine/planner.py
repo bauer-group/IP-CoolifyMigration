@@ -714,7 +714,10 @@ def resource_images(snapshot: ResourceSnapshot) -> tuple[str, ...]:
     """Every image reference this resource will pull. PURE.
 
     We build the target with the SAME references, so these are exactly what the
-    target will resolve — possibly to a different image than the source runs.
+    target will resolve — possibly to a different image than the source runs. A
+    service's are its own compose's, template services included: their target is
+    given the source's compose right after the create
+    (resources.carry_source_compose), not the catalog's current one.
     """
     images: list[str] = []
     if snapshot.image:
@@ -885,8 +888,11 @@ async def build_plan(
             ResourceKind.SERVICE_TEMPLATE,
             ResourceKind.SERVICE_COMPOSE,
         )
-        if snapshot.kind is ResourceKind.SERVICE_COMPOSE:
+        if snapshot.kind in (ResourceKind.SERVICE_TEMPLATE, ResourceKind.SERVICE_COMPOSE):
+            # Both service kinds' targets run the source's compose — a template's
+            # given it by PATCH, which re-dumps it before 4.4 like the create.
             warnings.extend(fidelity.compose_redump_warning(version=coolify_version))
+            refusals.extend(fidelity.service_compose_refusals(snapshot.docker_compose_raw))
         if compose_backed:
             refusals.extend(
                 fidelity.compose_refusals(snapshot.docker_compose_raw, version=coolify_version)

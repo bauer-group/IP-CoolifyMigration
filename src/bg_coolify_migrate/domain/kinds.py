@@ -64,7 +64,7 @@ class ResourceKind(StrEnum):
     """One of the eight standalone engines. Never builds."""
 
     SERVICE_TEMPLATE = "service_template"
-    """One-click service from the live template catalogue."""
+    """One-click service: created from its template, then given the source's compose."""
 
     SERVICE_COMPOSE = "service_compose"
     """Service from raw ``docker_compose_raw``."""
@@ -258,3 +258,21 @@ def label_id_key(kind: ResourceKind) -> str:
     if kind in (ResourceKind.SERVICE_TEMPLATE, ResourceKind.SERVICE_COMPOSE):
         return "coolify.serviceId"
     return "coolify.applicationId"
+
+
+def removed_from_compose(part: object) -> bool:
+    """Whether a service part — a GET's ``applications[]``/``databases[]`` entry — left its compose.
+
+    serviceParser never deletes a part whose name left the compose: the row keeps
+    its ``fqdn`` and storages on every release. From 4.7.0 it FLAGS it
+    (markServicePartsRemovedFromCompose, parsers.php v4.7.0:2425-2438, called at
+    :2568; the column from migration 2026_11_03_192547, cast and not hidden,
+    ServiceApplication.php v4.7.0:72, ServiceDatabase.php :38), and only the
+    service status skips it (Service.php v4.7.0:331-334). Read by KEY PRESENCE,
+    never by version: before 4.7.0 the key is absent and such a part looks live,
+    exactly as it did. Flagged, it has no container after the next start
+    (StartService v4.7.0:78,87, compose up --remove-orphans), yet Coolify's
+    domain-conflict and managed-DNS holder checks still count its hosts. So it
+    stays in every holder set; only what the TARGET is built from leaves it out.
+    """
+    return isinstance(part, dict) and part.get("is_removed_from_compose") is True

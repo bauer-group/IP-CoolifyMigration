@@ -160,9 +160,11 @@ def scheduled_task_warnings(
 def task_container_mismatches(tasks: list[dict[str, Any]], available: set[str]) -> list[str]:
     """Tasks whose ``container`` names nothing the TARGET runs. PURE.
 
-    A service target is created from the instance's CURRENT template catalog and a
-    dockercompose app from git HEAD — not from the source's compose — so a renamed
-    compose service leaves the task pointing at nothing. Empty when at most one
+    A dockercompose app's target is created from git HEAD — not from the source's
+    compose — so a renamed compose service leaves the task pointing at nothing. A
+    service target runs the source's compose (a template one since
+    resources.carry_source_compose), so there only a task naming a part that left
+    the compose can miss. Empty when at most one
     container exists: ScheduledTaskJob then ignores the field (v4.5.0:190,
     v4.1.2:149).
     """

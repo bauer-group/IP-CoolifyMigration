@@ -449,6 +449,9 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
     source_wildcard = placement.source_wildcard
     # The release the plan was made for: every body below is built for it.
     version = ctx.coolify_version
+    # Template parts a target keeps that its source's compose lacks, by service
+    # name (fidelity.leftover_template_parts); told once CREATE has succeeded.
+    leftovers: dict[str, list[str]] = {}
     try:
         sources = {
             r.snapshot.uuid: await ctx.api.get_resource(r.snapshot.collection, r.snapshot.uuid)
@@ -524,6 +527,19 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                     target_log_drain=ctx.plan.target_server.log_drain_enabled,
                 )
 
+            # A template service was created from the instance's CURRENT catalog,
+            # which the CDN changes under every release (v4.7.0's moved getoutline
+            # to postgres 16 on the same volume key). Its target runs the SOURCE's
+            # compose instead: one PATCH, now the uuid is journaled, and before
+            # anything below reads its part names, env rows or volumes. The env
+            # rows only the template generated are deleted with it.
+            if snapshot.kind is ResourceKind.SERVICE_TEMPLATE and (
+                left := await api_resources.carry_source_compose(
+                    ctx.api, snapshot, target_uuid, version=version
+                )
+            ):
+                leftovers[snapshot.name] = left
+
             # A service's domains ride its sub-applications: carried by one PATCH
             # now the uuid is journaled, and before copy_envs (4.5 derives the
             # target's SERVICE_URL_* rows from them in that PATCH).
@@ -572,12 +588,12 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
             if snapshot.kind is ResourceKind.APP_GIT_COMPOSE:
                 await _assert_compose_target_ready(ctx, resource, target_uuid=target_uuid)
             elif snapshot.kind in (ResourceKind.SERVICE_TEMPLATE, ResourceKind.SERVICE_COMPOSE):
-                # A service is created from the INSTANCE's template catalog, not the
-                # source's compose, and v4.3.10 -> v4.5.0 changed 95 templates (some
-                # moved or dropped volume mounts). Its storage rows exist as soon as
-                # POST /services returns (`parse(isNew: true)`, synchronous), so the
-                # pairing DISCOVER will need can be rehearsed now — while the source
-                # still serves — instead of refusing after the stop.
+                # A service target runs the source's compose (a template one since
+                # carry_source_compose), and its storage rows exist as soon as the
+                # POST or PATCH returns (both parse synchronously). So the pairing
+                # DISCOVER will need is rehearsed now — while the source still
+                # serves — instead of refusing after the stop; for a template it is
+                # also the read-back proof that the compose took.
                 await _pair_volumes(
                     ctx,
                     snapshot,
@@ -633,6 +649,22 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
             raise _undo_incomplete(ctx, problems, cause=exc) from exc
         raise
 
+    # Before 4.7.0 nothing flags such a part: the status job marks it exited
+    # (GetContainersStatus v4.6.0:357-397), the started service reads degraded
+    # (ContainerStatusAggregator v4.6.0:269-271), and the scheduler skips every
+    # task of a resource that is not 'running' (ScheduledJobManager
+    # v4.6.0:677-678) — the carried ones too, with no error anywhere. No API
+    # removes a part, and excluding it from the status by PATCH runs
+    # updateCompose (UpdateServiceApplicationFromApi v4.6.0:92-93, :139), which
+    # writes the part's image back into the compose and so brings the part back.
+    for name, parts in leftovers.items():
+        ctx.notices.append(
+            f"{name}: its target keeps template part(s) {parts} that the source's compose "
+            "does not declare. Coolify before 4.7.0 counts them as exited, so the started "
+            "target reads degraded and Coolify skips its scheduled tasks while it does; "
+            "4.7.0+ flags and ignores them from the next start. Check the target's status "
+            "and scheduled tasks in Coolify."
+        )
     return {"target_uuids": created}
 
 
@@ -1583,9 +1615,11 @@ async def _pair_volumes(
                 "Target declares: "
                 f"{sorted(f'{e.name} @ {e.mount_path}' for e in target_eps) or 'nothing'}\n"
                 "A mismatch usually means the target was created from a different "
-                "compose than the source runs — the branch HEAD moved, or (services) "
-                "the instance's template catalog changed since the source was "
-                f"created. {consequence}"
+                "compose than the source runs — the branch HEAD moved, or (services, "
+                "built from the source's stored compose) the source still runs or "
+                "keeps a volume that compose no longer declares: it was edited and not "
+                "redeployed since, or a part left it together with its volume (Coolify "
+                f"keeps both). {consequence}"
             ),
         ) from exc
     if is_service:
@@ -1612,15 +1646,20 @@ async def _assert_template_kept_its_mounts(
     target_uuid: str,
     consequence: str,
 ) -> None:
-    """Refuse a service whose template moved a volume's mount path.
+    """Refuse a service whose target mounts a volume somewhere the source does not.
 
     Key pairing answers WHICH volume is which; it never asks WHERE the target
-    mounts it. A template service's target is built from the instance's current
+    mounts it. A template service's target starts out as the instance's current
     catalog, and between v4.1.2 and v4.5.0 several templates kept a volume key and
     moved its mount — opnform's `postgresql-data` went from /var/lib/postgresql/data
     (postgres 16) to /var/lib/postgresql (postgres 18). Paired by key alone, the
     bytes are copied, VERIFY compares two identical volumes and passes, and the
-    target's database starts empty beside them.
+    target's database starts empty beside them. Since the target is given the
+    source's compose (resources.carry_source_compose) the re-parse moves every
+    part's row back to the source's path; what can still differ is a template
+    part the source's compose does not have, which keeps its row under the same
+    ``{uuid}_{key}`` name. So this check stays: it is also the read-back proof
+    that the compose took.
 
     Every path the TARGET declares for a key must be one the source declares
     (Coolify's own parse of its compose) or mounts live. Declarations alone
@@ -1655,14 +1694,14 @@ async def _assert_template_kept_its_mounts(
             f"{snapshot.name}: the target mounts volume(s) {sorted(moved)} at a different "
             "path than the source",
             hint=(
-                "A service is recreated from the instance's CURRENT template catalog, and "
-                "that template has moved where these volumes are mounted since the source "
-                "was created — usually together with a new image (a major database "
-                "upgrade). Copying the bytes across would pass verification and still "
-                "start the target on an empty data directory.\n"
+                "A template service's target is created from the instance's CURRENT "
+                "template catalog and then given the source's compose. A path the "
+                "target still declares for one of these volumes comes from a template "
+                "part the source's compose does not have, or the compose did not take. "
+                "Copying the bytes across could pass verification and still start the "
+                "target on an empty data directory.\n"
                 + "\n".join(f"  {k}: source {s} -> target {t}" for k, (s, t) in moved.items())
-                + "\nUpgrade the source to the current template first, or migrate this "
-                f"service by hand. {consequence}"
+                + f"\nMigrate this service by hand. {consequence}"
             ),
         )
 
@@ -2088,17 +2127,16 @@ async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
         envs = await ctx.api.get_envs(resource.snapshot.collection, target_uuid)
         if resource.snapshot.collection == "services":
             # What its proxy is configured from: sub-application domains, the
-            # route keys of a minio/logto/garage image, a custom compose's own
-            # Host() labels — not the derived SERVICE_* rows (dns/extract.py).
+            # route keys of a minio/logto/garage image, the compose's own Host()
+            # labels — not the derived SERVICE_* rows (dns/extract.py). A
+            # template's compose too: its target runs the source's, edits and
+            # all (resources.carry_source_compose), not the catalog's.
             compose = full.get("docker_compose_raw")
             hostnames.extend(
                 dns_extract.collect_service(
                     applications=full.get("applications"),
                     envs=envs,
-                    compose=compose
-                    if resource.snapshot.kind is ResourceKind.SERVICE_COMPOSE
-                    and isinstance(compose, str)
-                    else None,
+                    compose=compose if isinstance(compose, str) else None,
                 )
             )
             continue

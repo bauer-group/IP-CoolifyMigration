@@ -433,7 +433,7 @@ class TestFinishServiceTarget:
         )
         with pytest.raises(UnsupportedResource, match=r"\['web'\]") as exc_info:
             await self._finish(api, _source(connect_to_docker_network=True))
-        assert "template catalog" in (exc_info.value.hint or "")
+        assert "source's own compose" in (exc_info.value.hint or "")
         assert "never stopped" in (exc_info.value.hint or "")
         assert not patch.called
 

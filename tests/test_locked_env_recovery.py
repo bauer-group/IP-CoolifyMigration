@@ -363,6 +363,8 @@ _SERVICE = {
     "name": "store",
     "collection": "services",
     "kind": ResourceKind.SERVICE_COMPOSE,
+    # A service without its compose is refused at plan time: the target is built from it.
+    "docker_compose_raw": "services:\n  store:\n    image: postgres:16\n",
 }
 _REDIS = {
     "uuid": "db1",

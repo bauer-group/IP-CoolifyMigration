@@ -43,7 +43,7 @@ from bg_coolify_migrate.domain.coolify_versions import (
     supports,
 )
 from bg_coolify_migrate.domain.domains import compose_domains, custom_hosts
-from bg_coolify_migrate.domain.kinds import DatabaseEngine
+from bg_coolify_migrate.domain.kinds import DatabaseEngine, removed_from_compose
 from bg_coolify_migrate.domain.locked_envs import is_locked
 from bg_coolify_migrate.domain.versions import Version
 
@@ -1394,6 +1394,85 @@ def service_refusals(source: dict[str, Any], *, version: Version | None) -> list
                 "sub-application its own URL on the source, then migrate."
             )
     return out
+
+
+def service_compose_refusals(raw: str | None) -> list[str]:
+    """A service whose compose the GET did not return. PURE.
+
+    Both service kinds' targets run the source's own compose: a compose service is
+    created from it, a template one is created from its template and then given
+    it (resources.carry_source_compose). Without it there is nothing to build the
+    target from — refused here rather than after a target was made.
+    """
+    if raw:
+        return []
+    return [
+        "Coolify returned no docker_compose_raw for this service, and its target is "
+        "built from exactly that. This usually means the API token lacks "
+        "read:sensitive (Coolify then omits it with no error); re-check the token, "
+        "then plan again."
+    ]
+
+
+def leftover_template_parts(target: Mapping[str, Any], compose_raw: str) -> list[str]:
+    """Parts of a template target that the source's compose lacks and nothing flags. PURE.
+
+    The target is created from the instance's CURRENT template, then given the
+    source's compose (resources.carry_source_compose). The re-parse keeps every
+    part it does not name; from 4.7.0 it flags them (kinds.removed_from_compose)
+    and the service status ignores them. Before 4.7.0 they stay unflagged, get no
+    container, and the status job marks them exited (GetContainersStatus
+    v4.6.0:357-397), so the started target reads degraded (ContainerStatusAggregator
+    v4.6.0:269-271) and the scheduler skips its scheduled tasks
+    (ScheduledJobManager v4.6.0:677-678). Empty when the compose does not parse:
+    the PATCH accepted it, so the re-parse did, and a guess here would be noise.
+    """
+    try:
+        declared = set(compose_mod.services(compose_mod.parse(compose_raw)))
+    except compose_mod.ComposeError:
+        return []
+    return sorted(
+        str(part["name"])
+        for key in ("applications", "databases")
+        for part in target.get(key) or []
+        if isinstance(part, dict)
+        and part.get("name")
+        and str(part["name"]) not in declared
+        and not removed_from_compose(part)
+    )
+
+
+def leftover_template_envs(
+    target_envs: list[dict[str, Any]], source_envs: list[dict[str, Any]]
+) -> list[tuple[str, str]]:
+    """``(key, uuid)`` of a template target's env rows whose key the source has no row for. PURE.
+
+    The ``type`` create parses the instance's CURRENT template and writes a row
+    for every variable it declares. Nothing removes one later: the re-parse of
+    the source's compose deletes only keys starting with ``$`` or ending with
+    ``}`` (serviceParser, parsers.php v4.1.2:1533-1536, v4.7.0:2466-2475), and
+    the bulk upsert copy_envs sends is an updateOrCreate per key
+    (create_bulk_envs, ServicesController v4.7.0:1730). Yet saveComposeConfigs
+    writes EVERY row into the service's .env (Service.php v4.1.2:1582-1593,
+    v4.6.0:1673-1691, v4.7.0:1676-1694), and the parser gives every compose
+    service ``env_file: .env`` (parsers.php v4.1.2:2696-2702, v4.6.0:3611-3617,
+    v4.7.0:3664-3670). So a row only the template has reaches every container:
+    v4.7.0's litellm added ``LITELLM_SALT_KEY=${SERVICE_PASSWORD_SALTKEY}``
+    (templates/compose/litellm.yaml v4.7.0:21, absent at v4.6.0), and a source
+    that never had one would get a fresh salt key, under which the credentials
+    it stored encrypted no longer decrypt.
+
+    The target now parses the source's compose, and the source has a row for
+    everything that compose generates, so a key the source lacks is a template
+    leftover. Compared by key, like the upsert. A source row copy_envs leaves to
+    the target (a URL row naming the source) still names its key, and stays.
+    """
+    keys = {str(row.get("key")) for row in source_envs if row.get("key")}
+    return sorted(
+        (str(row["key"]), str(row.get("uuid") or ""))
+        for row in target_envs
+        if row.get("key") and str(row["key"]) not in keys
+    )
 
 
 def _service_url_parts(source: dict[str, Any]) -> list[tuple[str, str]]:

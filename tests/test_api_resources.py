@@ -480,8 +480,12 @@ class TestCreateService:
         route = respx_mock.post(f"{BASE}/services").mock(
             return_value=httpx.Response(201, json={"uuid": "s2"})
         )
+        # The source's compose is carried by the PATCH after the create
+        # (carry_source_compose), never in it: `type` and compose 422 together.
         snapshot = self._snapshot(
-            kind=ResourceKind.SERVICE_TEMPLATE, service_type="minio", docker_compose_raw=None
+            kind=ResourceKind.SERVICE_TEMPLATE,
+            service_type="minio",
+            docker_compose_raw="services:\n  minio:\n    image: minio/minio\n",
         )
         await create_resource(api, snapshot, _placement(), {})
         body = route.calls[0].request.read().decode()

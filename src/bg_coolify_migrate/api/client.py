@@ -500,6 +500,25 @@ class CoolifyClient:
         """
         return await self.patch(f"/{collection}/{uuid}/envs/bulk", {"data": entries})
 
+    async def delete_env(self, collection: str, uuid: str, env_uuid: str) -> bool:
+        """Delete one environment variable by its uuid. False when it was already gone.
+
+        The route exists on every release (routes/api.php v4.1.2:189,
+        v4.7.0:441) and force-deletes the row (ServicesController
+        v4.7.0:1952-1963); from 4.6.0 it needs the ``delete`` ability (v4.6.0:427)
+        that a rollback's DELETE needs anyway. A DELETE is retried after a
+        timeout or a 502/504, and the retry of one that did commit answers 404
+        "Environment variable not found." — the outcome asked for, not an error.
+        Any other 404 (the resource itself) still raises.
+        """
+        try:
+            await self.delete(f"/{collection}/{uuid}/envs/{env_uuid}")
+            return True
+        except CoolifyApiError as exc:
+            if exc.status_code == 404 and "environment variable not found" in str(exc.body).lower():
+                return False
+            raise
+
     async def create_storage(self, collection: str, uuid: str, body: dict[str, Any]) -> Any:
         return await self.post(f"/{collection}/{uuid}/storages", body)
 

@@ -177,7 +177,7 @@ async def _warn_unmatched_containers(
     """Say so when a task's ``container`` names nothing the target runs.
 
     A warning, not a refusal, like copy_tags: the source cannot be edited to a
-    name that exists only in the new template, so the operator fixes the task on
+    name that exists only at the new git HEAD, so the operator fixes the task on
     the target. Never raises — a failed check costs the check, not the cutover.
     """
     if not any(b.get("container") for b in bodies):
