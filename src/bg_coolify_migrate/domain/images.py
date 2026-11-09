@@ -207,6 +207,51 @@ def mount_path_is_guessable(image: str) -> bool:
     return bool(_COOLIFY_PG_VERSION_RE.search(image))
 
 
+#: DockerRegistryLogins::DOCKER_HUB (v4.4.0:16, v4.7.0:18): how a login and an
+#: image without a registry name Docker Hub.
+DOCKER_HUB = "docker.io"
+#: The config keys Docker Hub logins are stored under, folded into DOCKER_HUB by
+#: DockerRegistryLogins::normalizeRegistry (v4.4.0:186, v4.7.0:265).
+_DOCKER_HUB_ALIASES = frozenset(
+    {"index.docker.io", "registry-1.docker.io", "registry.hub.docker.com", DOCKER_HUB}
+)
+_URL_SCHEME = re.compile(r"^[a-z][a-z0-9+.-]*://")
+
+
+def normalise_registry(key: str) -> str:
+    """A registry login's host, compared the way Coolify compares it. PURE.
+
+    Mirrors DockerRegistryLogins::normalizeRegistry (v4.4.0:180-189 =
+    v4.7.0:259-268): lowercased, scheme and path dropped, Docker Hub's aliases
+    folded into ``docker.io`` (``https://index.docker.io/v1/`` is the key ``docker
+    login`` writes for it).
+    """
+    host = _URL_SCHEME.sub("", key.strip().lower()).split("/", 1)[0]
+    return DOCKER_HUB if host in _DOCKER_HUB_ALIASES else host
+
+
+def registry_of(reference: str) -> str:
+    """The registry an image is pulled from, as a login names it. PURE.
+
+    DockerRegistryLogins::registryFromImage (v4.4.0:195-208, v4.7.0:274-287) applies
+    the same rule as :func:`parse`: the first path part is a registry only with a
+    dot, a port or as ``localhost``. Anything else is Docker Hub.
+    """
+    registry = parse(reference).registry
+    return normalise_registry(registry) if registry else DOCKER_HUB
+
+
+def is_docker_official(reference: str) -> bool:
+    """A Docker Official Image (``postgres:16``, ``docker.io/library/redis``). PURE.
+
+    Public on Docker Hub by definition, so its pull never needs a login.
+    """
+    ref = parse(reference)
+    if ref.registry and normalise_registry(ref.registry) != DOCKER_HUB:
+        return False
+    return "/" not in ref.name or ref.name.startswith("library/")
+
+
 def same_image(a: str | None, b: str | None) -> bool:
     """Whether two references name the same image AND tag. PURE."""
     if not a or not b:

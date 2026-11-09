@@ -387,9 +387,20 @@ Stated plainly rather than papered over.
   never guess.
 - **Compose comments and formatting are destroyed** on the service path: Coolify
   round-trips `docker_compose_raw` through `Yaml::dump(Yaml::parse(...))`.
-- **Registry credentials have no API surface.** They live in
-  `~/.docker/config.json` on each server and must be provisioned out of band.
-  Preflight checks that the image resolves before anything is stopped.
+- **Registry logins are per server, and never copied.** They live in the SSH
+  user's `~/.docker/config.json` on each server, and no API carries them to
+  another server. An application's deploy pulls and pushes in a helper container
+  that mounts that one file, so on a non-root server a login made with
+  `sudo docker login` (root's) does not count for it. Services and databases pull
+  on the host, and read that file too from Coolify 4.5.1 (before, they ran under
+  sudo with root's). Nothing pulls an image before the stop: the target's first
+  pull is START. So log the target in to every private registry first, as its
+  SSH user (Servers > Registries in Coolify, or `docker login` without sudo).
+  From Coolify 4.4 the plan compares what `GET /servers/{uuid}/registries` lists
+  for both servers and warns about each image whose registry the source is
+  logged in to and the target is not, and up to 4.5 about the image name a build
+  pushes to (CREATE carries it there, and a failed push fails the deploy). Only a
+  warning: a public image needs no login at all.
 - **Anonymous volumes are refused.** Docker names them with a random 64-hex id
   that cannot be reproduced on the target, and there is no stable key to pair
   them by. Refusing beats silently starting with an empty volume.

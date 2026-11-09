@@ -398,6 +398,36 @@ class CoolifyClient:
         result = await self._get_optional(f"/servers/{uuid}/destinations")
         return None if result is None else _as_list(result)
 
+    async def get_server_registries(self, uuid: str) -> tuple[frozenset[str], str | None] | None:
+        """``(registries the server is logged in to, Coolify's error)``. ``None``: no route.
+
+        ``GET /servers/{uuid}/registries`` (4.4.0+, read:sensitive, a team admin)
+        reads the SSH user's ``~/.docker/config.json`` on the server, the logins
+        every deploy and pull there uses (ServerDockerRegistriesController
+        v4.4.0:94-124 = v4.7.0:94-124). Each row is ``{registry, logged_in, source,
+        username, used_by[]}``, and a registry some resource uses but no login
+        holds comes back with ``logged_in`` false. Only the NAMES of the rows
+        logged in leave this method: ``username``, ``source`` and ``used_by`` are
+        dropped HERE, as :meth:`get_backups` drops ``message``, so none of it can
+        reach a plan, the journal or a log line. ``error`` is set when the server
+        is not functional or its config could not be read (fixed strings at every
+        tag); the names are then empty and prove nothing.
+        """
+        result = await self._get_optional(f"/servers/{uuid}/registries")
+        if result is None:
+            return None
+        body = _as_dict(result)
+        rows = body.get("registries")
+        if not isinstance(rows, list):
+            raise CoolifyApiError(f"GET /servers/{uuid}/registries returned no registries list")
+        names = frozenset(
+            str(row["registry"]).strip().lower()
+            for row in rows
+            if isinstance(row, dict) and row.get("logged_in") is True and row.get("registry")
+        )
+        error = body.get("error")
+        return names, (str(error)[:200] if error else None)
+
     async def get_tag_names(self, collection: str, uuid: str) -> list[str] | None:
         """A resource's tag names. ``None`` when the route does not exist.
 

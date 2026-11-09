@@ -738,6 +738,22 @@ def resource_images(snapshot: ResourceSnapshot) -> tuple[str, ...]:
     return tuple(dict.fromkeys(images))
 
 
+def pulled_images(snapshot: ResourceSnapshot, full: dict[str, Any]) -> tuple[str, ...]:
+    """Every image reference the target's server pulls for this resource. PURE.
+
+    :func:`resource_images`, plus a dockerimage application's image: its GET has
+    no ``image``, the reference is ``docker_registry_image_name``, which CREATE
+    carries for that build pack (api/fields APPLICATION_ROUTE_REQUIRED). A build's
+    base images are inside a Dockerfile no GET returns, so they are not here; what
+    a build PUSHES is domain/fidelity.pushed_image_name.
+    """
+    images = list(resource_images(snapshot))
+    name = full.get("docker_registry_image_name")
+    if snapshot.kind is ResourceKind.APP_DOCKERIMAGE and isinstance(name, str) and name.strip():
+        images.append(name.strip())
+    return tuple(dict.fromkeys(images))
+
+
 async def assess_drift(
     source_host: RemoteHost, snapshot: ResourceSnapshot
 ) -> RebuildDriftReport | None:
@@ -1057,6 +1073,11 @@ async def build_plan(
         api, served, target=target_ref, version=coolify_version
     ):
         notes.append(records)
+    notes.extend(
+        await registry_login_notes(
+            api, served, source=source_ref, target=target_ref, version=coolify_version
+        )
+    )
 
     return MigrationPlan(
         project=project_name,
@@ -1210,6 +1231,58 @@ async def target_records_note(
         log.debug("planner.dns_zones_unavailable", error=str(exc)[:120])
         return None
     return dns_managed.target_records_note(zones, target_wildcard=target.wildcard_domain or None)
+
+
+def _logins(
+    result: tuple[frozenset[str], str | None] | None, *, server: str
+) -> frozenset[str] | None:
+    """A server's registry logins, or ``None`` when Coolify could not tell."""
+    if result is None:
+        return None
+    names, error = result
+    if error is not None:
+        log.debug("planner.registry_logins_unreadable", server=server, error=error[:120])
+        return None
+    return names
+
+
+async def registry_login_notes(
+    api: CoolifyClient,
+    served: list[tuple[ResourceSnapshot, dict[str, Any], list[dict[str, Any]]]],
+    *,
+    source: ServerRef,
+    target: ServerRef,
+    version: Version | None,
+) -> list[str]:
+    """Warn of images whose registry the source server is logged in to and the target is not.
+
+    Reads ``GET /servers/{uuid}/registries`` (4.4.0+; tried on an unknown release,
+    where an older one answers 404) for the source, then the target. Fail-soft: an
+    absent route, a failed read or a server whose config Coolify could not read is
+    no warning, never a refusal (domain/fidelity.registry_login_warnings). Keyed by
+    name, merged: Coolify lets an application and a database share one.
+    """
+    if not supports("server_registry_logins", version):
+        return []
+    images: dict[str, tuple[str, ...]] = {}
+    pushes: dict[str, tuple[str, ...]] = {}
+    for snapshot, full, _ in served:
+        images[snapshot.name] = images.get(snapshot.name, ()) + pulled_images(snapshot, full)
+        if pushed := fidelity.pushed_image_name(full, version=version):
+            pushes[snapshot.name] = (*pushes.get(snapshot.name, ()), pushed)
+    if not any(images.values()) and not pushes:
+        return []
+    try:
+        source_logins = _logins(await api.get_server_registries(source.uuid), server=source.name)
+        if not source_logins:
+            return []
+        target_logins = _logins(await api.get_server_registries(target.uuid), server=target.name)
+    except Exception as exc:  # diagnostics only, never fatal
+        log.debug("planner.registry_logins_unavailable", error=str(exc)[:120])
+        return []
+    return fidelity.registry_login_warnings(
+        images, source_logins, target_logins, target_server=target.name, pushes=pushes
+    )
 
 
 async def dns_baseline(

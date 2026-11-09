@@ -306,6 +306,11 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         # when the token opts in (CloudflareDnsProvider v4.7.0:239, IntegrationToken
         # :136-138).
         "automatic_dns_on_api_create": Gate(since=(4, 7, 0)),
+        # GET /servers/{uuid}/registries lists the registries a server's Docker
+        # config holds a login for, read over SSH (routes/api.php v4.4.0:196,
+        # v4.7.0:209; absent at v4.3.24; ServerDockerRegistriesController
+        # v4.4.0:94-124 = v4.7.0:94-124).
+        "server_registry_logins": Gate(since=(4, 4, 0)),
         # GET /databases/{uuid} nulls internal_db_url and external_db_url for a
         # sensitive caller when the credential variable is locked
         # (DatabasesController v4.5.1:262-270; isCredentialLocked in

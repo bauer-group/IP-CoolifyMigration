@@ -30,13 +30,13 @@ import hashlib
 import re
 import shlex
 import unicodedata
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
 from bg_coolify_migrate.dns.extract import normalise_host
 from bg_coolify_migrate.domain import compose as compose_mod
-from bg_coolify_migrate.domain import locked_envs
+from bg_coolify_migrate.domain import images, locked_envs
 from bg_coolify_migrate.domain.coolify_versions import (
     carries,
     every_application_route_carries,
@@ -2582,6 +2582,107 @@ def docker_cleanup(server: dict[str, Any]) -> tuple[bool, str]:
     if isinstance(threshold, int | str) and str(threshold).strip().isdigit():
         return True, f"{schedule}, when disk usage is at or above {str(threshold).strip()}%"
     return True, f"{schedule}, when disk usage crosses its threshold"
+
+
+def pushed_image_name(source: dict[str, Any], *, version: Version | None) -> str | None:
+    """The image name the target's first deploy pushes to a registry, or None.
+
+    CREATE carries the source's name up to 4.5.x, and a building application with
+    one pushes its image after every build (push_to_docker_registry,
+    ApplicationDeploymentJob v4.4.0:1290, v4.5.0:1350-1393); a failed push throws,
+    so the deploy fails. From 4.6 CREATE leaves the name out
+    (:func:`unshareable_image_name`), and the target pushes nothing.
+    """
+    if unshareable_image_name(source, version=version):
+        return None
+    return _pushed_image_name(source)
+
+
+def _registry_unknown(ref: str) -> bool:
+    """Whether a variable stands where the registry is: ``${REG}/app``, ``${IMAGE}``.
+
+    ``ghcr.io/acme/app:${TAG:-latest}`` names its registry, so it is checked.
+    """
+    return "$" in ref.split("/", 1)[0]
+
+
+def registry_login_warnings(
+    images_by_resource: Mapping[str, Iterable[str]],
+    source_logins: Collection[str] | None,
+    target_logins: Collection[str] | None,
+    *,
+    target_server: str,
+    pushes: Mapping[str, Iterable[str]] | None = None,
+) -> list[str]:
+    """One warning per (resource, registry) the source server is logged in to and the target is not.
+
+    Registry logins live only in the SSH user's ``~/.docker/config.json`` on each
+    server; no API copies them, and invariant 5 keeps this tool from carrying
+    credentials. CREATE sends ``instant_deploy`` false, so a private image's first
+    pull on the target is START, after QUIESCE removed the source's containers.
+    ``pushes`` are the names the target's first deploy pushes
+    (:func:`pushed_image_name`): a push needs the login, and a failed one fails it.
+
+    That file is what the route reads (DockerRegistryLogins::READ_CONFIG
+    v4.7.0:21) and all an application's deploy sees: it pulls and pushes in a
+    helper container that mounts only that file (ApplicationDeploymentJob
+    v4.4.0:2740-2756, v4.7.0:3392-3418; the image pull v4.4.0:4760-4765,
+    v4.7.0:5664-5675). So root's login on a non-root server (``sudo docker
+    login``) never counts there, as Coolify's own error says (v4.7.0:3407), and the
+    remedy names the SSH user. Host-side pulls (services, databases, compose apps)
+    read the same file from 4.5.1 and fall back to root's only when the SSH user
+    has none (docker.php serverDockerConfigPrefix v4.5.1:529-541, v4.7.0:612-624);
+    before 4.5.1 they ran under sudo with HOME=/root, as that comment says.
+
+    A warning, never a refusal: the target's list proves no failure. A public image
+    pulls anonymously from a registry the source is logged in to, and Coolify lists
+    the ``auths`` and ``credHelpers`` keys only (parseConfig v4.7.0:94-119). A
+    Docker Official Image is public by definition and a variable in the registry
+    part leaves the registry unknown, so neither is checked. Unknown logins
+    (``None``) are no warning.
+    """
+    if not source_logins or target_logins is None:
+        return []
+    missing = {images.normalise_registry(r) for r in source_logins} - {
+        images.normalise_registry(r) for r in target_logins
+    }
+    pushes = pushes or {}
+    remedy = (
+        f"Log the target in first, as its SSH user: Servers > {target_server} > Registries "
+        "in Coolify, or `docker login` without sudo. An application's deploy reads only "
+        "that user's ~/.docker/config.json (its helper container mounts that file alone), "
+        "so a login made with sudo, which is root's, does not count for it."
+    )
+    lines: list[str] = []
+    for resource in dict.fromkeys([*images_by_resource, *pushes]):
+        for registry, refs in _by_missing_registry(images_by_resource.get(resource, ()), missing):
+            lines.append(
+                f"{resource}: pulls {', '.join(refs)} from {registry}, which the source "
+                f"server is logged in to and the target server {target_server!r} is not, "
+                "as far as its Docker config shows. If the image is private, the target's "
+                f"pull fails at START, after the source is stopped. {remedy}"
+            )
+        for registry, refs in _by_missing_registry(pushes.get(resource, ()), missing):
+            lines.append(
+                f"{resource}: builds and pushes {', '.join(refs)} to {registry}, which the "
+                f"source server is logged in to and the target server {target_server!r} is "
+                "not, as far as its Docker config shows. Coolify < 4.6 carries that name, so "
+                "the target's first deploy pushes there at START, after the source is "
+                f"stopped, and a failed push fails that deploy. {remedy}"
+            )
+    return lines
+
+
+def _by_missing_registry(refs: Iterable[str], missing: set[str]) -> list[tuple[str, list[str]]]:
+    """``refs`` grouped by registry, only the registries in ``missing``, sorted."""
+    by_registry: dict[str, list[str]] = {}
+    for ref in dict.fromkeys(refs):
+        if _registry_unknown(ref) or images.is_docker_official(ref):
+            continue
+        registry = images.registry_of(ref)
+        if registry in missing:
+            by_registry.setdefault(registry, []).append(ref)
+    return sorted(by_registry.items())
 
 
 def server_warnings(source_server: dict[str, Any], target_server: dict[str, Any]) -> list[str]:
