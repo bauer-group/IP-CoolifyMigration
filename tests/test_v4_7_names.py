@@ -17,19 +17,29 @@ The predicates mirror PHP exactly: /u is PCRE2_UTF + PCRE2_UCP, so ``\\s`` and
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 import respx
+from hypothesis import assume, given, settings
+from hypothesis import strategies as st
 
 from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.api.resources import Placement, create_resource
 from bg_coolify_migrate.domain import fidelity
 from bg_coolify_migrate.domain.coolify_versions import supports
 from bg_coolify_migrate.domain.kinds import DatabaseEngine, ResourceKind
-from bg_coolify_migrate.domain.plan import ResourceSnapshot
+from bg_coolify_migrate.domain.plan import ResourcePlan, ResourceSnapshot, Strategy
+from bg_coolify_migrate.domain.statemachine import FinalizePolicy
+from bg_coolify_migrate.engine import steps
+from bg_coolify_migrate.engine.context import MigrationContext
+from bg_coolify_migrate.journal.store import Journal
+from bg_coolify_migrate.settings.base import Settings
+from tests.conftest import FakeHost
 from tests.test_engine_planner import _PlanApi
+from tests.test_engine_steps import _manifest, _plan, _snapshot
 
 HOST = "https://coolify.example.com"
 BASE = f"{HOST}/api/v1"
@@ -409,3 +419,121 @@ class TestPlan:
             monkeypatch, "web", description="Prod: main site", version="4.6.0"
         )
         assert not any("description" in w for w in plan.warnings)
+
+
+# ── the names the tool itself writes ─────────────────────────────────────────
+
+
+class TestRenamedSourceName:
+    def test_the_usual_suffix(self) -> None:
+        assert fidelity.renamed_source_name("postgres", "abc123") == "postgres-old-abc123"
+
+    @pytest.mark.parametrize("name", ["n8n", "Müller & Co (prod)", "owner/repo:main-abc"])
+    def test_the_suffix_keeps_a_good_name_good(self, name: str) -> None:
+        assert fidelity.name_rule_problem(fidelity.renamed_source_name(name, "abc123")) is None
+
+    def test_a_long_name_is_cut_to_255(self) -> None:
+        renamed = fidelity.renamed_source_name("x" * 250, "abc123")
+        assert len(renamed) == 255
+        assert renamed.endswith("-old-abc123")
+        assert fidelity.name_rule_problem(renamed) is None
+
+    def test_length_is_counted_after_the_trim(self) -> None:
+        # The server strips the leading whitespace, so it is not counted (or sent).
+        assert fidelity.renamed_source_name("  web", "abc123") == "web-old-abc123"
+        assert len(fidelity.renamed_source_name("  " + "x" * 244, "abc123")) == 255
+
+    def test_a_trailing_invisible_character_is_dropped(self) -> None:
+        # The trim makes 'web' + U+200B pass; the suffix would put the U+200B inside.
+        zwsp = chr(0x200B)
+        assert fidelity.renamed_source_name("web" + zwsp, "abc123") == "web-old-abc123"
+        assert fidelity.renamed_source_name("web" + zwsp + "  ", "abc123") == "web-old-abc123"
+
+    @pytest.mark.parametrize("char", sorted(fidelity._TRIMMED), ids=lambda c: f"U+{ord(c):04X}")
+    @pytest.mark.parametrize("where", ["leading", "trailing", "both"])
+    def test_every_trimmed_character_at_an_edge_stays_out(self, char: str, where: str) -> None:
+        name = {"leading": char + "web", "trailing": "web" + char, "both": char + "web" + char}[where]
+        assert fidelity.name_rule_problem(name) is None
+        renamed = fidelity.renamed_source_name(name, "abc123")
+        assert renamed == "web-old-abc123"
+        assert fidelity.name_rule_problem(renamed) is None
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "a b" + chr(0x3164) + "c",  # U+3164 is Lo: allowed inside, trimmed at an edge
+            chr(0xA0) + "Müller & Co" + chr(0xAD),
+            "ab" + chr(0x3000) + "x" * 250 + chr(0x200B),  # the cut lands after the trim
+            "x" * 243 + " " + "y" * 5,  # the cut ends on an inner space
+            chr(0xFEFF) + "owner/repo:main#1" + chr(0),
+        ],
+    )
+    def test_a_passing_name_renames_to_a_passing_name(self, name: str) -> None:
+        assert fidelity.name_rule_problem(name) is None
+        renamed = fidelity.renamed_source_name(name, "abc123")
+        assert fidelity.name_rule_problem(renamed) is None
+        assert len(renamed) <= 255
+        # The server trims nothing off it, so what is sent is what is stored.
+        assert fidelity._trim_bounds(renamed) == (0, len(renamed))
+
+    @given(
+        lead=st.text(st.sampled_from(sorted(fidelity._TRIMMED)), max_size=3),
+        body=st.text(
+            st.characters(categories=("L", "M", "N", "Zs"))
+            | st.sampled_from(sorted(fidelity._NAME_PUNCTUATION | fidelity._PCRE_SPACE)),
+            min_size=1,
+            max_size=300,
+        ),
+        tail=st.text(st.sampled_from(sorted(fidelity._TRIMMED)), max_size=3),
+        stamp=st.text("0123456789abcdef", min_size=6, max_size=6),
+    )
+    @settings(max_examples=300, deadline=None)
+    def test_property_a_passing_name_never_fails_once_renamed(
+        self, lead: str, body: str, tail: str, stamp: str
+    ) -> None:
+        name = lead + body + tail
+        assume(fidelity.name_rule_problem(name) is None)
+        renamed = fidelity.renamed_source_name(name, stamp)
+        assert fidelity.name_rule_problem(renamed) is None
+        assert fidelity._trim_bounds(renamed) == (0, len(renamed))
+
+
+class TestFinalizeRename:
+    async def test_a_long_source_name_is_renamed_within_255(
+        self, tmp_path: Path, respx_mock: respx.Router
+    ) -> None:
+        """The PATCH runs after the cutover: a 422 there leaves a run half-finalized."""
+        name = "x" * 250
+        plan = _plan(
+            finalize_policy=FinalizePolicy.RENAME,
+            resources=(
+                ResourcePlan(
+                    snapshot=_snapshot(name=name), strategy=Strategy.COPY_DATA, manifest=_manifest()
+                ),
+            ),
+        )
+        route = respx_mock.patch(f"{BASE}/databases/db1").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        source, target = FakeHost(), FakeHost()
+        source.on(r"rm -rf", exit_status=0)
+        target.on(r"sed -i", exit_status=0)
+        for host in (source, target):
+            host.on(r"docker ps", stdout="")  # no pins
+        api = CoolifyClient(HOST, "tok", max_retries=0)
+        try:
+            ctx = MigrationContext(
+                api=api,
+                settings=Settings(_env_file=None, state_dir=tmp_path),
+                plan=plan,
+                journal=Journal.create(tmp_path, "20261109-120000-abc123"),
+                migration_id="20261109-120000-abc123",
+                source_host=source,  # type: ignore[arg-type]
+                target_host=target,  # type: ignore[arg-type]
+            )
+            await steps.step_finalize(ctx)
+        finally:
+            await api.aclose()
+        sent = json.loads(route.calls[0].request.read())["name"]
+        assert len(sent) == 255
+        assert sent == "x" * 244 + "-old-abc123"

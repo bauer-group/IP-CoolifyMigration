@@ -316,6 +316,27 @@ def description_warning(source: dict[str, Any], *, version: Version | None) -> s
     )
 
 
+def renamed_source_name(name: str, stamp: str) -> str:
+    """FINALIZE RENAME's ``{name}-old-{stamp}``, cut to what Coolify takes. PURE.
+
+    Built from the TRIMMED name, both ends: the rule judges a name without what
+    the trim strips, so a passing name may still END in a character the pattern
+    refuses (U+200B, U+00AD, U+FEFF, NUL...). The suffix would put it inside the
+    name, where the trim no longer reaches it. Every character left is one the
+    pattern allows, and so is every one of the suffix (``-``, letters, the
+    migration id's hex digits), so the result passes the 4.7.0 rule whenever the
+    name does — and the plan refused it otherwise. Its LENGTH does not follow:
+    every update has had max:255 (ApplicationsController v4.1.2:2371,
+    ServicesController v4.1.2:965, DatabasesController v4.1.2:348), counted after
+    the trim, so a name of 245+ characters would 422 this PATCH after the cutover.
+    The name is cut instead of refusing the plan: nothing reads the renamed name
+    back, and a rollback restores the original from the plan.
+    """
+    suffix = f"-old-{stamp}"
+    start, end = _trim_bounds(name)
+    return f"{name[start:end][: _NAME_MAX_LENGTH - len(suffix)]}{suffix}"
+
+
 # ── applications ─────────────────────────────────────────────────────────────
 
 

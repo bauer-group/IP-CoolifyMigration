@@ -2418,7 +2418,8 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
             continue
 
         if policy is FinalizePolicy.RENAME:
-            new_name = f"{snapshot.name}-old-{stamp}"
+            # Within Coolify's name rule, or this PATCH 422s after the cutover.
+            new_name = fidelity.renamed_source_name(snapshot.name, stamp)
             await api_resources.rename(ctx.api, snapshot.collection, snapshot.uuid, new_name)
             actions.append(f"renamed {snapshot.name} -> {new_name}")
             continue
