@@ -1,4 +1,4 @@
-"""Coolify 4.7 platform changes: the token throttle, the authorized_keys lock.
+"""Coolify 4.7 platform changes: the token throttle, the authorized_keys lock, the F2 host-key pin.
 
 Each answers one finding of the v4.6.0 -> v4.7.x release-tag audit:
 
@@ -7,16 +7,19 @@ Each answers one finding of the v4.6.0 -> v4.7.x release-tag audit:
   say so out loud and keep waiting, never abort a rollback early.
 * AuthorizedKeys (v4.7.0) edits the SSH user's authorized_keys under a mkdir
   lock. The ephemeral-key append and the sed revoke take the same lock.
+* Coolify (4.7.0) pins its own host's SSH key; F2 moves the pin and not the key.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -25,8 +28,14 @@ from structlog.testing import capture_logs
 
 from bg_coolify_migrate.api import client as client_mod
 from bg_coolify_migrate.api.client import CoolifyClient
+from bg_coolify_migrate.domain import coolify_versions as cv
+from bg_coolify_migrate.domain import host_keys
+from bg_coolify_migrate.domain.statemachine import Outcome
 from bg_coolify_migrate.engine import keys
+from bg_coolify_migrate.engine.executor import RunResult
 from bg_coolify_migrate.errors import CoolifyApiError, TransferError
+from bg_coolify_migrate.server import runner as server_runner
+from bg_coolify_migrate.server.inventory import ServerInventory, take
 from bg_coolify_migrate.transfer.ssh import SshTarget
 from tests.conftest import FakeHost
 
@@ -287,3 +296,245 @@ class TestLockInARealShell:
         result = self._run(tmp_path, keys._locked("echo line >> ~/.ssh/authorized_keys"))
         assert result.returncode == 0, result.stderr
         assert not lock.exists()
+
+
+# ── F2: Coolify's pin of its own host key ────────────────────────────────────
+
+
+def _localhost(**settings: Any) -> dict[str, Any]:
+    pinned: dict[str, Any] = {
+        "ssh_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOld",
+        "ssh_host_key_fingerprints": ["SHA256:old (ssh-ed25519)"],
+        "is_ssh_host_key_check_disabled": False,
+        "is_ssh_host_key_check_enforced": False,
+    }
+    pinned.update(settings)
+    return {
+        "uuid": "srv-local",
+        "name": "localhost",
+        "ip": "host.docker.internal",
+        "settings": pinned,
+    }
+
+
+V47 = (4, 7, 0)
+
+
+class TestFeatureRow:
+    def test_pinning_starts_in_4_7_0(self) -> None:
+        assert not cv.supports("ssh_host_key_pinning", (4, 6, 0))
+        assert cv.supports("ssh_host_key_pinning", V47)
+        assert cv.supports("ssh_host_key_pinning", (4, 7, 1))
+
+
+class TestInstanceCheckingMode:
+    @pytest.mark.parametrize(
+        ("text", "mode"),
+        [
+            ("APP_KEY=x\n", "warn"),  # absent: Coolify's default
+            ("SSH_HOST_KEY_CHECKING=enforce\n", "enforce"),
+            ('SSH_HOST_KEY_CHECKING="Enforce "\n', "enforce"),  # strtolower(trim())
+            ("SSH_HOST_KEY_CHECKING='off'\n", "off"),
+            ("export SSH_HOST_KEY_CHECKING=off # no checks\n", "off"),
+            ("SSH_HOST_KEY_CHECKING=strict\n", "warn"),  # unknown: Coolify uses warn
+            ("SSH_HOST_KEY_CHECKING=\n", "warn"),
+            ("SSH_HOST_KEY_CHECKING=off\nSSH_HOST_KEY_CHECKING=enforce\n", "enforce"),
+            ("SSH_HOST_KEY_CHECKING=off\nSSH_HOST_KEY_CHECKING=warn\n", "warn"),
+            ("#SSH_HOST_KEY_CHECKING=off\n", "warn"),
+        ],
+    )
+    def test_read_as_coolify_reads_it(self, text: str, mode: str) -> None:
+        assert host_keys.instance_checking_mode(text) == mode
+
+    def test_an_unread_file_is_unknown(self) -> None:
+        assert host_keys.instance_checking_mode(None) is None
+
+
+class TestSelfHostKeyWarning:
+    def test_silent_before_4_7(self) -> None:
+        assert (
+            host_keys.self_host_key_warning(_localhost(), version=(4, 6, 0), instance_mode="warn")
+            is None
+        )
+
+    def test_warn_mode_says_it_still_connects_and_how_to_trust(self) -> None:
+        warning = host_keys.self_host_key_warning(_localhost(), version=V47, instance_mode="warn")
+        assert warning is not None
+        assert "'localhost'" in warning
+        assert "still connects" in warning
+        assert "ENFORCED" not in warning
+        assert "Servers > localhost > Security" in warning
+        assert "/api/v1/servers/srv-local/host-key/reset" in warning
+        assert "ssh-keygen -lf" in warning
+        assert "Never send it empty" in warning
+
+    @pytest.mark.parametrize(
+        ("instance_mode", "flag"), [("enforce", False), ("warn", True), (None, True)]
+    )
+    def test_enforce_says_the_host_is_unreachable_after_the_fence(
+        self, instance_mode: str | None, flag: bool
+    ) -> None:
+        warning = host_keys.self_host_key_warning(
+            _localhost(is_ssh_host_key_check_enforced=flag),
+            version=V47,
+            instance_mode=instance_mode,
+        )
+        assert warning is not None
+        assert "ENFORCED" in warning
+        assert "cannot reach its own host" in warning
+        assert "after the source is fenced" in warning
+
+    def test_an_unread_mode_names_both_outcomes(self) -> None:
+        warning = host_keys.self_host_key_warning(_localhost(), version=V47, instance_mode=None)
+        assert warning is not None
+        assert "warn mode (the default)" in warning
+        assert "under enforce" in warning
+
+    @pytest.mark.parametrize(
+        ("server", "instance_mode"),
+        [
+            (_localhost(is_ssh_host_key_check_disabled=True), "enforce"),
+            (_localhost(is_ssh_host_key_check_enforced=True), "off"),  # never weaker than off
+            (_localhost(ssh_host_key=None, ssh_host_key_fingerprints=[]), "enforce"),
+        ],
+    )
+    def test_silent_when_nothing_is_checked_or_nothing_pinned(
+        self, server: dict[str, Any], instance_mode: str
+    ) -> None:
+        """No pin: Coolify pins whatever the new host presents on first use."""
+        assert (
+            host_keys.self_host_key_warning(server, version=V47, instance_mode=instance_mode)
+            is None
+        )
+
+    def test_a_record_that_does_not_say_warns(self) -> None:
+        server = {"uuid": "srv-local", "name": "localhost", "settings": {}}
+        assert host_keys.self_host_key_warning(server, version=V47, instance_mode="warn")
+
+    def test_an_unknown_version_fails_toward_the_warning(self) -> None:
+        assert host_keys.self_host_key_warning(_localhost(), version=None, instance_mode="warn")
+
+
+ENV_TEXT = """APP_KEY=base64:zSyKF1cWYVNQ0PmA7wNJvKTGxu2vHmT3nRoXqPqEBFI=
+DB_PASSWORD=s3cr3tpassword
+SSH_HOST_KEY_CHECKING=enforce
+"""
+
+
+def _source(*, second_read_fails: bool = False) -> FakeHost:
+    host = FakeHost()
+    host.on(r"test -e /data/coolify/source/\.env", exit_status=0)
+    host.on(r"test -e /data/coolify$", exit_status=0)
+    host.on(r"docker volume ls", stdout=json.dumps({"Name": "v1", "Driver": "local"}))
+    host.on(r"docker ps", stdout="")
+    host.on(r"du -sk", stdout="1024\n")
+    host.on(r"find .* -type f", stdout="5\n")
+    reads: list[dict[str, object]] = [{"stdout": ENV_TEXT}]
+    reads.append({"exit_status": 1} if second_read_fails else {"stdout": ENV_TEXT})
+    host.on_sequence(r"cat", reads)
+    host.on(r"test -e", exit_status=1)  # fence marker absent
+    return host
+
+
+def _target_host() -> FakeHost:
+    host = FakeHost(SshTarget(host="10.0.0.2"))
+    host.on(r"command -v docker", exit_status=0)
+    host.on(r"test -e /data/coolify", exit_status=1)
+    host.on(r"df -Pk", stdout="999999999")
+    return host
+
+
+class TestInventoryPlumbing:
+    async def test_the_plan_warns_with_the_mode_from_the_copied_env(self) -> None:
+        inv = await take(
+            _source(),  # type: ignore[arg-type]
+            _target_host(),  # type: ignore[arg-type]
+            coolify_version="4.7.0",
+            self_server=_localhost(),
+        )
+        assert not inv.is_blocked  # a warning, never a refusal
+        assert "ENFORCED" in inv.self_host_key_warning
+        assert inv.self_host_key_warning in inv.warnings
+
+    async def test_no_warning_before_4_7(self) -> None:
+        inv = await take(
+            _source(),  # type: ignore[arg-type]
+            _target_host(),  # type: ignore[arg-type]
+            coolify_version="4.6.0",
+            self_server=_localhost(),
+        )
+        assert inv.self_host_key_warning == ""
+        assert not any("host key" in w for w in inv.warnings)
+
+    async def test_an_unreadable_env_leaves_the_mode_unknown(self) -> None:
+        inv = await take(
+            _source(second_read_fails=True),  # type: ignore[arg-type]
+            _target_host(),  # type: ignore[arg-type]
+            coolify_version="4.7.0",
+            self_server=_localhost(),
+        )
+        assert "under enforce" in inv.self_host_key_warning
+
+    async def test_the_env_text_never_reaches_the_inventory(self) -> None:
+        inv = await take(
+            _source(),  # type: ignore[arg-type]
+            _target_host(),  # type: ignore[arg-type]
+            coolify_version="4.7.0",
+            self_server=_localhost(),
+        )
+        dumped = inv.model_dump_json()
+        assert "s3cr3tpassword" not in dumped
+        assert "zSyKF1cW" not in dumped
+
+
+def _inventory(warning: str) -> ServerInventory:
+    return ServerInventory(
+        source_host="10.0.0.1",
+        target_host="10.0.0.2",
+        coolify_version="4.7.0",
+        self_host_key_warning=warning,
+    )
+
+
+class TestRunNotice:
+    def test_a_success_repeats_the_warning_as_a_notice(self) -> None:
+        result = RunResult(outcome=Outcome.SUCCEEDED, reached=None)
+        server_runner._note_self_host_key(result, _inventory("trust the new key"))
+        assert result.notices == ["trust the new key"]
+
+    def test_a_rolled_back_run_does_not(self) -> None:
+        """The rollback starts the source, whose pin matches its own key."""
+        result = RunResult(outcome=Outcome.ROLLED_BACK, reached=None)
+        server_runner._note_self_host_key(result, _inventory("trust the new key"))
+        assert result.notices == []
+
+    def test_nothing_to_repeat(self) -> None:
+        result = RunResult(outcome=Outcome.SUCCEEDED, reached=None)
+        server_runner._note_self_host_key(result, _inventory(""))
+        assert result.notices == []
+
+
+class _Api:
+    """Just what _source_ssh reads: the server list, the record, the keys."""
+
+    def __init__(self, servers: list[dict[str, Any]]) -> None:
+        self._servers = servers
+
+    async def list_servers(self) -> list[dict[str, Any]]:
+        return self._servers
+
+    async def get_server(self, uuid: str) -> dict[str, Any]:
+        return next(s for s in self._servers if s["uuid"] == uuid)
+
+    async def get(self, path: str) -> list[dict[str, Any]]:
+        return []
+
+
+class TestSourceRecord:
+    async def test_the_listed_record_comes_back_with_its_settings(self) -> None:
+        own = _localhost()
+        other = {"uuid": "srv-2", "name": "edge", "ip": "10.0.0.9", "settings": {}}
+        target, record = await server_runner._source_ssh(_Api([other, own]), None)  # type: ignore[arg-type]
+        assert record is own
+        assert target.host == "host.docker.internal"
+        assert record["settings"]["ssh_host_key_fingerprints"]

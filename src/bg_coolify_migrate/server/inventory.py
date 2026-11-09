@@ -13,12 +13,17 @@ We enumerate ``docker volume ls`` (everything that exists) AND ``docker ps -a``
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 import structlog
 from pydantic import BaseModel, ConfigDict
 
 from bg_coolify_migrate.discovery import docker
+from bg_coolify_migrate.domain import host_keys
+from bg_coolify_migrate.domain.versions import parse_version
+from bg_coolify_migrate.errors import MigrationError
 from bg_coolify_migrate.server.fencing import FENCE_MARKER
 from bg_coolify_migrate.transfer.ssh import RemoteHost
 
@@ -66,6 +71,11 @@ class ServerInventory(BaseModel):
     blocking_reasons: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
 
+    self_host_key_warning: str = ""
+    """Coolify (4.7+) pins its own host's SSH key, and the new host presents
+    another (domain/host_keys.py). One of ``warnings`` too; kept apart because its
+    remedy is due AFTER the move, so the run repeats it as a notice."""
+
     @property
     def total_bytes(self) -> int:
         return self.coolify_data_bytes + self.volumes_bytes
@@ -112,8 +122,13 @@ async def take(
     coolify_version: str,
     headroom_factor: float = 1.2,
     force_overwrite: bool = False,
+    self_server: Mapping[str, Any] | None = None,
 ) -> ServerInventory:
-    """Inventory both ends. Reads only."""
+    """Inventory both ends. Reads only.
+
+    ``self_server`` is Coolify's record of the source host, settings included, as
+    the API listed it; it only feeds the host-key warning.
+    """
     blocking: list[str] = []
     warnings: list[str] = []
 
@@ -148,6 +163,24 @@ async def take(
         app_key_fp = appkey.fingerprint(key)
     except Exception as exc:
         blocking.append(str(exc).splitlines()[0])
+
+    self_host_key_warning = None
+    if self_server is not None:
+        # The instance-wide checking mode is in the same .env, which the target
+        # inherits with /data/coolify. Read again rather than widening appkey.read:
+        # the text never leaves this frame, and an unreadable file only leaves
+        # the mode unknown (the warning then names both outcomes).
+        try:
+            env_text: str | None = await source.read_file(appkey.COOLIFY_ENV_PATH)
+        except MigrationError:
+            env_text = None
+        self_host_key_warning = host_keys.self_host_key_warning(
+            self_server,
+            version=parse_version(coolify_version),
+            instance_mode=host_keys.instance_checking_mode(env_text),
+        )
+        if self_host_key_warning:
+            warnings.append(self_host_key_warning)
 
     # ── target ──────────────────────────────────────────────────────────────
     target_has_docker = await target.which("docker")
@@ -202,4 +235,5 @@ async def take(
         app_key_fingerprint=app_key_fp,
         blocking_reasons=tuple(blocking),
         warnings=tuple(warnings),
+        self_host_key_warning=self_host_key_warning or "",
     )

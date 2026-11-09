@@ -258,6 +258,15 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         # mismatch; a multi-server deploy needs a Docker image
         # (ensureRegistryImageForMultipleServers).
         "multi_server_restrictions": Gate(since=(4, 4, 0)),
+        # Coolify pins every managed server's SSH host key on first use — its own
+        # host (localhost) too, with no exemption — and checks it on every
+        # connection (server_settings columns: migrations 2026_10_30_120000 :11-17
+        # and 2026_11_06_194613 :12, absent at v4.6.0; learnHostKey
+        # SshMultiplexingHelper v4.7.0:731-783, hostKeyOptions :835-856; v4.6.0:507
+        # still connected with StrictHostKeyChecking=no). A changed key is kept
+        # pending and reported (Server.php :2614-2654); under enforce the server is
+        # marked unreachable and unusable at once (ServerConnectionCheckJob :105-113).
+        "ssh_host_key_pinning": Gate(since=(4, 7, 0)),
         # Task timeout gains max:36000 on create and update (ScheduledTasksController
         # v4.4.0:73, v4.5.0:88; plain integer|min:1 up to v4.3.24).
         "task_timeout_max": Gate(since=(4, 4, 0)),

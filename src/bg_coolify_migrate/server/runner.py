@@ -10,6 +10,8 @@ source, then work over SSH.
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 
 from bg_coolify_migrate.api.client import CoolifyClient
@@ -27,12 +29,16 @@ from bg_coolify_migrate.transfer.ssh import RemoteHost, SshTarget
 log = structlog.get_logger(__name__)
 
 
-async def _source_ssh(api: CoolifyClient, settings: Settings) -> SshTarget:
-    """Reach the Coolify host itself.
+async def _source_ssh(api: CoolifyClient, settings: Settings) -> tuple[SshTarget, dict[str, Any]]:
+    """Reach the Coolify host itself. Returns its SSH target and its server record.
 
     Coolify's own record for the machine it runs on is the server whose ip is
     localhost/127.0.0.1 — it manages itself. If that is absent the instance is
     controlling only remote servers, which F2 does not handle.
+
+    The record is the ``GET /servers`` row, which carries the settings row
+    (ServersController v4.7.0:163-172) — what the host-key warning reads, with no
+    further request.
     """
     from bg_coolify_migrate.engine.planner import server_ref
 
@@ -41,12 +47,12 @@ async def _source_ssh(api: CoolifyClient, settings: Settings) -> SshTarget:
         # guess that happens to work on a default install and fails on any
         # instance whose self-record uses a real address.
         if CoolifyClient.server_is_coolify_host(server):
-            return await ssh_target_for(api, server_ref(server))
+            return await ssh_target_for(api, server_ref(server)), server
 
     for server in await api.list_servers():
         ip = str(server.get("ip", ""))
         if ip in ("127.0.0.1", "localhost", "host.docker.internal"):
-            return await ssh_target_for(api, server_ref(server))
+            return await ssh_target_for(api, server_ref(server)), server
 
     raise PreflightError(
         "could not find Coolify's own server record",
@@ -66,7 +72,7 @@ async def plan_server_migration(
 
     async with CoolifyClient(url, token, verify=settings.coolify_verify_tls) as api:
         version = await api.version()
-        source_ssh = await _source_ssh(api, settings)
+        source_ssh, source_server = await _source_ssh(api, settings)
 
     target_ssh = SshTarget(host=target_host, user="root")
 
@@ -87,6 +93,7 @@ async def plan_server_migration(
             coolify_version=version,
             headroom_factor=settings.disk_headroom_factor,
             force_overwrite=force_overwrite,
+            self_server=source_server,
         )
 
 
@@ -103,7 +110,7 @@ async def run_server_migration(
     journal = Journal.create(settings.resolved_state_dir(), migration_id)
 
     async with CoolifyClient(url, token, verify=settings.coolify_verify_tls) as api:
-        source_ssh = await _source_ssh(api, settings)
+        source_ssh, _ = await _source_ssh(api, settings)
 
     target_ssh = SshTarget(host=target_host, user="root")
 
@@ -137,4 +144,15 @@ async def run_server_migration(
         )
         result = await saga.run()
         log.info("server_migration.finished", id=migration_id, outcome=result.outcome.value)
+        _note_self_host_key(result, inventory)
         return result, migration_id
+
+
+def _note_self_host_key(result: RunResult, inventory: ServerInventory) -> None:
+    """Repeat the plan's host-key warning once the new instance runs.
+
+    Only after a success: its remedy is on the NEW instance, which a failed run
+    never left in charge — the rollback starts the source, whose pin matches.
+    """
+    if result.ok and inventory.self_host_key_warning:
+        result.notices.append(inventory.self_host_key_warning)
