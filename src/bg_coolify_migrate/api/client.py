@@ -32,6 +32,7 @@ from typing import Any, Self
 import httpx
 import structlog
 
+from bg_coolify_migrate.domain.deployments import Deployment, read_deployment
 from bg_coolify_migrate.errors import CoolifyApiError, InsufficientTokenScope
 
 log = structlog.get_logger(__name__)
@@ -547,6 +548,24 @@ class CoolifyClient:
         it. This is why the rollback path that ends the outage uses restart.
         """
         return await self.post(f"/{collection}/{uuid}/restart")
+
+    async def get_deployment(self, uuid: str) -> Deployment | None:
+        """One application deployment's status and gate verdict. ``None`` on a 404.
+
+        The route and its shape hold on every supported release
+        (``domain/deployments.py``), so a 404 means Coolify has no such row —
+        never an older instance. Everything but ``status`` and the image-scan
+        gate's ``blocked``/``headline`` is dropped HERE, before anything can log
+        it: ``logs`` is the full deployment log, and a token that reads sensitive
+        data gets it (DeployController v4.7.0:27-40).
+        """
+        try:
+            row = await self.get(f"/deployments/{uuid}")
+        except CoolifyApiError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        return read_deployment(uuid, row)
 
     async def stop(self, collection: str, uuid: str) -> bool:
         """Request a stop. Returns whether Coolify actually dispatched one.

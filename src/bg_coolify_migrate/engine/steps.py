@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import shlex
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
@@ -35,6 +35,13 @@ from bg_coolify_migrate.dns.gate import (
     is_definitive,
 )
 from bg_coolify_migrate.domain import domains, fidelity
+from bg_coolify_migrate.domain.deployments import (
+    Progress,
+    deployment_uuid_of,
+    judge,
+    start_failure_hint,
+)
+from bg_coolify_migrate.domain.deployments import Verdict as DeploymentVerdict
 from bg_coolify_migrate.domain.kinds import GitAuth, ResourceKind
 from bg_coolify_migrate.domain.manifest import DockerMount
 from bg_coolify_migrate.domain.naming import (
@@ -2249,12 +2256,22 @@ async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
 
 
 async def step_start_target(ctx: MigrationContext) -> dict[str, Any]:
+    """Start every target, journalling each application's deployment uuid.
+
+    The uuid is no secret, and journalled rather than kept on the context so a
+    resumed HEALTHCHECK still watches the deployment (:func:`step_healthcheck`).
+    """
     started = []
+    deployments: dict[str, str] = {}
     for resource in ctx.plan.resources:
         target_uuid = ctx.target_uuids[resource.snapshot.uuid]
-        await ctx.api.start(resource.snapshot.collection, target_uuid)
+        answer = await ctx.api.start(resource.snapshot.collection, target_uuid)
         started.append(target_uuid)
-    return {"started": started}
+        if resource.snapshot.collection == "applications" and (
+            deployment := deployment_uuid_of(answer)
+        ):
+            deployments[resource.snapshot.uuid] = deployment
+    return {"started": started, "deployments": deployments}
 
 
 #: Container states a deploy passes THROUGH. Seeing one means "not settled yet",
@@ -2378,18 +2395,109 @@ async def _containers_by_uuid(ctx: MigrationContext, resource: ResourcePlan) -> 
     return sorted(f"{c.name} ({c.state})" for c in managed if docker.carries_uuid(c, target_uuid))
 
 
+def _start_deployments(ctx: MigrationContext) -> dict[str, str]:
+    """Source uuid -> the deployment START asked for, read from START's journal record."""
+    recorded = ctx.journal.undo_info(State.START_TARGET.value).get("deployments")
+    if not isinstance(recorded, dict):
+        return {}
+    return {k: v for k, v in recorded.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+@dataclass(slots=True)
+class _StartDeployments:
+    """What HEALTHCHECK has read of the deployments START asked for, by source uuid."""
+
+    pending: dict[str, str]
+    """Not terminal yet: source uuid -> deployment uuid, read again each round."""
+    finished: set[str] = field(default_factory=set)
+    failed: dict[str, DeploymentVerdict] = field(default_factory=dict)
+    """Failed, cancelled or missing: these targets will start nothing."""
+    statuses: dict[str, str] = field(default_factory=dict)
+    """The last status read, for the timeout message."""
+
+
+async def _read_deployments(ctx: MigrationContext, seen: _StartDeployments) -> None:
+    """Read each pending deployment once; a terminal one leaves ``pending``.
+
+    Only failure is decided from them — a failed, cancelled or missing deployment
+    (``domain/deployments.judge``). Success stays the daemon's: a deployment can
+    finish before its containers are healthy, and a status this tool does not
+    know is pending. A read that fails decides nothing.
+    """
+    for source_uuid, deployment_uuid in list(seen.pending.items()):
+        try:
+            found = await ctx.api.get_deployment(deployment_uuid)
+        except Exception as exc:  # the daemon still decides; a read error decides nothing
+            log.debug("healthcheck.deployment_unread", uuid=deployment_uuid, error=str(exc)[:120])
+            continue
+        verdict = judge(deployment_uuid, found)
+        if found is not None:
+            seen.statuses[source_uuid] = found.status
+        if verdict.progress is Progress.PENDING:
+            continue
+        del seen.pending[source_uuid]
+        if verdict.progress is Progress.FINISHED:
+            seen.finished.add(source_uuid)
+        else:
+            seen.failed[source_uuid] = verdict
+
+
+def _every_other_start_landed(
+    ctx: MigrationContext, health: list[_ResourceHealth], seen: _StartDeployments
+) -> bool:
+    """Whether every target whose deployment did not fail is up or done deploying.
+
+    The rollback a failure triggers stops the targets with a plain ``/stop``, which
+    cancels no deployment (StopApplication v4.7.0:19-101) and runs on the 'high'
+    queue (StopApplication :17, StopService :18), while a service or database
+    start waits on the deployment queue (StartService :27, StartDatabase :32). A
+    stop sent while a sibling's start is still on its way finds no container and
+    is overtaken: the sibling comes up after the rollback, routing — and asking
+    ACME for — the custom hosts CREATE claimed, beside the restarted source or as
+    an orphan once its row is deleted. So a failure waits until every other start
+    has landed — the daemon shows it up, or its deployment ended — and STOP_TARGET
+    then finds what it must stop. Before the deployment was read, HEALTHCHECK
+    waited out deploy_timeout and gave every start that long.
+    """
+    return all(
+        r.snapshot.uuid in seen.failed or r.snapshot.uuid in seen.finished or h.is_up
+        for r, h in zip(ctx.plan.resources, health, strict=True)
+    )
+
+
+def _deployment_failure(ctx: MigrationContext, seen: _StartDeployments) -> TransferError:
+    """The refusal naming every target deployment that failed; a gate block's hint first."""
+    names = {r.snapshot.uuid: r.snapshot.name for r in ctx.plan.resources}
+    lines = [
+        f"the target of {names.get(source_uuid, source_uuid)} did not deploy: {verdict.reason}"
+        for source_uuid, verdict in seen.failed.items()
+    ]
+    verdicts = list(seen.failed.values())
+    first = next((v for v in verdicts if v.gate_blocked), verdicts[0])
+    return TransferError("\n".join(lines), hint=start_failure_hint(first))
+
+
 async def _healthcheck_failure(
-    ctx: MigrationContext, health: list[_ResourceHealth], *, deadline: float
+    ctx: MigrationContext,
+    health: list[_ResourceHealth],
+    *,
+    deadline: float,
+    statuses: dict[str, str] | None = None,
 ) -> TransferError:
     """Build the refusal, naming what the daemon actually showed us.
 
     Separate from the gate because the message is the whole value of a timeout:
     the previous one said only "not running: <no containers appeared>", which is
     the same sentence for a stack that failed to deploy and for a filter that
-    cannot see it.
+    cannot see it. ``statuses`` adds what Coolify last said of each deployment.
     """
     unhealthy = [h for h in health if not h.is_up]
     blind = {h.resource for h in unhealthy if not h.containers}
+    names = {r.snapshot.uuid: r.snapshot.name for r in ctx.plan.resources}
+    deployments = [
+        f"  {names.get(source_uuid, source_uuid)}: its deployment in Coolify reads {status!r}"
+        for source_uuid, status in sorted((statuses or {}).items())
+    ]
 
     probes: list[str] = []
     for resource in ctx.plan.resources:
@@ -2410,7 +2518,7 @@ async def _healthcheck_failure(
         )
     return TransferError(
         f"target did not become healthy within {deadline:.0f}s:\n"
-        + "\n".join(h.describe() for h in unhealthy),
+        + "\n".join([h.describe() for h in unhealthy] + deployments),
         hint=hint,
     )
 
@@ -2440,9 +2548,18 @@ async def step_healthcheck(ctx: MigrationContext) -> dict[str, Any]:
       stopped there. Every other gate (PREFLIGHT, the pre-stop mount capture)
       asks per resource with all three name labels; this one was the exception
       and is no longer.
+
+    Each round that is not yet healthy also reads each application's deployment
+    (:func:`_read_deployments`). Without that, a deploy that failed before it
+    created a container (a build error, a full queue, Coolify 4.7's image-scan
+    gate) sat out the whole deploy_timeout with the source down, then said
+    "nothing matched". One that failed ends the wait as soon as every other
+    target's start has landed (:func:`_every_other_start_landed`) — at once for a
+    single target — and at the deadline otherwise, with the failure's reason.
     """
     deadline = ctx.settings.deploy_timeout
     waited = 0.0
+    seen = _StartDeployments(pending=_start_deployments(ctx))
 
     while True:
         health = [await _target_health(ctx, resource) for resource in ctx.plan.resources]
@@ -2452,8 +2569,13 @@ async def step_healthcheck(ctx: MigrationContext) -> dict[str, Any]:
                 "finished": sum(len(h.finished) for h in health),
                 "waited": round(waited, 1),
             }
+        await _read_deployments(ctx, seen)
+        if seen.failed and (waited >= deadline or _every_other_start_landed(ctx, health, seen)):
+            raise _deployment_failure(ctx, seen)
         if waited >= deadline:
-            raise await _healthcheck_failure(ctx, health, deadline=deadline)
+            raise await _healthcheck_failure(
+                ctx, health, deadline=deadline, statuses=seen.statuses
+            )
         await asyncio.sleep(_HEALTH_POLL_INTERVAL)
         waited += _HEALTH_POLL_INTERVAL
 

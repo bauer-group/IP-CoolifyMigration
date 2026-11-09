@@ -11,6 +11,7 @@ is recorded and the run reports honestly at the end.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any
@@ -20,6 +21,12 @@ import structlog
 from bg_coolify_migrate.api import resources as api_resources
 from bg_coolify_migrate.discovery import docker, pins
 from bg_coolify_migrate.domain import domains
+from bg_coolify_migrate.domain.deployments import (
+    Progress,
+    deployment_uuid_of,
+    judge,
+    restart_blocked_notice,
+)
 from bg_coolify_migrate.domain.statemachine import (
     STOP_REQUESTED,
     Compensation,
@@ -385,12 +392,28 @@ async def undo_quiesce(ctx: MigrationContext, undo_info: dict[str, Any]) -> None
     operator runs ``rollback <id>`` again (a KEPT target, a kept pin, a failed
     restore), so without this the tool's own remedy took production down twice.
     A restart that failed is not recorded and is tried again.
+
+    An application's ``/restart`` is a deployment, accepted with HTTP 200 before
+    it runs, and it can fail after QUIESCE removed the containers — a build
+    error, a full queue, or from 4.7.0 Coolify's image-scan gate
+    (``domain/deployments.py``). So an application counts as restarted only once
+    its deployment FINISHED (:func:`_await_restart_deployments`). The deployment
+    uuid is journalled when Coolify accepts it, so a rollback interrupted while
+    it watched one watches it again instead of redeploying the source a second
+    time (:func:`_restart_deployments_since_stop`).
     """
-    already = _restarted_since_stop(ctx.journal.read())
+    records = list(ctx.journal.read())
+    already = _restarted_since_stop(records)
+    asked = _restart_deployments_since_stop(records)
     failures: list[str] = []
+    watch: dict[str, str] = {}
     for resource in ctx.plan.resources:
-        if resource.snapshot.uuid in already:
-            log.info("compensate.source_already_restarted", name=resource.snapshot.name)
+        snapshot = resource.snapshot
+        if snapshot.uuid in already:
+            log.info("compensate.source_already_restarted", name=snapshot.name)
+            continue
+        if snapshot.uuid in asked and await _restart_stands(ctx, asked[snapshot.uuid]):
+            watch[snapshot.uuid] = asked[snapshot.uuid]
             continue
         try:
             # restart, NOT start. QUIESCE removed the container (docker rm -f),
@@ -399,23 +422,30 @@ async def undo_quiesce(ctx: MigrationContext, undo_info: dict[str, Any]) -> None
             # fact down. /restart carries no such guard and actually brings it
             # back. Found by the e2e rollback test — the single postgres test
             # never rolled back, so it never hit this.
-            await ctx.api.restart(resource.snapshot.collection, resource.snapshot.uuid)
-            log.info("compensate.source_restarted", name=resource.snapshot.name)
-            ctx.journal.append(
-                "rollback_step",
-                state=State.QUIESCE.value,
-                detail={
-                    "compensation": Compensation.RESTART_SOURCE.value,
-                    "restarted": resource.snapshot.uuid,
-                },
-            )
+            answer = await ctx.api.restart(snapshot.collection, snapshot.uuid)
         except Exception as exc:
-            failures.append(f"{resource.snapshot.name}: {exc}")
-            log.error(
-                "compensate.source_restart_failed",
-                name=resource.snapshot.name,
-                error=str(exc)[:200],
-            )
+            failures.append(f"{snapshot.name}: {exc}")
+            log.error("compensate.source_restart_failed", name=snapshot.name, error=str(exc)[:200])
+            continue
+        deployment = deployment_uuid_of(answer) if snapshot.collection == "applications" else None
+        if deployment is None:
+            # A database or a service queues no deployment, and a "skipped" answer
+            # names none (a deployment of that commit is already queued or running;
+            # a recorded restart of ours that stands is watched, never asked
+            # again): nothing to watch, so accepted is all there is to know.
+            _journal_restarted(ctx, snapshot.uuid, snapshot.name)
+            continue
+        ctx.journal.append(
+            "rollback_step",
+            state=State.QUIESCE.value,
+            detail={
+                "compensation": Compensation.RESTART_SOURCE.value,
+                "restart_deployment": deployment,
+                "source": snapshot.uuid,
+            },
+        )
+        watch[snapshot.uuid] = deployment
+    failures.extend(await _await_restart_deployments(ctx, watch))
     if failures:
         # The source stays down, so RELEASE_SOURCE_PINS will find its volumes
         # unmounted and keep their pins; say so where the operator looks first.
@@ -427,6 +457,131 @@ async def undo_quiesce(ctx: MigrationContext, undo_info: dict[str, Any]) -> None
             " and then releases the pins - or start it yourself, then"
             f" `coolify-migrate unpin {ctx.migration_id}`)"
         )
+
+
+#: How often a rollback re-reads the deployments of the restarts it asked for.
+_DEPLOYMENT_POLL_INTERVAL = 5.0
+
+
+def _journal_restarted(ctx: MigrationContext, source_uuid: str, name: str) -> None:
+    """Record that this stop's restart of one source is done — the once-per-stop mark."""
+    log.info("compensate.source_restarted", name=name)
+    ctx.journal.append(
+        "rollback_step",
+        state=State.QUIESCE.value,
+        detail={"compensation": Compensation.RESTART_SOURCE.value, "restarted": source_uuid},
+    )
+
+
+async def _restart_stands(ctx: MigrationContext, deployment_uuid: str) -> bool:
+    """Whether a restart an interrupted rollback asked for may still bring its source up.
+
+    Queued, running or finished: it stands, and asking again would redeploy a
+    source that is coming up. Failed, cancelled or missing: ask again.
+
+    Unreadable stands too, and is watched (:func:`_await_restart_deployments`
+    reads it again each round): a read error decides nothing. Asking again on one
+    redeployed a source the first restart had brought back, or got a 'skipped'
+    answer naming nothing to watch while that restart was still running
+    (queue_application_deployment v4.7.0:65-79), and journalled a restart nobody
+    had seen finish.
+    """
+    try:
+        found = await ctx.api.get_deployment(deployment_uuid)
+    except Exception as exc:
+        log.debug(
+            "compensate.restart_deployment_unread", uuid=deployment_uuid, error=str(exc)[:120]
+        )
+        return True
+    return judge(deployment_uuid, found).progress is not Progress.FAILED
+
+
+async def _await_restart_deployments(ctx: MigrationContext, watch: Mapping[str, str]) -> list[str]:
+    """Wait for each application restart's deployment to end. Returns the failures.
+
+    A deployment that FINISHED is journalled as restarted. One that failed, was
+    cancelled or does not exist (:func:`domain.deployments.judge`) is not: the
+    source is still down, RESTART_SOURCE fails, RELEASE_SOURCE_PINS keeps the pins
+    without a look, and the next ``rollback <id>`` asks again. A gate block also
+    leaves the way out as a notice (:func:`domain.deployments.restart_blocked_notice`).
+
+    Bounded by ``deploy_timeout``. A deployment still pending then is journalled
+    as restarted, as every accepted restart was before this watch existed: a slow
+    queue must never cost the source a second redeploy. A read that fails decides
+    nothing and is tried again on the next round.
+    """
+    names = {r.snapshot.uuid: r.snapshot.name for r in ctx.plan.resources}
+    pending = dict(watch)
+    failures: list[str] = []
+    waited = 0.0
+    while True:
+        for source_uuid, deployment_uuid in list(pending.items()):
+            try:
+                found = await ctx.api.get_deployment(deployment_uuid)
+            except Exception as exc:
+                log.debug(
+                    "compensate.restart_deployment_unread",
+                    uuid=deployment_uuid,
+                    error=str(exc)[:120],
+                )
+                continue
+            verdict = judge(deployment_uuid, found)
+            if verdict.progress is Progress.PENDING:
+                continue
+            del pending[source_uuid]
+            name = names.get(source_uuid, source_uuid)
+            if verdict.progress is Progress.FINISHED:
+                _journal_restarted(ctx, source_uuid, name)
+                continue
+            failures.append(f"{name}: {verdict.reason}")
+            log.error(
+                "compensate.source_restart_deployment_failed", name=name, uuid=deployment_uuid
+            )
+            if verdict.gate_blocked:
+                ctx.notices.append(
+                    restart_blocked_notice(name, deployment_uuid, migration_id=ctx.migration_id)
+                )
+        if not pending:
+            return failures
+        if waited >= ctx.settings.deploy_timeout:
+            break
+        await asyncio.sleep(_DEPLOYMENT_POLL_INTERVAL)
+        waited += _DEPLOYMENT_POLL_INTERVAL
+    for source_uuid, deployment_uuid in pending.items():
+        name = names.get(source_uuid, source_uuid)
+        log.warning("compensate.source_restart_unfinished", name=name, uuid=deployment_uuid)
+        _journal_restarted(ctx, source_uuid, name)
+        ctx.notices.append(
+            f"{name}'s restart (deployment {deployment_uuid}) had not finished after "
+            f"{ctx.settings.deploy_timeout:.0f}s; it may still be running - check it in Coolify. "
+            "If it failed, start the source there, then "
+            f"coolify-migrate unpin {ctx.migration_id}."
+        )
+    return failures
+
+
+def _restart_deployments_since_stop(records: Iterable[JournalRecord]) -> dict[str, str]:
+    """Source uuid -> the deployment of the last restart asked for after the last stop. PURE.
+
+    Reset by a stop request like :func:`_restarted_since_stop`; a later request
+    for the same source replaces an earlier one.
+    """
+    asked: dict[str, str] = {}
+    for record in records:
+        if (
+            record.event == "step_started"
+            and record.state == State.QUIESCE.value
+            and record.detail.get(STOP_REQUESTED) is True
+        ):
+            asked.clear()
+        elif (
+            record.event == "rollback_step"
+            and record.detail.get("compensation") == Compensation.RESTART_SOURCE.value
+            and isinstance(source := record.detail.get("source"), str)
+            and isinstance(deployment := record.detail.get("restart_deployment"), str)
+        ):
+            asked[source] = deployment
+    return asked
 
 
 def _restarted_since_stop(records: Iterable[JournalRecord]) -> set[str]:

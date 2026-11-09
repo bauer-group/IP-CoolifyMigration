@@ -95,6 +95,16 @@ def _next_step(result: RunResult, migration_id: str) -> str:
         )
 
     if result.outcome is Outcome.ROLLED_BACK:
+        # A restart that FAILED is never here: RESTART_SOURCE then fails and the
+        # outcome is ROLLBACK_FAILED. A notice is what is left: a restart whose
+        # deployment had not finished, a pin kept because the source did not
+        # mount its volumes in time - neither proves the source runs.
+        if result.notices:
+            return (
+                "Everything we changed has been undone, but read what was left in place\n"
+                "above: it says what may not be back yet.\n"
+                "Your data was never at risk: the source is only destroyed at finalize."
+            )
         return (
             "Everything we changed has been undone and your source is running again.\n"
             "Your data was never at risk: the source is only destroyed at finalize."
