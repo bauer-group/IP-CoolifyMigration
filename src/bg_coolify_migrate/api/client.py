@@ -17,7 +17,9 @@ Three non-obvious behaviours this client exists to handle:
    into a POST.
 
 3. **Deploy endpoints rate-limit.** 429 is expected under normal operation, not
-   exceptional, so it is retried with backoff rather than surfaced.
+   exceptional, so it is retried with backoff rather than surfaced. One 429 is
+   not ours to cause, though: Coolify 4.7's failed-request throttle blocks a
+   whole TOKEN for minutes (:data:`_TOKEN_BLOCKED`), and it is said out loud.
 """
 
 from __future__ import annotations
@@ -45,6 +47,16 @@ _RETRY_STATUS = frozenset({429, 502, 503, 504})
 #: it before the controller runs. A 502/503/504 from the proxy can arrive after
 #: Coolify committed the row, so a create that must not double retries only this.
 _THROTTLED = frozenset({429})
+
+#: The start of the 429 body Coolify's failed-request throttle answers with
+#: (ThrottleFailedApiRequests v4.7.0:45-50, global middleware, Kernel.php :62; absent
+#: at v4.6.0). 30 failed requests in a minute (API_FAILED_REQUEST_RATE_LIMIT; a 401
+#: or 403, a 404 only without a token: :63-67) block the bearer token — keyed on its
+#: hash, so EVERY client of the token — for 60, then 300, then 900 s (:30, :77-85).
+#: While blocked every request gets this 429 before the controller runs, so
+#: :data:`_THROTTLED` still holds. Matched on the text, never on a version: the body
+#: says which throttle it is, and only this one deserves a warning and a hint.
+_TOKEN_BLOCKED = "Too many failed API requests"
 
 
 class CoolifyClient:
@@ -134,6 +146,18 @@ class CoolifyClient:
 
             if response.status_code in retry_statuses and attempt <= self._max_retries:
                 retry_after = _parse_retry_after(response)
+                if _is_token_blocked(response):
+                    # Up to 15 minutes of silence per attempt, maybe mid-QUIESCE or
+                    # mid-rollback: say why. Still wait it out rather than give up —
+                    # a rollback needs this same token, and aborting it early only
+                    # leaves the source down longer. Never the token or a header.
+                    log.warning(
+                        "api.token_blocked",
+                        method=method,
+                        path=path,
+                        retry_after=retry_after,
+                        attempt=attempt,
+                    )
                 await self._backoff(attempt, reason=str(response.status_code), floor=retry_after)
                 continue
 
@@ -594,6 +618,17 @@ def _parse_retry_after(response: httpx.Response) -> float | None:
         return None
 
 
+def _is_token_blocked(response: httpx.Response) -> bool:
+    """Whether a 429 is the failed-request block of the whole token."""
+    if response.status_code != 429:
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and str(body.get("message", "")).startswith(_TOKEN_BLOCKED)
+
+
 def _to_error(method: str, path: str, response: httpx.Response) -> CoolifyApiError:
     try:
         body = response.json()
@@ -669,6 +704,20 @@ def _to_error(method: str, path: str, response: httpx.Response) -> CoolifyApiErr
         )
     elif response.status_code == 404:
         hint = "Resource not found, or the API is disabled for this instance."
+    elif _is_token_blocked(response):
+        # The retries waited out every block and the token is still blocked. The
+        # cause is a refused request, and in normal operation this tool sends
+        # none: every request carries the token, so its 404 probes do not count,
+        # and a 401/403 aborts the command. Its one repeated 403 is a rollback's
+        # per-target DELETE with a token that lacks `delete` (4.6+).
+        hint = (
+            "Coolify (4.7+) blocks a token for 1, then 5, then 15 minutes after 30 "
+            "failed (401/403) requests in one minute, from ANY client that uses it — "
+            "this tool's own refused requests included, e.g. a rollback's deletes "
+            "with a token that lacks `delete`. Coolify notified the token's team "
+            "naming the last failed request: fix or revoke that client, and give "
+            "this tool a token of its own with every ability it needs."
+        )
 
     return CoolifyApiError(
         f"{method} {path} failed",
