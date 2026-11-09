@@ -206,7 +206,9 @@ def register_server(token: str, *, name: str, ip: str, key_uuid: str) -> str:
 def validate_server(token: str, uuid: str, name: str) -> bool:
     for attempt in range(1, 13):
         try:
-            api(f"/servers/{uuid}/validate", token)
+            # POST: the GET form only answers 405 "This endpoint has changed to a
+            # POST request." (routes/api.php v4.6.0:199-200, v4.7.0:205-206).
+            api(f"/servers/{uuid}/validate", token, method="POST")
         except RuntimeError as exc:
             print(f"  {name}: validate attempt {attempt} -> {str(exc)[:120]}")
         server = api(f"/servers/{uuid}", token)
