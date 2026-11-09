@@ -1,6 +1,6 @@
-"""Services against Coolify 4.7: the source's own compose, removed parts.
+"""Services against Coolify 4.7: the source's own compose, removed parts, dotted names.
 
-Two findings of the v4.6.0 -> v4.7.0 audit, one module:
+Three findings of the v4.6.0 -> v4.7.0 audit, one module:
 
 * A template service's target was built from the instance's CURRENT catalog,
   which the CDN refreshes for every release: v4.7.0's moved getoutline from
@@ -10,6 +10,7 @@ Two findings of the v4.6.0 -> v4.7.0 audit, one module:
 * A part that left the compose stays in the GET (4.7.0 flags it
   ``is_removed_from_compose``): never carried, refused while it holds a custom
   host or a migrated volume.
+* 4.5.0-4.6.x corrupt a dotted compose service name on every URL update.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import respx
 
 from bg_coolify_migrate.api import resources
 from bg_coolify_migrate.api.client import CoolifyClient
+from bg_coolify_migrate.domain import coolify_versions as cv
 from bg_coolify_migrate.domain import fidelity
 from bg_coolify_migrate.domain.compose import MountClass
 from bg_coolify_migrate.domain.kinds import ResourceKind, removed_from_compose
@@ -731,3 +733,42 @@ class TestRemovedPartRefusals:
         )
         assert plan.is_blocked
         assert any("['docs']" in r and "removed" in r for r in plan.resources[0].refusals)
+
+
+# ── C: dotted sub-application names on 4.5.0-4.6.x ───────────────────────────
+
+
+def _dotted(fqdn: str) -> dict[str, Any]:
+    return {"applications": [{"name": "api.test", "fqdn": fqdn}, {"name": "web", "fqdn": fqdn + "x"}]}
+
+
+class TestDottedNames:
+    def test_the_gate_is_bounded(self) -> None:
+        gate = cv.FEATURES["service_url_patch_splits_dotted_names"]
+        assert (gate.since, gate.until) == ((4, 5, 0), (4, 7, 0))
+
+    @pytest.mark.parametrize("version", [(4, 5, 0), (4, 5, 2), (4, 6, 0), None])
+    @pytest.mark.parametrize(
+        "fqdn", ["https://api.example.com", f"https://api.{SRC_WC}"], ids=["custom", "bound"]
+    )
+    def test_refused_where_the_url_update_splits_the_name(
+        self, version: tuple[int, int, int] | None, fqdn: str
+    ) -> None:
+        (line,) = fidelity.service_refusals(_dotted(fqdn), version=version)
+        assert "['api.test']" in line
+        assert "4.7.0" in line
+        assert "rename the compose service" in line
+        # Before 4.7.0 the old part keeps its name and domain, flagged by nothing.
+        assert "domain of the old part" in line
+
+    @pytest.mark.parametrize("version", [(4, 4, 7), (4, 7, 0), (4, 7, 1)])
+    def test_passes_where_it_does_not(self, version: tuple[int, int, int]) -> None:
+        assert fidelity.service_refusals(_dotted("https://api.example.com"), version=version) == []
+
+    def test_a_generated_host_is_never_named_in_a_patch(self) -> None:
+        source = _dotted("http://api-test-svc1.10.0.0.1.sslip.io")
+        assert fidelity.service_refusals(source, version=(4, 6, 0)) == []
+
+    def test_no_url_no_patch(self) -> None:
+        source = {"applications": [{"name": "api.test", "fqdn": None}]}
+        assert fidelity.service_refusals(source, version=(4, 6, 0)) == []

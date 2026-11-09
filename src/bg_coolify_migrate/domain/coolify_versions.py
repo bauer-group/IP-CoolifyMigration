@@ -176,6 +176,17 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         # check (ValidationPatterns::normalizeApplicationDomains); 4.1.x compares
         # raw strings.
         "service_urls_normalised": Gate(since=(4, 2, 0)),
+        # A sub-application named in a `urls` (or, 4.5.1+, its own) PATCH has its
+        # compose image rewritten through a DOTTED path: updateCompose reads and
+        # writes "services.{$name}.image" (services.php v4.6.0:397-399, :411; the
+        # same at v4.1.2:223-225), and its `!==` compares two fresh Stringables
+        # (data_get_str, shared.php v4.6.0:1599-1604), so it runs on every call.
+        # A name like `api.test` gets a nested `test:` key, and the next parse
+        # (START) fails. The urls PATCH reaches it from 4.5.0 (applyServiceUrls
+        # ServicesController v4.5.0:214; absent at v4.4.7); array key paths fix it
+        # in 4.7.0 (services.php v4.7.0:398-400, :412; commit 05e52fc41, only in
+        # v4.7.0 and v4.7.1). Unknown holds, and refuses (fidelity.service_refusals).
+        "service_url_patch_splits_dotted_names": Gate(since=(4, 5, 0), until=(4, 7, 0)),
         # An explicit domain port moves into the hidden applications.domain_port_overrides.
         "port_overrides_hidden": Gate(since=(4, 3, 15)),
         # ...and a compose service's domain port too: a UI save from 4.3.15

@@ -42,7 +42,7 @@ from bg_coolify_migrate.domain.coolify_versions import (
     every_application_route_carries,
     supports,
 )
-from bg_coolify_migrate.domain.domains import compose_domains, custom_hosts
+from bg_coolify_migrate.domain.domains import compose_domains, custom_hosts, without_generated
 from bg_coolify_migrate.domain.kinds import DatabaseEngine, removed_from_compose
 from bg_coolify_migrate.domain.locked_envs import is_locked
 from bg_coolify_migrate.domain.versions import Version
@@ -1395,6 +1395,32 @@ def service_refusals(source: dict[str, Any], *, version: Version | None) -> list
                 "the target's whole domain update when one URL is set on two containers, "
                 "so none of this service's domains could be carried. Give each "
                 "sub-application its own URL on the source, then migrate."
+            )
+
+    # 4.5.0-4.6.x: every urls PATCH (and sub-application PATCH) runs updateCompose
+    # for each part it names, which writes `services.{name}.image` through a
+    # dotted path (coolify_versions "service_url_patch_splits_dotted_names"). The
+    # target's claim names every part holding a host that is not generated — a
+    # custom one, or a server-bound one rewritten — so a dotted name there gets a
+    # nested key in the target's compose, latent until START parses it after the
+    # stop. FINALIZE's release would do the same to a kept source. A rename alone
+    # is no way out there: the old part stays, unflagged before 4.7.0
+    # (kinds.removed_from_compose), with its dotted name and its domain.
+    if supports("service_url_patch_splits_dotted_names", version):
+        dotted = sorted(
+            {
+                name
+                for name, url in parts
+                if "." in name and name not in removed and normalise_host(without_generated(url))
+            }
+        )
+        if dotted:
+            out.append(
+                f"sub-application(s) {dotted} have a '.' in their compose service name. "
+                "Coolify 4.5.0-4.6.x writes a nested key into the compose on every URL "
+                "update, so the target would not start after the stop. Upgrade Coolify to "
+                "4.7.0+, or rename the compose service without '.' and clear the domain "
+                "of the old part (Coolify keeps it under the old name), then migrate."
             )
     return out
 
