@@ -8,15 +8,252 @@ where the rule lives.
 
 from __future__ import annotations
 
+import base64
 from typing import Any
 
 import pytest
 
-from bg_coolify_migrate.domain import fidelity
+from bg_coolify_migrate.domain import fidelity, schedules
 
 V47 = (4, 7, 0)
 V471 = (4, 7, 1)
 V46 = (4, 6, 0)
+
+# ── compose image overrides (4.7.0 security updates) ─────────────────────────
+
+COMPOSE = """\
+services:
+  web:
+    image: nginx:1.27.1
+  db:
+    image: postgres:16.1
+  worker:
+    build: .
+"""
+
+
+def _compose_app(**kw: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "uuid": "app1",
+        "build_pack": "dockercompose",
+        "compose_parsing_version": "3",
+        "settings": {"is_raw_compose_deployment_enabled": False},
+        "docker_compose_raw": COMPOSE,
+        "docker_compose_image_overrides": {
+            "web": {"from": "nginx:1.27.1", "to": "nginx:1.27.3"},
+        },
+    }
+    return {**base, **kw}
+
+
+class TestComposeImageOverrides:
+    def test_an_active_override_warns_with_service_and_both_images(self) -> None:
+        line = fidelity.compose_image_override_warning(_compose_app())
+        assert line is not None
+        assert "web: nginx:1.27.1 -> nginx:1.27.3" in line
+        assert "Git" in line and "security update on the target" in line
+
+    @pytest.mark.parametrize("version", [V47, V471, None])
+    def test_the_plan_carries_it_whatever_the_version(self, version: Any) -> None:
+        """The column exists from 4.7.0 only: its presence is the gate."""
+        out = fidelity.application_warnings(_compose_app(), version=version)
+        assert any("nginx:1.27.3" in line for line in out)
+
+    def test_a_stale_override_is_silent(self) -> None:
+        """The compose no longer names `from`: Coolify deploys the compose as written."""
+        source = _compose_app(
+            docker_compose_image_overrides={"web": {"from": "nginx:1.26.0", "to": "nginx:1.26.2"}}
+        )
+        assert fidelity.active_compose_image_overrides(source) == {}
+        assert fidelity.compose_image_override_warning(source) is None
+
+    def test_the_comparison_trims_like_php(self) -> None:
+        source = _compose_app(
+            docker_compose_image_overrides={"db": {"from": " postgres:16.1\t", "to": "postgres:16.4"}}
+        )
+        assert fidelity.active_compose_image_overrides(source) == {
+            "db": (" postgres:16.1\t", "postgres:16.4")
+        }
+
+    def test_a_base64_compose_is_read(self) -> None:
+        raw = base64.b64encode(COMPOSE.encode()).decode()
+        assert fidelity.active_compose_image_overrides(_compose_app(docker_compose_raw=raw))
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"settings": {"is_raw_compose_deployment_enabled": True}},
+            {"compose_parsing_version": "2"},
+            {"compose_parsing_version": None},
+            {"build_pack": "nixpacks"},
+            {"docker_compose_image_overrides": None},
+            {"docker_compose_image_overrides": {}},
+            {"docker_compose_image_overrides": []},
+            {"docker_compose_raw": None},
+            {"docker_compose_raw": "services: [unclosed"},
+        ],
+    )
+    def test_silent_where_upstream_applies_nothing(self, change: dict[str, Any]) -> None:
+        """Raw compose deployments and parsing versions < 3 never use the parser that
+        applies an override; a missing or unreadable compose matches no service."""
+        assert fidelity.compose_image_override_warning(_compose_app(**change)) is None
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "nginx:1.27.3",
+            {"from": "nginx:1.27.1"},
+            {"from": "nginx:1.27.1", "to": 3},
+            {"from": None, "to": "nginx:1.27.3"},
+        ],
+    )
+    def test_a_malformed_entry_is_ignored(self, entry: object) -> None:
+        source = _compose_app(docker_compose_image_overrides={"web": entry})
+        assert fidelity.compose_image_override_warning(source) is None
+
+    def test_a_service_without_an_image_or_unknown_to_the_compose_is_ignored(self) -> None:
+        source = _compose_app(
+            docker_compose_image_overrides={
+                "worker": {"from": "nginx:1.27.1", "to": "nginx:1.27.3"},
+                "gone": {"from": "nginx:1.27.1", "to": "nginx:1.27.3"},
+                "db": {"from": "postgres:16.1", "to": "postgres:16.4"},
+            }
+        )
+        assert fidelity.active_compose_image_overrides(source) == {
+            "db": ("postgres:16.1", "postgres:16.4")
+        }
+
+    def test_a_stock_compose_app_is_silent(self) -> None:
+        source = _compose_app()
+        del source["docker_compose_image_overrides"]
+        assert fidelity.application_warnings(source, version=V47) == []
+
+
+# ── saved Git host keys (4.7.0) ──────────────────────────────────────────────
+
+#: GitHub's published ed25519 key: its fingerprint is documented by GitHub, so
+#: it checks the computation independently of the implementation.
+ED25519 = "AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+ED25519_FP = "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU"
+#: GitLab's published ed25519 key (fingerprint documented on docs.gitlab.com).
+GITLAB_ED25519 = "AAAAC3NzaC1lZDI1NTE5AAAAIAfuCHKVTjquxvt6CM6tdG4SLp1Btn/nOeHHE5UOzRdf"
+GITLAB_FP = "SHA256:eUXGGm1YGsMAS7vkcx6JOJdOGHPem5gQp4taiCfCLB8"
+
+
+class TestGitKnownHosts:
+    def test_a_saved_self_hosted_key_warns_with_its_fingerprint_not_its_key(self) -> None:
+        source = {"build_pack": "nixpacks", "git_ssh_known_hosts": f"git.example.com ssh-ed25519 {ED25519}\n"}
+        line = fidelity.git_known_hosts_warning(source)
+        assert line is not None
+        assert f"git.example.com ssh-ed25519 {ED25519_FP}" in line
+        assert ED25519 not in line
+        assert "first contact" in line and "Source > SSH host keys" in line
+        assert "OpenSSH" not in line  # only a compose load runs on the server
+
+    def test_the_plan_carries_it_whatever_the_version(self) -> None:
+        source = {"git_ssh_known_hosts": f"git.example.com ssh-ed25519 {ED25519}"}
+        for version in (V47, None):
+            assert any(ED25519_FP in line for line in fidelity.application_warnings(source, version=version))
+
+    def test_a_compose_app_also_hears_about_old_openssh(self) -> None:
+        source = {
+            "build_pack": "dockercompose",
+            "git_ssh_known_hosts": f"[git.example.com]:2222 ssh-ed25519 {ED25519}",
+        }
+        line = fidelity.git_known_hosts_warning(source)
+        assert line is not None
+        assert f"[git.example.com]:2222 ssh-ed25519 {ED25519_FP}" in line
+        assert "OpenSSH older than 7.6" in line
+
+    def test_lines_are_cleaned_and_deduplicated_like_upstream(self) -> None:
+        raw = (
+            f"  git.example.com   ssh-ed25519\t{ED25519}  \r\n"
+            f"git.example.com ssh-ed25519 {ED25519}\n"
+            "\n"
+            "# a comment\n"
+            f"@cert-authority *.example.com ssh-ed25519 {ED25519}\n"
+            f"|1|aGFzaA==|aGFzaA== ssh-ed25519 {ED25519}\n"
+            f"git.example.com ssh-dss {ED25519}\n"
+            f"other.example.com ssh-ed25519 {GITLAB_ED25519} comment\n"
+        )
+        assert fidelity.trusted_git_host_keys(raw) == [f"git.example.com ssh-ed25519 {ED25519}"]
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            f"github.com ssh-ed25519 {ED25519}",
+            f"[ssh.github.com]:443 ssh-ed25519 {ED25519}",
+            f"gitlab.com ssh-ed25519 {GITLAB_ED25519}",
+            f"bitbucket.org,[altssh.bitbucket.org]:443 ssh-ed25519 {ED25519}",
+            f"GitHub.com ssh-ed25519 {ED25519}",
+        ],
+    )
+    def test_a_pinned_provider_is_not_reported(self, line: str) -> None:
+        """Every server checks those against Coolify's own keys, never on first use."""
+        assert fidelity.git_known_hosts_warning({"git_ssh_known_hosts": line}) is None
+
+    @pytest.mark.parametrize("raw", [None, "", "   \n", 42])
+    def test_nothing_saved_is_silent(self, raw: object) -> None:
+        assert fidelity.git_known_hosts_warning({"git_ssh_known_hosts": raw}) is None
+
+    def test_the_fingerprint_matches_the_published_one(self) -> None:
+        assert fidelity.known_host_fingerprint(f"h.example ssh-ed25519 {GITLAB_ED25519}") == (
+            "h.example",
+            "ssh-ed25519",
+            GITLAB_FP,
+        )
+
+    def test_a_key_without_its_padding_still_fingerprints(self) -> None:
+        """PHP's base64_decode is lenient about padding; the fingerprint must agree."""
+        rsa_ish = base64.b64encode(b"\x00\x00\x00\x07ssh-rsa" + b"x" * 6).decode()
+        assert rsa_ish.endswith("=")
+        padded = fidelity.known_host_fingerprint(f"h ssh-rsa {rsa_ish}")
+        assert fidelity.known_host_fingerprint(f"h ssh-rsa {rsa_ish.rstrip('=')}") == padded
+
+
+# ── scheduled tasks Coolify switched off itself (4.7.0) ──────────────────────
+
+REASON = "Disabled automatically after 10 failed runs in a row since 2026-11-01 02:00:00 UTC."
+
+
+def _task_warnings(tasks: list[dict[str, Any]]) -> list[str]:
+    return schedules.scheduled_task_warnings(
+        tasks, source_uuid="app1", source_server=None, target_server=None, version=V47
+    )
+
+
+class TestAutoDisabledTasks:
+    def test_a_task_coolify_switched_off_is_named_never_explained(self) -> None:
+        tasks = [
+            {"name": "nightly", "enabled": False, "disabled_reason": REASON, "command": "pg_dump -W s3cr3t"},
+            {"name": "hourly", "enabled": True},
+        ]
+        [line] = _task_warnings(tasks)
+        assert "['nightly']" in line and "hourly" not in line
+        assert "switched off by Coolify itself" in line
+        assert REASON not in line and "failed runs" not in line
+        assert "s3cr3t" not in line and "pg_dump" not in line  # invariant 5
+
+    @pytest.mark.parametrize(
+        "task",
+        [
+            {"name": "off", "enabled": False},
+            {"name": "off", "enabled": False, "disabled_reason": None},
+            {"name": "on", "enabled": True, "disabled_reason": REASON},
+            {"name": "4.6-shaped", "enabled": False, "frequency": "@daily"},
+        ],
+    )
+    def test_a_task_switched_off_by_hand_or_running_is_silent(self, task: dict[str, Any]) -> None:
+        assert _task_warnings([task]) == []
+
+    def test_no_version_gate(self) -> None:
+        tasks = [{"name": "nightly", "enabled": False, "disabled_reason": REASON}]
+        for version in (V46, None):
+            out = schedules.scheduled_task_warnings(
+                tasks, source_uuid="", source_server=None, target_server=None, version=version
+            )
+            assert len(out) == 1
+
 
 # ── shared image names: a 4.7.0 restart skips the check ──────────────────────
 

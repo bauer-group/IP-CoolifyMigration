@@ -125,6 +125,26 @@ def scheduled_task_warnings(
                 "service name (e.g. 'web') on the source, or on the target afterwards."
             )
 
+    # From 4.7.0 Coolify switches a task off itself after 10 failed runs in a row
+    # whose first is at least 24h old, and writes why into disabled_reason
+    # (ScheduledTask v4.7.0:54-59,99-114, from ScheduledTaskJob::failed :363;
+    # migration 2026_11_03_192735, absent at v4.6.0). `enabled: false` is carried
+    # as it is; disabled_reason is in no create or update array
+    # (ScheduledTasksController v4.7.0:81,164), so the target shows a plainly
+    # disabled task. Enabling a task clears the reason (ScheduledTask :64-69), so a
+    # reason beside enabled=false is Coolify's own. The column is the gate: no
+    # version check. Names only, never the reason or the command (invariant 5).
+    switched_off = sorted(
+        _name(t) for t in tasks if t.get("enabled") is False and t.get("disabled_reason")
+    )
+    if switched_off:
+        out.append(
+            f"scheduled task(s) {switched_off} were switched off by Coolify itself after "
+            "failing again and again (Coolify 4.7+). They are carried disabled, but no API "
+            "can record why, so the target shows them as plainly disabled. Fix what makes "
+            "them fail, then enable them on the target if they should run."
+        )
+
     source_tz, target_tz = server_timezone(source_server), server_timezone(target_server)
     armed = sorted(_name(t) for t in tasks if t.get("enabled") is not False)
     if armed and source_tz and target_tz and source_tz != target_tz:

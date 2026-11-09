@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import re
 import shlex
 import unicodedata
@@ -689,6 +690,10 @@ def application_warnings(
             "and applies from 4.5 on. The target — and the source's own next deploy — "
             "runs with them; check it behaves as the running source does."
         )
+    if line := compose_image_override_warning(source):
+        out.append(line)
+    if line := git_known_hosts_warning(source):
+        out.append(line)
     return out
 
 
@@ -1057,6 +1062,185 @@ def newly_mapped_run_options(raw: object) -> list[str]:
         elif flag in _NEWLY_MAPPED_FLAGS or _NEWLY_MAPPED_SHORT.fullmatch(token):
             found.add(flag)
     return sorted(found)
+
+
+# ── Coolify 4.7: state only the UI and the deploy job write ──────────────────
+#
+# Both columns arrive with a v4.7.0 migration (absent at v4.6.0), are returned by
+# GET /applications/{uuid} and are in no create or update array
+# (ApplicationsController v4.7.0:1613, :3662; nothing in app/Http or routes names
+# them). Their presence is the gate, as for the backup fields: no version check.
+
+#: PHP trim()'s character set, which composeImageOverride compares with.
+_PHP_TRIM = " \t\n\r\0\x0b"
+
+
+def active_compose_image_overrides(source: dict[str, Any]) -> dict[str, tuple[str, str]]:
+    """``{compose service: (from, to)}`` for each security update the source deploys. PURE.
+
+    A security update of a dockercompose app (UpdateResourceImage v4.7.0:297-356)
+    does not edit the compose in Git: it stores ``{service: {from, to}}`` in
+    ``docker_compose_image_overrides`` (migration 2026_10_29_100000:133-136), and
+    applicationParser deploys ``to`` while the compose still names ``from``
+    (parsers.php v4.7.0:2305-2308). Mirrors Application::activeComposeImageOverrides
+    (v4.7.0:2532-2565): well-formed string pairs only, against the image of the
+    service in ``docker_compose_raw``, trimmed. That parser runs only from
+    compose_parsing_version 3 (Application::parse, :2599) and not for a raw
+    compose deployment (ApplicationDeploymentJob v4.7.0:940-942 takes the old
+    parser), so an entry outliving either switch applies to nothing. A same-tag
+    update is no override at all: a 6-hour start pin (ImageStartPin v4.7.0:9-18).
+    """
+    overrides = source.get("docker_compose_image_overrides")
+    if source.get("build_pack") != "dockercompose" or not isinstance(overrides, dict):
+        return {}
+    if _count(source.get("compose_parsing_version")) < 3 or (
+        _settings(source).get("is_raw_compose_deployment_enabled")
+    ):
+        return {}
+    services = _parsed_compose_services(source.get("docker_compose_raw"))
+    if services is None:
+        return {}
+    images = {str(name): body.get("image") for name, body in services.items()}
+    active: dict[str, tuple[str, str]] = {}
+    for name, override in overrides.items():
+        if not isinstance(override, dict):
+            continue
+        old, new, image = override.get("from"), override.get("to"), images.get(str(name))
+        if (
+            isinstance(old, str)
+            and isinstance(new, str)
+            and isinstance(image, str)
+            and image.strip(_PHP_TRIM) == old.strip(_PHP_TRIM)
+        ):
+            active[str(name)] = (old, new)
+    return active
+
+
+def compose_image_override_warning(source: dict[str, Any]) -> str | None:
+    """The images a security update put on the source, which the target will not run.
+
+    CREATE builds a git compose target without ``docker_compose_raw``, so it loads
+    the compose from Git and runs ``from``. UpdateResourceImage never crosses a
+    major version (v4.7.0:33-34), so this is drift, not a refusal: for a database
+    service, an older minor on data a newer one wrote.
+    """
+    active = active_compose_image_overrides(source)
+    if not active:
+        return None
+    detail = ", ".join(f"{name}: {old} -> {new}" for name, (old, new) in sorted(active.items()))
+    return (
+        f"Coolify security updates replaced the image of compose service(s) [{detail}] on "
+        "the source. Coolify keeps such an update as an override beside the compose, used "
+        "while the compose in Git still names the old image, and no API can set it: the "
+        "target loads its compose from Git and runs the image the update replaced. Pin "
+        "the new image in the compose in Git (the source's next deploy then drops the "
+        "override as stale), or re-apply the security update on the target after START."
+    )
+
+
+#: isValidGitKnownHostsLine (bootstrap/helpers/applications.php v4.7.0:806-812):
+#: `host[,host] key-type key`, no markers, hashed names or comments.
+_KNOWN_HOSTS_HOST = r"(?:[A-Za-z0-9._:-]+|\[[A-Za-z0-9._:-]+\]:[0-9]{1,5})"
+_KNOWN_HOSTS_LINE = re.compile(
+    rf"{_KNOWN_HOSTS_HOST}(?:,{_KNOWN_HOSTS_HOST})* "
+    r"(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)"
+    r"|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) "
+    r"[A-Za-z0-9+/]+={0,2}"
+)
+#: The hosts of GIT_PINNED_HOST_KEYS (v4.7.0:698-708, gitPinnedHosts :832-835):
+#: checked strictly against Coolify's built-in keys on every server, so a target
+#: never trusts them on first use. Deployments ignore a saved github or bitbucket
+#: line altogether (gitKnownHostsLines :861-869).
+_PINNED_GIT_HOSTS = frozenset(
+    {
+        "github.com",
+        "ssh.github.com",
+        "gitlab.com",
+        "altssh.gitlab.com",
+        "bitbucket.org",
+        "altssh.bitbucket.org",
+    }
+)
+#: PHP's `\s` without the /u flag.
+_PHP_SPACE = re.compile(r"[ \t\n\x0b\x0c\r]+")
+_PORTED_HOST = re.compile(r"\[(.+)\]:[0-9]+")
+
+
+def _known_hosts_line_hosts(line: str) -> set[str]:
+    """gitKnownHostsLineHosts (v4.7.0:819-825): names without brackets and ports."""
+    return {
+        (m.group(1) if (m := _PORTED_HOST.fullmatch(host)) else host).lower()
+        for host in line.split(" ", 1)[0].split(",")
+    }
+
+
+def trusted_git_host_keys(raw: object) -> list[str]:
+    """The saved known_hosts lines a self-hosted Git host was trusted with. PURE.
+
+    gitKnownHostsLines (v4.7.0:861-869): each line trimmed and its whitespace
+    collapsed, valid lines only, once each — less the lines of a pinned provider,
+    which a target checks against Coolify's own keys instead.
+    """
+    if not isinstance(raw, str):
+        return []
+    lines: list[str] = []
+    for part in raw.splitlines():
+        line = _PHP_SPACE.sub(" ", part.strip(_PHP_TRIM))
+        if (
+            _KNOWN_HOSTS_LINE.fullmatch(line)
+            and not _known_hosts_line_hosts(line) & _PINNED_GIT_HOSTS
+            and line not in lines
+        ):
+            lines.append(line)
+    return lines
+
+
+def known_host_fingerprint(line: str) -> tuple[str, str, str]:
+    """``(hosts, key type, SHA256:...)`` as gitKnownHostFingerprint (v4.7.0:895-905) shows it.
+
+    The Coolify UI lists the same fingerprint, and ``ssh-keygen -lf`` prints it,
+    so the operator can compare without the key itself. Like PHP's lenient
+    base64_decode, this ignores missing padding and a dangling last character.
+    """
+    hosts, kind, key = line.split(" ")
+    body = key.rstrip("=")
+    if len(body) % 4 == 1:
+        body = body[:-1]
+    decoded = base64.b64decode(body + "=" * (-len(body) % 4))
+    digest = base64.b64encode(hashlib.sha256(decoded).digest()).decode().rstrip("=")
+    return hosts, kind, f"SHA256:{digest}"
+
+
+def git_known_hosts_warning(source: dict[str, Any]) -> str | None:
+    """The Git host keys the source pinned, which the target has to trust anew.
+
+    ``git_ssh_known_hosts`` (migration 2026_10_30_120000, Application v4.7.0:60,
+    :168, not in $hidden :290-304) holds the keys of self-hosted Git hosts that
+    a deploy accepted on first use (ApplicationDeploymentJob v4.7.0:3827-3869) or
+    an operator accepted by hand. Everything but a pinned provider is trusted on
+    first use, seeded with these lines (gitSshSetupCommand v4.7.0:923-955). The
+    target starts with none, so its first contact trusts whatever key the host
+    presents. Host keys are public; only fingerprints go into the line anyway.
+    """
+    lines = trusted_git_host_keys(source.get("git_ssh_known_hosts"))
+    if not lines:
+        return None
+    keys = "; ".join(" ".join(known_host_fingerprint(line)) for line in lines)
+    compose = (
+        " A compose application's compose load at CREATE runs on the target server "
+        "itself, where an OpenSSH older than 7.6 cannot trust a new key at all: CREATE "
+        "then fails before the source is stopped."
+        if source.get("build_pack") == "dockercompose"
+        else ""
+    )
+    return (
+        f"the source has saved SSH host keys for its Git host(s) ({keys}). No API sets "
+        "them, so the target starts without them and trusts whatever key the host "
+        "presents on its first contact, then saves that one. After START, compare the "
+        "keys in the target's Source > SSH host keys with these fingerprints: a "
+        "different one means the host changed its key, or something else answered in "
+        "its place." + compose
+    )
 
 
 # ── services and databases ───────────────────────────────────────────────────
