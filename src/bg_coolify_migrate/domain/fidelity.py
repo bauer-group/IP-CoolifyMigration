@@ -1837,7 +1837,9 @@ def env_warnings(
             for e in envs
             if e.get("key")
             and _saved_before_exact_escaping(e)
-            and legacy_escaping_changes_value(e, collection=collection, engine=engine)
+            and legacy_escaping_changes_value(
+                e, collection=collection, engine=engine, version=version
+            )
         )
         if changed:
             credentials = [k for k in changed if _CREDENTIAL_KEY.search(k)]
@@ -1894,7 +1896,11 @@ _LEGACY_ESCAPED = frozenset({"\\", "\r", "\t", "\x00", '"', "'"})
 
 
 def legacy_escaping_changes_value(
-    env: dict[str, Any], *, collection: str, engine: DatabaseEngine | None
+    env: dict[str, Any],
+    *,
+    collection: str,
+    engine: DatabaseEngine | None,
+    version: Version | None = None,
 ) -> bool:
     """Port of HasSecretManager::legacyEscapingChangesValue (v4.5.0:189-219). PURE.
 
@@ -1902,11 +1908,22 @@ def legacy_escaping_changes_value(
     exact one with the same saved value would. Reads the stored `value`: upstream
     reads the resolved one, so a {{team.X}}-style shared reference is judged by
     its reference text — the one approximation here.
+
+    From 4.6.0 upstream first asks useExactEscaping (v4.6.0:224-229, v4.7.0:227-231):
+    a legacy row Coolify writes exact anyway reaches the source's container exactly
+    as a new row reaches the target's (:func:`_legacy_row_written_exact`). Its other
+    clause, compose references that got the stored value before 4.5
+    (dockerComposeVariablesWithStoredValueBeforeExactEscaping, shared.php
+    v4.6.0:5673, v4.7.0:5798), is not ported: it needs upstream's compose reference
+    parsers, and leaving it out costs a warning that need not fire, never a missing
+    one.
     """
     value = env.get("value")
     if not isinstance(value, str) or not value.strip() or _VAULT_REFERENCE.search(value):
         return False
     app_or_service = collection in ("applications", "services")
+    if app_or_service and _legacy_row_written_exact(env, value, version):
+        return False
 
     if env.get("key") == "REDIS_PASSWORD" and engine in _REDIS_FAMILY and "$" in value:
         return True
@@ -1917,6 +1934,23 @@ def legacy_escaping_changes_value(
         # database environment lists keep them.
         return "'" in value if app_or_service else True
     return bool(_LEGACY_ESCAPED & set(value)) or (app_or_service and " #" in value)
+
+
+def _legacy_row_written_exact(env: dict[str, Any], value: str, version: Version | None) -> bool:
+    """HasSecretManager::legacyEnvFileLineIsUnreadable, for an application or service.
+
+    A JSON object or array holding a newline (v4.7.0:187-189), else a literal or
+    multiline value holding a quote (v4.6.0:180-188, v4.7.0:191); a JSON one never
+    falls through to the quote rule. Only for a KNOWN release: on an unknown one
+    the warning stays, as it did before either rule existed.
+    """
+    if value.startswith(("{", "[")) and _is_json(value):
+        return "\n" in value and supports("legacy_json_multiline_exact", version, if_unknown=False)
+    return (
+        bool(env.get("is_literal") or env.get("is_multiline"))
+        and "'" in value
+        and supports("legacy_unreadable_line_exact", version, if_unknown=False)
+    )
 
 
 #: PHP json_validate: strict JSON, NaN/Infinity rejected (Python's json takes them).

@@ -219,6 +219,17 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         # escaping. Asked of an env row's own `version` stamp as well as of the
         # instance (locked_envs.saved_before_exact_escaping).
         "exact_env_escaping": Gate(since=(4, 5, 0)),
+        # A LEGACY literal or multiline row of an application or service whose
+        # resolved value holds a `'` (and is no JSON object/array) is written exact
+        # after all: the old single quotes would break the .env
+        # (HasSecretManager::useExactEscaping v4.6.0:153-171,
+        # legacyEnvFileLineIsUnreadable :178-189; v4.5.3:151-154 is the bare flag).
+        "legacy_unreadable_line_exact": Gate(since=(4, 6, 0)),
+        # ...and so is a legacy JSON object/array holding a newline, whatever its
+        # flags (#8279: written raw it breaks the whole .env;
+        # legacyEnvFileLineIsUnreadable v4.7.0:179-192, commit 0b45d8dd6).
+        # Databases never: useExactEscaping returns false for them (:159-161).
+        "legacy_json_multiline_exact": Gate(since=(4, 7, 0)),
         # TrimStrings no longer trims an env `value` / `data.*.value`
         # (TrimStrings v4.7.0:18-20); the model trims a single-line value itself
         # (withoutEdgeWhitespace, EnvironmentVariable v4.7.0:894-899, set :907, get

@@ -1076,6 +1076,12 @@ _FRAGMENTS = [
     "'",
     "\\0",
     "\\n",
+    # edge whitespace a multi-line value keeps from 4.7.0 (withoutEdgeWhitespace)
+    "  ",
+    "\n\n",
+    " \n",
+    "\t\n",
+    "-----END KEY-----\n",
 ]
 
 
@@ -1098,10 +1104,22 @@ class _Case:
     ports_exposes: str | None
     host_line: bool
     """Else the app has a build-only HOST row, so Coolify writes no HOST line."""
+    legacy_exact: bool = False
+    """A legacy row Coolify writes exact after all (HasSecretManager::useExactEscaping
+    v4.6.0:153-171, v4.7.0:153-192) — here for ANY legacy dotenv row and value, a
+    superset of upstream's conditions, which the decoder does not consult."""
 
     @property
     def kind(self) -> FileKind:
         return FileKind.COMPOSE if self.collection == "databases" else FileKind.DOTENV
+
+
+def _without_edge_whitespace(value: str) -> str:
+    """EnvironmentVariable::withoutEdgeWhitespace (v4.7.0:894-899): a value is
+    trimmed unless its trimmed form holds a newline. Every earlier release trimmed
+    every value (v4.6.0:750, :803, :811) — a subset of what this generates."""
+    trimmed = value.strip(" \t\n\r\0\x0b")
+    return value if "\n" in trimmed else trimmed
 
 
 @st.composite
@@ -1110,10 +1128,12 @@ def _cases(draw: st.DrawFn) -> _Case:
     collection = draw(st.sampled_from(["applications", "services", "databases"]))
     compose_app = collection == "applications" and draw(st.booleans())
     port_line = collection == "applications" and not compose_app and draw(st.booleans())
+    exact = draw(st.booleans())
     return _Case(
-        value=value.strip(" \t\n\r\0\x0b"),
+        value=_without_edge_whitespace(value),
         flags={"is_literal": draw(st.booleans()), "is_multiline": draw(st.booleans())},
-        exact=draw(st.booleans()),
+        exact=exact,
+        legacy_exact=not exact and collection != "databases" and draw(st.booleans()),
         collection=collection,
         compose_app=compose_app,
         compose=(
@@ -1138,7 +1158,12 @@ def test_round_trip_property_exact_or_nothing(case: _Case) -> None:
     b = row("B", "b$1 'x'", version="4.3.10")
     envs = [a, target, b]
     rows = [("A", written(a, "plain-a", kind))]
-    k_line = ("K", written(target, value, kind))
+    raw = (
+        le.escape_compose_env_file_value(value, le.allows_interpolation(target, value))
+        if case.legacy_exact
+        else written(target, value, kind)
+    )
+    k_line = ("K", raw)
     b_line = ("B", written(b, "b$1 'x'", kind))
     rows += [b_line, k_line] if case.k_last else [k_line, b_line]
     lines = rows
@@ -1182,7 +1207,6 @@ def test_round_trip_property_exact_or_nothing(case: _Case) -> None:
     else:
         assert "K" in rec.unrecoverable
 
-    raw = written(target, value, kind)
     if kind is FileKind.COMPOSE or raw[0] == '"':  # exact: every inner quote is escaped
         delimited = True
     else:

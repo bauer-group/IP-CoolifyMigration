@@ -26,7 +26,9 @@ Coolify itself writes the value to the source server, every time it deploys:
 Each line is ``KEY=ENC(resolved)``, where ENC is a known encoding chosen per
 row: the exact escaping of 4.5 (``escapeComposeEnvFileValue`` /
 ``escapeDollarSign``) for rows saved on 4.5+, the legacy form otherwise
-(:func:`legacy_format`). We decode, then RE-ENCODE and require the line back
+(:func:`legacy_format`) — or, from 4.6.0, the exact one for the legacy rows of
+an application or service whose legacy line would be unreadable
+(:func:`written_forms`). We decode, then RE-ENCODE and require the line back
 byte for byte. A wrong guess, a secret-manager line, a truncated multi-line
 record all fail that round trip and come out as "unrecoverable" — never as a
 different value. The container's environment is the wrong source: compose has
@@ -52,8 +54,9 @@ message.
 Indistinguishable cases, carried as their RESOLVED value (documented, accepted):
 a secret-manager ``{{vault.X}}`` value that upstream deliberately keeps out of
 the DB can encode exactly like a plain row (an application exact row without
-``$``, a legacy literal row, a database row without ``$``). The secret-manager
-link is visible through no API, so nothing here can tell them apart.
+``$``, a legacy literal row, a legacy application/service row in its exact form,
+a database row without ``$``). The secret-manager link is visible through no
+API, so nothing here can tell them apart.
 """
 
 from __future__ import annotations
@@ -323,35 +326,67 @@ def allows_interpolation(env: Mapping[str, Any], value: str) -> bool:
     return not json_like and not env.get("is_literal") and not env.get("is_multiline")
 
 
-def encode(env: Mapping[str, Any], value: str, kind: FileKind) -> str:
-    """The text Coolify writes after ``KEY=`` for this row and resolved value."""
-    if saved_before_exact_escaping(env):
-        return legacy_format(env, value)
+def written_forms(
+    env: Mapping[str, Any], value: str, kind: FileKind, *, legacy: str | None = None
+) -> tuple[str, ...]:
+    """Every text Coolify may write after ``KEY=`` for this row and resolved value.
+
+    One for a row with exact escaping. A LEGACY row has its legacy form —
+    ``legacy`` where the caller already holds it (an unlocked row's API
+    real_value IS that form), :func:`legacy_format` of ``value`` otherwise — and,
+    in a dotenv file, the exact one too: HasSecretManager::useExactEscaping
+    writes some legacy rows of applications and services exact after all — from
+    4.6.0 a compose reference like ``FOO=${FOO:-}`` and a literal or multiline
+    value holding a quote (v4.6.0:153-189), from 4.7.0 also a JSON object or
+    array holding a newline, whatever its flags (v4.7.0:179-192). Never a
+    database's (:159-161), whose file is no dotenv.
+
+    Both forms are accepted for every legacy dotenv row, without the release, the
+    flags or the compose that decide which one it got, because they cannot
+    collide: no legacy form starts with an unescaped ``"`` (JSON opens with
+    ``{``/``[``, a literal with ``'``, and escapeEnvVariables turns every ``"``
+    into ``\\"``), and every exact dotenv form does. The ONE pair of encoders
+    :func:`decode` and :func:`_expected_raws` both judge a line by.
+    """
     allow = allows_interpolation(env, value)
+    if not saved_before_exact_escaping(env):
+        if kind is FileKind.DOTENV:
+            return (escape_compose_env_file_value(value, allow),)
+        return (value if allow else escape_dollar_sign(value),)
+    old = legacy_format(env, value) if legacy is None else legacy
     if kind is FileKind.DOTENV:
-        return escape_compose_env_file_value(value, allow)
-    return value if allow else escape_dollar_sign(value)
+        return (old, escape_compose_env_file_value(value, allow))
+    return (old,)
+
+
+def encode(env: Mapping[str, Any], value: str, kind: FileKind) -> str:
+    """The text Coolify writes after ``KEY=`` for this row and resolved value.
+
+    The first of :func:`written_forms`: for a legacy row its legacy form.
+    """
+    return written_forms(env, value, kind)[0]
 
 
 def decode(raw: str, env: Mapping[str, Any], kind: FileKind) -> str | None:
     """The value whose encoding is exactly ``raw``, or None.
 
     Collects every plausible decoding — the legacy form has three shapes, and
-    which one a line took depends on the VALUE (JSON or not) — and keeps those
-    that re-encode to ``raw``. For the encodings above the survivors never
+    which one a line took depends on the VALUE (JSON or not); a legacy row in a
+    dotenv file may be written exact as well — and keeps those that re-encode to
+    ``raw`` (:func:`written_forms`). For the encodings above the survivors never
     disagree, but a line that two different values could have produced would be
     refused, not guessed: this function returns a value or nothing, never a
     second-best one.
     """
+    legacy = saved_before_exact_escaping(env)
     candidates: set[str] = set()
-    if not saved_before_exact_escaping(env):
-        if kind is FileKind.DOTENV:
-            unquoted = _unescape_compose_env_file_value(raw)
-            if unquoted is not None:
-                candidates.add(unquoted)
-        else:
-            candidates.update({raw, raw.replace("$$", "$")})
-    else:
+    if kind is FileKind.DOTENV:
+        unquoted = _unescape_compose_env_file_value(raw)
+        if unquoted is not None:
+            candidates.add(unquoted)
+    elif not legacy:
+        candidates.update({raw, raw.replace("$$", "$")})
+    if legacy:
         if raw.startswith(("{", "[")) and is_json(raw):
             candidates.add(raw)
         if len(raw) >= 2 and raw[0] == raw[-1] == "'":
@@ -359,7 +394,7 @@ def decode(raw: str, env: Mapping[str, Any], kind: FileKind) -> str | None:
         unescaped = _unescape_env_variables(raw)
         if unescaped is not None:
             candidates.add(unescaped)
-    exact = {v for v in candidates if v and encode(env, v, kind) == raw}
+    exact = {v for v in candidates if v and raw in written_forms(env, v, kind)}
     return exact.pop() if len(exact) == 1 else None
 
 
@@ -683,19 +718,13 @@ def _expected_raws(env: Mapping[str, Any], real_value: str, kind: FileKind) -> t
     value (v4.5.0 EnvironmentVariable.php:265-283; v4.1.2:171-209); for an exact
     row it is the resolved value, which the writer then escapes.
 
-    From 4.6.0 a legacy row of an application or service can be written exact after
-    all (HasSecretManager::useExactEscaping v4.6.0:153-171: a compose reference like
-    ``FOO=${FOO:-}``, a literal holding a quote). Its real_value is then the resolved
-    value too (EnvironmentVariable v4.6.0:310-314). This only judges whether the file
-    is current: a LOCKED value still has to round-trip through :func:`decode`.
+    A legacy row of an application or service that Coolify writes exact after all
+    (:func:`written_forms`: from 4.6.0, more of them from 4.7.0) has the resolved
+    value as its real_value too (EnvironmentVariable v4.6.0:310-314, v4.7.0:377-381).
+    This only judges whether the file is current: a LOCKED value still has to
+    round-trip through :func:`decode`.
     """
-    allow = allows_interpolation(env, real_value)
-    if kind is FileKind.DOTENV:
-        exact = escape_compose_env_file_value(real_value, allow)
-        return (real_value, exact) if saved_before_exact_escaping(env) else (exact,)
-    if saved_before_exact_escaping(env):
-        return (real_value,)
-    return (real_value if allow else escape_dollar_sign(real_value),)
+    return written_forms(env, real_value, kind, legacy=real_value)
 
 
 def _stale(written: Sequence[Mapping[str, Any]], parsed: _Parsed, kind: FileKind) -> bool:
