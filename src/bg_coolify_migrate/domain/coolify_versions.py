@@ -297,6 +297,15 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         "noindex_domains": Gate(since=(4, 3, 0)),
         # Managed DNS ships in v4.4.0 (absent at v4.3.24 and v4.4-rc.1).
         "managed_dns": Gate(since=(4, 4, 0)),
+        # Every API create of an application or a service queues a DNS record for
+        # EACH hostname of the new resource, pointing at its server's first public
+        # address (ApplicationsController v4.7.0:2003,2243,2477,2617,2753;
+        # ServicesController v4.7.0:617,809; ResourceDnsRecords v4.7.0:50-53,158-181).
+        # At v4.6.0 only a domain PATCH queued one (:3871, ServicesController :1341).
+        # CREATE carries no custom host, so these are the target's OWN hosts; proxied
+        # when the token opts in (CloudflareDnsProvider v4.7.0:239, IntegrationToken
+        # :136-138).
+        "automatic_dns_on_api_create": Gate(since=(4, 7, 0)),
         # GET /databases/{uuid} nulls internal_db_url and external_db_url for a
         # sensitive caller when the credential variable is locked
         # (DatabasesController v4.5.1:262-270; isCredentialLocked in

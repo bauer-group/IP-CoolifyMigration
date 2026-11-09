@@ -37,6 +37,7 @@ from bg_coolify_migrate.discovery.docker import (
 from bg_coolify_migrate.dns import gate as dns_gate
 from bg_coolify_migrate.dns import managed as dns_managed
 from bg_coolify_migrate.dns import resolve as dns_resolve
+from bg_coolify_migrate.dns import wildcard as dns_wildcard
 from bg_coolify_migrate.domain import compose as compose_mod
 from bg_coolify_migrate.domain import domains, fidelity
 from bg_coolify_migrate.domain.coolify_versions import supports
@@ -1052,6 +1053,10 @@ async def build_plan(
         api, served, source_wildcard=source_ref.wildcard_domain or None, version=coolify_version
     ):
         notes.append(automatic)
+    if records := await target_records_note(
+        api, served, target=target_ref, version=coolify_version
+    ):
+        notes.append(records)
 
     return MigrationPlan(
         project=project_name,
@@ -1178,6 +1183,33 @@ async def automatic_dns_note(
         log.debug("planner.dns_status_unavailable", error=str(exc)[:120])
         return None
     return dns_managed.automatic_dns_note(statuses, hosts=owners)
+
+
+async def target_records_note(
+    api: CoolifyClient,
+    served: list[tuple[ResourceSnapshot, dict[str, Any], list[dict[str, Any]]]],
+    *,
+    target: ServerRef,
+    version: Version | None,
+) -> str | None:
+    """Warn when CREATE can make Coolify create DNS records for the target's own hosts.
+
+    Independent of custom hosts, unlike :func:`automatic_dns_note`: these are the
+    hosts under the TARGET's wildcard. Reads ``GET /dns/zones`` (4.6.0+) once, only
+    when dns/managed.target_hosts_get_records says a create can queue one and the
+    target has a wildcard. Fail-soft: an unreadable list is a plan without it.
+    """
+    collections = {snapshot.collection for snapshot, _, _ in served}
+    if not dns_managed.target_hosts_get_records(collections, version=version):
+        return None
+    if not dns_wildcard.wildcard_base(target.wildcard_domain or None):
+        return None
+    try:
+        zones = await api.get("/dns/zones")
+    except Exception as exc:  # diagnostics only, never fatal
+        log.debug("planner.dns_zones_unavailable", error=str(exc)[:120])
+        return None
+    return dns_managed.target_records_note(zones, target_wildcard=target.wildcard_domain or None)
 
 
 async def dns_baseline(

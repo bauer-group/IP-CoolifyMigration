@@ -5,16 +5,17 @@ come from a team's Cloudflare integration tokens, CloudflareDnsProvider
 ::zonesForTeam v4.4.0:73-76, v4.5.0:80-83). The REST API exposes none of it up to
 4.5.x, so whether a given record IS managed cannot be read there; what can be read
 is whether its zone is on Cloudflare at all. From 4.6.0 ``GET .../dns`` shows what
-Coolify tracks. Both are for MESSAGES and plan warnings only. Safety never depends
-on them: the domain hand-over is make-before-break on every version
-(domain/domains.py), and the DNS gate blocks an answer it cannot place for every
-provider alike (dns/gate.py).
+Coolify tracks, and ``GET /dns/zones`` the team's zones. All of it is for MESSAGES
+and plan warnings only. Safety never depends on them: the domain hand-over is
+make-before-break on every version (domain/domains.py), and the DNS gate blocks an
+answer it cannot place for every provider alike (dns/gate.py).
 """
 
 from __future__ import annotations
 
 from collections.abc import Collection, Iterable
 
+from bg_coolify_migrate.dns.wildcard import wildcard_base
 from bg_coolify_migrate.domain.coolify_versions import supports
 from bg_coolify_migrate.domain.plan import HostBaseline
 from bg_coolify_migrate.domain.versions import Version
@@ -119,4 +120,83 @@ def automatic_dns_note(statuses: Iterable[object], *, hosts: Collection[str]) ->
         "the target before the target runs, and a rollback does not remove it. Give such "
         "a host its own record first, or turn automatic DNS off on that token for the "
         "migration."
+    )
+
+
+def target_hosts_get_records(collections: Collection[str], *, version: Version | None) -> bool:
+    """Whether CREATE can make Coolify queue records for the TARGET's own hosts.
+
+    From 4.7.0 every API create of an application or a service queues one for each
+    hostname of the new resource (FEATURES "automatic_dns_on_api_create"): the
+    server-bound hosts CREATE rewrote onto the target's wildcard, and the ones
+    Coolify generates there. A service got them on 4.6.0 already, at CREATE's
+    ``urls`` PATCH (api/resources.finish_service_target), which adds the rewritten
+    hosts (ServicesController v4.6.0:1341). A database holds no domain. Only for a
+    version KNOWN to do it: the note reads GET /dns/zones, which 4.6.0 added.
+    """
+    if supports("automatic_dns_on_api_create", version, if_unknown=False):
+        return bool({"applications", "services"} & set(collections))
+    return "services" in collections and supports(
+        "automatic_dns_on_api_save", version, if_unknown=False
+    )
+
+
+def _zone_name(row: object) -> str:
+    name = row.get("zone") if isinstance(row, dict) else None
+    return name.strip().lower().rstrip(".") if isinstance(name, str) else ""
+
+
+def zones_holding(host: str, zones: object) -> list[dict[str, object]]:
+    """The ``GET /dns/zones`` rows Coolify picks for ``host``.
+
+    Mirrors CloudflareDnsProvider::findZones (v4.7.0:69-78): the zone that IS the
+    host or a parent of it, and of several, only the longest. One row per zone and
+    token (DnsController v4.6.0 = v4.7.0:111-131), so two tokens on one zone are
+    two rows, and Coolify then queues nothing (ResourceDnsRecords v4.7.0:166-168).
+    """
+    host = host.strip().lower().rstrip(".")
+    rows = zones if isinstance(zones, list) else []
+    matches = [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and (name := _zone_name(row))
+        and (host == name or host.endswith("." + name))
+    ]
+    longest = max((len(_zone_name(row)) for row in matches), default=0)
+    return [row for row in matches if len(_zone_name(row)) == longest]
+
+
+def target_records_note(zones: object, *, target_wildcard: str | None) -> str | None:
+    """The plan warning for :func:`target_hosts_get_records`, when the zone is the team's.
+
+    ``zones`` is the ``GET /dns/zones`` body: the team's Cloudflare zones, without
+    the token's automatic or proxied setting, so this says "may". DNS-only records
+    (the default) point at the target, which the DNS gate reads as READY. Proxied
+    ones (the token's opt-in, IntegrationToken v4.7.0:136-138) resolve to
+    Cloudflare, which the gate reads as ELSEWHERE, after the source is stopped. A
+    warning, never a refusal: the zone list does not say whether the token proxies.
+    ``GET .../dns`` does (``providers[].proxied_dns``, ResourceDnsRecords v4.6.0 =
+    v4.7.0:73-79), but only for the hostnames of a resource that exists, and the
+    target's do not until CREATE.
+    """
+    base = wildcard_base(target_wildcard)
+    if not base:
+        return None
+    held = zones_holding(base, zones)
+    if len(held) != 1:
+        return None
+    zone = _zone_name(held[0])
+    token = held[0].get("integration_token_name")
+    by_token = f" (integration token {token!r})" if isinstance(token, str) and token else ""
+    return (
+        f"{base}, the target server's wildcard, lies in the team's Cloudflare zone "
+        f"{zone}{by_token}. With automatic DNS on for that token (the default), Coolify "
+        "may create a record for each of the target's own hosts under it at CREATE, "
+        "pointing at the target server (from 4.7 for every resource the API creates, "
+        "from 4.6 for a service's URLs). DNS-only records are harmless. If the token "
+        "creates proxied records, those hosts resolve to Cloudflare, and the DNS gate "
+        "finds them on neither server after the source is stopped: pass "
+        "--accept-dns-host for each of them on the run, or turn proxied DNS off on that "
+        "token for the migration."
     )
