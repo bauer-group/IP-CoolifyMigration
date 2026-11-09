@@ -304,8 +304,16 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         # (Application::otherApplicationBuildingSameImage v4.6.0:1123-1137;
         # dockerimage and dockercompose are exempt). Every create 422s on it
         # (ApplicationsController v4.6.0:1699,1962,2194,2345), and every deploy
-        # fails, /restart included (ApplicationDeploymentJob v4.6.0:380,:2588-2594).
+        # fails, /restart included up to 4.6.x (ApplicationDeploymentJob
+        # v4.6.0:380,:2588-2594; from 4.7.0 see the next row).
         "registry_image_name_unique": Gate(since=(4, 6, 0)),
+        # ensureRegistryImageIsNotShared returns early for a restart
+        # (ApplicationDeploymentJob v4.7.0:2730-2741; no guard at v4.6.0:2588-2594),
+        # and it runs once, at :465, before a restart that finds no image falls
+        # back to a build. restart_only survives only for nixpacks, static and
+        # railpack (:320-323 clears it for dockerimage, dockerfile, dockercompose),
+        # so a dockerfile /restart is a full deploy and still fails the check.
+        "registry_image_check_skips_restarts": Gate(since=(4, 7, 0)),
         # An application without a Git source or deploy key can hold HTTPS git
         # credentials. The password is hidden from the resource GET
         # (ApplicationsController v4.6.0:128-143 does not make it visible); the

@@ -344,6 +344,10 @@ def renamed_source_name(name: str, stamp: str) -> str:
 
 #: Build packs that push no image of their own: Application v4.6.0:1125.
 _BUILD_PACKS_WITHOUT_PUSHED_IMAGE = ("dockerimage", "dockercompose")
+#: Build packs whose /restart stays a restart. The deploy job clears restart_only
+#: for every other one (ApplicationDeploymentJob v4.6.0:268-271 = v4.7.0:320-323),
+#: so their /restart is a full deploy. A pack not named here counts as one.
+_RESTART_ONLY_BUILD_PACKS = ("nixpacks", "static", "railpack")
 
 
 def _pushed_image_name(app: dict[str, Any]) -> str | None:
@@ -369,11 +373,20 @@ def shared_image_refusals(
     """Refuse a source whose image name another application of the team also builds.
 
     Such a source cannot deploy at all from 4.6, /restart included, so a rollback
-    would be accepted and leave it down. ``name`` and ``uuid`` of the others are
-    not secret.
+    would be accepted and leave it down. From 4.7.0 the check skips a restart
+    (``registry_image_check_skips_restarts``), and the rollback's /restart of a
+    nixpacks, static or railpack source comes back — even when it turns into a
+    build because the image is gone, the check having run before that. A
+    dockerfile source's /restart is a full deploy and still fails. An unknown
+    version keeps refusing: the refusal costs a rename, the miss a source left
+    down. ``name`` and ``uuid`` of the others are not secret.
     """
     name = unshareable_image_name(source, version=version)
     if name is None:
+        return []
+    if supports("registry_image_check_skips_restarts", version, if_unknown=False) and (
+        source.get("build_pack") in _RESTART_ONLY_BUILD_PACKS
+    ):
         return []
     others = sorted(
         str(app.get("name") or app.get("uuid"))
@@ -386,9 +399,10 @@ def shared_image_refusals(
         return []
     return [
         f"this application builds the image {name!r}, and so does {', '.join(others)}. "
-        "Coolify >= 4.6 fails every deploy of such an application, restarts included, so "
-        "a rollback could not bring the source back. Give each application its own image "
-        "name first."
+        "Coolify >= 4.6 fails every deploy of such an application, and its restart too "
+        "(up to 4.6 for every build pack, from 4.7 for a dockerfile one, whose restart "
+        "is a full deploy), so a rollback could not bring the source back. Give each "
+        "application its own image name first."
     ]
 
 
