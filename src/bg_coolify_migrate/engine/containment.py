@@ -16,6 +16,7 @@ rollback would delete what they wrote.
 from __future__ import annotations
 
 import shlex
+from collections.abc import Sequence
 from typing import Any, NoReturn
 
 import structlog
@@ -138,32 +139,37 @@ def journal_started_early(ctx: MigrationContext, uuids: list[str]) -> None:
     )
 
 
-async def _seen(host: RemoteHost, container: docker.Container, *, inspect: bool) -> Seen:
+async def _seen(
+    host: RemoteHost,
+    container: docker.Container,
+    *,
+    inspect: bool,
+    volumes: Sequence[str] | None = None,
+) -> Seen:
+    """What the daemon says of one container. ``volumes`` only for one found by
+    the volume probe alone: whether it mounts one of them writable."""
+    handle = container.id or container.name
     started = None
     if inspect and container.is_stopped:
-        started = await quiesce.started_at(host, container.id or container.name)
+        started = await quiesce.started_at(host, handle)
+    writes = None
+    if volumes is not None:
+        mounts = await quiesce.mounts_of(host, handle)
+        writes = None if mounts is None else containment.mounts_writable(mounts, volumes)
+        if writes is False:
+            log.debug("containment.read_only_reader", container=container.name)
     return Seen(
         name=container.name,
         state=container.state,
         labels=container.labels,
         image=container.image,
         started_at=started,
+        writes=writes,
     )
 
 
-async def _source_breaches(ctx: MigrationContext, *, checkpoint: str) -> list[Breach]:
-    """The source side: the plan's label filter, then the probes no rename can hide from.
-
-    The uuid probe and the migrated-volume probe are PREFLIGHT's
-    (``steps._label_independent_containers``): a project, environment or
-    resource renamed after PLAN and then deployed carries the NEW names, which
-    the plan's filter cannot see. Pins — ours and any other migration's — are
-    created and never started, and are left out.
-    """
-    host = ctx.source_host
-    since = revival_clock(ctx)
-    stack = observed_labels(ctx.plan)
-    watched = [
+def _watched_sources(ctx: MigrationContext) -> list[Watched]:
+    return [
         Watched(
             name=r.snapshot.name,
             uuid=r.snapshot.uuid,
@@ -173,6 +179,23 @@ async def _source_breaches(ctx: MigrationContext, *, checkpoint: str) -> list[Br
         )
         for r in ctx.plan.resources
     ]
+
+
+async def _source_breaches(ctx: MigrationContext, *, checkpoint: str) -> list[Breach]:
+    """The source side: the plan's label filter, then the probes no rename can hide from.
+
+    The uuid probe and the migrated-volume probe are PREFLIGHT's
+    (``steps._label_independent_containers``): a project, environment or
+    resource renamed after PLAN and then deployed carries the NEW names, which
+    the plan's filter cannot see. Pins — ours and any other migration's — are
+    created and never started, and are left out. A container only the volume
+    probe found has its mounts read: a read-only reader is no revival
+    (``containment.source_breaches``).
+    """
+    host = ctx.source_host
+    since = revival_clock(ctx)
+    stack = observed_labels(ctx.plan)
+    watched = _watched_sources(ctx)
     found: dict[str, docker.Container] = {}
     for container in await docker.list_containers(host, label_filters=stack):
         found.setdefault(container.id or container.name, container)
@@ -188,9 +211,14 @@ async def _source_breaches(ctx: MigrationContext, *, checkpoint: str) -> list[Br
             found.setdefault(container.id or container.name, container)
 
     inspect = since is not None
-    seen = [
-        await _seen(host, c, inspect=inspect) for c in found.values() if not pins.is_pin(c)
-    ]
+    seen: list[Seen] = []
+    for c in found.values():
+        if pins.is_pin(c):
+            continue
+        alone = containment.volume_only(
+            watched, stack, name=c.name, image=c.image, labels=c.labels
+        )
+        seen.append(await _seen(host, c, inspect=inspect, volumes=volumes if alone else None))
     events = await quiesce.start_events(host, since=since) if since is not None else None
     if since is None:
         log.warning(

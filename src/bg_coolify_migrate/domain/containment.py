@@ -35,6 +35,18 @@ Times are the host's own clock throughout — ``date +%s`` read on the source
 once the stop gate passed, ``StartedAt`` and event times written by that
 daemon — so a skewed workstation cannot narrow the window.
 
+One reader is no revival: Coolify's scheduled VOLUME backup (4.3.0+) runs
+``docker run --rm --name volume-backup-<execution uuid> -v <volume>:/volume:ro``
+whatever the resource's status — its scheduler has no 'running' skip, unlike the
+task and database-backup schedulers (VolumeBackupJob v4.3.0:78-87,
+v4.5.0:94-112, v4.7.2:101-123; ScheduledJobManager v4.3.0:382-430,
+v4.7.2:531-600). It carries no Coolify label and no resource uuid, so only the
+migrated-volume probe finds it, and it mounts the volume read-only. A container
+found ONLY that way counts when it mounts a migrated volume writable
+(:attr:`Seen.writes`); one that only reads cannot make the copy stale. Its
+``stop_during_backup`` mode stops and restarts RUNNING containers only
+(``docker ps -q``, v4.7.2:383-396,401-419), so it never starts a pin.
+
 The SOURCE is judged from the moment the stop gate proved it down
 (:func:`judged_from`); the TARGET from its creation: its uuid
 did not exist before CREATE, so any start of a container carrying it, at any
@@ -47,7 +59,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -119,6 +131,11 @@ class Seen:
     started_at: int | None = None
     """When it last started, on that host's clock; ``None`` if it never did or
     the daemon did not say (running containers are not inspected)."""
+    writes: bool | None = None
+    """Asked only of a container found by the migrated-volume probe alone
+    (:func:`volume_only`): does it mount one of those volumes writable
+    (:func:`mounts_writable`)? ``None`` when that could not be told — it then
+    counts as a writer, like every container found any other way."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +237,31 @@ def parse_event_log(stdout: str) -> EventLog:
     return EventLog(starts=tuple(starts), oldest=oldest)
 
 
+def mounts_writable(mounts_json: str, volumes: Collection[str]) -> bool | None:
+    """Does a container mount one of ``volumes`` writable? PURE.
+
+    From ``docker inspect --format '{{json .Mounts}}'``: each entry's ``Name``
+    is the volume's (empty for a bind) and ``RW`` false for a ``:ro`` mount.
+    An entry without ``RW`` is Docker's default, read-write. ``None`` when it
+    cannot be told — output that does not parse, or none of ``volumes`` among
+    the mounts — and the caller counts that as a writer.
+    """
+    try:
+        entries = json.loads(mounts_json.strip() or "null")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(entries, list):
+        return None
+    found = False
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("Name") not in volumes:
+            continue
+        if entry.get("RW") is not False:
+            return True
+        found = True
+    return False if found else None
+
+
 def parse_volume_created(stdout: str) -> dict[str, str]:
     """``docker volume inspect --format '{{.Name}} {{.CreatedAt}}'`` -> ``{name: CreatedAt}``."""
     out: dict[str, str] = {}
@@ -277,6 +319,24 @@ def _owner(watched: Sequence[Watched], name: str, image: str, labels: Mapping[st
     return by_uuid or next((w for w in watched if matches(labels, w.labels)), None)
 
 
+def volume_only(
+    watched: Sequence[Watched],
+    stack: Mapping[str, str],
+    *,
+    name: str,
+    image: str,
+    labels: Mapping[str, str],
+) -> bool:
+    """Is this a container only the migrated-volume probe can have found? PURE.
+
+    Neither the plan's labels (``stack``) nor a watched uuid: what the label
+    filter and the uuid probe find always carries one of them. Coolify's volume
+    backup helper is such a container (module docstring); so is a debug shell
+    someone ran on the volume.
+    """
+    return _owner(watched, name, image, labels) is None and not matches(labels, stack)
+
+
 def _clock(when: int) -> str:
     return datetime.fromtimestamp(when, UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -296,11 +356,18 @@ def source_breaches(
     clock :func:`judged_from` gives — once the stop gate proved the stack down,
     or a block after START since; without it (a journal older than the record)
     only a container running NOW counts.
+
+    A container only the volume probe found (:func:`volume_only`) that mounts
+    those volumes read-only (``writes`` False) is left out: Coolify's volume
+    backup reads them on its schedule whatever the source's status, and a
+    reader cannot make the copy stale. Every other container counts, writer or not.
     """
     breaches: list[Breach] = []
     reported: set[str] = set()
     for container in seen:
         owner = _owner(watched, container.name, container.image, container.labels)
+        if owner is None and container.writes is False and not matches(container.labels, stack):
+            continue
         resource = owner.name if owner else "the stack"
         if container.state not in _STOPPED:
             breaches.append(Breach(resource, container.name, f"is {container.state}"))

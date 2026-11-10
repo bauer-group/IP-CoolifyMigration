@@ -31,6 +31,9 @@ class FakeContainer:
     volumes: list[str] = field(default_factory=list)
     started_at: str = "0001-01-01T00:00:00Z"
     """``State.StartedAt`` as docker prints it; docker's zero time = never started."""
+    read_only: bool = False
+    """Its volumes are mounted ``:ro`` — as every pin's are (``readonly`` in
+    ``--mount``) and Coolify's volume backup helper's (``-v <volume>:/volume:ro``)."""
 
     @property
     def id(self) -> str:
@@ -61,8 +64,11 @@ class FakeDaemon(FakeHost):
         state: str = "running",
         labels: dict[str, str] | None = None,
         volumes: tuple[str, ...] = (),
+        read_only: bool = False,
     ) -> FakeContainer:
-        container = FakeContainer(name, state, dict(labels or {}), list(volumes))
+        container = FakeContainer(
+            name, state, dict(labels or {}), list(volumes), read_only=read_only
+        )
         self.containers[name] = container
         self.volumes.update(volumes)
         return container
@@ -161,7 +167,7 @@ class FakeDaemon(FakeHost):
                     "Name": v,
                     "Source": f"/var/lib/docker/volumes/{v}/_data",
                     "Destination": f"/pin/{v}",
-                    "RW": False,
+                    "RW": not container.read_only,
                 }
                 for v in container.volumes
             ]
@@ -187,17 +193,19 @@ class FakeDaemon(FakeHost):
         name = argv[argv.index("--name") + 1]
         labels = dict(argv[i + 1].split("=", 1) for i, a in enumerate(argv) if a == "--label")
         volumes: list[str] = []
+        read_only = False
         for i, a in enumerate(argv):
             if a != "--mount":
                 continue
             spec = dict(
                 part.split("=", 1) if "=" in part else (part, "") for part in argv[i + 1].split(",")
             )
+            read_only = read_only or "readonly" in spec
             if spec["source"] not in self.volumes:
                 # What Docker would do, and what a pin must never cause.
                 self.volumes.add(spec["source"])
             volumes.append(spec["source"])
         if name in self.containers:
             return self._err(command, f"Conflict. The container name {name!r} is already in use")
-        self.containers[name] = FakeContainer(name, "created", labels, volumes)
+        self.containers[name] = FakeContainer(name, "created", labels, volumes, read_only=read_only)
         return self._ok(command, f"id-{name}")

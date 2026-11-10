@@ -390,3 +390,22 @@ async def started_at(host: RemoteHost, container: str) -> int | None:
             return None
         result.check()
     return started_at_of(result.stdout)
+
+
+async def mounts_of(host: RemoteHost, container: str) -> str | None:
+    """A container's ``{{json .Mounts}}``, raw; ``None`` if it is gone.
+
+    For ``containment.mounts_writable``: which of its volumes it may write. The
+    same inspect as :func:`~bg_coolify_migrate.discovery.docker.inspect_mounts`,
+    but a container removed since it was listed is an answer here, not an
+    error — a ``--rm`` helper ends that way — and the caller counts it as a
+    writer, its mounts unknown. Any other failure raises.
+    """
+    result = await host.run(
+        f"docker inspect --format '{{{{json .Mounts}}}}' {shlex.quote(container)}"
+    )
+    if not result.ok:
+        if "no such object" in (result.stderr + result.stdout).lower():
+            return None
+        result.check()
+    return result.stdout
