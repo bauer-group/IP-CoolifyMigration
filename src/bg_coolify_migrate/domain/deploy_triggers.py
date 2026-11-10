@@ -364,7 +364,15 @@ def pending_for(
 
 
 def run_note() -> str:
-    """The plan note for every plan that moves an application."""
+    """The plan note for every plan that moves an application.
+
+    What a revived source does to the run is ``engine/containment.py``'s, and
+    this says exactly that: found before START has asked Coolify to start a
+    target, the run rolls back; found once it has — the checkpoint of a resumed
+    START, or FINALIZE's (HEALTHCHECK has none) — it BLOCKS
+    (``errors.SourceRevivedAfterStart``) and rolls nothing back, because the
+    target may have served users since.
+    """
     return (
         "deploys during the run: QUIESCE switches each source application's auto-deploy "
         "off (and its preview deployments, where on), and every target is created with "
@@ -373,9 +381,14 @@ def run_note() -> str:
         "for a source is waited for before the stop; one that does not end within the "
         "deploy timeout refuses the run while the source still serves. A CI call to POST "
         "/deploy (by uuid or tag), a manual deploy, the API and MCP bypass auto-deploy and "
-        "still start a source: pause them from QUIESCE until FINALIZE - a source deployed "
-        "during the run rolls the run back. Under finalize keep or rename the kept "
-        "source's auto-deploy stays off afterwards; a rollback switches it back on."
+        "still start a source: pause them from QUIESCE until FINALIZE. A source found "
+        "running again before START has asked Coolify to start a target rolls the run "
+        "back (the source keeps what it wrote); one found once START has asked - by a "
+        "resumed START or by FINALIZE - BLOCKS the run and rolls nothing back, because "
+        "the target may hold users' writes by then: stop the source and resume, or roll "
+        "back by hand. Under finalize keep or rename the kept source's auto-deploy stays "
+        "off afterwards, and nothing checks the source any more; a rollback switches it "
+        "back on once, after it has switched the targets' auto-deploy off."
     )
 
 
@@ -404,13 +417,22 @@ def application_warnings(resource: Mapping[str, Any]) -> list[str]:
 
 
 def kept_source_notice(names: Iterable[str], *, migration_id: str) -> str:
-    """FINALIZE keep/rename: the source stays disarmed, and what still reaches it."""
+    """FINALIZE keep/rename: the source stays disarmed, and what still reaches it.
+
+    FINALIZE's containment checkpoint is the last (``engine/containment.py``):
+    during the run a revived source rolled it back before START had asked for a
+    target and blocked it after; from here on a deploy of the kept source does
+    neither, it just runs.
+    """
     return (
         f"{', '.join(names)} (the kept source) keep(s) auto-deploy and preview deployments "
         "OFF: they share their repository and webhook with the target, so a push would "
         "otherwise deploy the stale source beside it. A CI call to POST /deploy by uuid or "
-        "tag, a manual deploy and the UI still reach the source - they bypass auto-deploy. "
-        f"coolify-migrate rollback {migration_id} switches them back on."
+        "tag, a manual deploy and the UI still reach the source - they bypass auto-deploy - "
+        "and nothing checks for that any more: during the run a revived source rolled the "
+        "run back before START had asked for a target and blocked it once START had; now "
+        "such a deploy simply starts the copy from before the cutover beside the target. "
+        f"coolify-migrate rollback {migration_id} switches them back on, once."
     )
 
 

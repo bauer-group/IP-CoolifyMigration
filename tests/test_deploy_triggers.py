@@ -213,6 +213,24 @@ class TestNotes:
         assert "POST /deploy" in note and "pause them from QUIESCE until FINALIZE" in note
         assert "keep or rename" in note
 
+    def test_the_run_note_says_what_a_revival_does_before_and_after_start(self) -> None:
+        # engine/containment.py: a rollback before START asked for a target, a
+        # block once it has (errors.SourceRevivedAfterStart) - never a rollback then.
+        note = dt.run_note()
+        assert "before START has asked Coolify to start a target rolls the run back" in note
+        assert "by a resumed START or by FINALIZE - BLOCKS the run and rolls nothing back" in note
+        assert "stop the source and resume, or roll back by hand" in note
+        assert "a source deployed during the run rolls the run back" not in note
+
+    def test_the_run_note_matches_what_the_checkpoints_tell_the_operator(self) -> None:
+        # If containment ever changes which side of START rolls back, this note
+        # must change with it.
+        from bg_coolify_migrate.domain import containment
+
+        assert "The run rolls back now" in containment.source_hint()
+        after = containment.revived_after_start_hint(policy="keep", migration_id="m1")
+        assert "does not roll back by itself" in after and "coolify-migrate resume m1" in after
+
     def test_a_41_source_is_told_its_setting_is_unreadable(self) -> None:
         [line] = dt.application_warnings({"uuid": "app1"})
         assert "before 4.2" in line and "Coolify's default" in line
@@ -231,6 +249,15 @@ class TestNotes:
         notice = dt.kept_source_notice(["shop", "api"], migration_id="m1")
         assert notice.startswith("shop, api (the kept source)")
         assert "coolify-migrate rollback m1" in notice and "POST /deploy" in notice
+
+    def test_the_kept_source_notice_says_nothing_checks_it_any_more(self) -> None:
+        # FINALIZE's checkpoint is the last: a deploy of the kept source after it
+        # neither rolls back nor blocks anything.
+        notice = dt.kept_source_notice(["shop"], migration_id="m1")
+        assert "nothing checks for that any more" in notice
+        assert "rolled the run back before START had asked for a target" in notice
+        assert "blocked it once START had" in notice
+        assert "switches them back on, once" in notice
 
     def test_a_failed_arm_says_what_to_set(self) -> None:
         on = dt.arm_failed_notice("shop", "appT", True, reason="HTTP 500")
