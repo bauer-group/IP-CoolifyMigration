@@ -683,6 +683,12 @@ async def _remove_bind_targets(ctx: MigrationContext) -> None:
     path is deleted only while the source still holds its bind
     (:func:`statemachine.source_copy_unproven`), else it is kept and the
     compensation fails loudly.
+
+    Each removal is journalled in its own record the moment it succeeds, not
+    once at the end: a later one that fails (a refused path is kept and the
+    loop goes on; any other error, an ``SshError`` from a failed ``rm``,
+    escapes) must not leave the earlier ones unrecorded, or the replayed
+    rollback its failure asks for would ``rm -rf`` them again.
     """
     owed = binds.owed_bind_targets((r.event, r.detail) for r in ctx.journal.read())
     if not owed:
@@ -732,21 +738,21 @@ async def _remove_bind_targets(ctx: MigrationContext) -> None:
             await transfer_binds.remove_created(ctx.target_host, target, removable=allowed)
         except TransferError as exc:
             # A path that resolves elsewhere now is not deleted; the others still
-            # are, and every removal so far is journalled below.
+            # are, each journalled as it goes.
             log.error("compensate.bind_target_redirected", path=target.path)
             kept.append(f"{target.path} ({exc.args[0] if exc.args else exc})")
             continue
-        removed.append(target.path)
-
-    if removed:
         ctx.journal.append(
             "rollback_step",
             state=State.COPY.value,
             detail={
                 "compensation": Compensation.DROP_TARGET_VOLUMES.value,
-                binds.BINDS_REMOVED: removed,
+                binds.BINDS_REMOVED: [target.path],
             },
         )
+        removed.append(target.path)
+
+    if removed:
         log.info("compensate.bind_targets_removed", count=len(removed))
     if kept:
         raise RuntimeError(

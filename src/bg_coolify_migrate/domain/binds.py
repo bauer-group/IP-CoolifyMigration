@@ -123,6 +123,8 @@ SYSTEM_DIRS = frozenset(
 BIND_TARGET = "bind_target"
 #: Journal key of the bind targets a rollback removed (a ``rollback_step``
 #: detail): a replayed rollback must not delete what someone created there since.
+#: Written once per path, the moment its removal succeeded; every record
+#: counts (:func:`owed_bind_targets`).
 BINDS_REMOVED = "binds_removed"
 
 

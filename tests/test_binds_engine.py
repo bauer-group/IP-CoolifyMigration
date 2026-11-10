@@ -186,11 +186,13 @@ def _storages(*rows: tuple[str, str]) -> dict[str, Any]:
     }
 
 
-@pytest.fixture
-async def ctx(tmp_path: Path):  # type: ignore[no-untyped-def]
-    api = CoolifyClient(HOST, "tok", max_retries=0)
+def bind_context(tmp_path: Path) -> MigrationContext:
+    """One service with a relative and an absolute bind, on two :class:`FsHost` servers.
+
+    The caller closes ``context.api``.
+    """
     context = MigrationContext(
-        api=api,
+        api=CoolifyClient(HOST, "tok", max_retries=0),
         settings=Settings(_env_file=None, state_dir=tmp_path),
         plan=_plan(resources=(_service(_bind(f"{SRC}/data"), _bind("/srv/files", "/files")),)),
         journal=Journal.create(tmp_path, "m1"),
@@ -201,8 +203,14 @@ async def ctx(tmp_path: Path):  # type: ignore[no-untyped-def]
         target_host=FsHost(target=SshTarget(host="10.0.0.2")),  # type: ignore[arg-type]
     )
     context.target_uuids = {"svc1": "tgt1"}
+    return context
+
+
+@pytest.fixture
+async def ctx(tmp_path: Path):  # type: ignore[no-untyped-def]
+    context = bind_context(tmp_path)
     yield context
-    await api.aclose()
+    await context.api.aclose()
 
 
 def _src(ctx: MigrationContext) -> FsHost:
