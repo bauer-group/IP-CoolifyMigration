@@ -16,7 +16,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from bg_coolify_migrate.domain.statemachine import Outcome
+from bg_coolify_migrate.domain.statemachine import Outcome, State
 from bg_coolify_migrate.engine.executor import RunResult
 from bg_coolify_migrate.ui.console import human_duration
 
@@ -88,8 +88,7 @@ def _next_step(result: RunResult, migration_id: str) -> str:
 
     if result.outcome is Outcome.BLOCKED:
         return (
-            "This is NOT a failure. The target is created and its data is verified;\n"
-            "your source is untouched and still stopped.\n\n"
+            f"This is NOT a failure. {_where_blocked(result)}\n\n"
             f"Fix the condition above, then: coolify-migrate resume {migration_id}\n"
             f"Or abandon it:               coolify-migrate rollback {migration_id}"
         )
@@ -122,6 +121,32 @@ def _next_step(result: RunResult, migration_id: str) -> str:
         f"Nothing was changed, or it has been undone.\n"
         f"Inspect: coolify-migrate status {migration_id}"
     )
+
+
+def _where_blocked(result: RunResult) -> str:
+    """What a gate's stop has and has not touched — true for the gate that stopped it.
+
+    Two gates block. The drift gate stops at PREFLIGHT, before anything is
+    created or stopped. The DNS gate stops after VERIFY with the source stopped,
+    and it checks first that nothing restarted the source or started the target
+    (``engine/containment.py``) — the claim it may make is that one, as of that
+    check: nothing guards either while the run waits.
+    """
+    reached = str(result.reached)
+    if reached == State.PREFLIGHT.value:
+        return (
+            "Nothing has been created or stopped yet:\n"
+            "your source runs exactly as it did."
+        )
+    if reached == State.DNS_GATE.value:
+        return (
+            "The target is created and its data is verified.\n"
+            "Your source is stopped: this gate checked that nothing had started it, or the\n"
+            "target, since the stop. Nothing watches either while the run waits - a deploy\n"
+            "of either meanwhile (a git push with auto-deploy on, a CI deploy, the dashboard)\n"
+            "is found when you resume, and the run then rolls back."
+        )
+    return "Nothing has been undone: the run stopped where it says above."
 
 
 def verification_table(result_context: object) -> Table | None:

@@ -350,9 +350,15 @@ async def resume_migration(
     """Continue a blocked or interrupted migration.
 
     The journal is a hypothesis, not a fact: the executor re-reads it and skips
-    only states it recorded as completed, and every step re-checks the world it
-    depends on. Geczy's reuse of a stale archive with no validation is the
-    anti-pattern.
+    only states it recorded as completed, and every step it runs re-checks the
+    world it depends on. Geczy's reuse of a stale archive with no validation is
+    the anti-pattern.
+
+    That includes the two stacks the run holds still. A resume can come hours
+    after a block, and nothing guards them meanwhile: the DNS gate, START and
+    FINALIZE first check that the source is still stopped and the target still
+    unstarted (``engine/containment.py``), and a run that finds otherwise rolls
+    back rather than finish on a copy the source has moved on from.
     """
     journal = Journal.open(settings.resolved_state_dir(), migration_id)
     if journal.is_finished:
