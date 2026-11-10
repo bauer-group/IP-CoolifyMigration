@@ -34,6 +34,18 @@ class FakeHost:
         self._fallbacks: list[tuple[re.Pattern[str], Callable[[str], CommandResult]]] = []
         self.commands: list[str] = []
         self.forwards: list[tuple[str, int]] = []
+        #: What `docker info --format '{{.ID}}'` answers (PREFLIGHT's shared-daemon
+        #: check, engine/containment.py): one engine per fake host, as two real
+        #: servers have. A FALLBACK, so a test's own route still wins.
+        self.engine_id = f"fake-engine-{id(self):x}"
+        self._fallbacks.append(
+            (
+                re.compile(r"^docker info"),
+                lambda command: CommandResult(
+                    command=command, exit_status=0, stdout=f"{self.engine_id}\n", stderr=""
+                ),
+            )
+        )
 
     def quiet_docker(self) -> FakeHost:
         """A daemon with no containers and no events — unless a route says otherwise.

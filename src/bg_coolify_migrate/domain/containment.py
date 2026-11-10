@@ -262,6 +262,18 @@ def mounts_writable(mounts_json: str, volumes: Collection[str]) -> bool | None:
     return False if found else None
 
 
+def parse_daemon_id(stdout: str) -> str | None:
+    """``docker info --format '{{.ID}}'`` -> the daemon's engine ID; ``None`` if it gave none.
+
+    A UUID the daemon writes once into ``engine-id`` in its data root and reads
+    back at every start (moby v27.5.1 daemon/id.go:12-35, unchanged in v28.3.3;
+    daemon/info.go v27.5.1:53): one daemon, one ID, whichever address it is
+    reached by. ``<no value>`` is what the template prints for a missing field.
+    """
+    line = next((raw.strip() for raw in stdout.splitlines() if raw.strip()), "")
+    return line if line and line != "<no value>" else None
+
+
 def parse_volume_created(stdout: str) -> dict[str, str]:
     """``docker volume inspect --format '{{.Name}} {{.CreatedAt}}'`` -> ``{name: CreatedAt}``."""
     out: dict[str, str] = {}
@@ -570,6 +582,40 @@ TARGET_HINT = (
     "written to the volumes being copied. The run rolls back now: the target is "
     "stopped and deleted with its volumes, and the source restarted if it was "
     "stopped. Hold pushes and CI deploys of the stack, then migrate again."
+)
+
+
+def shared_daemon_refusal(
+    source_id: str | None, target_id: str | None, *, source: str, target: str
+) -> str | None:
+    """Two server records, one Docker daemon. PURE.
+
+    The plan's same-server refusal compares server uuids, and Coolify gives one
+    SSH endpoint one server record (ServersController v4.7.2:637,
+    ``sshEndpointInUse``) — but one machine reached two ways (localhost and its
+    public IP, or two SSH ports) is two records. Every source-side checkpoint
+    would then find the running target under the source's labels, the stack's
+    project, environment and name, and take it for the source started again.
+    Refused only when BOTH daemons answered with the same ID; an unanswered
+    probe proves nothing and refuses nothing.
+    """
+    if not source_id or not target_id or source_id != target_id:
+        return None
+    return (
+        f"the source server {source!r} and the target server {target!r} are one Docker "
+        f"daemon (both report engine ID {source_id}): Coolify knows this machine twice, "
+        "under two addresses. A migration between them never leaves it - the checks that "
+        "prove the source stays stopped would see the target's containers as the source "
+        "started again, every custom domain resolves to both sides, and bind mounts would "
+        "be copied onto themselves. Pick a target server on another machine."
+    )
+
+
+SHARED_DAEMON_HINT = (
+    "Compare `docker info --format '{{.ID}}'` on both servers. If they really are two "
+    "machines, one was cloned from the other together with Docker's data root "
+    "(/var/lib/docker by default) and kept its engine-id file: remove that file on one "
+    "of them and restart Docker there, which writes a new ID. Nothing has been changed."
 )
 
 

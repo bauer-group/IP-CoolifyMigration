@@ -11,6 +11,9 @@ source, never deleted before FINALIZE, keeps whatever it wrote. Once START has
 asked for a target, a revived source BLOCKS the run instead
 (``SourceRevivedAfterStart``): the target may have served users since, and the
 rollback would delete what they wrote.
+
+Also here, because it guards the same claim: PREFLIGHT's refusal of two server
+records that are one daemon (:func:`assert_separate_daemons`).
 """
 
 from __future__ import annotations
@@ -27,10 +30,18 @@ from bg_coolify_migrate.domain.containment import Breach, Seen, Watched
 from bg_coolify_migrate.domain.statemachine import START_REQUESTED, STARTED_EARLY, State
 from bg_coolify_migrate.engine.context import MigrationContext
 from bg_coolify_migrate.engine.planner import observed_labels, resource_labels
-from bg_coolify_migrate.errors import SourceRevived, SourceRevivedAfterStart, TargetStartedEarly
+from bg_coolify_migrate.errors import (
+    PreflightError,
+    SourceRevived,
+    SourceRevivedAfterStart,
+    TargetStartedEarly,
+)
 from bg_coolify_migrate.transfer.ssh import RemoteHost
 
 log = structlog.get_logger(__name__)
+
+#: The daemon's engine ID (``containment.parse_daemon_id``).
+DAEMON_ID_COMMAND = "docker info --format '{{.ID}}'"
 
 
 async def assert_contained(
@@ -276,6 +287,39 @@ async def _target_breaches(ctx: MigrationContext) -> tuple[list[Breach], list[st
         watched, seen, await quiesce.start_events(host, since=0)
     )
     return breaches, sorted({b.uuid for b in breaches if b.uuid})
+
+
+async def assert_separate_daemons(ctx: MigrationContext) -> None:
+    """PREFLIGHT: refuse when the source and target servers are one Docker daemon.
+
+    Read-only: ``docker info`` on each (``containment.shared_daemon_refusal``).
+    A daemon that does not answer proves nothing, so the run goes on — with a
+    warning, because the plan's uuid comparison is then the only guard.
+
+    Raises:
+        PreflightError: Both daemons report the same engine ID.
+    """
+    ids = [await _daemon_id(host) for host in (ctx.source_host, ctx.target_host)]
+    refusal = containment.shared_daemon_refusal(
+        ids[0],
+        ids[1],
+        source=ctx.plan.source_server.name,
+        target=ctx.plan.target_server.name,
+    )
+    if refusal is not None:
+        raise PreflightError(refusal, hint=containment.SHARED_DAEMON_HINT)
+    if None in ids:
+        log.warning(
+            "preflight.daemon_id_unread",
+            source=ids[0] is not None,
+            target=ids[1] is not None,
+            hint="could not tell whether the two servers are one Docker daemon",
+        )
+
+
+async def _daemon_id(host: RemoteHost) -> str | None:
+    result = await host.run(DAEMON_ID_COMMAND)
+    return containment.parse_daemon_id(result.stdout) if result.ok else None
 
 
 async def record_source_volumes(ctx: MigrationContext) -> dict[str, str]:

@@ -116,6 +116,8 @@ class FakeDaemon(FakeHost):
             return self._create(command, command.split(" && ", 1)[1])
         if "docker events --since 0" in command and "event=start" in command:
             return self._ok(command, self.events)
+        if command.startswith("docker info"):
+            return self._ok(command, f"{self.engine_id}\n")
         argv = shlex.split(command)
         if argv[:3] == ["docker", "volume", "inspect"] and "--format" in argv:
             names = argv[argv.index("--format") + 2 :]

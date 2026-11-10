@@ -317,6 +317,9 @@ async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
         await rsync.ensure_installed(host, label=label)
         if not await host.which("docker"):
             raise PreflightError(f"docker is not installed on the {label} server")
+    # Two server records can be one machine (localhost and its public IP), which
+    # the plan's uuid comparison cannot see: ask both daemons who they are.
+    await containment.assert_separate_daemons(ctx)
 
     # Before anything expensive: can we actually SEE this stack? Everything that
     # follows - the quiesce gate, the mount capture, the mid-copy restart check -
