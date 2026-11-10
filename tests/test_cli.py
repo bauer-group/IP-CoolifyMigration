@@ -804,19 +804,33 @@ class TestPicker:
         respx.get(f"{BASE}/projects/p1/production").mock(
             return_value=httpx.Response(200, json={"applications": [{"uuid": "a1", "name": "web"}]})
         )
+        respx.get(f"{BASE}/applications/a1").mock(
+            return_value=httpx.Response(200, json={"uuid": "a1", "server_uuid": "s1"})
+        )
+        respx.get(f"{BASE}/servers/s1").mock(
+            return_value=httpx.Response(200, json={"uuid": "s1", "name": "source"})
+        )
         respx.get(f"{BASE}/servers").mock(
             return_value=httpx.Response(
                 200, json=[{"uuid": "s2", "name": "target", "ip": "1.1.1.1"}]
             )
         )
+        excluded: list[str | None] = []
+
+        def choose_server(servers: object, *, message: str, exclude: str | None = None) -> str:
+            excluded.append(exclude)
+            return "s2"
+
         monkeypatch.setattr(wizard, "choose_project", lambda projects: "shop")
         monkeypatch.setattr(wizard, "choose_scope_environment", lambda envs: "production")
         monkeypatch.setattr(wizard, "choose_scope_resource", lambda resources: "web")
-        monkeypatch.setattr(wizard, "choose_server", lambda servers, message: "s2")
+        monkeypatch.setattr(wizard, "choose_server", choose_server)
 
         selection, target = await _pick(api, None)
         assert selection == Selection("shop", "production", "web")
         assert target == "s2"
+        # The source's own server is never offered: the plan would refuse it.
+        assert excluded == ["s1"]
 
     @respx.mock
     async def test_whole_project_skips_resource_and_keeps_given_target(

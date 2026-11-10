@@ -505,15 +505,52 @@ async def _pick(api: object, target: str | None) -> tuple[Selection, str]:
     environment = await _off_loop(wizard.choose_scope_environment, environments)
 
     resource: str | None = None
+    source_uuid: str | None = None
     if environment is not None:
         resources = await environment_resources(api, project_uuid, environment)  # type: ignore[arg-type]
         resource = await _off_loop(wizard.choose_scope_resource, resources)
+        if target is None:
+            source_uuid = await _source_server_uuid(api, resources, resource)
 
     if target is None:
         servers = await api.list_servers()  # type: ignore[attr-defined]
-        target = await _off_loop(wizard.choose_server, servers, message="Target server?")
+        # Never offer the source's own server: the plan refuses it (same_server_refusal).
+        target = await _off_loop(
+            wizard.choose_server, servers, message="Target server?", exclude=source_uuid
+        )
 
     return Selection(project=project_name, environment=environment, resource=resource), target
+
+
+async def _source_server_uuid(
+    api: object, resources: list[tuple[str, dict[str, Any]]], resource: str | None
+) -> str | None:
+    """The server the picked scope runs on, to leave out of the target menu.
+
+    Read off the resource's own GET (the environment listing's rows are used for
+    uuid, name and type only) the way ``_build`` finds the source. ``None`` when
+    it cannot be read: the menu then offers every server, and the plan still
+    refuses the source's. Never raises.
+    """
+    import structlog
+
+    from bg_coolify_migrate.engine.planner import resolve_server
+
+    rows = [
+        (collection, row)
+        for collection, row in resources
+        if resource is None or resource in (row.get("name"), row.get("uuid"))
+    ]
+    if not rows or not rows[0][1].get("uuid"):
+        return None
+    collection, row = rows[0]
+    try:
+        full = await api.get_resource(collection, str(row["uuid"]))  # type: ignore[attr-defined]
+        server = await resolve_server(api, full)  # type: ignore[arg-type]
+    except Exception as exc:  # a nicer menu only; the plan refuses either way
+        structlog.get_logger(__name__).debug("cli.source_server_unknown", error=str(exc)[:120])
+        return None
+    return str(server["uuid"]) if server and server.get("uuid") else None
 
 
 async def _project_or_none(api: object, name_or_uuid: str) -> dict[str, Any] | None:

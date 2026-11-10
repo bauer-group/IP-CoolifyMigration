@@ -180,7 +180,7 @@ def blocking_panel(plan: MigrationPlan) -> Panel | None:
     """Why the migration will not proceed."""
     if not plan.is_blocked:
         return None
-    lines: list[Text] = []
+    lines: list[Text] = [Text(f"• {reason}") for reason in plan.plan_refusals]
     for resource in plan.blocked_resources:
         lines.append(Text(resource.snapshot.name, style="bold err"))
         for reason in plan.blocking_reasons_of(resource):
@@ -219,6 +219,7 @@ def plain_plan(plan: MigrationPlan) -> str:
         f"finalize: {plan.finalize_policy.value}",
         f"blocked: {plan.is_blocked}",
     ]
+    lines.extend(f"blocking: {reason}" for reason in plan.plan_refusals)
     for resource in plan.resources:
         reasons = plan.blocking_reasons_of(resource)
         lines.append(

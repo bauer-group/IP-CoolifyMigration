@@ -395,12 +395,12 @@ class TestFindProjectHint:
 
 
 def _plan(**kwargs: object) -> MigrationPlan:
-    ref = ServerRef(uuid="s", name="server", ip="10.0.0.1")
+    # Two servers: a plan whose target is its source is refused (same_server_refusal).
     return MigrationPlan(
         project="Shop",
         environment="production",
-        source_server=ref,
-        target_server=ref,
+        source_server=ServerRef(uuid="s1", name="old", ip="10.0.0.1"),
+        target_server=ServerRef(uuid="s2", name="new", ip="10.0.0.2"),
         **kwargs,  # type: ignore[arg-type]
     )
 

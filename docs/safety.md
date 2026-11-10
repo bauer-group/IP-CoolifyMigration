@@ -293,6 +293,9 @@ A custom domain (`shop.example.com`) always has a live holder of this migration:
   (the compose is reloaded from git, and a service renamed there since CREATE
   loses its entry). Otherwise the stopped source keeps them and the run report
   says which host the target lost.
+* **Source and target are two servers.** A plan whose target is its source's
+  own server is refused: the DNS gate places a host by the address only one
+  side answers as, and on one server every address is both sides'.
 * **A rollback before FINALIZE writes nothing to the source's domains**: it never
   lost them. After FINALIZE the source gets them back BEFORE it is restarted, and
   a target that holds them is deleted only once the source holds them again. If

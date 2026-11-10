@@ -384,6 +384,16 @@ class MigrationPlan(BaseModel):
         """FINALIZE leaves the source in place: policy keep or rename."""
         return self.finalize_policy is not FinalizePolicy.DELETE
 
+    @property
+    def plan_refusals(self) -> tuple[str, ...]:
+        """Reasons the move as a whole may not run, whatever its resources.
+
+        Derived on every read, never stored: a plan.json from before a rule
+        existed is judged by it too.
+        """
+        refusal = same_server_refusal(self.source_server, self.target_server)
+        return (refusal,) if refusal else ()
+
     def blocking_reasons_of(self, resource: ResourcePlan) -> tuple[str, ...]:
         """Every reason ``resource`` may not be migrated under THIS plan's policy."""
         out = list(resource.blocking_reasons)
@@ -398,7 +408,7 @@ class MigrationPlan(BaseModel):
         The SINGLE source of truth for a plan: :attr:`is_blocked`, the report
         and PREFLIGHT read it, so a reason listed is a reason that stops the run.
         """
-        out: list[str] = []
+        out = list(self.plan_refusals)
         for r in self.resources:
             out.extend(f"{r.snapshot.name}: {x}" for x in self.blocking_reasons_of(r))
         return tuple(out)
@@ -417,11 +427,12 @@ class MigrationPlan(BaseModel):
 
         A plan blocked by nothing but anonymous volumes of running containers
         (:attr:`ResourcePlan.offline_only`) clears once those stacks are stopped.
-        Empty when anything else blocks it — a refusal of the policy, another
-        resource — because stopping them then buys downtime and no migration.
+        Empty when anything else blocks it — a plan refusal, a refusal of the
+        policy, another resource — because stopping them then buys downtime and
+        no migration.
         """
         offline = tuple(r for r in self.resources if r.offline_only)
-        if not offline or len(offline) != len(self.blocked_resources):
+        if not offline or self.plan_refusals or len(offline) != len(self.blocked_resources):
             return ()
         if any(self.blocking_reasons_of(r) != r.blocking_reasons for r in offline):
             return ()
@@ -443,6 +454,36 @@ class MigrationPlan(BaseModel):
                 out.extend(f"{r.snapshot.name}: {w}" for w in r.kept_source_warnings)
             out.extend(f"{r.snapshot.name}: {w}" for w in r.manifest.warnings)
         return tuple(out)
+
+
+def same_server_refusal(source: ServerRef, target: ServerRef) -> str | None:
+    """A migration whose target server is its source server. PURE, not gated.
+
+    Moving resources within one server is nothing this tool can make safe:
+
+    * the DNS gate places each custom host by the addresses only ONE side
+      answers as (dns/gate.classify); on one server every address is both
+      sides', so every custom host reads ELSEWHERE and needs its own
+      ``--accept-dns-host`` — the gate could no longer tell a cutover from none;
+    * labels kept verbatim (readonly labels off, carried from 4.5.1) would put
+      the source's routers, under the source's names, on the target's proxy —
+      the same proxy;
+    * a bind mount is mirrored path to path, here onto itself.
+
+    Compared by uuid: Coolify gives one SSH endpoint (ip + port) one server
+    record (ServersController v4.7.2:637, ``sshEndpointInUse``). An empty uuid
+    proves nothing and refuses nothing.
+    """
+    if not source.uuid or source.uuid != target.uuid:
+        return None
+    return (
+        f"the target server {target.name!r} is the source server: a migration moves "
+        "resources between two servers. On one server every custom domain resolves to "
+        "both sides, so the DNS gate cannot tell a cutover from none (each would need "
+        "--accept-dns-host), labels kept verbatim would declare the source's routers "
+        "twice on the same proxy, and bind mounts would be copied onto themselves. "
+        "Pick another target server."
+    )
 
 
 def _volume_prune_notes(plan: MigrationPlan) -> list[str]:

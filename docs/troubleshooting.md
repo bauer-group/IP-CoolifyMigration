@@ -813,6 +813,14 @@ Two ways out:
 API does not show the setting, the plan says **"does not show whether its
 readonly labels are on"** instead: check the setting on the source by hand.
 
+## "the target server '…' is the source server"
+
+Source and target must be two servers. On one server every custom domain
+resolves to both sides, so the DNS gate cannot tell a cutover from none (each
+host would need its own `--accept-dns-host`), labels kept verbatim would declare
+the source's routers twice on the same proxy, and bind mounts would be copied
+onto themselves. Pick another target server with `--to`.
+
 ## Coolify 4.6: image names and HTTPS git credentials
 
 **"docker_registry_image_name=… is not carried".** From 4.6 Coolify refuses a second

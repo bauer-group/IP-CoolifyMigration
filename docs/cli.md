@@ -43,6 +43,13 @@ Migrating one resource stops only that resource on the source; the rest of the
 environment stays up. A whole-project run migrates each environment in turn and
 stops at the first failure, leaving later environments untouched.
 
+The target must be **another server**. A plan whose target is the source's own
+server is refused: on one server every custom domain resolves to both sides, so
+the DNS gate cannot tell a cutover from none, labels kept verbatim would declare
+the source's routers twice on one proxy, and bind mounts would be copied onto
+themselves. When you pick an environment or a resource interactively, the target
+menu leaves the source's server out.
+
 ### Host keys
 
 The first time a command reaches a server, its SSH host key is unknown. In a
