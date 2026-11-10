@@ -191,7 +191,18 @@ def _storage_host_path(s: ApiStorage, context: _BindContext) -> str | None:
 def _is_content_skip(
     source: str, destination: str, decision: Decision, context: _BindContext
 ) -> bool:
-    """A skipped bind whose file Coolify writes on the target from its row. PURE."""
+    """A skipped bind whose file Coolify writes on the target from its row. PURE.
+
+    Never a database's TLS certificate: the target starts without TLS, so it
+    has no such row to read back (``binds.is_database_tls_certificate``).
+    """
+    path = binds.normalise(source)
+    if (
+        context.carry is binds.StorageCarry.NONE
+        and path is not None
+        and binds.is_database_tls_certificate(path, destination, context.uuid)
+    ):
+        return False
     return decision is Decision.SKIP and binds.regenerated_content(
         context.rows, source=source, destination=destination
     )

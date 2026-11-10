@@ -1319,6 +1319,16 @@ carry the rest of the evidence.
   refused, and what Coolify writes from its columns at every start (StartPostgresql
   v4.7.2:163-190) is skipped. The rest is read back at the end of CREATE
   (`binds.content_problem`): a catalog or a branch HEAD can drop a file.
+- **A database's TLS certificate files are content rows, and skipped.** With
+  TLS on, every start writes `{dir}/ssl/server.{crt,key,pem}` and keeps them as
+  FILE STORAGE rows with the content (SslHelper::generateSslCertificate
+  v4.7.5:176-223, mountPath per engine the same at v4.1.2/v4.5.0/v4.7.5); a start
+  without TLS deletes them (StartPostgresql v4.7.5:47-63). The target starts
+  without TLS, so `binds.is_database_tls_certificate` skips exactly those files
+  and CREATE reads no target row back for them. Refusing them as "a database's
+  content file" refused every TLS database (found by the e2e run). The rows hold
+  the private key: the plan keeps only `has_content` (`planner`, ApiStorage), and
+  a database's rows are never POSTed anywhere.
 - **Deleting a resource removes its own directory only** (deleteConfigurations,
   Application v4.7.2:587-594, Service v4.7.2:226-233 via DeleteService
   v4.7.2:30-32; LocalFileVolume v4.7.2:269-271). A target delete takes a

@@ -185,6 +185,21 @@ STATES = frozenset(
 KIND_DIR = "dir"
 KIND_FILE = "file"
 
+#: Where each standalone engine mounts its TLS certificate files, the same at
+#: v4.1.2, v4.5.0 and v4.7.5 (the ``mountPath:`` each StartX passes to
+#: SslHelper::generateSslCertificate; ClickHouse and SQLite have none).
+DATABASE_TLS_CERT_DIRS = frozenset(
+    {
+        "/var/lib/postgresql/certs",
+        "/etc/mysql/certs",
+        "/etc/mongo/certs",
+        "/etc/redis/certs",
+        "/etc/keydb/certs",
+        "/etc/dragonfly/certs",
+    }
+)
+_TLS_CERT_FILES = frozenset({"server.crt", "server.key", "server.pem"})
+
 
 # ── paths ────────────────────────────────────────────────────────────────────
 
@@ -235,6 +250,27 @@ def own_dir_of(path: str, uuid: str | None) -> str | None:
         if path != directory and is_within(path, directory):
             return directory
     return None
+
+
+def is_database_tls_certificate(path: str, destination: str, uuid: str | None) -> bool:
+    """Is this bind a database's own TLS certificate file, as Coolify writes it? PURE.
+
+    While TLS is on, every start of a standalone database writes its
+    certificate and key into ``{configuration_dir}/ssl/`` and keeps them as
+    FILE STORAGE rows with the content (SslHelper::generateSslCertificate,
+    ``fs_path`` ``{dir}/ssl/server.{crt,key,pem}``, ``mount_path``
+    ``{mountPath}/server.*``: v4.7.5:176-223); a start without TLS deletes both
+    (StartPostgresql v4.7.5:47-63). Not the database's data, and not the
+    target's: it starts without TLS (``fidelity.database_tls_lost_warning``)
+    and gets a certificate of its own server's CA once TLS is switched on there
+    (``database_tls_identity_warning``).
+    """
+    own = own_dir_of(path, uuid)
+    name = path.rsplit("/", 1)[-1]
+    if own is None or name not in _TLS_CERT_FILES or path != f"{own}/ssl/{name}":
+        return False
+    mount = normalise(destination)
+    return mount is not None and mount in {f"{d}/{name}" for d in DATABASE_TLS_CERT_DIRS}
 
 
 def is_system_path(path: str, *, uuid: str | None = None) -> bool:
@@ -399,6 +435,12 @@ def classify(
         )
 
     inside_own = own_dir_of(path, uuid) is not None
+    if carry is StorageCarry.NONE and is_database_tls_certificate(path, destination, uuid):
+        return BindAction.SKIP, (
+            f"{path} is the database's TLS certificate file, which Coolify writes at every "
+            "start while TLS is on; the target starts without TLS and gets a certificate "
+            "of its own server's CA once TLS is switched on there"
+        )
     system = not inside_own and is_system_path(path, uuid=uuid)
     match = _matching_row(rows, destination=destination, path=path)
     if match is not None and match.writes_content:
