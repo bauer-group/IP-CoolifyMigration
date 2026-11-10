@@ -901,6 +901,10 @@ async def build_plan(
 
         warnings: list[str] = []
         refusals: list[str] = []
+        # What holds only while FINALIZE keeps the source (keep, rename): the plan
+        # applies these under its policy at read time (ResourcePlan.kept_source_refusals).
+        kept_refusals: list[str] = []
+        kept_warnings: list[str] = []
         compose_backed = snapshot.kind in (
             ResourceKind.APP_GIT_COMPOSE,
             ResourceKind.SERVICE_TEMPLATE,
@@ -960,6 +964,13 @@ async def build_plan(
                 )
             )
             refusals.extend(fidelity.application_refusals(full, version=coolify_version))
+            # Verbatim labels outlive FINALIZE's release of the custom hosts.
+            kept_refusals.extend(
+                fidelity.kept_source_label_refusals(full, source_wildcard=origin_wildcard or None)
+            )
+            kept_warnings.extend(
+                fidelity.kept_source_label_warnings(full, source_wildcard=origin_wildcard or None)
+            )
             warnings.extend(image_scan_gate_warnings(version=coolify_version))
             if fidelity.unshareable_image_name(full, version=coolify_version):
                 if team_applications is None:
@@ -1037,6 +1048,8 @@ async def build_plan(
                 warnings=tuple(warnings),
                 refusals=tuple(refusals),
                 recover_env_keys=review.recover_env_keys,
+                kept_source_refusals=tuple(kept_refusals),
+                kept_source_warnings=tuple(kept_warnings),
             )
         )
 

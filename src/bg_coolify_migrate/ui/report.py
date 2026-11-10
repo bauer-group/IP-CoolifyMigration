@@ -161,7 +161,9 @@ def resources_table(plan: MigrationPlan) -> Table:
 
     for resource in plan.resources:
         status = (
-            Text("BLOCKED", style="err") if resource.is_blocked else Text("ready", style="ok")
+            Text("BLOCKED", style="err")
+            if plan.blocking_reasons_of(resource)
+            else Text("ready", style="ok")
         )
         table.add_row(
             Text(resource.snapshot.name),
@@ -181,7 +183,7 @@ def blocking_panel(plan: MigrationPlan) -> Panel | None:
     lines: list[Text] = []
     for resource in plan.blocked_resources:
         lines.append(Text(resource.snapshot.name, style="bold err"))
-        for reason in resource.blocking_reasons:
+        for reason in plan.blocking_reasons_of(resource):
             lines.append(Text(f"  • {reason}"))
     return Panel(
         Group(*lines),
@@ -218,12 +220,13 @@ def plain_plan(plan: MigrationPlan) -> str:
         f"blocked: {plan.is_blocked}",
     ]
     for resource in plan.resources:
+        reasons = plan.blocking_reasons_of(resource)
         lines.append(
             f"resource: name={resource.snapshot.name} kind={resource.snapshot.kind.value} "
             f"strategy={resource.strategy.value} volumes={len(resource.manifest.to_migrate)} "
-            f"bytes={resource.manifest.total_bytes} blocked={resource.is_blocked}"
+            f"bytes={resource.manifest.total_bytes} blocked={bool(reasons)}"
         )
-        for reason in resource.blocking_reasons:
+        for reason in reasons:
             lines.append(f"  blocking: {reason}")
     for warning in plan.warnings:
         lines.append(f"warning: {warning}")

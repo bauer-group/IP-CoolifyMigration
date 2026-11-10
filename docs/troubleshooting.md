@@ -779,13 +779,39 @@ of them are carried, so these lines disappear from a plan made against 4.5.1:
   to the source server (or one the DNS gate never checks) would make the target
   answer for it. Then the plan says **"readonly labels ON instead"**: the target
   regenerates its labels from its own domains, and hand-made routers,
-  middlewares or headers have to be re-applied by hand.
+  middlewares or headers have to be re-applied by hand. What readonly labels
+  off means for the SOURCE under `keep` or `rename` is a refusal, below.
 
 On every release the plan also warns when an application's Dockerfile has its own
 `HEALTHCHECK` while Coolify's health check is enabled: the target runs Coolify's
 configured check instead, and from 4.5.1 so does the source's next deploy and a
 rollback's restart. Disable Coolify's health check on the source, or redeploy the
 source once to prove the configured check passes, before migrating.
+
+## "readonly labels are off on this application and its labels route …"
+
+A refusal under `--finalize keep` and `rename` only. Finalize releases the
+source's custom domains, but with readonly labels off Coolify keeps the
+application's labels exactly as stored when its domains change, and every deploy
+writes them into its container. The kept source's next restart, redeploy or git
+push would route the moved hosts again next to the target, and request their
+certificates — invisibly, since Coolify's domain-conflict check and managed DNS
+read the domains, never the labels. A dockercompose application is not affected:
+its labels are generated from its domains at every deploy.
+
+Two ways out:
+
+- switch the source's label management back to Coolify (Readonly labels on, or
+  "Managed by Coolify" under Labels on newer releases). Coolify regenerates the
+  labels from its domains — hand-made routers, middlewares or headers are lost,
+  on the target too — then plan again;
+- or keep the hand-made labels and migrate with `--finalize delete`: from
+  Coolify 4.5.1 the target carries them verbatim (when they route nothing but
+  its own custom domains, above), and the source is gone.
+
+`plan --finalize delete` shows the plan under that policy. On Coolify 4.1, whose
+API does not show the setting, the plan says **"does not show whether its
+readonly labels are on"** instead: check the setting on the source by hand.
 
 ## Coolify 4.6: image names and HTTPS git credentials
 

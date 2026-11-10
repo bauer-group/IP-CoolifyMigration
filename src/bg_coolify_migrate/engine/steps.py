@@ -387,10 +387,9 @@ async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
             report=[r.drift for r in undecided],
         )
 
-    # Hard reasons: these are not judgements and no flag overrides them.
-    hard = [
-        f"  {r.snapshot.name}: {x}" for r in ctx.plan.resources for x in r.hard_blocking_reasons
-    ]
+    # Hard reasons: these are not judgements and no flag overrides them. The
+    # plan's, not each resource's: some hold only under its finalize policy.
+    hard = [f"  {x}" for x in ctx.plan.blocking_reasons]
     if hard:
         raise PreflightError("the plan is blocked:\n" + "\n".join(hard))
 

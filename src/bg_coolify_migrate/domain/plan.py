@@ -223,6 +223,16 @@ class ResourcePlan(BaseModel):
     carry (domain/locked_envs.py). KEY NAMES ONLY — this model is saved as
     plan.json. CREATE re-reads them and refuses, before any write, if one of
     them can no longer be read."""
+    kept_source_refusals: tuple[str, ...] = ()
+    """Refusals that hold only while FINALIZE keeps the source — policy keep or
+    rename, never delete. Decided by domain/fidelity.py from the captured GETs,
+    like :attr:`refusals`, but applied by the plan under ITS policy
+    (:meth:`MigrationPlan.blocking_reasons_of`): the run command swaps the policy
+    onto a plan that is already built (``model_copy``), so a line baked into
+    :attr:`refusals` would answer for the policy the plan was built with."""
+    kept_source_warnings: tuple[str, ...] = ()
+    """Warnings that hold only while FINALIZE keeps the source; applied by
+    :attr:`MigrationPlan.warnings` like :attr:`kept_source_refusals`."""
 
     @property
     def hard_blocking_reasons(self) -> tuple[str, ...]:
@@ -231,6 +241,10 @@ class ResourcePlan(BaseModel):
         Kept apart from drift because drift is overridable (``--accept-rebuild-
         drift``) and these are not. Conflating the two makes the flag a lie: it
         gets accepted, and the migration aborts anyway on the generic check.
+
+        Independent of the finalize policy: what only holds under one is
+        :attr:`kept_source_refusals`, which the plan adds
+        (:meth:`MigrationPlan.blocking_reasons_of`).
         """
         out: list[str] = list(self.refusals)
         out.extend(f"{i.source_name or i.mount_path}: {i.reason}" for i in self.manifest.refused)
@@ -280,13 +294,15 @@ class ResourcePlan(BaseModel):
 
     @property
     def blocking_reasons(self) -> tuple[str, ...]:
-        """Every reason this resource may not be migrated, full stop.
+        """Every reason this resource may not be migrated, whatever the policy.
 
         Only hard reasons: drift is a question, not a refusal. The SINGLE source
         of truth for blocking — :attr:`is_blocked` is derived from it rather than
         re-deriving the conditions, because two parallel implementations of "is
         this blocked?" drift apart, and the dangerous direction is the one where a
-        reason is listed in the report while the migration proceeds anyway.
+        reason is listed in the report while the migration proceeds anyway. A
+        plan asks :meth:`MigrationPlan.blocking_reasons_of`, which adds what its
+        finalize policy refuses.
         """
         return self.hard_blocking_reasons
 
@@ -364,12 +380,52 @@ class MigrationPlan(BaseModel):
         return sum(r.manifest.total_bytes for r in self.resources)
 
     @property
+    def keeps_source(self) -> bool:
+        """FINALIZE leaves the source in place: policy keep or rename."""
+        return self.finalize_policy is not FinalizePolicy.DELETE
+
+    def blocking_reasons_of(self, resource: ResourcePlan) -> tuple[str, ...]:
+        """Every reason ``resource`` may not be migrated under THIS plan's policy."""
+        out = list(resource.blocking_reasons)
+        if self.keeps_source:
+            out.extend(resource.kept_source_refusals)
+        return tuple(out)
+
+    @property
+    def blocking_reasons(self) -> tuple[str, ...]:
+        """Every reason this plan may not run, one line each, resource-named.
+
+        The SINGLE source of truth for a plan: :attr:`is_blocked`, the report
+        and PREFLIGHT read it, so a reason listed is a reason that stops the run.
+        """
+        out: list[str] = []
+        for r in self.resources:
+            out.extend(f"{r.snapshot.name}: {x}" for x in self.blocking_reasons_of(r))
+        return tuple(out)
+
+    @property
     def is_blocked(self) -> bool:
-        return any(r.is_blocked for r in self.resources)
+        return bool(self.blocking_reasons)
 
     @property
     def blocked_resources(self) -> tuple[ResourcePlan, ...]:
-        return tuple(r for r in self.resources if r.is_blocked)
+        return tuple(r for r in self.resources if self.blocking_reasons_of(r))
+
+    @property
+    def offline_only_resources(self) -> tuple[ResourcePlan, ...]:
+        """The resources to stop up front when nothing else blocks the plan.
+
+        A plan blocked by nothing but anonymous volumes of running containers
+        (:attr:`ResourcePlan.offline_only`) clears once those stacks are stopped.
+        Empty when anything else blocks it — a refusal of the policy, another
+        resource — because stopping them then buys downtime and no migration.
+        """
+        offline = tuple(r for r in self.resources if r.offline_only)
+        if not offline or len(offline) != len(self.blocked_resources):
+            return ()
+        if any(self.blocking_reasons_of(r) != r.blocking_reasons for r in offline):
+            return ()
+        return offline
 
     @property
     def warnings(self) -> tuple[str, ...]:
@@ -383,6 +439,8 @@ class MigrationPlan(BaseModel):
         )
         for r in self.resources:
             out.extend(f"{r.snapshot.name}: {w}" for w in r.warnings)
+            if self.keeps_source:
+                out.extend(f"{r.snapshot.name}: {w}" for w in r.kept_source_warnings)
             out.extend(f"{r.snapshot.name}: {w}" for w in r.manifest.warnings)
         return tuple(out)
 

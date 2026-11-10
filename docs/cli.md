@@ -138,6 +138,21 @@ next to the target and keep trying to renew its certificate — quietly costing
 ACME rate-limit budget. Its server-bound and generated URLs stay: they collide
 with nothing on the target.
 
+The release stops the routing only where Coolify manages an application's
+labels. With **readonly labels off** (label management "manually"), Coolify
+keeps `custom_labels` exactly as stored when the domains change, and every
+deploy of the application writes them into its container — so a kept source
+would route the moved hosts again on its next restart, redeploy or git push.
+The plan therefore **refuses** `keep` and `rename` for an application (any
+build pack but dockercompose) whose readonly labels are off and whose labels
+route one of the custom domains finalize moves. Switch its label management
+back to Coolify (it then regenerates the labels from its domains, dropping
+hand-made ones) and plan again, or use `--finalize delete`. On Coolify 4.1,
+whose API does not show the setting, the plan warns instead.
+
+`plan` takes the same `--finalize` (default `rename`), so it judges the policy
+`run` will use.
+
 ## Domains & DNS
 
 A resource answers on two kinds of hostname, and they migrate in opposite ways.

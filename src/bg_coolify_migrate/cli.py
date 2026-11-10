@@ -608,6 +608,10 @@ def plan(
     output: Annotated[
         Path | None, typer.Option(help="Write the plan JSON here (single-scope only).")
     ] = None,
+    finalize: Annotated[
+        str,
+        typer.Option(help="keep|rename|delete - the policy `run --finalize` will use."),
+    ] = "rename",
     log_level: Annotated[str, typer.Option(help="DEBUG|INFO|WARNING|ERROR")] = "INFO",
     log_format: Annotated[str, typer.Option(help="console|json")] = "console",
 ) -> None:
@@ -616,18 +620,31 @@ def plan(
     Scope it with the selector: a project (all environments), a project/environment,
     a project/environment/resource, or just a resource's uuid. Exercises preflight,
     discovery, volume pairing, the drift gate and the DNS gate. If `plan` is clean,
-    `run` has already had its risky decisions made.
+    `run` has already had its risky decisions made - for the same --finalize, as
+    some refusals hold only while the source is kept.
     """
     settings = _settings(log_level, log_format)
+    policy = _finalize_policy(finalize)
     try:
         asyncio.run(
             _plan(
                 settings, selector, to, environment, output, trust_host_key,
-                source_wildcard, target_wildcard,
+                source_wildcard, target_wildcard, policy,
             )
         )
     except MigrationError as exc:
         _fail(exc)
+
+
+def _finalize_policy(raw: str) -> FinalizePolicy:
+    """``--finalize`` as a policy; exit 2 on anything else."""
+    try:
+        return FinalizePolicy(raw)
+    except ValueError:
+        get_console(stderr=True).print(
+            Text(f"error: --finalize must be keep|rename|delete, got {raw!r}", style="err")
+        )
+        raise typer.Exit(2) from None
 
 
 async def _plan(
@@ -639,6 +656,7 @@ async def _plan(
     trust_host_key: bool = False,
     source_wildcard: str | None = None,
     target_wildcard: str | None = None,
+    policy: FinalizePolicy = FinalizePolicy.RENAME,
 ) -> None:
     from bg_coolify_migrate.api.client import CoolifyClient
     from bg_coolify_migrate.ui import wizard
@@ -660,12 +678,13 @@ async def _plan(
 
         for job_project, job_environment, job_resource in jobs:
             try:
-                plans.append(
-                    await _build(
-                        api, settings, job_project, job_environment, resolved_target,
-                        job_resource, trust_host_key, source_wildcard, target_wildcard,
-                    )
+                built = await _build(
+                    api, settings, job_project, job_environment, resolved_target,
+                    job_resource, trust_host_key, source_wildcard, target_wildcard,
                 )
+                # Swapped on as `run` does: the plan derives what its policy
+                # refuses on read (ResourcePlan.kept_source_refusals).
+                plans.append(built.model_copy(update={"finalize_policy": policy}))
             except EmptyEnvironment:
                 # Only an empty environment is skippable, and only while scanning a
                 # whole project. A single scope, or any real failure (host key, no
@@ -879,13 +898,7 @@ def run(
     whole environment, or a whole project (every environment, migrated in turn).
     """
     settings = _settings(log_level, log_format)
-    try:
-        policy = FinalizePolicy(finalize)
-    except ValueError:
-        get_console(stderr=True).print(
-            Text(f"error: --finalize must be keep|rename|delete, got {finalize!r}", style="err")
-        )
-        raise typer.Exit(2) from None
+    policy = _finalize_policy(finalize)
 
     try:
         code = asyncio.run(
@@ -1107,9 +1120,10 @@ async def _offer_offline(
 
     out = list(plans)
     for index, plan in enumerate(out):
-        offline = [r for r in plan.resources if r.offline_only]
-        if not offline or len(offline) != len(plan.blocked_resources):
-            continue  # nothing to offer, or something else blocks it anyway
+        # Empty when nothing is offline-only, or something else blocks it anyway.
+        offline = list(plan.offline_only_resources)
+        if not offline:
+            continue
         if not await _off_loop(wizard.confirm_offline, plan, offline):
             continue
         for resource in offline:

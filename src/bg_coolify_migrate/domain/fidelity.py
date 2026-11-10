@@ -824,6 +824,16 @@ def labels_route_beyond_domains(
     if not text:
         return []
     own = set(custom_hosts(source.get("fqdn"), source_wildcard=source_wildcard))
+    return sorted({h for h in _label_routes(text) if h not in own})
+
+
+def _label_routes(text: str) -> list[str]:
+    """Every host a Traefik router rule or a Caddy site label in ``text`` routes.
+
+    The ONE label parser (:func:`labels_route_beyond_domains`,
+    :func:`label_routed_release_hosts`). A HostRegexp rule cannot be enumerated
+    and comes back as ``HostRegexp(...)``. PURE.
+    """
     routed: list[str] = []
     for matcher, args in _TRAEFIK_HOST_RULE.findall(text):
         if matcher == "HostRegexp":
@@ -834,7 +844,144 @@ def labels_route_beyond_domains(
         routed.extend(
             h for raw in re.split(r"[,\s]+", site.strip("\"'")) if raw and (h := normalise_host(raw))
         )
-    return sorted({h for h in routed if h not in own})
+    return routed
+
+
+# ── a kept source's labels (finalize keep / rename) ──────────────────────────
+# FINALIZE lets a kept or renamed source go of its custom hosts with one domain
+# PATCH (api/resources.release_application_domains). That PATCH rebuilds
+# custom_labels from the new fqdn only while readonly labels is on
+# (`is_container_label_readonly_enabled && $requestHasDomains ...`,
+# ApplicationsController v4.1.2:2668, v4.3.10:3122, v4.5.0:3777, v4.5.1:3814,
+# v4.6.0:3863, v4.7.2:4107). Every deploy of a non-compose application —
+# /restart included — writes the STORED custom_labels into the container and
+# replaces only their `coolify.*` lines (ApplicationDeploymentJob
+# v4.1.2:3099-3115, v4.5.0:4118-4132, v4.7.2:4740-4763; every deploy_* but the
+# compose one calls generate_compose_file). So with readonly labels off the
+# release changes the fqdn and nothing the proxy reads: the next deploy of the
+# kept source routes the moved hosts again, next to the target, and requests
+# their certificates. Nothing in Coolify notices: the conflict check and the
+# managed-DNS release read fqdn and docker_compose_domains only.
+#
+# Not a compose application: its labels are generated from docker_compose_domains
+# at every parse (parsers v4.7.2:2207-2266) and deploy_docker_compose_buildpack
+# (ApplicationDeploymentJob v4.7.2:876) never reads custom_labels. Not a service:
+# custom_labels is an applications column only (migration
+# 2023_10_18_072519_add_custom_labels_applications_table).
+
+#: The build pack whose deploys never use custom_labels.
+_LABELS_FROM_COMPOSE = "dockercompose"
+
+
+def readonly_labels(source: Mapping[str, Any]) -> bool | None:
+    """Does Coolify manage this application's labels (readonly labels on)? PURE.
+
+    ``settings.is_container_label_readonly_enabled``, a boolean cast
+    (ApplicationSetting v4.1.2:16, v4.7.2:80), on by default since migration
+    2025_01_08_154008 (present at v4.1.2). ``None`` when the GET does not say:
+    the application GET returns no ``settings`` on 4.1.x, and only from 4.2
+    nests them under ``settings``. Read by key, never by version.
+    """
+    settings = source.get("settings")
+    value = (
+        settings.get("is_container_label_readonly_enabled")
+        if isinstance(settings, Mapping)
+        else None
+    )
+    return value if isinstance(value, bool) else None
+
+
+def label_routed_release_hosts(
+    source: Mapping[str, Any], *, source_wildcard: str | None
+) -> list[str]:
+    """The custom hosts FINALIZE releases that this application's stored labels route.
+
+    Whatever the readonly setting says — :func:`hosts_routed_after_release`
+    adds that. The released hosts are the custom ones of the fqdn
+    (domain/domains.custom_hosts: neither generated nor under the source
+    wildcard), in fqdn order. A HostRegexp rule cannot be enumerated: it is
+    returned, after them, whenever there is a host to release. Empty for a
+    dockercompose application, whose deploys never read custom_labels. PURE.
+    """
+    if source.get("build_pack") == _LABELS_FROM_COMPOSE:
+        return []
+    released = custom_hosts(source.get("fqdn"), source_wildcard=source_wildcard)
+    text = _label_text(source.get("custom_labels"))
+    if not released or not text:
+        return []
+    routes = _label_routes(text)
+    named = set(routes)
+    hit = [h for h in released if h in named]
+    hit.extend(sorted({r for r in routes if r.startswith("HostRegexp(")}))
+    return hit
+
+
+def hosts_routed_after_release(
+    source: Mapping[str, Any], *, source_wildcard: str | None
+) -> list[str]:
+    """The released custom hosts this source still routes once FINALIZE let go of them.
+
+    Non-empty only when readonly labels is known to be OFF and the stored labels
+    route a host the release removes from the fqdn (:func:`label_routed_release_hosts`).
+    The ONE predicate behind both the plan's keep/rename refusal
+    (:func:`kept_source_label_refusals`) and FINALIZE's report, which re-reads
+    the source at release time (api/resources.release_application_domains). PURE.
+    """
+    if readonly_labels(source) is not False:
+        return []
+    return label_routed_release_hosts(source, source_wildcard=source_wildcard)
+
+
+def kept_source_label_refusals(
+    source: Mapping[str, Any], *, source_wildcard: str | None
+) -> list[str]:
+    """Why a source FINALIZE keeps (keep or rename) would go on routing its moved hosts.
+
+    A refusal, not a warning: the release is FINALIZE's promise that a kept
+    source cannot claim the hosts twice, and with verbatim labels it provably
+    breaks it on the next deploy. Delete removes the source, so the planner
+    stores this on ``ResourcePlan.kept_source_refusals`` and the plan applies it
+    under its policy at read time. PURE.
+    """
+    hosts = hosts_routed_after_release(source, source_wildcard=source_wildcard)
+    if not hosts:
+        return []
+    return [
+        f"readonly labels are off on this application and its labels route "
+        f"{', '.join(hosts)}, which finalize moves to the target. With --finalize keep or "
+        "rename the source stays, and Coolify keeps its labels exactly as stored when "
+        "finalize removes those hosts from its domains: its next deploy (a restart, a "
+        "redeploy, a git push) routes them again next to the target and requests their "
+        "certificates. Switch the source's label management back to Coolify (Readonly "
+        "labels on; 'Managed by Coolify' on newer releases), which regenerates its labels "
+        "from its domains and drops hand-made routers, middlewares or headers, then plan "
+        "again - or finalize with --finalize delete."
+    ]
+
+
+def kept_source_label_warnings(
+    source: Mapping[str, Any], *, source_wildcard: str | None
+) -> list[str]:
+    """:func:`kept_source_label_refusals` when the readonly setting cannot be read.
+
+    Coolify 4.1 returns no application settings, and readonly labels is on by
+    default — when it is, the release regenerates the labels without the moved
+    hosts. A warning, then: the plan cannot know. PURE.
+    """
+    if readonly_labels(source) is not None:
+        return []
+    hosts = label_routed_release_hosts(source, source_wildcard=source_wildcard)
+    if not hosts:
+        return []
+    return [
+        f"this application's labels route {', '.join(hosts)}, which finalize moves to the "
+        "target, and the API does not show whether its readonly labels are on (Coolify 4.1 "
+        "returns no application settings). They are by default, and then finalize "
+        "regenerates the labels without those hosts. If they are off, a kept or renamed "
+        "source routes them again on its next deploy, next to the target: check Readonly "
+        "labels on the source, and switch them on (or finalize with --finalize delete) "
+        "if they are off."
+    ]
 
 
 def hidden_port_overrides(source: dict[str, Any]) -> list[int]:
