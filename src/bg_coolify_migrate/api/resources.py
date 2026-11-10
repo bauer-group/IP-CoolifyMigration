@@ -1467,6 +1467,7 @@ async def release_application_domains(
     *,
     source_wildcard: str | None,
     before: Mapping[str, Any] | None = None,
+    version: Version | None = None,
 ) -> DomainRelease:
     """Remove an application source's CUSTOM hosts at FINALIZE.
 
@@ -1493,10 +1494,11 @@ async def release_application_domains(
     released by resubmitting its docker_compose_domains, from which Coolify
     generates its routers at every deploy — next to the labels its compose
     declares itself, which no domain write touches. The plan refuses keep and
-    rename for a router written there for a released host
-    (fidelity.kept_source_compose_label_refusals); one the plan could not see
-    (a variable) or added since is reported in
-    :attr:`DomainRelease.compose_routed`. Both are asked about every host the
+    rename for a router written there for a released host that the proxy still
+    serves — a Caddy site, a Traefik router on a service that keeps a domain or
+    sets traefik.enable=true (fidelity.kept_source_compose_label_refusals; on
+    ``version``, the instance's release); one the plan could not see (a
+    variable) or added since is reported in :attr:`DomainRelease.compose_routed`. Both are asked about every host the
     source held before the release — its current domains and ``before``, the
     restore body CREATE journalled (:func:`held_before_release`) — also when
     there is nothing left to release: a resumed FINALIZE finds the PATCH already
@@ -1513,7 +1515,11 @@ async def release_application_domains(
         if snapshot.kind is ResourceKind.APP_GIT_COMPOSE:
             composed = tuple(
                 fidelity.compose_hosts_routed_after_release(
-                    current, collection="applications", source_wildcard=source_wildcard, held=held
+                    current,
+                    collection="applications",
+                    source_wildcard=source_wildcard,
+                    held=held,
+                    version=version,
                 )
             )
             parsed = _parse_compose_domains(current.get("docker_compose_domains"))
@@ -1566,6 +1572,7 @@ async def release_service_urls(
     *,
     source_wildcard: str | None,
     before: Mapping[str, Any] | None = None,
+    version: Version | None = None,
 ) -> DomainRelease:
     """Blank the source's custom sub-application URLs at FINALIZE.
 
@@ -1589,8 +1596,9 @@ async def release_service_urls(
     A service has no custom_labels (an applications column only, migration
     2023_10_18_072519), but the parser merges each compose service's own
     ``labels:`` into every deploy. The plan refuses keep and rename for a router
-    written there for a released host (fidelity.kept_source_compose_label_refusals);
-    one it could not see — a variable, a route row's host — or added since is
+    written there for a released host that the proxy still serves
+    (fidelity.kept_source_compose_label_refusals, on ``version``); one it could
+    not see — a variable, a route row's host — or added since is
     reported in :attr:`DomainRelease.compose_routed`, read off the same GET and
     asked about every host the source held: its sub-application URLs, its route
     rows and ``before``, the restore body CREATE journalled
@@ -1626,6 +1634,7 @@ async def release_service_urls(
                 collection="services",
                 source_wildcard=source_wildcard,
                 held=(*held, *held_before_release({"route_envs": route})),
+                version=version,
             )
         )
         _log_compose_routes(uuid, composed)
@@ -1646,6 +1655,7 @@ async def release_source_domains(
     *,
     source_wildcard: str | None,
     before: Mapping[str, Any] | None = None,
+    version: Version | None = None,
 ) -> DomainRelease:
     """FINALIZE's release of one source's custom hosts. Never raises.
 
@@ -1657,11 +1667,11 @@ async def release_source_domains(
     """
     if snapshot.collection == "services":
         return await release_service_urls(
-            api, snapshot.uuid, source_wildcard=source_wildcard, before=before
+            api, snapshot.uuid, source_wildcard=source_wildcard, before=before, version=version
         )
     if snapshot.collection == "applications":
         return await release_application_domains(
-            api, snapshot, source_wildcard=source_wildcard, before=before
+            api, snapshot, source_wildcard=source_wildcard, before=before, version=version
         )
     return DomainRelease(ok=True)
 

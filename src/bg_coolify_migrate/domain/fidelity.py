@@ -46,6 +46,7 @@ from bg_coolify_migrate.domain.domains import (
     compose_domains,
     custom_hosts,
     is_custom,
+    without_custom,
     without_generated,
 )
 from bg_coolify_migrate.domain.kinds import DatabaseEngine, removed_from_compose
@@ -836,15 +837,27 @@ def _label_routes(text: str) -> list[str]:
     """Every host a Traefik router rule or a Caddy site label in ``text`` routes.
 
     The ONE label parser (:func:`labels_route_beyond_domains`,
-    :func:`label_routed_release_hosts`). A HostRegexp rule cannot be enumerated
-    and comes back as ``HostRegexp(...)``. PURE.
+    :func:`label_routed_release_hosts`, and per proxy for a compose:
+    :func:`compose_hosts_routed_after_release`). A HostRegexp rule cannot be
+    enumerated and comes back as ``HostRegexp(...)``. PURE.
     """
+    return [*_traefik_routes(text), *_caddy_routes(text)]
+
+
+def _traefik_routes(text: str) -> list[str]:
+    """What the Traefik router rules in ``text`` route (:func:`_label_routes`). PURE."""
     routed: list[str] = []
     for matcher, args in _TRAEFIK_HOST_RULE.findall(text):
         if matcher == "HostRegexp":
             routed.append(f"HostRegexp({args.strip()})")
             continue
         routed.extend(h for raw in _BACKTICKED.findall(args) if (h := normalise_host(raw)))
+    return routed
+
+
+def _caddy_routes(text: str) -> list[str]:
+    """What the Caddy site labels in ``text`` route (:func:`_label_routes`). PURE."""
+    routed: list[str] = []
     for site in _CADDY_SITE.findall(text):
         routed.extend(
             h for raw in re.split(r"[,\s]+", site.strip("\"'")) if raw and (h := normalise_host(raw))
@@ -880,11 +893,31 @@ def _label_routes(text: str) -> list[str]:
 # v4.7.2:1520,2170,2303; serviceParser v4.1.2:1997,2588,2674,
 # v4.5.0:2858,3447,3570, v4.7.2:2930,3518,3641), whatever the readonly
 # setting (the parsers never read it). A router written into the compose by
-# hand therefore outlives the release of the domains on every release:
-# :func:`compose_hosts_routed_after_release`, refused under keep and rename
-# like hand-kept custom_labels. What the plan cannot read off the GET — a host
-# docker compose fills in from a variable, the env rows a SPECIFIC_SERVICES
-# part is routed from — is warned about instead (:func:`compose_routes_unseen`).
+# hand therefore outlives the release of the domains on every release — where
+# the proxy still serves its container:
+#
+# * Coolify's Traefik serves only containers labelled traefik.enable=true: it
+#   runs with --providers.docker.exposedbydefault=false (proxy.php v4.1.2:351,
+#   v4.5.0:809, v4.7.2:809; swarm alike at :340, :798, :798). The one such
+#   label Coolify writes for a resource comes from fqdnLabelsForTraefik
+#   (docker.php v4.1.2:417, v4.5.0:950, v4.7.2:1048), which each parser calls
+#   only for a compose service that has a domain (`$fqdns->count() > 0`:
+#   applicationParser v4.1.2:1320, v4.5.0:2139, v4.7.2:2179; serviceParser
+#   v4.1.2:2597, v4.5.0:3456, v4.7.2:3527). So a Traefik router routes after
+#   the release only on a service that sets traefik.enable=true itself or keeps
+#   a domain (:func:`_traefik_serves_after_release`); on any other the release
+#   stops it, unless someone edited the proxy to expose every container, which
+#   no API shows.
+# * caddy-docker-proxy has no such switch (Coolify starts it with a polling
+#   interval and a Caddyfile path only, proxy.php v4.1.2:372-373,
+#   v4.7.2:831-832): a Caddy site label always routes.
+#
+# What provably routes is :func:`compose_hosts_routed_after_release`, refused
+# under keep and rename like hand-kept custom_labels. What the plan cannot tell
+# — a Traefik router on a service the proxy serves only if it was edited
+# (:func:`compose_routes_unexposed`), a host docker compose fills in from a
+# variable, the env rows a SPECIFIC_SERVICES part is routed from — is warned
+# about instead (:func:`compose_routes_unseen`).
 
 #: The build pack whose deploys never use custom_labels.
 _LABELS_FROM_COMPOSE = "dockercompose"
@@ -1054,24 +1087,246 @@ def _compose_released_hosts(
     return list(dict.fromkeys(hosts))
 
 
-def _compose_label_lines(source: Mapping[str, Any]) -> str:
-    """Every ``labels:`` entry of the source's own compose, one per line. PURE.
-
-    Read off ``docker_compose_raw``, the operator's compose: the parsed
-    ``docker_compose`` holds the generated labels too. Empty when it cannot be
-    read.
-    """
-    services = _parsed_compose_services(source.get("docker_compose_raw"))
-    if not services:
-        return ""
-    return "\n".join(_compose_label_text(body.get("labels")) for body in services.values())
-
-
 def _compose_backed(source: Mapping[str, Any], collection: str) -> bool:
     """A dockercompose application or a service: what deploys from a compose."""
     if collection == "applications":
         return source.get("build_pack") == _LABELS_FROM_COMPOSE
     return collection == "services"
+
+
+#: The spellings Go's strconv.ParseBool takes: Traefik decodes ``traefik.enable``
+#: with it (traefik/paerser).
+_GO_TRUE = frozenset({"1", "t", "T", "TRUE", "true", "True"})
+_GO_FALSE = frozenset({"0", "f", "F", "FALSE", "false", "False"})
+
+
+def _traefik_enable(labels: str) -> bool | None:
+    """A compose service's own ``traefik.enable``: None when unset or unreadable. PURE.
+
+    The last one wins, as in docker compose's list form. A YAML boolean
+    (``traefik.enable: true``) arrives here as ``True``, which Go reads too.
+    """
+    value: bool | None = None
+    for line in labels.splitlines():
+        key, sep, raw = line.partition("=")
+        if sep and key.strip() == "traefik.enable":
+            raw = raw.strip()
+            value = True if raw in _GO_TRUE else False if raw in _GO_FALSE else None
+    return value
+
+
+#: A compose variable naming a service's URL: ``SERVICE_URL_WEB``,
+#: ``SERVICE_FQDN_MY_APP_3000`` (parseServiceEnvironmentVariable, services.php
+#: v4.7.2:597-627: an all-digit last segment is the port).
+_SERVICE_URL_VARIABLE = re.compile(r"SERVICE_(?:FQDN|URL)_([A-Za-z0-9_]+)")
+
+
+def _environment_text(body: Mapping[str, Any]) -> list[str]:
+    """A compose service's ``environment`` and ``build.args``, as KEY=value lines. PURE.
+
+    What both parsers read for the SERVICE_* variables (applicationParser
+    v4.7.2:1239-1241, serviceParser v4.7.2:2631-2633).
+    """
+    build = body.get("build")
+    out: list[str] = []
+    for raw in (body.get("environment"), build.get("args") if isinstance(build, Mapping) else None):
+        if isinstance(raw, Mapping):
+            out.extend(f"{k}={'' if v is None else v}" for k, v in raw.items())
+        elif isinstance(raw, list):
+            out.extend(str(item) for item in raw)
+    return out
+
+
+def _names_own_url(services: Mapping[str, Mapping[str, Any]], name: str) -> bool:
+    """Does any service's environment name ``name``'s SERVICE_URL_*/SERVICE_FQDN_*? PURE.
+
+    Matched like Coolify matches them: lowercased, ``-`` and ``.`` read as
+    ``_`` (normalizeComposeServiceName, domains.php v4.7.2:381-384), an
+    all-digit last segment taken for the port.
+    """
+    want = name.replace("-", "_").replace(".", "_").lower()
+    for body in services.values():
+        for line in _environment_text(body):
+            for found in _SERVICE_URL_VARIABLE.findall(line):
+                head, _, last = found.rpartition("_")
+                named = head if head and last.isdigit() else found
+                if named.lower() == want:
+                    return True
+    return False
+
+
+def _declares_service_url(body: Mapping[str, Any]) -> bool:
+    """Does this compose service declare a SERVICE_FQDN_*/SERVICE_URL_* key itself? PURE."""
+    return any(
+        line.partition("=")[0].strip().startswith(("SERVICE_FQDN_", "SERVICE_URL_"))
+        for line in _environment_text(body)
+    )
+
+
+def _keeps_domain_after_release(
+    source: Mapping[str, Any],
+    *,
+    collection: str,
+    name: str,
+    services: Mapping[str, Mapping[str, Any]],
+    source_wildcard: str | None,
+    version: Version | None,
+) -> bool:
+    """Does compose service ``name`` still have a domain once FINALIZE released? PURE.
+
+    Then Coolify generates traefik.enable=true for it on the next deploy (see the
+    note above :data:`_LABELS_FROM_COMPOSE`).
+
+    A dockercompose application keeps the generated and server-bound hosts of its
+    docker_compose_domains entry (api/resources.release_application_domains). An
+    entry the release leaves blank is stored ``['domain' => null]``
+    (ApplicationsController v4.1.2:2605, v4.7.2:3993) and comes back generated on
+    the next parse while the compose names the service's SERVICE_URL_*/FQDN_*
+    variable — before 4.3.17 (``compose_blank_domain_regenerated``), or on any
+    release when there is no entry at all.
+
+    A service keeps a sub-application that held no custom host as it is; one that
+    did is blanked whole (release_service_urls) and gets a generated fqdn back on
+    the next parse when the service declares a SERVICE_FQDN_*/SERVICE_URL_* key
+    itself (serviceParser v4.1.2:1732,1806, v4.5.0:2591,2671, v4.7.2:2663,2743).
+    A SPECIFIC_SERVICES part is routed from env rows Coolify refills when blank
+    (generateServiceSpecificFqdns, docker.php v4.7.2:757-855): it always keeps
+    one. Any other compose service (a ServiceDatabase) has no domain.
+    """
+    body = services.get(name) or {}
+    if collection == "applications":
+        entries = compose_domains(source.get("docker_compose_domains"))
+        normalised = name.replace("-", "_").replace(".", "_")
+        entry = entries.get(name, entries.get(normalised))
+        if entry is not None and without_custom(entry, source_wildcard=source_wildcard):
+            return True
+        if not _names_own_url(services, name):
+            return False
+        return entry is None or supports("compose_blank_domain_regenerated", version)
+    parts = {
+        str(app.get("name")): app
+        for app in source.get("applications") or []
+        if isinstance(app, Mapping)
+    }
+    part = parts.get(name)
+    if part is None:
+        return False
+    if route_env_keys([part]):
+        return True
+    values = [str(part.get(key) or "") for key in ("url", "fqdn")]
+    untouched = not any(custom_hosts(v, source_wildcard=source_wildcard) for v in values)
+    if untouched and any(v.strip() for v in values):
+        return True
+    # Blanked by the release (or already, on a resumed FINALIZE), or never set.
+    return _declares_service_url(body)
+
+
+def _traefik_serves_after_release(
+    source: Mapping[str, Any],
+    *,
+    collection: str,
+    name: str,
+    labels: str,
+    services: Mapping[str, Mapping[str, Any]],
+    source_wildcard: str | None,
+    version: Version | None,
+) -> bool | None:
+    """Does Coolify's Traefik serve compose service ``name`` once FINALIZE released? PURE.
+
+    True when the service keeps a domain (Coolify then labels it
+    traefik.enable=true itself, on top of the compose's labels) or sets
+    traefik.enable=true; False when it keeps none and sets traefik.enable=false,
+    which no proxy setting overrides; None when it keeps none and sets nothing —
+    the proxy then ignores it unless it was edited to expose every container.
+    """
+    if _keeps_domain_after_release(
+        source,
+        collection=collection,
+        name=name,
+        services=services,
+        source_wildcard=source_wildcard,
+        version=version,
+    ):
+        return True
+    return _traefik_enable(labels)
+
+
+def _compose_routers(
+    source: Mapping[str, Any],
+    *,
+    collection: str,
+    source_wildcard: str | None,
+    version: Version | None,
+) -> list[tuple[str, str, bool | None]]:
+    """``(service, labels, Traefik serves it)`` for each compose service with labels. PURE.
+
+    Read off ``docker_compose_raw``, the operator's compose: the parsed
+    ``docker_compose`` holds the generated labels too. Empty when it cannot be
+    read.
+    """
+    services = _parsed_compose_services(source.get("docker_compose_raw")) or {}
+    out: list[tuple[str, str, bool | None]] = []
+    for name, body in services.items():
+        labels = _compose_label_text(body.get("labels"))
+        if not labels:
+            continue
+        serves = _traefik_serves_after_release(
+            source,
+            collection=collection,
+            name=str(name),
+            labels=labels,
+            services=services,
+            source_wildcard=source_wildcard,
+            version=version,
+        )
+        out.append((str(name), labels, serves))
+    return out
+
+
+def _release_routes(
+    source: Mapping[str, Any],
+    *,
+    collection: str,
+    source_wildcard: str | None,
+    held: Iterable[str],
+    version: Version | None,
+) -> tuple[list[str], list[str], list[str]]:
+    """``(routed, unexposed, unexposed_on)`` for a compose-backed source. PURE.
+
+    ``routed``: the released hosts (then every HostRegexp rule) that a Caddy site
+    label, or a Traefik router on a service Traefik still serves, routes after
+    the release. ``unexposed``: those that only a Traefik router on a service
+    that neither keeps a domain nor sets traefik.enable names, on the compose
+    services ``unexposed_on``. Never a host in both.
+    """
+    if not _compose_backed(source, collection):
+        return [], [], []
+    released = _with_held(
+        _compose_released_hosts(source, collection=collection, source_wildcard=source_wildcard),
+        held,
+        source_wildcard=source_wildcard,
+    )
+    if not released:
+        return [], [], []
+    routers = _compose_routers(
+        source, collection=collection, source_wildcard=source_wildcard, version=version
+    )
+    routes: list[str] = []
+    for _, labels, serves in routers:
+        routes.extend(_caddy_routes(labels))
+        if serves:
+            routes.extend(_traefik_routes(labels))
+    routed = _routed_among(released, routes)
+    unexposed: list[str] = []
+    on: list[str] = []
+    for name, labels, serves in routers:
+        if serves is not None:
+            continue
+        found = [h for h in _routed_among(released, _traefik_routes(labels)) if h not in routed]
+        if found:
+            on.append(name)
+            unexposed.extend(found)
+    return routed, list(dict.fromkeys(unexposed)), on
 
 
 def compose_hosts_routed_after_release(
@@ -1080,6 +1335,7 @@ def compose_hosts_routed_after_release(
     collection: str,
     source_wildcard: str | None,
     held: Iterable[str] = (),
+    version: Version | None = None,
 ) -> list[str]:
     """The released custom hosts that routers written into the source's compose route.
 
@@ -1087,27 +1343,47 @@ def compose_hosts_routed_after_release(
     the note above :data:`_LABELS_FROM_COMPOSE`), so releasing the domains of a
     dockercompose application or a service stops only the routers Coolify
     generates from them: one the operator wrote into the compose routes its host
-    again on the kept source's next deploy, next to the target. Only literal
-    hosts are seen; a rule built from a variable (``Host(`${DOMAIN}`)``) is
-    what :func:`compose_routes_unseen` reports. A HostRegexp rule is returned
-    like :func:`label_routed_release_hosts` returns it. ``held``: the hosts the
-    source held before the release (:func:`_with_held`).
+    again on the kept source's next deploy, next to the target — a Caddy site
+    label always, a Traefik router where Traefik still serves its container
+    (:func:`_traefik_serves_after_release`; the others are
+    :func:`compose_routes_unexposed`). Only literal hosts are seen; a rule built
+    from a variable (``Host(`${DOMAIN}`)``) is what :func:`compose_routes_unseen`
+    reports. A HostRegexp rule is returned like :func:`label_routed_release_hosts`
+    returns it. ``held``: the hosts the source held before the release
+    (:func:`_with_held`). ``version``: the instance's release, unknown when
+    ``None`` (``compose_blank_domain_regenerated`` then holds).
 
     The ONE predicate behind the plan's keep/rename refusal
     (:func:`kept_source_compose_label_refusals`) and FINALIZE's report, which
     asks it of the GET its release is built from (api/resources). PURE.
     """
-    if not _compose_backed(source, collection):
-        return []
-    released = _with_held(
-        _compose_released_hosts(source, collection=collection, source_wildcard=source_wildcard),
-        held,
-        source_wildcard=source_wildcard,
+    routed, _, _ = _release_routes(
+        source, collection=collection, source_wildcard=source_wildcard, held=held, version=version
     )
-    text = _compose_label_lines(source) if released else ""
-    if not text:
-        return []
-    return _routed_among(released, _label_routes(text))
+    return routed
+
+
+def compose_routes_unexposed(
+    source: Mapping[str, Any],
+    *,
+    collection: str,
+    source_wildcard: str | None,
+    version: Version | None = None,
+) -> tuple[list[str], list[str]]:
+    """Released hosts only Traefik routers on services Coolify's Traefik ignores name.
+
+    ``(hosts, compose services)``: routers written into the compose for a host
+    FINALIZE releases, on services that keep no domain after the release and set
+    no ``traefik.enable`` (:func:`_traefik_serves_after_release` is None). The
+    release stops them — Coolify's Traefik serves only containers labelled
+    traefik.enable=true — unless the proxy was edited to expose every container,
+    which the plan cannot see. A warning, then; never a host
+    :func:`compose_hosts_routed_after_release` returns. PURE.
+    """
+    _, hosts, on = _release_routes(
+        source, collection=collection, source_wildcard=source_wildcard, held=(), version=version
+    )
+    return hosts, on
 
 
 #: A variable reference docker compose fills in: ``$X`` or ``${X...}``.
@@ -1141,13 +1417,19 @@ def label_escaping(source: Mapping[str, Any], *, collection: str) -> bool | None
 
 
 def compose_routes_unseen(
-    source: Mapping[str, Any], *, collection: str, source_wildcard: str | None
+    source: Mapping[str, Any],
+    *,
+    collection: str,
+    source_wildcard: str | None,
+    version: Version | None = None,
 ) -> tuple[list[str], list[str]]:
     """What routers written into the compose may route that the plan cannot match.
 
     ``(variable_rules, unmatched)``, both empty unless FINALIZE has something to
-    release, and never a host :func:`compose_hosts_routed_after_release`
-    returns — that one is refused, these are only warned about:
+    release, and never a host :func:`compose_hosts_routed_after_release` or
+    :func:`compose_routes_unexposed` returns — the first is refused, these and
+    the second are only warned about. A Traefik router on a service that keeps no
+    domain and sets traefik.enable=false routes nothing and is not counted:
 
     * ``variable_rules``: ``Host()``/``HostSNI()`` rules and Caddy site labels
       built from a variable, which docker compose fills in at every deploy
@@ -1173,25 +1455,30 @@ def compose_routes_unseen(
     route_keys = (
         route_env_keys(source.get("applications")) if collection == "services" else frozenset()
     )
-    text = _compose_label_lines(source) if released or route_keys else ""
-    if not text:
+    if not released and not route_keys:
         return [], []
+    routers = _compose_routers(
+        source, collection=collection, source_wildcard=source_wildcard, version=version
+    )
+    # A Traefik router on a service nothing serves is no route of anything.
+    traefik = "\n".join(labels for _, labels, serves in routers if serves is not False)
+    caddy = "\n".join(labels for _, labels, _ in routers)
     variables: list[str] = []
     if label_escaping(source, collection=collection) is not True:
         rules = {
             f"{matcher}({args.strip()})"
-            for matcher, args in _TRAEFIK_HOST_RULE.findall(text)
+            for matcher, args in _TRAEFIK_HOST_RULE.findall(traefik)
             if matcher != "HostRegexp" and _VARIABLE.search(args)
         }
         sites = {
             f"caddy {site.strip()}"
-            for site in _CADDY_SITE.findall(text)
+            for site in _CADDY_SITE.findall(caddy)
             if _VARIABLE.search(site)
         }
         variables = sorted(rules | sites)
     unmatched: list[str] = []
     if route_keys:
-        routes = _label_routes(text)
+        routes = [*_traefik_routes(traefik), *_caddy_routes(caddy)]
         unmatched = [
             h
             for h in dict.fromkeys(routes)
@@ -1205,10 +1492,11 @@ def compose_routes_unseen(
 
 
 _COMPOSE_ROUTER_HARM = (
-    "Coolify adds a compose's own labels to every deploy, whatever its domains say, so "
-    "with --finalize keep or rename the kept source routes those hosts again on its next "
-    "deploy (a restart, a redeploy, a git push), next to the target, and requests their "
-    "certificates."
+    "Coolify adds a compose's own labels to every deploy, whatever its domains say, and its "
+    "proxy still serves these (a Caddy site label, or a Traefik router on a service that "
+    "keeps a domain or sets traefik.enable=true), so with --finalize keep or rename the kept "
+    "source routes those hosts again on its next deploy (a restart, a redeploy, a git push), "
+    "next to the target, and requests their certificates."
 )
 
 
@@ -1233,19 +1521,24 @@ def _compose_router_remedy(collection: str) -> str:
 
 
 def kept_source_compose_label_refusals(
-    source: Mapping[str, Any], *, collection: str, source_wildcard: str | None
+    source: Mapping[str, Any],
+    *,
+    collection: str,
+    source_wildcard: str | None,
+    version: Version | None = None,
 ) -> list[str]:
     """Why a kept (keep or rename) compose-backed source would go on routing moved hosts.
 
     A refusal, like :func:`kept_source_label_refusals` and for the same reason:
     the release is FINALIZE's promise that a kept source cannot claim the
-    hosts twice, and a router written into the compose provably breaks it on
-    the next deploy. Delete removes the source, so the planner stores this on
-    ``ResourcePlan.kept_source_refusals`` and the plan applies it under its
-    policy at read time. PURE.
+    hosts twice, and a router written into the compose that the proxy still
+    serves provably breaks it on the next deploy
+    (:func:`compose_hosts_routed_after_release`). Delete removes the source, so
+    the planner stores this on ``ResourcePlan.kept_source_refusals`` and the plan
+    applies it under its policy at read time. PURE.
     """
     hosts = compose_hosts_routed_after_release(
-        source, collection=collection, source_wildcard=source_wildcard
+        source, collection=collection, source_wildcard=source_wildcard, version=version
     )
     if not hosts:
         return []
@@ -1256,29 +1549,53 @@ def kept_source_compose_label_refusals(
 
 
 def kept_source_compose_label_warnings(
-    source: Mapping[str, Any], *, collection: str, source_wildcard: str | None
+    source: Mapping[str, Any],
+    *,
+    collection: str,
+    source_wildcard: str | None,
+    version: Version | None = None,
 ) -> list[str]:
     """What a kept compose-backed source's own routers may route that the plan cannot tell.
 
-    :func:`compose_routes_unseen` as warning lines, held on
-    ``ResourcePlan.kept_source_warnings`` and shown only under keep and rename.
-    Never about a host :func:`kept_source_compose_label_refusals` names, so the
-    plan does not show one host as both a refusal and a warning. PURE.
+    :func:`compose_routes_unexposed` and :func:`compose_routes_unseen` as warning
+    lines, held on ``ResourcePlan.kept_source_warnings`` and shown only under keep
+    and rename. Never about a host :func:`kept_source_compose_label_refusals`
+    names, so the plan does not show one host as both a refusal and a warning.
+    PURE.
     """
+    unexposed, on = compose_routes_unexposed(
+        source, collection=collection, source_wildcard=source_wildcard, version=version
+    )
     variables, unmatched = compose_routes_unseen(
-        source, collection=collection, source_wildcard=source_wildcard
+        source, collection=collection, source_wildcard=source_wildcard, version=version
     )
     where = (
         "the compose file in git"
         if collection == "applications"
         else "the source service's compose in Coolify"
     )
+    remedy = f"remove those routers from {where}, or finalize with --finalize delete."
     tail = (
         "If one does, a kept or renamed source routes it again on its next deploy, next to "
-        f"the target, and requests its certificate: remove those routers from {where}, or "
-        "finalize with --finalize delete."
+        f"the target, and requests its certificate: {remedy}"
     )
     out: list[str] = []
+    if unexposed:
+        which = (
+            f"compose service {on[0]}, which keeps no domain after finalize and sets"
+            if len(on) == 1
+            else f"compose services {', '.join(on)}, which keep no domain after finalize and set"
+        )
+        out.append(
+            f"routers written into its compose route {', '.join(unexposed)}, which finalize "
+            f"moves to the target, on {which} no traefik.enable. Coolify's Traefik serves "
+            "only containers labelled "
+            "traefik.enable=true (--providers.docker.exposedbydefault=false) and adds that "
+            "label only for a service with a domain, so finalize stops these routers - unless "
+            "this server's proxy was edited to expose every container, which the plan cannot "
+            "tell. If it was, a kept or renamed source routes those hosts again on its next "
+            f"deploy, next to the target, and requests their certificates: {remedy}"
+        )
     if variables:
         if label_escaping(source, collection=collection) is False:
             escaping = "its label escaping is off"

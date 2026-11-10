@@ -46,6 +46,8 @@ BASE = f"{HOST}/api/v1"
 WILD = "app.0046-20.cloud.bauer-group.com"
 SHOP = "https://shop.example.com"
 LITERAL = "traefik.http.routers.shop.rule=Host(`shop.example.com`)"
+#: A released ``web`` keeps no domain: Traefik serves it on its own label only.
+ENABLE = "traefik.enable=true"
 
 #: An application whose FINALIZE domain PATCH went through: no custom host in
 #: its fqdn any more, and its hand-kept labels (readonly off) still route one.
@@ -67,7 +69,7 @@ def _released_compose_app() -> dict[str, Any]:
     return {
         "uuid": "a1",
         "build_pack": "dockercompose",
-        "docker_compose_raw": _compose(LITERAL),
+        "docker_compose_raw": _compose(ENABLE, LITERAL),
         "docker_compose_domains": json.dumps({"web": {"domain": ""}}),
     }
 

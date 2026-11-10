@@ -227,6 +227,19 @@ FEATURES: Mapping[str, Gate] = MappingProxyType(
         "compose_service_port_fallback": Gate(since=(4, 3, 16)),
         # ...the service's first TCP port only, and nothing else (parsers.php v4.3.18:1357).
         "compose_tcp_port_fallback": Gate(since=(4, 3, 18)),
+        # A dockercompose application's compose service whose domain was blanked
+        # gets a GENERATED one back on the next parse while its compose names the
+        # service's SERVICE_URL_*/SERVICE_FQDN_* variable: applicationParser puts
+        # one when `data_get($domains->get($serviceName), 'domain')` is null
+        # (parsers.php v4.1.2:615-620, v4.3.16:529,656), and the update stores a
+        # blank domain as `['domain' => null]` (ApplicationsController
+        # v4.1.2:2605, v4.7.2:3993; ConvertEmptyStringsToNull). From 4.3.17 any
+        # entry, "including an explicitly empty entry left when a user removes its
+        # generated domain", stops it (hasComposeServiceDomainEntry, parsers.php
+        # v4.3.17:528,653, v4.7.2:1326,1454; domains.php v4.3.17:452,
+        # v4.7.2:493-509). Then Coolify labels the service traefik.enable=true
+        # again (fidelity._keeps_domain_after_release). Unknown holds.
+        "compose_blank_domain_regenerated": Gate(until=(4, 3, 17)),
         # ManualWebhookSecret: a new secret must be >= 16 characters.
         "webhook_secret_min_length": Gate(since=(4, 4, 0)),
         # {{vault.KEY}} references, resolved from a link no GET returns.

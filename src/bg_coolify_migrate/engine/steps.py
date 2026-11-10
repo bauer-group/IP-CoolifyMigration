@@ -3289,9 +3289,10 @@ async def _release_source_domains(ctx: MigrationContext) -> list[str]:
 
     So does a release whose source still ROUTES a host: its readonly labels are
     off, so Coolify kept its custom_labels as they were, or a router written
-    into its compose names the host — switched or added since PLAN, which
-    refuses keep and rename for both, or a host PLAN could not read (a
-    variable, a route row). Its domains are released all the same, but it is
+    into its compose that the proxy still serves names the host — switched or
+    added since PLAN, which refuses keep and rename for both, or a host PLAN
+    could not read (a variable, a route row). Asked of the run's release
+    (``ctx.coolify_version``), like PLAN. Its domains are released all the same, but it is
     not listed as released — its next deploy routes the hosts again. The hosts
     asked about are those it held BEFORE the release, read off the restore body
     CREATE journalled: a FINALIZE resumed after the release finds them gone
@@ -3317,7 +3318,11 @@ async def _release_source_domains(ctx: MigrationContext) -> list[str]:
         if not await _target_still_holds(ctx, snapshot, source_wildcard=source_wildcard):
             continue
         outcome = await api_resources.release_source_domains(
-            ctx.api, snapshot, source_wildcard=source_wildcard, before=restores.get(snapshot.uuid)
+            ctx.api,
+            snapshot,
+            source_wildcard=source_wildcard,
+            before=restores.get(snapshot.uuid),
+            version=ctx.coolify_version,
         )
         if outcome.released:
             released.append(snapshot.uuid)

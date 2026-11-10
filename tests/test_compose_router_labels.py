@@ -8,10 +8,13 @@ service's sub-application URLs, therefore stops only the routers Coolify
 generates: a ``Host()`` rule the operator wrote into the compose routes the moved
 host again on the kept source's next deploy, next to the target.
 
-The plan refuses keep and rename for it, like hand-kept custom_labels (what it
-cannot read off the GET is warned about: tests/test_compose_router_refusals.py),
-and FINALIZE asks the same predicate of the GET its release is built from, so
-such a source is never reported as released.
+Where the proxy still serves the router's container — a Caddy site label, or
+a Traefik router on a service that sets traefik.enable=true or keeps a domain
+(tests/test_compose_router_exposure.py) — the plan refuses keep and rename for
+it, like hand-kept custom_labels (what it cannot read off the GET is warned
+about: tests/test_compose_router_refusals.py), and FINALIZE asks the same
+predicate of the GET its release is built from, so such a source is never
+reported as released.
 """
 
 from __future__ import annotations
@@ -58,13 +61,22 @@ services:
     image: busybox
 """
 
+#: ``web`` keeps no domain once finalize releases shop.example.com, so its own
+#: (YAML boolean) traefik.enable is what keeps Traefik serving the router.
 MAP_COMPOSE = """\
 services:
   web:
     image: nginx
     labels:
+      traefik.enable: true
       traefik.http.routers.shop.rule: Host(`shop.example.com`) && PathPrefix(`/api`)
 """
+
+#: The usual extra router on top of the generated one: no traefik.enable of its
+#: own, so the release stops it (Coolify's Traefik serves only containers
+#: labelled traefik.enable=true) - unless the proxy was edited, which the plan
+#: cannot see: a warning, not a refusal.
+UNEXPOSED_COMPOSE = MAP_COMPOSE.replace("      traefik.enable: true\n", "")
 
 CADDY_COMPOSE = """\
 services:
@@ -125,6 +137,24 @@ class TestComposeHostsRoutedAfterRelease:
 
     def test_a_router_in_a_service_s_compose(self) -> None:
         assert _routed(_service(), "services") == ["shop.example.com"]
+
+    def test_a_router_traefik_no_longer_serves_is_a_warning(self) -> None:
+        source = _compose_app(UNEXPOSED_COMPOSE)
+        assert "traefik.enable" not in UNEXPOSED_COMPOSE
+        assert _routed(source, "applications") == []
+        assert fidelity.compose_routes_unexposed(
+            source, collection="applications", source_wildcard=WILD
+        ) == (["shop.example.com"], ["web"])
+        assert (
+            fidelity.kept_source_compose_label_refusals(
+                source, collection="applications", source_wildcard=WILD
+            )
+            == []
+        )
+        [line] = fidelity.kept_source_compose_label_warnings(
+            source, collection="applications", source_wildcard=WILD
+        )
+        assert "cannot tell" in line and "compose service web" in line
 
     def test_a_base64_compose_is_read(self) -> None:
         raw = base64.b64encode(LIST_COMPOSE.encode()).decode()

@@ -31,6 +31,9 @@ WILD = "app.0046-20.cloud.bauer-group.com"
 SHOP = "https://shop.example.com"
 
 LITERAL = "traefik.http.routers.shop.rule=Host(`shop.example.com`)"
+#: ``web`` keeps no domain once finalize releases its custom host: Traefik serves
+#: it only with its own traefik.enable=true (tests/test_compose_router_exposure.py).
+ENABLE = "traefik.enable=true"
 VARIABLE = "traefik.http.routers.var.rule=Host(`${DOMAIN}`)"
 
 
@@ -227,7 +230,7 @@ class TestPlannerWiring:
 
         plan = await _plan_one_app(
             monkeypatch,
-            _compose_app(LITERAL, escape=True),
+            _compose_app(ENABLE, LITERAL, escape=True),
             version="4.7.2",
             snapshot={
                 "collection": "applications",
