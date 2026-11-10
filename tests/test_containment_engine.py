@@ -42,6 +42,7 @@ from bg_coolify_migrate.errors import (
     CoolifyApiError,
     QuiesceError,
     SourceRevived,
+    SourceRevivedAfterStart,
     TargetStartedEarly,
 )
 from bg_coolify_migrate.journal.store import Journal
@@ -168,14 +169,15 @@ class TestASourceRevived:
         with pytest.raises(SourceRevived, match="the stack: debug-shell is running"):
             await containment.assert_contained(ctx, checkpoint="COPY", target=False)
 
-    async def test_after_start_the_hint_says_the_target_goes_too(
+    async def test_after_start_it_blocks_instead_of_rolling_back(
         self, ctx: MigrationContext
     ) -> None:
+        # tests/test_containment_after_start.py has the rest of this case.
         ctx.journal.append("step_completed", state=State.START_TARGET.value, detail={})
         _src(ctx).add("postgres-db1", labels=COOLIFY)
-        with pytest.raises(SourceRevived) as excinfo:
+        with pytest.raises(SourceRevivedAfterStart) as excinfo:
             await containment.assert_contained(ctx, checkpoint="FINALIZE", target=False)
-        assert "serving since START" in (excinfo.value.hint or "")
+        assert "does not roll back by itself" in (excinfo.value.hint or "")
 
 
 class TestWithoutTheStopClock:

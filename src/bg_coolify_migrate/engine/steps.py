@@ -2301,7 +2301,9 @@ async def step_start_target(ctx: MigrationContext) -> dict[str, Any]:
     """Start every target, each request journalled before it is made.
 
     First the containment checkpoint: the source still stopped, no target
-    started by someone else (engine/containment.py).
+    started by someone else (engine/containment.py). On a resume after START
+    already asked for a target, a revived source blocks there rather than
+    rolls back: that target may be serving users.
 
     Every target uuid is journalled BEFORE its ``/start`` (``START_REQUESTED``):
     from that moment it may come up whatever this step does next, so a rollback
@@ -2744,10 +2746,11 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
     stamp = ctx.migration_id.split("-")[-1]
     actions: list[str] = []
     # The source must still be stopped before any policy applies to it: a revived
-    # source holds writes the target lacks, and a DELETE would destroy them. Asked
-    # BEFORE the policy is journalled, so a first attempt that finds one rolls
-    # back like every other checkpoint, instead of meeting rollback_refusal's
-    # "the source is deleted" when nothing of it has been touched.
+    # source holds writes the target lacks, and a DELETE would destroy them. START
+    # is done, so a revival BLOCKS here (errors.SourceRevivedAfterStart) and rolls
+    # nothing back - the target may hold users' writes since the cutover. Asked
+    # BEFORE the policy is journalled, so the operator's own `rollback` after the
+    # block is not met by rollback_refusal when nothing of the source was touched.
     await containment.assert_contained(ctx, checkpoint="FINALIZE", target=False)
     # On disk before anything is touched: after a DELETE has begun, no rollback
     # may run, even if this step dies part-way (statemachine.rollback_refusal).

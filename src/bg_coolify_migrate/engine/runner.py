@@ -357,8 +357,10 @@ async def resume_migration(
     That includes the two stacks the run holds still. A resume can come hours
     after a block, and nothing guards them meanwhile: the DNS gate, START and
     FINALIZE first check that the source is still stopped and the target still
-    unstarted (``engine/containment.py``), and a run that finds otherwise rolls
-    back rather than finish on a copy the source has moved on from.
+    unstarted (``engine/containment.py``). Before START asked for a target, a
+    run that finds otherwise rolls back rather than finish on a copy the source
+    has moved on from. After it, a revived source blocks again — the target may
+    hold users' writes — until the operator has stopped it, or rolls back.
     """
     journal = Journal.open(settings.resolved_state_dir(), migration_id)
     if journal.is_finished:

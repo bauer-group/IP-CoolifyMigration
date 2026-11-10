@@ -74,6 +74,12 @@ STOP_CLOCK = "stop_clock"
 #: attempt. Whatever ran before the gate passed wrote before the copy read.
 STOPPED_CLOCK = "stopped_clock"
 
+#: Journalled when a checkpoint after START finds the source revived and BLOCKS
+#: (``errors.SourceRevivedAfterStart``): the source's clock then. The operator
+#: was shown what started it, and a resume judges from this instant, so a source
+#: they stopped again passes, and anything started after the block still counts.
+REVIVAL_SEEN_CLOCK = "revival_seen_clock"
+
 #: COPY journals ``{source volume: CreatedAt}`` for every source volume it copied,
 #: once the end-of-copy checkpoint passed. A rollback after FINALIZE(keep/rename)
 #: compares it (``compensations.source_data_refusal``): a volume pruned and
@@ -233,12 +239,17 @@ def _clock_of(detail: Mapping[str, object], key: str) -> int | None:
 def judged_from(quiesce_detail: Mapping[str, object]) -> int | None:
     """From when a source start counts as a revival, given QUIESCE's merged journal detail.
 
-    :data:`STOPPED_CLOCK`, the stop gate's proof. Without it, the stop
-    request's (:data:`STOP_CLOCK`): stricter, never looser. ``None`` when the
-    journal holds neither.
+    The later of :data:`STOPPED_CLOCK` (the stop gate's proof) and
+    :data:`REVIVAL_SEEN_CLOCK` (a block the operator has been shown). Without
+    the gate's clock, the stop request's (:data:`STOP_CLOCK`): stricter, never
+    looser. ``None`` when the journal holds none of them.
     """
     proven = _clock_of(quiesce_detail, STOPPED_CLOCK)
-    return proven if proven is not None else _clock_of(quiesce_detail, STOP_CLOCK)
+    base = proven if proven is not None else _clock_of(quiesce_detail, STOP_CLOCK)
+    seen = _clock_of(quiesce_detail, REVIVAL_SEEN_CLOCK)
+    if base is None or seen is None:
+        return base if base is not None else seen
+    return max(base, seen)
 
 
 def carries(name: str, image: str, labels: Mapping[str, str], uuid: str) -> bool:
@@ -280,9 +291,9 @@ def source_breaches(
 
     ``seen`` comes from the plan's label filter (``stack``), the uuid probe and
     the migrated-volume probe, pins already left out. ``since`` is the source's
-    clock :func:`judged_from` gives — once the stop gate proved the stack down;
-    without it (a journal older than the record) only a container running NOW
-    counts.
+    clock :func:`judged_from` gives — once the stop gate proved the stack down,
+    or a block after START since; without it (a journal older than the record)
+    only a container running NOW counts.
     """
     breaches: list[Breach] = []
     reported: set[str] = set()
@@ -415,23 +426,53 @@ _SOURCE_CAUSES = (
 )
 
 
-def source_hint(*, target_serving: bool = False) -> str:
-    """What happened, why it matters and what the rollback does next.
+def source_hint() -> str:
+    """What happened, why it matters and what the rollback does next — before START.
 
-    ``target_serving``: found after START, so the target has served since then
-    and what it received goes with it — the operator must hear that.
+    Only before START asked for a target: no user has written to the target yet,
+    so rolling back costs nothing the source does not hold.
     """
-    target = (
-        "the target - serving since START, so whatever it received since then goes with "
-        "it - is stopped and deleted with its volumes"
-        if target_serving
-        else "the target is stopped and deleted with its copied volumes"
-    )
     return (
-        f"{_SOURCE_CAUSES}The run rolls back now: {target}, and the source restarted. "
-        "Nothing deletes the source before FINALIZE, so what it wrote survives. Hold "
-        "pushes and CI deploys of it, then migrate again."
+        f"{_SOURCE_CAUSES}The run rolls back now: the target is stopped and deleted "
+        "with its copied volumes, and the source restarted. Nothing deletes the source "
+        "before FINALIZE, so what it wrote survives. Hold pushes and CI deploys of it, "
+        "then migrate again."
     )
+
+
+_FINALIZE_FATE = {
+    "delete": "deletes the source, and those writes with it",
+    "rename": "renames the source and leaves it stopped, with those writes on it",
+    "keep": "leaves the source stopped, with those writes on it",
+}
+
+
+def revived_after_start_hint(*, policy: str, migration_id: str) -> str:
+    """A revival found once START asked for a target: the two ways on, neither taken.
+
+    No rollback runs by itself here. The target may have served users since
+    START — the DNS gate let it start — and what they wrote is on the target
+    only, while the rollback stops it and deletes it with its volumes
+    (DROP_TARGET_VOLUMES, DELETE_TARGET_RESOURCE). Whose writes to give up, the
+    revived source's or the target's, is the operator's call, so the run BLOCKS
+    like the DNS gate: resumable, nothing undone (``errors.SourceRevivedAfterStart``).
+    """
+    fate = _FINALIZE_FATE.get(policy, "applies the finalize policy to the source")
+    return (
+        f"{_SOURCE_CAUSES}START has already asked Coolify to start the target, and the "
+        "DNS gate let it: it may have served users since then, and what they wrote is "
+        "on the target only. A rollback would delete that with the target, so this run "
+        "does not roll back by itself. Nothing has been undone, and FINALIZE has not "
+        "touched the source.\n"
+        "To finish: stop the source in Coolify and hold pushes and CI deploys of it, "
+        f"then coolify-migrate resume {migration_id} - FINALIZE then {fate}. The resume "
+        "refuses again while a source container runs, or if one starts after this "
+        "check.\n"
+        f"To give up the target instead: coolify-migrate rollback {migration_id} - it "
+        "deletes the target and everything written to it since START, and restarts "
+        "the source."
+    )
+
 
 TARGET_HINT = (
     "Something started the target before START asked for it. The usual causes: a git "

@@ -128,13 +128,26 @@ class ContainmentBreach(QuiesceError):
 
     Raised by the checkpoints of ``engine/containment.py`` from QUIESCE to
     FINALIZE. Never a warning and with no override (the quiesce gate has no
-    ``--force``): the run rolls back, and the source — never deleted before
-    FINALIZE — keeps what it wrote.
+    ``--force``): before START the run rolls back, and the source — never
+    deleted before FINALIZE — keeps what it wrote. After START it blocks
+    instead (:class:`SourceRevivedAfterStart`).
     """
 
 
 class SourceRevived(ContainmentBreach):
     """The source ran again after QUIESCE stopped it: writes the copy does not have."""
+
+
+class SourceRevivedAfterStart(SourceRevived):
+    """The source ran again, found once START had asked Coolify to start a target.
+
+    A BLOCK, like :class:`DnsGateBlocked` — resumable, nothing rolled back
+    (``engine/executor.py``). By then the target may have served users since
+    START, and the rollback deletes it with its volumes: an automatic rollback
+    would trade the target's writes for the revived source's without asking.
+    The operator stops the source and resumes, or rolls back by hand (the CLI
+    asks first). Exit code 5, like every containment breach.
+    """
 
 
 class TargetStartedEarly(ContainmentBreach):

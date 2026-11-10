@@ -221,8 +221,7 @@ class TestMessages:
         for cause in ("auto-deploy", "/deploy", "dashboard", "queued or building"):
             assert cause in hint
         assert "rolls back" in hint and "what it wrote survives" in hint
-        assert "serving since START" not in hint
-        assert "serving since START" in c.source_hint(target_serving=True)
+        assert "resume" not in hint, "before START there is nothing to decide"
 
     def test_the_target_hint(self) -> None:
         assert "same push to both" in c.TARGET_HINT

@@ -6,14 +6,17 @@ only once and nothing in Coolify keeps it so (a git push, a CI ``/deploy``, the
 dashboard), and CREATE leaves the target startable by the same pushes and tags.
 
 A breach is never a warning and has no override — the quiesce gate has no
-``--force``. The checkpoint raises; the run rolls back, and the source, never
-deleted before FINALIZE, keeps whatever it wrote.
+``--force``. The checkpoint raises. Before START the run rolls back, and the
+source, never deleted before FINALIZE, keeps whatever it wrote. Once START has
+asked for a target, a revived source BLOCKS the run instead
+(``SourceRevivedAfterStart``): the target may have served users since, and the
+rollback would delete what they wrote.
 """
 
 from __future__ import annotations
 
 import shlex
-from typing import Any
+from typing import Any, NoReturn
 
 import structlog
 
@@ -23,7 +26,7 @@ from bg_coolify_migrate.domain.containment import Breach, Seen, Watched
 from bg_coolify_migrate.domain.statemachine import START_REQUESTED, STARTED_EARLY, State
 from bg_coolify_migrate.engine.context import MigrationContext
 from bg_coolify_migrate.engine.planner import observed_labels, resource_labels
-from bg_coolify_migrate.errors import SourceRevived, TargetStartedEarly
+from bg_coolify_migrate.errors import SourceRevived, SourceRevivedAfterStart, TargetStartedEarly
 from bg_coolify_migrate.transfer.ssh import RemoteHost
 
 log = structlog.get_logger(__name__)
@@ -39,7 +42,11 @@ async def assert_contained(
     START does not take its own start for someone else's.
 
     Raises:
-        SourceRevived: A source container runs, or started after the stop.
+        SourceRevived: A source container runs, or started after the stop gate
+            proved it down — before START asked for any target: the run rolls
+            back.
+        SourceRevivedAfterStart: The same, once START has asked for a target:
+            the run blocks (:func:`_block_after_start`).
         TargetStartedEarly: A target container runs, or ever started, before
             START asked for it. Journalled first under START's state, so the
             rollback owes STOP_TARGET for it (``statemachine.target_may_run``).
@@ -49,14 +56,14 @@ async def assert_contained(
     if early:
         journal_started_early(ctx, early)
     if found_source:
-        raise SourceRevived(
-            containment.breach_message(
-                "the source was started again after QUIESCE stopped it",
-                checkpoint,
-                [*found_source, *found_target],
-            ),
-            hint=containment.source_hint(target_serving=_target_serving(ctx)),
+        message = containment.breach_message(
+            "the source was started again after QUIESCE stopped it",
+            checkpoint,
+            [*found_source, *found_target],
         )
+        if _start_asked(ctx):
+            await _block_after_start(ctx, message)
+        raise SourceRevived(message, hint=containment.source_hint())
     if found_target:
         raise TargetStartedEarly(
             containment.breach_message(
@@ -78,8 +85,46 @@ def start_requested(ctx: MigrationContext) -> list[str]:
     return [u for u in raw if isinstance(u, str)] if isinstance(raw, list) else []
 
 
-def _target_serving(ctx: MigrationContext) -> bool:
-    return State.START_TARGET.value in ctx.journal.completed_states()
+def _start_asked(ctx: MigrationContext) -> bool:
+    """Has START asked Coolify to start any target — so one may be serving users?
+
+    ``START_REQUESTED`` is journalled before each request, and a START that
+    completed asked for all of them. A target someone ELSE started does not
+    count (``STARTED_EARLY``): that happens before the DNS gate let anything
+    start, and rolling it back is the containment's whole point.
+    """
+    return bool(start_requested(ctx)) or (
+        State.START_TARGET.value in ctx.journal.completed_states()
+    )
+
+
+async def _block_after_start(ctx: MigrationContext, message: str) -> NoReturn:
+    """Stop the run, roll nothing back, and say what the operator decides.
+
+    The source's clock is journalled first (``containment.REVIVAL_SEEN_CLOCK``):
+    a resume judges from it, so the starts this message names do not block it
+    again once the operator has stopped the source, and anything that starts
+    after it still does. A clock that cannot be read is no reason to give up the
+    block — a rollback is exactly what must not happen here — so the resume then
+    judges from the old instant and blocks again until the source's daemon has
+    forgotten those starts; the operator can roll back by hand.
+    """
+    try:
+        seen_at = await quiesce.now_on(ctx.source_host)
+    except Exception as exc:  # the block itself must not become a rollback
+        log.warning("containment.revival_clock_unread", error=str(exc)[:200])
+    else:
+        ctx.journal.append(
+            "containment",
+            state=State.QUIESCE.value,
+            detail={containment.REVIVAL_SEEN_CLOCK: seen_at},
+        )
+    raise SourceRevivedAfterStart(
+        message,
+        hint=containment.revived_after_start_hint(
+            policy=ctx.plan.finalize_policy.value, migration_id=ctx.migration_id
+        ),
+    )
 
 
 def journal_started_early(ctx: MigrationContext, uuids: list[str]) -> None:

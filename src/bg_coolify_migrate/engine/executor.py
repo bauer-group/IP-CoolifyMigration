@@ -45,6 +45,7 @@ from bg_coolify_migrate.errors import (
     MigrationError,
     RebuildDriftBlocked,
     RollbackError,
+    SourceRevivedAfterStart,
 )
 from bg_coolify_migrate.journal.store import Journal
 
@@ -193,10 +194,12 @@ class Saga:
 
             try:
                 undo_info = await step(self.context)
-            except (DnsGateBlocked, RebuildDriftBlocked) as exc:
+            except (DnsGateBlocked, RebuildDriftBlocked, SourceRevivedAfterStart) as exc:
                 # A gate is a deliberate, resumable stop — NOT a failure. Nothing
                 # is rolled back: the target is created and its data verified,
-                # and the operator resumes after fixing the world.
+                # and the operator resumes after fixing the world. A source found
+                # revived after START blocks too: the rollback would delete a
+                # target that may have served users since, which is theirs to decide.
                 self.journal.append("blocked", state=key, detail={"reason": str(exc)[:500]})
                 log.warning("saga.blocked", state=key)
                 return RunResult(outcome=Outcome.BLOCKED, reached=state, error=exc)

@@ -18,6 +18,7 @@ from rich.text import Text
 
 from bg_coolify_migrate.domain.statemachine import Outcome, State
 from bg_coolify_migrate.engine.executor import RunResult
+from bg_coolify_migrate.errors import SourceRevivedAfterStart
 from bg_coolify_migrate.ui.console import human_duration
 
 _OUTCOME_STYLE = {
@@ -75,7 +76,11 @@ def outcome_panel(result: RunResult, *, migration_id: str, elapsed: float | None
 
     return Panel(
         Group(*lines),
-        title=_OUTCOME_TITLE[result.outcome],
+        title=(
+            "Stopped - the source was started again, and needs your decision"
+            if isinstance(result.error, SourceRevivedAfterStart)
+            else _OUTCOME_TITLE[result.outcome]
+        ),
         border_style=_OUTCOME_STYLE[result.outcome],
         title_align="left",
     )
@@ -130,8 +135,16 @@ def _where_blocked(result: RunResult) -> str:
     created or stopped. The DNS gate stops after VERIFY with the source stopped,
     and it checks first that nothing restarted the source or started the target
     (``engine/containment.py``) — the claim it may make is that one, as of that
-    check: nothing guards either while the run waits.
+    check: nothing guards either while the run waits. And a source found running
+    again once START asked for a target blocks too: the target is up, the
+    source is NOT stopped, and the error above says the two ways on.
     """
+    if isinstance(result.error, SourceRevivedAfterStart):
+        return (
+            "Nothing has been undone: the target is started and keeps what it\n"
+            "received. Your source is NOT stopped - something started it again (above).\n"
+            "Stop it in Coolify and resume to finish, or roll back to give up the target."
+        )
     reached = str(result.reached)
     if reached == State.PREFLIGHT.value:
         return (
