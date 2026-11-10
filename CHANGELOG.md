@@ -1,6 +1,111 @@
 # CHANGELOG
 
 
+## v2.14.0 (2026-11-10)
+
+### Bug Fixes
+
+- **engine**: Kept the rename within 255 chars
+  ([`ecff0a6`](https://github.com/bauer-group/IP-CoolifyMigration/commit/ecff0a6ace9c32757d59e89330ccbe3105ded167))
+
+- **engine**: Watched start and restart deployments
+  ([`c89a6c7`](https://github.com/bauer-group/IP-CoolifyMigration/commit/c89a6c78fc6316cfd967fba6e43c84540496a1d3))
+
+- **envs**: Handled legacy rows written exact
+  ([`9e8cca9`](https://github.com/bauer-group/IP-CoolifyMigration/commit/9e8cca9179783f092a56cf799ae36a8a42d87ab4))
+
+- **fidelity**: Narrowed the shared image refusal
+  ([`a6b35b7`](https://github.com/bauer-group/IP-CoolifyMigration/commit/a6b35b79e01edeb557365c98b962a0e0aad7f42d))
+
+- **keys**: Took Coolify's authorized_keys lock
+  ([`da03d7a`](https://github.com/bauer-group/IP-CoolifyMigration/commit/da03d7a18d9f344e2e668843514404673577b063))
+
+- **plan**: Corrected wording for Coolify 4.7
+  ([`fefcdef`](https://github.com/bauer-group/IP-CoolifyMigration/commit/fefcdef1d55e60d16cb478254dd0512d76178c89))
+
+- **services**: Refused dotted names on 4.5-4.6
+  ([`bd477fe`](https://github.com/bauer-group/IP-CoolifyMigration/commit/bd477fe4f290f077ff8900a0869b1e851fede55d))
+
+- **services**: Refused leftover parts with tasks
+  ([`c879b3f`](https://github.com/bauer-group/IP-CoolifyMigration/commit/c879b3fbce429f891edb09741f1e1d3806232901))
+
+### Chores
+
+- **git**: Ignored saved plan files
+  ([`f7e6a28`](https://github.com/bauer-group/IP-CoolifyMigration/commit/f7e6a28adecce11e05a8ffab8a80c2df324771b5))
+
+### Continuous Integration
+
+- **dependabot**: Moved the update schedule to Sunday afternoon
+  ([`9db62d2`](https://github.com/bauer-group/IP-CoolifyMigration/commit/9db62d2248217c584398071516981b10cf2c4029))
+
+### Documentation
+
+- Named all token abilities the tool needs
+  ([`bb211b3`](https://github.com/bauer-group/IP-CoolifyMigration/commit/bb211b3510c1f6bbf4c32b363025f6a0424c4660))
+
+- Update README.MD [automated]
+  ([`fec076e`](https://github.com/bauer-group/IP-CoolifyMigration/commit/fec076e2891d75c42d25cd40d3ce4166542502be))
+
+- **agents**: Corrected the git password note
+  ([`bf444bc`](https://github.com/bauer-group/IP-CoolifyMigration/commit/bf444bcf65335d24a6822d8446cf615f6c01e183))
+
+- **security**: Updated the security policy
+  ([`463197c`](https://github.com/bauer-group/IP-CoolifyMigration/commit/463197cc042aec71f3ce47e35a58edd6c37c0634))
+
+### Features
+
+- **api**: Carried the 4.7.0 application settings
+  ([`cd8a2b6`](https://github.com/bauer-group/IP-CoolifyMigration/commit/cd8a2b6f44a6adba0a3a7a57f9a66b19b09c099a))
+
+- **api**: Warned when Coolify blocks the token
+  ([`b4d9085`](https://github.com/bauer-group/IP-CoolifyMigration/commit/b4d9085fc465a3512284e53284506b1a6a4a578d))
+
+- **dns**: Warned of 4.7 records for target hosts
+  ([`01d1835`](https://github.com/bauer-group/IP-CoolifyMigration/commit/01d1835abd755d7d6db957c8da8bb83f5c22f566))
+
+- **envs**: Carried empty env values from 4.7
+  ([`b403f5f`](https://github.com/bauer-group/IP-CoolifyMigration/commit/b403f5ff86b4e3e805ab2df94be8a4c10904b175))
+
+- **envs**: Warned on server refs, fixed remedies
+  ([`7650dcf`](https://github.com/bauer-group/IP-CoolifyMigration/commit/7650dcf98d5b0dcbdedc127990591c438a11be3d))
+
+- **fidelity**: Refused names Coolify 4.7 rejects
+  ([`98c37f2`](https://github.com/bauer-group/IP-CoolifyMigration/commit/98c37f272d3c84a250c8a09252168106f270e3c3))
+
+- **plan**: Warned about state no 4.7 API carries
+  ([`133b640`](https://github.com/bauer-group/IP-CoolifyMigration/commit/133b64055a253971cd3d6f1948558f703043d667))
+
+- **plan**: Warned about the 4.7 image-scan gate
+  ([`2b6c732`](https://github.com/bauer-group/IP-CoolifyMigration/commit/2b6c732a23e0c2815ba4eecdead4132354ce8674))
+
+- **plan**: Warned of missing registry logins
+  ([`cfd1b37`](https://github.com/bauer-group/IP-CoolifyMigration/commit/cfd1b3734e4c72eaeb0d0b719fb1bac31877111d))
+
+- **schedules**: Carried use_shell from 4.7.0
+  ([`3e131cb`](https://github.com/bauer-group/IP-CoolifyMigration/commit/3e131cb5038c0582e28e9a548e64126375d8cad5))
+
+- **server**: Warned about Coolify's own host key
+  ([`1222d8c`](https://github.com/bauer-group/IP-CoolifyMigration/commit/1222d8c8c4822d1de19463fe1f42dabbe5926196))
+
+- **services**: Handled parts removed from compose
+  ([`b1a5268`](https://github.com/bauer-group/IP-CoolifyMigration/commit/b1a5268c83f70d83aedade618bab5423720e9e18))
+
+- **services**: Used source compose for templates
+  ([`37c5336`](https://github.com/bauer-group/IP-CoolifyMigration/commit/37c5336f0e99eb34b877d1ef4ec4b475165da225))
+
+- **versions**: Validated Coolify 4.7.2
+  ([`7c124a3`](https://github.com/bauer-group/IP-CoolifyMigration/commit/7c124a3a4614a6920f85e4ce303cdf01edad26c6))
+
+### Testing
+
+- **e2e**: Fingerprinted mysql with sha2
+  ([`a1854ef`](https://github.com/bauer-group/IP-CoolifyMigration/commit/a1854eff101a06dc30476c5e2bda6f6396e9b8e6))
+
+- **e2e**: Validated rig servers with POST
+  ([`9085f4f`](https://github.com/bauer-group/IP-CoolifyMigration/commit/9085f4f3a68a46c8e39459d8fba189b2cf6ed600))
+
+
 ## v2.13.0 (2026-11-05)
 
 ### Documentation
