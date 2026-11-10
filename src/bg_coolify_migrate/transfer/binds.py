@@ -8,6 +8,7 @@ source comes from a compose file someone else wrote.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 from collections.abc import Sequence
 
@@ -36,6 +37,41 @@ done"""
 _INSPECT_FORMAT = (
     '{"name":{{json .Name}},"labels":{{json .Config.Labels}},"mounts":{{json .Mounts}}}'
 )
+
+#: ``$1`` the ``docker inspect`` format. Every container, running or not, one
+#: line each. The listing is checked on its own: piped straight into
+#: ``xargs -r``, a daemon that does not answer lists nothing, ``xargs`` runs
+#: nothing and the pipeline exits 0 — "nobody else mounts it" out of a silence.
+HOST_BINDS_SCRIPT = r'''ids=$(docker ps -aq --no-trunc) || exit 1
+[ -n "$ids" ] || exit 0
+printf '%s\n' "$ids" | xargs docker inspect --format "$1"'''
+
+#: What ``docker inspect`` prints for a listed container removed before it got
+#: there, per container, on stderr — and then exits 1 after printing every
+#: other one. Docker 29: ``error: no such object: <id>``; older clients
+#: ``Error: No such object: <id>``; the typed ``container inspect`` says
+#: ``Error response from daemon: No such container: <id>``.
+_VANISHED = re.compile(
+    r"(?:error(?: response from daemon)?:\s*)?no such (?:object|container):\s*[0-9a-f]{12,64}",
+    re.IGNORECASE,
+)
+
+
+def _script(script: str, *args: str) -> str:
+    """A fixed script with its arguments quoted, never spliced into it. PURE."""
+    return "sh -c " + shlex.quote(script) + " sh " + " ".join(shlex.quote(a) for a in args)
+
+
+def vanished_only(stderr: str) -> bool:
+    """Does ``stderr`` report nothing but listed containers that no longer exist? PURE.
+
+    Such a container (a ``coolify-helper`` deploy container, a ``--rm`` job, a
+    CI runner) mounts nothing any more, so the others' answer is complete. Any
+    other line — the daemon, a permission, a timeout — is an error, and an
+    empty stderr on a failure proves nothing either.
+    """
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    return bool(lines) and all(_VANISHED.fullmatch(line) for line in lines)
 
 
 async def path_states(host: RemoteHost, paths: Sequence[str]) -> dict[str, str]:
@@ -95,18 +131,25 @@ def parse_host_binds(stdout: str) -> list[binds.HostBind]:
 async def host_binds(host: RemoteHost) -> list[binds.HostBind]:
     """Every bind mount of every container on the server, running or not.
 
+    A container removed between the listing and the inspect is no failure: on
+    a busy server deploy helpers and ``--rm`` jobs come and go by the second,
+    and one that is gone mounts nothing (:func:`vanished_only`).
+
     Raises:
-        TransferError: When the daemon will not answer: "nobody else mounts
-            it" must be a fact, not a silence.
+        TransferError: When the daemon will not answer, or answers with any
+            other error: "nobody else mounts it" must be a fact, not a silence.
     """
-    result = await host.run(
-        "docker ps -aq --no-trunc | xargs -r docker inspect --format "
-        + shlex.quote(_INSPECT_FORMAT)
-    )
+    result = await host.run(_script(HOST_BINDS_SCRIPT, _INSPECT_FORMAT))
     if not result.ok:
-        raise TransferError(
-            f"could not list the containers' mounts on {host.target.host}",
-            hint=(result.stderr or "").strip()[:300] or None,
+        if not vanished_only(result.stderr or ""):
+            raise TransferError(
+                f"could not list the containers' mounts on {host.target.host}",
+                hint=(result.stderr or "").strip()[:300] or None,
+            )
+        log.info(
+            "binds.containers_vanished",
+            host=host.target.host,
+            count=len((result.stderr or "").strip().splitlines()),
         )
     return parse_host_binds(result.stdout)
 
@@ -162,11 +205,6 @@ if rm --help 2>&1 | grep -q -- --one-file-system; then
 else
   rm -rf -- "./$base"
 fi"""
-
-
-def _script(script: str, *args: str) -> str:
-    """A fixed script with its arguments quoted, never spliced into it. PURE."""
-    return "sh -c " + shlex.quote(script) + " sh " + " ".join(shlex.quote(a) for a in args)
 
 
 async def prepare_target(host: RemoteHost, path: str, *, kind: str, prior: str) -> None:

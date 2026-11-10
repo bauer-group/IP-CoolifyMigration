@@ -117,9 +117,10 @@ class TestProbes:
 
     async def test_a_daemon_that_will_not_answer_is_no_all_clear(self) -> None:
         host = FakeHost()
-        host.on(r"^docker ps -aq", exit_status=1, stderr="Cannot connect")
+        host.on(r"^sh -c ", exit_status=1, stderr="Cannot connect")
         with pytest.raises(TransferError, match="could not list"):
             await transfer_binds.host_binds(host)  # type: ignore[arg-type]
+        assert shlex.split(host.commands[0])[2] == transfer_binds.HOST_BINDS_SCRIPT
 
 
 def _args(command: str) -> list[str]:

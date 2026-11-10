@@ -118,10 +118,10 @@ class FsHost(FakeHost):
                 return self._prepare(command, *args)
             if script == transfer_binds.REMOVE_SCRIPT:
                 return self._remove(command, *args)
+            if script == transfer_binds.HOST_BINDS_SCRIPT:
+                out = "\n".join(json.dumps(c) for c in self.containers)
+                return CommandResult(command=command, exit_status=0, stdout=out, stderr="")
             out = "\n".join(self.state(p) for p in args)
-            return CommandResult(command=command, exit_status=0, stdout=out, stderr="")
-        if command.startswith("docker ps -aq"):
-            out = "\n".join(json.dumps(c) for c in self.containers)
             return CommandResult(command=command, exit_status=0, stdout=out, stderr="")
         if command.startswith("docker ps -a "):
             return ok  # no volume pins on this host
