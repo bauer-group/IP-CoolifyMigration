@@ -2588,13 +2588,15 @@ async def _healthcheck_failure(
     *,
     deadline: float,
     statuses: dict[str, str] | None = None,
+    unfinished: dict[str, str] | None = None,
 ) -> TransferError:
     """Build the refusal, naming what the daemon actually showed us.
 
     Separate from the gate because the message is the whole value of a timeout:
     the previous one said only "not running: <no containers appeared>", which is
     the same sentence for a stack that failed to deploy and for a filter that
-    cannot see it. ``statuses`` adds what Coolify last said of each deployment.
+    cannot see it. ``statuses`` adds what Coolify last said of each deployment;
+    ``unfinished`` the deployments START asked for that never read finished.
     """
     unhealthy = [h for h in health if not h.is_up]
     blind = {h.resource for h in unhealthy if not h.containers}
@@ -2603,6 +2605,24 @@ async def _healthcheck_failure(
         f"  {names.get(source_uuid, source_uuid)}: its deployment in Coolify reads {status!r}"
         for source_uuid, status in sorted((statuses or {}).items())
     ]
+    deployments += [
+        f"  {names.get(source_uuid, source_uuid)}: its deployment {uuid} could not be read"
+        for source_uuid, uuid in sorted((unfinished or {}).items())
+        if source_uuid not in (statuses or {})
+    ]
+    if not unhealthy:
+        # Every container is up, but not proven ours: START's deployment never
+        # finished. A container someone else deployed looks exactly like this.
+        return TransferError(
+            f"the targets' containers are up, but the deployment START asked for did not "
+            f"finish within {deadline:.0f}s:\n" + "\n".join(deployments),
+            hint=(
+                "A container counts only once the deployment START asked for has "
+                "finished: one that is up before then may be another deployment's - a "
+                "push or a CI deploy of the target. Check the deployment in Coolify. "
+                "The source is still intact."
+            ),
+        )
 
     probes: list[str] = []
     for resource in ctx.plan.resources:
@@ -2661,6 +2681,13 @@ async def step_healthcheck(ctx: MigrationContext) -> dict[str, Any]:
     "nothing matched". One that failed ends the wait as soon as every other
     target's start has landed (:func:`_every_other_start_landed`) — at once for a
     single target — and at the deadline otherwise, with the failure's reason.
+
+    And healthy containers count only once START's OWN deployment of every
+    application finished. A container is up just as well when someone else
+    deployed it — a push or a CI deploy of the target, before or after START —
+    and passing on it let FINALIZE release the source while START's deployment
+    failed. So each round reads the deployments first, and a failed one fails
+    the gate even with every container up.
     """
     deadline = ctx.settings.deploy_timeout
     waited = 0.0
@@ -2668,18 +2695,18 @@ async def step_healthcheck(ctx: MigrationContext) -> dict[str, Any]:
 
     while True:
         health = [await _target_health(ctx, resource) for resource in ctx.plan.resources]
-        if all(h.is_up for h in health):
+        await _read_deployments(ctx, seen)
+        if seen.failed and (waited >= deadline or _every_other_start_landed(ctx, health, seen)):
+            raise _deployment_failure(ctx, seen)
+        if all(h.is_up for h in health) and not seen.pending:
             return {
                 "containers": sum(len(h.running) for h in health),
                 "finished": sum(len(h.finished) for h in health),
                 "waited": round(waited, 1),
             }
-        await _read_deployments(ctx, seen)
-        if seen.failed and (waited >= deadline or _every_other_start_landed(ctx, health, seen)):
-            raise _deployment_failure(ctx, seen)
         if waited >= deadline:
             raise await _healthcheck_failure(
-                ctx, health, deadline=deadline, statuses=seen.statuses
+                ctx, health, deadline=deadline, statuses=seen.statuses, unfinished=seen.pending
             )
         await asyncio.sleep(_HEALTH_POLL_INTERVAL)
         waited += _HEALTH_POLL_INTERVAL

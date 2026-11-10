@@ -415,9 +415,12 @@ class TestHealthcheckWatchesTheDeployment:
         with pytest.raises(TransferError, match="did not become healthy"):
             await steps.step_healthcheck(ctx)
 
-    async def test_healthy_containers_need_no_deployment_read(
-        self, ctx: MigrationContext, respx_mock: respx.Router
+    @pytest.mark.parametrize(("status", "passes"), [("finished", True), ("failed", False)])
+    async def test_healthy_containers_count_only_once_their_deployment_finished(
+        self, ctx: MigrationContext, respx_mock: respx.Router, status: str, passes: bool
     ) -> None:
+        # Up is not proof: a container someone else deployed (a push, a CI
+        # deploy) is up just as well. START's own deployment decides.
         import json
 
         target = FakeHost()
@@ -439,11 +442,15 @@ class TestHealthcheckWatchesTheDeployment:
         ctx.target_host = target  # type: ignore[assignment]
         _started(ctx, {"app1": "dep1"})
         route = respx_mock.get(f"{BASE}/deployments/dep1").mock(
-            return_value=httpx.Response(200, json={"status": "failed"})
+            return_value=httpx.Response(200, json={"status": status})
         )
-        result = await steps.step_healthcheck(ctx)
-        assert result["containers"] == 1
-        assert not route.called, "the daemon decides success"
+        if passes:
+            result = await steps.step_healthcheck(ctx)
+            assert result["containers"] == 1
+        else:
+            with pytest.raises(TransferError, match="web did not deploy"):
+                await steps.step_healthcheck(ctx)
+        assert route.call_count == 1
 
 
 def _running(name: str) -> str:
