@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Collection
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -1400,10 +1401,31 @@ async def _restore_route_envs(api: CoolifyClient, uuid: str, route_envs: object)
 # ── releasing the source at FINALIZE ─────────────────────────────────────────
 
 
+@dataclass(frozen=True)
+class DomainRelease:
+    """What FINALIZE's release of one source's custom hosts achieved."""
+
+    ok: bool
+    """The domain write went through, or there was nothing to write."""
+    still_routed: tuple[str, ...] = ()
+    """Released hosts the source's labels still route: readonly labels off, so
+    the PATCH left its custom_labels as they were and its next deploy routes
+    them again (fidelity.hosts_routed_after_release). Hostnames only."""
+    compose_routed: tuple[str, ...] = ()
+    """Released hosts routers written into the source's compose still route:
+    Coolify merges a compose's own labels into every deploy
+    (fidelity.compose_hosts_routed_after_release). Hostnames only."""
+
+    @property
+    def released(self) -> bool:
+        """The source no longer holds, nor routes, any of its custom hosts."""
+        return self.ok and not self.still_routed and not self.compose_routed
+
+
 async def release_application_domains(
     api: CoolifyClient, snapshot: ResourceSnapshot, *, source_wildcard: str | None
-) -> bool:
-    """Remove an application source's CUSTOM hosts at FINALIZE. Returns success.
+) -> DomainRelease:
+    """Remove an application source's CUSTOM hosts at FINALIZE.
 
     The target holds them already (claimed at CREATE), so this is the "break"
     of make-before-break: Coolify's release job for the removed hosts finds the
@@ -1413,14 +1435,29 @@ async def release_application_domains(
     removing them would let Coolify delete a record of the source's own server.
 
     A kept or renamed source still holding the custom hosts would be a second
-    router and ACME requester on each the moment anyone restarts it, so this
-    runs under KEEP and RENAME alike. A dockercompose app's ``domains`` field
-    422s; it is released by resubmitting its docker_compose_domains. Never
+    router and ACME requester on each the moment anyone redeploys it, so this
+    runs under KEEP and RENAME alike. It stops the ROUTING only where Coolify
+    manages the labels: the PATCH regenerates custom_labels from the new fqdn
+    with readonly labels on and leaves them as stored with it off
+    (ApplicationsController v4.1.2:2668, v4.7.2:4107), and every non-compose
+    deploy writes the stored labels into the container (ApplicationDeploymentJob
+    v4.7.2:4740-4763). The plan refuses keep and rename for such a source
+    (fidelity.kept_source_label_refusals); one switched to hand-kept labels
+    since is caught here, read off the same GET the PATCH is built from, and
+    reported in :attr:`DomainRelease.still_routed`. The domains are released all
+    the same: the source then no longer holds the hosts for Coolify's conflict
+    check and managed DNS. A dockercompose app's ``domains`` field 422s; it is
+    released by resubmitting its docker_compose_domains, from which Coolify
+    generates its routers at every deploy — next to the labels its compose
+    declares itself, which no domain write touches: a router written there for a
+    released host is reported in :attr:`DomainRelease.compose_routed`. Never
     raises: the source is stopped, nothing routes it yet, and the caller reports
     a failure for the operator to finish by hand.
     """
     try:
         current = await api.get_resource("applications", snapshot.uuid)
+        still: tuple[str, ...] = ()
+        composed: tuple[str, ...] = ()
         if snapshot.kind is ResourceKind.APP_GIT_COMPOSE:
             parsed = _parse_compose_domains(current.get("docker_compose_domains"))
             released = [
@@ -1428,17 +1465,35 @@ async def release_application_domains(
                 for n, d in parsed.items()
             ]
             if released == [{"name": n, "domain": d} for n, d in parsed.items()]:
-                return True
+                return DomainRelease(ok=True)
+            # Read before the PATCH, like the labels below.
+            composed = tuple(
+                fidelity.compose_hosts_routed_after_release(
+                    current, collection="applications", source_wildcard=source_wildcard
+                )
+            )
             body: dict[str, Any] = {"docker_compose_domains": released}
         else:
             original = str(current.get("fqdn") or "")
             kept = domains.without_custom(original, source_wildcard=source_wildcard)
             if kept == ",".join(p.strip() for p in original.split(",") if p.strip()):
-                return True
+                return DomainRelease(ok=True)
+            # Read before the PATCH: the hosts it removes are the ones to look for.
+            still = tuple(
+                fidelity.hosts_routed_after_release(current, source_wildcard=source_wildcard)
+            )
             body = {"domains": kept}
         await api.update_resource("applications", snapshot.uuid, body)
         log.info("api.application.domains_released", uuid=snapshot.uuid)
-        return True
+        if still:
+            log.warning(
+                "api.application.labels_still_route",
+                uuid=snapshot.uuid,
+                hosts=list(still),
+                hint="Switch the source's label management back to Coolify, or delete it.",
+            )
+        _log_compose_routes(snapshot.uuid, composed)
+        return DomainRelease(ok=True, still_routed=still, compose_routed=composed)
     except CoolifyApiError as exc:
         log.warning(
             "api.application.domains_release_failed",
@@ -1446,13 +1501,24 @@ async def release_application_domains(
             error=str(exc)[:200],
             hint="Remove the source's custom domains by hand before restarting it.",
         )
-        return False
+        return DomainRelease(ok=False)
+
+
+def _log_compose_routes(uuid: str, hosts: tuple[str, ...]) -> None:
+    """Say that routers written into a released source's compose still route ``hosts``."""
+    if hosts:
+        log.warning(
+            "api.compose_labels_still_route",
+            uuid=uuid,
+            hosts=list(hosts),
+            hint="Remove those routers from the source's compose, or delete the source.",
+        )
 
 
 async def release_service_urls(
     api: CoolifyClient, uuid: str, *, source_wildcard: str | None
-) -> bool:
-    """Blank the source's custom sub-application URLs at FINALIZE. Returns success.
+) -> DomainRelease:
+    """Blank the source's custom sub-application URLs at FINALIZE.
 
     The target serves those hosts now. A kept or renamed source still holding
     them would put a second router on each the moment anyone restarts it, so
@@ -1469,12 +1535,23 @@ async def release_service_urls(
 
     From 4.4 removing a hostname queues ReleaseRemovedDnsHostnamesJob; the live
     target holds it, so a Coolify-managed record is re-referenced, not deleted
-    (ManagedDnsRecordCleanup v4.5.0:322-333). Never raises: the source is
-    stopped, so nothing routes it yet, and the caller reports a failure.
+    (ManagedDnsRecordCleanup v4.5.0:322-333).
+
+    A service has no custom_labels (an applications column only, migration
+    2023_10_18_072519), but the parser merges each compose service's own
+    ``labels:`` into every deploy: a router written there for a released host is
+    reported in :attr:`DomainRelease.compose_routed`, read off the same GET.
+    Never raises: the source is stopped, so nothing routes it yet, and the
+    caller reports a failure.
     """
     try:
         source = await api.get_resource("services", uuid)
         urls = service_custom_urls(source, source_wildcard=source_wildcard)
+        composed = tuple(
+            fidelity.compose_hosts_routed_after_release(
+                source, collection="services", source_wildcard=source_wildcard
+            )
+        )
         if urls:
             await api.update_resource(
                 "services", uuid, {"urls": [{"name": e["name"], "url": ""} for e in urls]}
@@ -1492,7 +1569,8 @@ async def release_service_urls(
                     "services", uuid, [{"key": e["key"], "value": ""} for e in route]
                 )
                 log.info("api.service.route_envs_released", uuid=uuid, keys=[e["key"] for e in route])
-        return True
+        _log_compose_routes(uuid, composed)
+        return DomainRelease(ok=True, compose_routed=composed)
     except CoolifyApiError as exc:
         log.warning(
             "api.service.urls_release_failed",
@@ -1500,18 +1578,24 @@ async def release_service_urls(
             error=str(exc)[:200],
             hint="Clear the source's domains by hand before restarting it.",
         )
-        return False
+        return DomainRelease(ok=False)
 
 
 async def release_source_domains(
     api: CoolifyClient, snapshot: ResourceSnapshot, *, source_wildcard: str | None
-) -> bool:
-    """FINALIZE's release of one source's custom hosts. Returns success, never raises."""
+) -> DomainRelease:
+    """FINALIZE's release of one source's custom hosts. Never raises.
+
+    A release that went through is reported as one only when nothing the
+    source deploys still routes a released host: neither its custom_labels
+    (an application with readonly labels off) nor a router written into its
+    compose (:class:`DomainRelease`). Databases hold no domains.
+    """
     if snapshot.collection == "services":
         return await release_service_urls(api, snapshot.uuid, source_wildcard=source_wildcard)
     if snapshot.collection == "applications":
         return await release_application_domains(api, snapshot, source_wildcard=source_wildcard)
-    return True
+    return DomainRelease(ok=True)
 
 
 # ── env vars ─────────────────────────────────────────────────────────────────

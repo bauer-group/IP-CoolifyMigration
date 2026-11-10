@@ -1295,8 +1295,8 @@ class TestReleaseApplicationDomains:
         route = respx_mock.patch(f"{BASE}/applications/a1").mock(
             return_value=httpx.Response(200, json={"uuid": "a1"})
         )
-        ok = await release_application_domains(api, self._snapshot(), source_wildcard=self.SRC)
-        assert ok is True
+        outcome = await release_application_domains(api, self._snapshot(), source_wildcard=self.SRC)
+        assert outcome.released is True
         assert json.loads(route.calls[0].request.read()) == {"domains": f"https://x.{self.SRC}"}
 
     async def test_a_custom_only_app_is_left_without_domains(
@@ -1366,7 +1366,8 @@ class TestReleaseApplicationDomains:
         respx_mock.get(f"{BASE}/applications/a1").mock(
             return_value=httpx.Response(200, json={"uuid": "a1", **source})
         )
-        assert await release_application_domains(api, self._snapshot(), source_wildcard=self.SRC)
+        outcome = await release_application_domains(api, self._snapshot(), source_wildcard=self.SRC)
+        assert outcome.released is True
         assert [c.request.method for c in respx_mock.calls] == ["GET"]
 
     async def test_compose_nothing_custom_writes_nothing(
@@ -1382,9 +1383,10 @@ class TestReleaseApplicationDomains:
                 json={"docker_compose_domains": json.dumps({"cfg": {"domain": f"https://c.{self.SRC}"}})},
             )
         )
-        assert await release_application_domains(
+        outcome = await release_application_domains(
             api, self._snapshot(ResourceKind.APP_GIT_COMPOSE), source_wildcard=self.SRC
         )
+        assert outcome.released is True
         assert [c.request.method for c in respx_mock.calls] == ["GET"]
 
     async def test_a_failure_is_reported_never_raised(
@@ -1393,10 +1395,8 @@ class TestReleaseApplicationDomains:
         from bg_coolify_migrate.api.resources import release_application_domains
 
         respx_mock.get(f"{BASE}/applications/a1").mock(return_value=httpx.Response(500))
-        assert (
-            await release_application_domains(api, self._snapshot(), source_wildcard=self.SRC)
-            is False
-        )
+        outcome = await release_application_domains(api, self._snapshot(), source_wildcard=self.SRC)
+        assert outcome.ok is False and outcome.released is False
 
     async def test_databases_have_nothing_to_release(
         self, api: CoolifyClient, respx_mock: respx.Router
@@ -1406,7 +1406,7 @@ class TestReleaseApplicationDomains:
         snapshot = ResourceSnapshot(
             uuid="db1", name="pg", collection="databases", kind=ResourceKind.DATABASE
         )
-        assert await release_source_domains(api, snapshot, source_wildcard=None)
+        assert (await release_source_domains(api, snapshot, source_wildcard=None)).released
         assert not respx_mock.calls
 
 

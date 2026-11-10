@@ -163,6 +163,15 @@ back to Coolify (it then regenerates the labels from its domains, dropping
 hand-made ones) and plan again, or use `--finalize delete`. On Coolify 4.1,
 whose API does not show the setting, the plan warns instead.
 
+A dockercompose application or a service routes by the labels Coolify generates
+from its domains — and by any router **written into its compose**, which Coolify
+adds to every deploy whatever the domains say. A compose router naming a custom
+domain finalize moves is a plan **warning** under `keep` and `rename`: a
+service's can be removed from the source's compose once the run has finalized
+(the target runs its own copy), while a compose application's comes from git,
+which the target deploys too — finalize it with `delete`, or never redeploy the
+kept source. Finalize does not list such a source as released.
+
 `plan` takes the same `--finalize` (default `rename`), so it judges the policy
 `run` will use.
 
@@ -201,9 +210,13 @@ without the source's custom domains and then claims them, overriding Coolify's
 domain-conflict check only over this migration's own resources. Under `keep` as
 well as `rename`, finalize then clears the custom domains from the stopped
 source as its last step, so restarting it by hand cannot put a second router on
-a hostname the target now serves. That order also keeps a DNS record Coolify
-(4.4+) manages at Cloudflare alive: Coolify deletes one only when its hostname
-loses its last holder.
+a hostname the target now serves — as long as Coolify generates its routers (see
+[Finalize policies](#finalize-policies): a source with readonly labels off is
+refused for `keep` and `rename`, a compose router naming a moved host is warned
+about, and a source either applies to at finalize is not reported as
+released). That order also keeps a DNS record Coolify (4.4+)
+manages at Cloudflare alive: Coolify deletes one only when its hostname loses
+its last holder.
 
 **Custom domains** — `shop.example.com` and the like. These are
 server-independent: they move *with* the app, by repointing their DNS record at

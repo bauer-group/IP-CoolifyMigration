@@ -31,13 +31,23 @@ Two upstream facts make a rollback's restore order matter as well (v4.1.2-v4.5.0
 * A domain PATCH only writes the database. It deploys nothing unless
   ``instant_deploy`` is sent (ApplicationsController v4.1.2:2660-2680,
   v4.5.0:3752-3793), and with read-only labels on — the default since migration
-  2025_01_08 — it regenerates ``custom_labels`` from the new fqdn.
+  2025_01_08 — it regenerates ``custom_labels`` from the new fqdn. With them
+  off it does not (v4.1.2:2668 .. v4.7.2:4107): the labels stay as stored.
 * Every deploy, ``/restart`` included, bakes the stored labels into the new
-  container (ApplicationDeploymentJob v4.1.2:3099-3113, v4.5.0:4118-4132).
+  container (ApplicationDeploymentJob v4.1.2:3099-3113, v4.5.0:4118-4132,
+  v4.7.2:4740-4763) — for every build pack but dockercompose, whose routers are
+  generated from ``docker_compose_domains`` at every parse, merged onto the
+  compose's own ``labels:`` (as a service's are onto its compose's;
+  parsers.php v4.7.2:2170, 3518).
 
 So the rollback planner restores the domains BEFORE it restarts the source
 (``statemachine._PRECEDENCE``), and deletes a target holding custom hosts only
-once its source holds them again.
+once its source holds them again. And FINALIZE's release is a break of the
+ROUTING only for the routers Coolify generates: an application with read-only
+labels off, or a router written into a compose, keeps routing the released
+hosts on the source's next deploy. The plan refuses keep and rename for the
+first (fidelity.kept_source_label_refusals) and warns about the second
+(fidelity.kept_source_compose_label_warnings).
 """
 
 from __future__ import annotations

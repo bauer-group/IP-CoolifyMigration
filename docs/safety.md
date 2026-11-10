@@ -293,6 +293,17 @@ A custom domain (`shop.example.com`) always has a live holder of this migration:
   (the compose is reloaded from git, and a service renamed there since CREATE
   loses its entry). Otherwise the stopped source keeps them and the run report
   says which host the target lost.
+* **Releasing a domain stops the routing only where Coolify manages the
+  labels.** With readonly labels off, Coolify keeps an application's
+  `custom_labels` as stored when its domains change, and every deploy writes
+  them into the container: a kept source would route the moved hosts again the
+  next time anything deploys it. The plan refuses `keep` and `rename` for such a
+  source (`delete` removes it); one switched to hand-kept labels after the plan
+  is released all the same but reported as still routing, never as released.
+  A router written into a compose is added to every deploy as well — of a
+  dockercompose application and of a service alike — so one naming a moved host
+  is a plan warning under `keep` and `rename`, and its source is reported as
+  still routing at finalize.
 * **Source and target are two servers.** A plan whose target is its source's
   own server is refused: the DNS gate places a host by the address only one
   side answers as, and on one server every address is both sides'.

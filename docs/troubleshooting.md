@@ -616,6 +616,31 @@ in Coolify (on the service that serves it now), then remove it from the source
 before anyone restarts the source. The same notice with `could not be read`
 means the target's or source's GET failed; check both by hand.
 
+### `... let go of its custom domains, but its labels still route ...`
+
+The source's readonly labels were switched off after the plan was made (the plan
+refuses `keep` and `rename` for such a source). FINALIZE removed the custom
+domains from it all the same, so Coolify's conflict check and managed DNS no
+longer count it as a holder, but Coolify kept its labels exactly as they were,
+and its next deploy — a restart, a redeploy, a git push — routes the named hosts
+again next to the target and requests their certificates. The run still
+succeeds; the source is not listed as released. Switch the source's label
+management back to Coolify (Readonly labels on, or "Managed by Coolify" under
+Labels on newer releases) — it then regenerates the labels from its domains —
+or delete the source, before anyone redeploys it.
+
+### `... let go of its custom domains, but routers written into its compose still route ...`
+
+The source's compose declares a router of its own (a `traefik...rule=Host(...)`
+or `caddy` label) for a host finalize moved; the plan warned about it. Coolify
+adds a compose's own labels to every deploy, whatever the domains say, so the
+source's next deploy routes the named hosts again next to the target. The run
+still succeeds; the source is not listed as released. For a service, remove
+those routers from the source's compose in Coolify (the target runs its own
+copy). A dockercompose application's compose comes from git, which the target
+deploys too: never redeploy the source, and delete it once you no longer need it
+as a fallback.
+
 ### `target(s) KEPT, holding custom domains their source does not hold`
 
 A rollback deletes a target that holds custom domains only once its source holds
@@ -796,8 +821,9 @@ application's labels exactly as stored when its domains change, and every deploy
 writes them into its container. The kept source's next restart, redeploy or git
 push would route the moved hosts again next to the target, and request their
 certificates — invisibly, since Coolify's domain-conflict check and managed DNS
-read the domains, never the labels. A dockercompose application is not affected:
-its labels are generated from its domains at every deploy.
+read the domains, never the labels. A dockercompose application has no
+`custom_labels` in its deploy: Coolify generates its routers from its domains at
+every deploy, next to whatever its compose declares (below).
 
 Two ways out:
 
@@ -812,6 +838,21 @@ Two ways out:
 `plan --finalize delete` shows the plan under that policy. On Coolify 4.1, whose
 API does not show the setting, the plan says **"does not show whether its
 readonly labels are on"** instead: check the setting on the source by hand.
+
+## "routers written into its compose route …"
+
+A warning under `--finalize keep` and `rename` only, for a dockercompose
+application or a service. Its compose declares a router of its own for a custom
+domain finalize moves. Finalize releases the domains, but Coolify adds a
+compose's own labels to every deploy whatever the domains say, so the kept
+source's next deploy routes the host again next to the target and requests its
+certificate. For a service, remove those routers from the source's compose in
+Coolify once the run has finalized (the target runs its own copy). A
+dockercompose application's compose comes from git and the target deploys the
+same file, so it cannot be fixed on the source alone: finalize with `--finalize
+delete`, or never redeploy the kept source and delete it once it is no longer
+needed. Only literal hosts are seen: a rule built from a variable
+(`` Host(`${DOMAIN}`) ``) is not.
 
 ## "the target server '…' is the source server"
 

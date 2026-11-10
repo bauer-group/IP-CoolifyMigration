@@ -863,11 +863,20 @@ def _label_routes(text: str) -> list[str]:
 # their certificates. Nothing in Coolify notices: the conflict check and the
 # managed-DNS release read fqdn and docker_compose_domains only.
 #
-# Not a compose application: its labels are generated from docker_compose_domains
-# at every parse (parsers v4.7.2:2207-2266) and deploy_docker_compose_buildpack
-# (ApplicationDeploymentJob v4.7.2:876) never reads custom_labels. Not a service:
-# custom_labels is an applications column only (migration
-# 2023_10_18_072519_add_custom_labels_applications_table).
+# Not a compose application: the labels Coolify generates for it come from
+# docker_compose_domains at every parse (parsers v4.7.2:2207-2266), and
+# deploy_docker_compose_buildpack (ApplicationDeploymentJob v4.7.2:876) never
+# reads custom_labels. Not a service: custom_labels is an applications column
+# only (migration 2023_10_18_072519_add_custom_labels_applications_table).
+#
+# Both still keep what the COMPOSE says: each parser starts a service's labels
+# from its own `labels:` and merges the generated ones on top
+# (applicationParser v4.1.2:665,1311,1400, v4.5.0:1472,2130,2263,
+# v4.7.2:1520,2170,2303; serviceParser v4.1.2:1997,2588,2674,
+# v4.5.0:2858,3447,3570, v4.7.2:2930,3518,3641), whatever the readonly
+# setting (the parsers never read it). A router written into the compose by
+# hand therefore outlives the release of the domains on every release:
+# :func:`compose_hosts_routed_after_release`.
 
 #: The build pack whose deploys never use custom_labels.
 _LABELS_FROM_COMPOSE = "dockercompose"
@@ -909,7 +918,11 @@ def label_routed_release_hosts(
     text = _label_text(source.get("custom_labels"))
     if not released or not text:
         return []
-    routes = _label_routes(text)
+    return _routed_among(released, _label_routes(text))
+
+
+def _routed_among(released: list[str], routes: list[str]) -> list[str]:
+    """The ``released`` hosts ``routes`` names, then every HostRegexp rule in it."""
     named = set(routes)
     hit = [h for h in released if h in named]
     hit.extend(sorted({r for r in routes if r.startswith("HostRegexp(")}))
@@ -981,6 +994,100 @@ def kept_source_label_warnings(
         "source routes them again on its next deploy, next to the target: check Readonly "
         "labels on the source, and switch them on (or finalize with --finalize delete) "
         "if they are off."
+    ]
+
+
+def _compose_released_hosts(
+    source: Mapping[str, Any], *, collection: str, source_wildcard: str | None
+) -> list[str]:
+    """The custom hosts FINALIZE releases from a compose-backed source, in order. PURE.
+
+    A dockercompose application gives up those of its docker_compose_domains
+    (api/resources.release_application_domains), a service those of its
+    sub-applications' url and fqdn (release_service_urls). Nothing else
+    deploys from a compose.
+    """
+    if collection == "applications":
+        if source.get("build_pack") != _LABELS_FROM_COMPOSE:
+            return []
+        values = list(compose_domains(source.get("docker_compose_domains")).values())
+    elif collection == "services":
+        values = [
+            str(app.get(key) or "")
+            for app in source.get("applications") or []
+            if isinstance(app, Mapping)
+            for key in ("url", "fqdn")
+        ]
+    else:
+        return []
+    hosts = (h for v in values for h in custom_hosts(v, source_wildcard=source_wildcard))
+    return list(dict.fromkeys(hosts))
+
+
+def compose_hosts_routed_after_release(
+    source: Mapping[str, Any], *, collection: str, source_wildcard: str | None
+) -> list[str]:
+    """The released custom hosts that routers written into the source's compose route.
+
+    Each parser merges a service's own compose ``labels:`` into every deploy (see
+    the note above :data:`_LABELS_FROM_COMPOSE`), so releasing the domains of a
+    dockercompose application or a service stops only the routers Coolify
+    generates from them: one the operator wrote into the compose routes its host
+    again on the kept source's next deploy, next to the target. Read off
+    ``docker_compose_raw``, the operator's compose (the parsed ``docker_compose``
+    holds the generated labels too); only literal hosts are seen — a rule built
+    from a variable (``Host(`${DOMAIN}`)``) is not resolved. A HostRegexp rule
+    is returned like :func:`label_routed_release_hosts` returns it.
+
+    The ONE predicate behind the plan's keep/rename warning
+    (:func:`kept_source_compose_label_warnings`) and FINALIZE's report, which
+    asks it of the GET its release is built from (api/resources). PURE.
+    """
+    released = _compose_released_hosts(
+        source, collection=collection, source_wildcard=source_wildcard
+    )
+    if not released:
+        return []
+    services = _parsed_compose_services(source.get("docker_compose_raw"))
+    if not services:
+        return []
+    text = "\n".join(_compose_label_text(body.get("labels")) for body in services.values())
+    return _routed_among(released, _label_routes(text))
+
+
+def kept_source_compose_label_warnings(
+    source: Mapping[str, Any], *, collection: str, source_wildcard: str | None
+) -> list[str]:
+    """Why a kept (keep or rename) compose-backed source would go on routing moved hosts.
+
+    A warning, held on ``ResourcePlan.kept_source_warnings`` and shown only under
+    keep and rename. Refusing it like :func:`kept_source_label_refusals` is the
+    operator's decision to make, not this tool's: a compose application's
+    compose comes from git, which the target deploys too, so the source cannot
+    be fixed on its own. PURE.
+    """
+    hosts = compose_hosts_routed_after_release(
+        source, collection=collection, source_wildcard=source_wildcard
+    )
+    if not hosts:
+        return []
+    head = (
+        f"routers written into its compose route {', '.join(hosts)}, which finalize moves "
+        "to the target. Coolify adds a compose's own labels to every deploy, whatever its "
+        "domains say, so with --finalize keep or rename the kept source routes those "
+        "hosts again on its next deploy (a restart, a redeploy), next to the target, and "
+        "requests their certificates. "
+    )
+    if collection == "applications":
+        return [
+            head + "Its compose comes from git, and the target deploys the same file: "
+            "finalize with --finalize delete, or never redeploy the kept source and delete "
+            "it once it is no longer needed as a fallback."
+        ]
+    return [
+        head + "Once the run has finalized, remove those routers from the source service's "
+        "compose in Coolify (the target runs its own copy) before anyone redeploys it - "
+        "or finalize with --finalize delete."
     ]
 
 

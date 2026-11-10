@@ -2591,6 +2591,15 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
     deletes one. KEEP releases them too: a kept source still holding them is a
     second router and ACME requester the moment anyone restarts it. DELETE
     releases by deleting.
+
+    The release stops a kept source ROUTING the hosts only where Coolify
+    generates its routers: with readonly labels off an application's
+    custom_labels stay as stored, and a router written into a compose is merged
+    into every deploy, so the next deploy routes those hosts again. PLAN refuses
+    keep and rename for the first (fidelity.kept_source_label_refusals) and
+    warns about the second (fidelity.kept_source_compose_label_warnings); a
+    source either still applies to at release time is not reported as released
+    (:func:`_release_source_domains`).
     """
     policy = ctx.plan.finalize_policy
     stamp = ctx.migration_id.split("-")[-1]
@@ -2666,6 +2675,13 @@ async def _release_source_domains(ctx: MigrationContext) -> list[str]:
     gives back exactly what is missing. A failed release leaves the source
     holding a host the target serves — stopped, so harmless until someone
     restarts it — and says so in the run report.
+
+    So does a release whose source still ROUTES a host: its readonly labels are
+    off (switched since PLAN, which refuses keep and rename for it), so Coolify
+    kept its custom_labels as they were, or a router written into its compose
+    names the host (which PLAN warned about). Its domains are released all the
+    same, but it is not listed as released — its next deploy routes the hosts
+    again.
     """
     owners = [
         r.snapshot.uuid
@@ -2683,10 +2699,38 @@ async def _release_source_domains(ctx: MigrationContext) -> list[str]:
             continue
         if not await _target_still_holds(ctx, snapshot, source_wildcard=source_wildcard):
             continue
-        if await api_resources.release_source_domains(
+        outcome = await api_resources.release_source_domains(
             ctx.api, snapshot, source_wildcard=source_wildcard
-        ):
+        )
+        if outcome.released:
             released.append(snapshot.uuid)
+            continue
+        if outcome.still_routed:
+            ctx.notices.append(
+                f"{snapshot.name} (the stopped source) let go of its custom domains, but its "
+                f"labels still route {', '.join(outcome.still_routed)}: its readonly labels "
+                "are off, so Coolify kept them as they were, and its next deploy routes those "
+                "hosts again next to the target and requests their certificates. Switch its "
+                "label management back to Coolify (Readonly labels on; 'Managed by Coolify' on "
+                "newer releases), which regenerates the labels from its domains, or delete it, "
+                "before anyone redeploys it."
+            )
+        if outcome.compose_routed:
+            fix = (
+                "Its compose comes from git, which the target deploys too: never redeploy "
+                "the source, and delete it once it is no longer needed as a fallback."
+                if snapshot.collection == "applications"
+                else "Remove those routers from the source's compose in Coolify (the target "
+                "runs its own copy), or delete the source, before anyone redeploys it."
+            )
+            ctx.notices.append(
+                f"{snapshot.name} (the stopped source) let go of its custom domains, but "
+                f"routers written into its compose still route "
+                f"{', '.join(outcome.compose_routed)}: Coolify adds a compose's own labels to "
+                "every deploy, so its next deploy routes those hosts again next to the target "
+                f"and requests their certificates. {fix}"
+            )
+        if outcome.ok:
             continue
         ctx.notices.append(
             f"{snapshot.name} (the stopped source) still holds its custom domains, which "

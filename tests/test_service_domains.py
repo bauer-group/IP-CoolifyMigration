@@ -1032,7 +1032,8 @@ class TestRouteEnvReleaseAndRestore:
         bulk = respx_mock.patch(f"{BASE}/services/svc1/envs/bulk").mock(
             return_value=httpx.Response(200, json={})
         )
-        assert await resources.release_service_urls(api, "svc1", source_wildcard=SRC_WC)
+        outcome = await resources.release_service_urls(api, "svc1", source_wildcard=SRC_WC)
+        assert outcome.released is True
         assert _body(bulk) == {"data": [{"key": "MINIO_SERVER_URL", "value": ""}]}
 
     async def test_a_stack_without_a_specific_image_reads_no_envs(
@@ -1040,7 +1041,8 @@ class TestRouteEnvReleaseAndRestore:
     ) -> None:
         source = _source(applications=_source()["applications"][1:])
         respx_mock.get(f"{BASE}/services/svc1").mock(return_value=httpx.Response(200, json=source))
-        assert await resources.release_service_urls(api, "svc1", source_wildcard=SRC_WC)
+        outcome = await resources.release_service_urls(api, "svc1", source_wildcard=SRC_WC)
+        assert outcome.released is True
         assert [c.request.url.path for c in respx_mock.calls] == ["/api/v1/services/svc1"]
 
     async def test_the_restore_puts_the_row_back_before_anything_else(

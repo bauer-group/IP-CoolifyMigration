@@ -995,6 +995,12 @@ async def build_plan(
             kept_warnings.extend(
                 fidelity.kept_source_label_warnings(full, source_wildcard=origin_wildcard or None)
             )
+            # ...and so do routers written into a dockercompose app's own compose.
+            kept_warnings.extend(
+                fidelity.kept_source_compose_label_warnings(
+                    full, collection=collection, source_wildcard=origin_wildcard or None
+                )
+            )
             warnings.extend(image_scan_gate_warnings(version=coolify_version))
             if fidelity.unshareable_image_name(full, version=coolify_version):
                 if team_applications is None:
@@ -1007,6 +1013,11 @@ async def build_plan(
             if not compose_backed:
                 refusals.extend(fidelity.storage_refusals(api_storages, version=coolify_version))
         else:
+            service_wildcard = (
+                source_wildcard
+                or (server_ref(source_server).wildcard_domain if source_server else None)
+                or None
+            )
             warnings.extend(fidelity.service_warnings(full, version=coolify_version))
             refusals.extend(fidelity.service_refusals(full, version=coolify_version))
             # A part that left the compose (4.7.0+) is not on the target: refused
@@ -1016,9 +1027,13 @@ async def build_plan(
                     full,
                     storages=api_storages,
                     migrating={i.source_name for i in manifest.to_migrate if i.source_name},
-                    source_wildcard=source_wildcard
-                    or (server_ref(source_server).wildcard_domain if source_server else None)
-                    or None,
+                    source_wildcard=service_wildcard,
+                )
+            )
+            # Routers written into the service's compose outlive FINALIZE's release.
+            kept_warnings.extend(
+                fidelity.kept_source_compose_label_warnings(
+                    full, collection=collection, source_wildcard=service_wildcard
                 )
             )
 
