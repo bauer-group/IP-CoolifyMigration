@@ -332,20 +332,20 @@ async def killed_since(
 
 
 def start_events_command(*, since: int) -> str:
-    """One SSH round trip: the oldest event the daemon holds, then every container
-    ``start`` since ``since``. PURE.
+    """One SSH round trip: when it reads, the oldest event the daemon holds, then
+    every container ``start`` since ``since``. PURE.
 
     Both ends are the host's own clock. The first query exists because the
     daemon keeps only its last 256 events (moby daemon/events/events.go:12): its
     oldest surviving event says whether the second one can still see back to
-    ``since`` (``containment.event_log_gap``). ``head`` ends that query early;
-    the exit status is the second query's, so a daemon that does not answer
-    fails the command.
+    ``since`` (``containment.event_log_gap``), and the ``until`` line dates a
+    log that holds none at all. ``head`` ends that query early; the exit status
+    is the second query's, so a daemon that does not answer fails the command.
     """
     if since < 0:
         raise ValueError(f"since must be a unix time, not {since}")
     return (
-        'u="$(date +%s)" && '
+        'u="$(date +%s)" && echo "until $u" && '
         "docker events --since 0 --until \"$u\" --format 'oldest {{.Time}}' | head -n 1 && "
         f"docker events --since {since} --until \"$u\" "
         "--filter type=container --filter event=start --format '{{json .}}'"

@@ -421,8 +421,15 @@ class TestStepQuiesce:
     containers, so everything that names them must read them after the wait."""
 
     @pytest.fixture
-    def stubbed(self, ctx: MigrationContext, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    def stubbed(
+        self, ctx: MigrationContext, monkeypatch: pytest.MonkeyPatch, respx_mock: respx.Router
+    ) -> list[str]:
         order: list[str] = []
+        # The deployment record QUIESCE journals with the stop clock
+        # (engine/containment.deployments_before_stop): nothing deployed yet.
+        respx_mock.get(f"{BASE}/deployments/applications/app1").mock(
+            return_value=httpx.Response(200, json={"count": 0, "deployments": []})
+        )
 
         async def capture(_ctx: Any) -> dict[str, list[str]]:
             order.append("capture")

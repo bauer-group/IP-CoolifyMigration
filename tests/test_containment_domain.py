@@ -203,10 +203,12 @@ class TestTheEventLogWindow:
         assert c.event_log_gap(c.EventLog(oldest=STOP + 100), STOP) == STOP + 100
 
     @pytest.mark.parametrize(
-        ("log", "since"), [(None, STOP), (c.EventLog(oldest=STOP + 1), None), (c.EventLog(), STOP)]
+        ("log", "since"), [(None, STOP), (c.EventLog(oldest=STOP + 1), None), (c.EventLog(), None)]
     )
     def test_nothing_to_say(self, log: c.EventLog | None, since: int | None) -> None:
         assert c.event_log_gap(log, since) is None
+
+    # An EMPTY log is no complete one: tests/test_containment_history.py.
 
 
 class TestMessages:

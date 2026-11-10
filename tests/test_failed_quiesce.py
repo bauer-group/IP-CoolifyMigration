@@ -185,10 +185,14 @@ class TestStepQuiesceMarksTheRequest:
         async def nothing(_ctx: Any) -> None:
             return None
 
+        async def no_deployments(_ctx: Any) -> dict[str, list[str]]:
+            return {}
+
         monkeypatch.setattr(steps, "_capture_mounts", capture)
         monkeypatch.setattr(steps, "_pin_source", no_pins)
         monkeypatch.setattr(steps.deploy_triggers, "disarm_sources", nothing)
         monkeypatch.setattr(steps.deploy_triggers, "await_source_deployments", nothing)
+        monkeypatch.setattr(steps.containment, "deployments_before_stop", no_deployments)
         monkeypatch.setattr(steps.quiesce, "now_on", now_on)
         monkeypatch.setattr(steps, "_request_stop", request_stop)
         monkeypatch.setattr(steps, "observed_labels", lambda _plan: {})

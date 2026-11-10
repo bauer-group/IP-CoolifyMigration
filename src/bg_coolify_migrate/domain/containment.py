@@ -18,9 +18,9 @@ Coolify keeps them that way:
   custom hosts that still resolve to the source and asks ACME for them
   (invariant 7), and writes into volumes being copied.
 
-So each checkpoint asks the daemons, and this module decides from what they
-said. Three kinds of evidence, because Coolify's stop REMOVES containers
-(``docker rm -f``) and a failed deploy removes the one it started
+So each checkpoint asks the daemons and Coolify, and this module decides from
+what they said. Four kinds of evidence, because Coolify's stop REMOVES
+containers (``docker rm -f``) and a failed deploy removes the one it started
 (ApplicationDeploymentJob v4.7.2:5601-5603):
 
 * a container that is not stopped now;
@@ -28,8 +28,19 @@ said. Three kinds of evidence, because Coolify's stop REMOVES containers
   durable for as long as the container exists;
 * a ``start`` in the daemon's event log, for a container that came and went.
   The daemon keeps only its last 256 events in memory (moby v27.5.1 and
-  v28.3.3 daemon/events/events.go:12,26,113-118), so on a busy server this
-  window may no longer reach back to the stop: :func:`event_log_gap` says when.
+  v28.3.3 daemon/events/events.go:12,26,113-118), and every Docker health
+  probe logs three (exec_create, exec_start, exec_die): on a host whose other
+  stacks probe every few seconds this window rarely reaches back to the stop,
+  and a daemon restarted since holds none at all. :func:`event_log_gap` says when;
+* for an APPLICATION, a row in its deployment history
+  (``GET /deployments/applications/{uuid}``) that the stop did not see ended
+  (:func:`deployment_breaches`). Durable where the event log is not: Coolify
+  keeps the rows for 60 days (CleanupDatabase v4.1.2:23-26,52-57,
+  v4.7.2:29-31,47) and a failed deploy leaves its row. Compared by uuid and
+  by Coolify's own order, never by a time, so no clock is involved at all.
+  QUIESCE waits out every source deployment before the stop
+  (``engine/deploy_triggers.await_source_deployments``), so a row this tool
+  did not see ended is never its own.
 
 Times are the host's own clock throughout — ``date +%s`` read on the source
 once the stop gate passed, ``StartedAt`` and event times written by that
@@ -94,6 +105,22 @@ STOPPED_CLOCK = "stopped_clock"
 #: they stopped again passes, and anything started after the block still counts.
 REVIVAL_SEEN_CLOCK = "revival_seen_clock"
 
+#: QUIESCE journals, with :data:`STOP_CLOCK`, the deployments every source
+#: APPLICATION had ENDED by then: ``{source app uuid: [deployment uuid, ...]}``
+#: (:func:`ended_deployments`). Read just before the stop request, after the
+#: wait for its deployments to end; one still queued or running then refuses
+#: the stop (``engine/containment.deployments_before_stop``). A row the record
+#: does not hold is a deployment of the stopped source (:func:`deployment_breaches`).
+#: A journal without the record (from before it) gets no deployment check.
+SOURCE_DEPLOYMENTS = "source_deployments"
+
+#: Journalled with :data:`REVIVAL_SEEN_CLOCK` at a block after START: every
+#: source deployment that check read, added to an earlier block's
+#: (:func:`seen_deployments`). The operator was shown them, so a resume does not
+#: block on them again; one queued after the block still counts, and one still
+#: queued or running counts until it ends.
+REVIVAL_SEEN_DEPLOYMENTS = "revival_seen_deployments"
+
 #: COPY journals ``{source volume: CreatedAt}`` for every source volume it copied,
 #: once the end-of-copy checkpoint passed. A rollback after FINALIZE(keep/rename)
 #: compares it (``compensations.source_data_refusal``): a volume pruned and
@@ -153,6 +180,9 @@ class EventLog:
     starts: tuple[StartEvent, ...] = ()
     oldest: int | None = None
     """The oldest event of ANY kind the daemon still holds; ``None`` if it holds none."""
+    read_at: int | None = None
+    """The host's clock when the log was read (the ``--until`` of both queries);
+    ``None`` when the output did not say."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,15 +235,21 @@ def started_at_of(state_json: str) -> int | None:
 
 
 def parse_event_log(stdout: str) -> EventLog:
-    """What :func:`quiesce.start_events` printed: an ``oldest <unix>`` line, then
-    one ``{{json .}}`` line per container ``start``. Anything else is skipped."""
+    """What :func:`quiesce.start_events` printed: an ``until <unix>`` line, an
+    ``oldest <unix>`` line, then one ``{{json .}}`` line per container ``start``.
+    Anything else is skipped."""
     oldest: int | None = None
+    read_at: int | None = None
     starts: list[StartEvent] = []
     for line in stdout.splitlines():
         line = line.strip()
         if line.startswith("oldest "):
             value = line.removeprefix("oldest ").strip()
             oldest = int(value) if value.isdigit() else oldest
+            continue
+        if line.startswith("until "):
+            value = line.removeprefix("until ").strip()
+            read_at = int(value) if value.isdigit() else read_at
             continue
         if not line.startswith("{"):
             continue
@@ -234,7 +270,7 @@ def parse_event_log(stdout: str) -> EventLog:
         if not isinstance(when, int):
             continue
         starts.append(StartEvent(name=attributes.get("name", ""), time=when, attributes=attributes))
-    return EventLog(starts=tuple(starts), oldest=oldest)
+    return EventLog(starts=tuple(starts), oldest=oldest, read_at=read_at)
 
 
 def mounts_writable(mounts_json: str, volumes: Collection[str]) -> bool | None:
@@ -472,10 +508,21 @@ def event_log_gap(events: EventLog | None, since: int | None) -> int | None:
     is older than ``since``, nothing after ``since`` was dropped. If it is newer,
     a container that started and was removed again before it cannot be ruled
     out — one that still exists, running or not, is found all the same.
+
+    A daemon that holds no event at all is no complete log: the buffer lives in
+    memory, so it was restarted since (the stop alone left events). Then the
+    log reaches back to nothing before it was read: ``read_at``, or ``since + 1``
+    when the output did not say.
     """
-    if events is None or since is None or events.oldest is None:
+    if events is None or since is None:
         return None
+    if events.oldest is None:
+        return events.read_at if events.read_at is not None else since + 1
     return events.oldest if events.oldest > since else None
+
+
+#: Coolify's cancellable statuses (below), and a row that could not be read.
+_PENDING = frozenset({QUEUED, IN_PROGRESS, ""})
 
 
 def unsettled(deployments: Iterable[Deployment]) -> list[Deployment]:
@@ -491,7 +538,112 @@ def unsettled(deployments: Iterable[Deployment]) -> list[Deployment]:
     (v4.7.2:234-278), so its container can outlive the delete. A status this
     tool does not know cannot be cancelled either, and does not count.
     """
-    return [d for d in deployments if d.status in (QUEUED, IN_PROGRESS, "")]
+    return [d for d in deployments if d.status in _PENDING]
+
+
+# ── the deployment history: the witness no clock and no buffer can lose ─────
+
+
+def ended_deployments(deployments: Iterable[Deployment]) -> list[str]:
+    """The uuids of the deployments that had ENDED: what QUIESCE journals at the stop.
+
+    One still queued or running is left out on purpose: Coolify's stop cancels
+    none, so it runs after the stop. QUIESCE refuses the stop over it
+    (``engine/containment.deployments_before_stop``); left out, it would be
+    reported by the first checkpoint all the same (:func:`deployment_breaches`).
+    """
+    return sorted({d.uuid for d in deployments if d.uuid and d.status not in _PENDING})
+
+
+def _uuid_lists(raw: object) -> dict[str, list[str]] | None:
+    if not isinstance(raw, dict):
+        return None
+    return {
+        str(app): [u for u in uuids if isinstance(u, str)]
+        for app, uuids in raw.items()
+        if isinstance(uuids, list)
+    }
+
+
+def accounted_deployments(
+    quiesce_detail: Mapping[str, object],
+) -> dict[str, frozenset[str]] | None:
+    """Per source application, the deployments a checkpoint need not report.
+
+    Those that had ended at the stop (:data:`SOURCE_DEPLOYMENTS`) and those a
+    block after START has shown (:data:`REVIVAL_SEEN_DEPLOYMENTS`). ``None``
+    when the journal holds no stop record: then there is nothing to compare with.
+    """
+    base = _uuid_lists(quiesce_detail.get(SOURCE_DEPLOYMENTS))
+    if base is None:
+        return None
+    shown = _uuid_lists(quiesce_detail.get(REVIVAL_SEEN_DEPLOYMENTS)) or {}
+    return {app: frozenset({*uuids, *shown.get(app, ())}) for app, uuids in base.items()}
+
+
+def seen_deployments(
+    previous: object, history: Mapping[str, Sequence[Deployment]]
+) -> dict[str, list[str]]:
+    """What a block after START journals: every row this check read, added to an
+    earlier block's record (``previous``, :data:`REVIVAL_SEEN_DEPLOYMENTS`)."""
+    out = {app: set(uuids) for app, uuids in (_uuid_lists(previous) or {}).items()}
+    for app, rows in history.items():
+        out.setdefault(app, set()).update(d.uuid for d in rows if d.uuid)
+    return {app: sorted(uuids) for app, uuids in sorted(out.items())}
+
+
+def deployment_breaches(
+    applications: Sequence[Watched],
+    accounted: Mapping[str, frozenset[str]],
+    history: Mapping[str, Sequence[Deployment]],
+) -> list[Breach]:
+    """Every deployment of a source application the stop did not see ended.
+
+    ``history`` holds each application's newest rows as Coolify lists them,
+    newest first (``GET /deployments/applications/{uuid}``: created_at
+    descending, v4.1.2 Application.php:1084-1099; with id as the tiebreak at
+    v4.7.2:1489-1490). A row counts when it
+
+    * is still queued or running, or could not be read — it starts the source,
+      or is starting it, and nothing here may wait for it; or
+    * is not ``accounted`` and no accounted row sorts above it: queued after the
+      stop, or not ended by it. A row BELOW an accounted one is older than it,
+      so it existed at the stop: one the stop's read did not reach (its page
+      ends at ``take`` rows), surfaced by two rows created in the same second
+      sorting the other way — v4.1.2 orders on created_at alone. Old rows are
+      pruned by age only (CleanupDatabase v4.7.2:47), so none resurfaces otherwise.
+
+    Statuses only, never a log: the client keeps nothing else of a row.
+    An application missing from ``accounted`` has no record and is not judged.
+    """
+    breaches: list[Breach] = []
+    for application in applications:
+        known = accounted.get(application.uuid)
+        rows = history.get(application.uuid)
+        if known is None or rows is None:
+            continue
+        below_known = False
+        for row in rows:
+            fresh = row.uuid not in known and not below_known
+            if row.uuid in known:
+                below_known = True
+            if row.status in _PENDING:
+                why = (
+                    f"is {row.status} (Coolify's deployment history): it starts the "
+                    "stopped source, or is starting it"
+                    if row.status
+                    else "has a status Coolify did not report (Coolify's deployment "
+                    "history): it may still start the source"
+                )
+            elif fresh:
+                why = (
+                    f"came after the stop, or had not ended by it, and is {row.status} "
+                    "(Coolify's deployment history; whatever it started may be gone)"
+                )
+            else:
+                continue
+            breaches.append(Breach(application.name, f"deployment {row.uuid}", why))
+    return breaches
 
 
 def volume_recreated(recorded: str, current: str) -> bool:
@@ -561,10 +713,11 @@ def revived_after_start_hint(*, policy: str, migration_id: str) -> str:
         "on the target only. A rollback would delete that with the target, so this run "
         "does not roll back by itself. Nothing has been undone, and FINALIZE has not "
         "touched the source.\n"
-        "To finish: stop the source in Coolify and hold pushes and CI deploys of it, "
-        f"then coolify-migrate resume {migration_id} - FINALIZE then {fate}. The resume "
-        "refuses again while a source container runs, or if one starts after this "
-        "check.\n"
+        "To finish: stop the source in Coolify, cancel any of its deployments still "
+        "queued or in progress, and hold pushes and CI deploys of it, then "
+        f"coolify-migrate resume {migration_id} - FINALIZE then {fate}. The resume "
+        "refuses again while a source container runs or a source deployment has not "
+        "ended, or if one starts after this check.\n"
         f"To give up the target instead: coolify-migrate rollback {migration_id} - it "
         "deletes the target and everything written to it since START, and restarts "
         "the source."

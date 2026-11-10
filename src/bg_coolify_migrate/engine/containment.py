@@ -10,10 +10,12 @@ A breach is never a warning and has no override — the quiesce gate has no
 source, never deleted before FINALIZE, keeps whatever it wrote. Once START has
 asked for a target, a revived source BLOCKS the run instead
 (``SourceRevivedAfterStart``): the target may have served users since, and the
-rollback would delete what they wrote.
+rollback would delete what they wrote. A check that cannot be answered — the
+event log, a deployment history — raises ``QuiesceError``: it never passes.
 
-Also here, because it guards the same claim: PREFLIGHT's refusal of two server
-records that are one daemon (:func:`assert_separate_daemons`).
+Also here, because they guard the same claim: the deployment record QUIESCE
+journals before its stop (:func:`deployments_before_stop`), and PREFLIGHT's
+refusal of two server records that are one daemon (:func:`assert_separate_daemons`).
 """
 
 from __future__ import annotations
@@ -27,11 +29,15 @@ import structlog
 from bg_coolify_migrate.discovery import docker, pins, quiesce
 from bg_coolify_migrate.domain import containment
 from bg_coolify_migrate.domain.containment import Breach, Seen, Watched
+from bg_coolify_migrate.domain.deployments import Deployment
 from bg_coolify_migrate.domain.statemachine import START_REQUESTED, STARTED_EARLY, State
 from bg_coolify_migrate.engine.context import MigrationContext
 from bg_coolify_migrate.engine.planner import observed_labels, resource_labels
 from bg_coolify_migrate.errors import (
+    MigrationError,
     PreflightError,
+    QuiesceError,
+    SourceDeploymentPending,
     SourceRevived,
     SourceRevivedAfterStart,
     TargetStartedEarly,
@@ -42,6 +48,9 @@ log = structlog.get_logger(__name__)
 
 #: The daemon's engine ID (``containment.parse_daemon_id``).
 DAEMON_ID_COMMAND = "docker info --format '{{.ID}}'"
+
+#: Each source application's deployment history, by uuid, as one check read it.
+History = dict[str, list[Deployment]]
 
 
 async def assert_contained(
@@ -55,15 +64,20 @@ async def assert_contained(
 
     Raises:
         SourceRevived: A source container runs, or started after the stop gate
-            proved it down — before START asked for any target: the run rolls
-            back.
+            proved it down, or a source application has a deployment the stop
+            did not see ended — before START asked for any target: the run
+            rolls back.
         SourceRevivedAfterStart: The same, once START has asked for a target:
             the run blocks (:func:`_block_after_start`).
         TargetStartedEarly: A target container runs, or ever started, before
             START asked for it. Journalled first under START's state, so the
             rollback owes STOP_TARGET for it (``statemachine.target_may_run``).
+        QuiesceError: The event log or a deployment history could not be read.
     """
-    found_source = await _source_breaches(ctx, checkpoint=checkpoint) if source else []
+    found_source: list[Breach] = []
+    history: History | None = None
+    if source:
+        found_source, history = await _source_breaches(ctx, checkpoint=checkpoint)
     found_target, early = await _target_breaches(ctx) if target else ([], [])
     if early:
         journal_started_early(ctx, early)
@@ -74,7 +88,7 @@ async def assert_contained(
             [*found_source, *found_target],
         )
         if _start_asked(ctx):
-            await _block_after_start(ctx, message)
+            await _block_after_start(ctx, message, history)
         raise SourceRevived(message, hint=containment.source_hint())
     if found_target:
         raise TargetStartedEarly(
@@ -110,7 +124,9 @@ def _start_asked(ctx: MigrationContext) -> bool:
     )
 
 
-async def _block_after_start(ctx: MigrationContext, message: str) -> NoReturn:
+async def _block_after_start(
+    ctx: MigrationContext, message: str, history: History | None
+) -> NoReturn:
     """Stop the run, roll nothing back, and say what the operator decides.
 
     The source's clock is journalled first (``containment.REVIVAL_SEEN_CLOCK``):
@@ -120,17 +136,26 @@ async def _block_after_start(ctx: MigrationContext, message: str) -> NoReturn:
     block — a rollback is exactly what must not happen here — so the resume then
     judges from the old instant and blocks again until the source's daemon has
     forgotten those starts; the operator can roll back by hand.
+
+    The deployments this check read go in the same record
+    (``containment.REVIVAL_SEEN_DEPLOYMENTS``), for the same reason, clock or no
+    clock: they are named above, and the resume reports only one that came after,
+    or one still queued or running.
     """
+    detail: dict[str, Any] = {}
+    if history is not None:
+        previous = ctx.journal.undo_info(State.QUIESCE.value).get(
+            containment.REVIVAL_SEEN_DEPLOYMENTS
+        )
+        detail[containment.REVIVAL_SEEN_DEPLOYMENTS] = containment.seen_deployments(
+            previous, history
+        )
     try:
-        seen_at = await quiesce.now_on(ctx.source_host)
+        detail[containment.REVIVAL_SEEN_CLOCK] = await quiesce.now_on(ctx.source_host)
     except Exception as exc:  # the block itself must not become a rollback
         log.warning("containment.revival_clock_unread", error=str(exc)[:200])
-    else:
-        ctx.journal.append(
-            "containment",
-            state=State.QUIESCE.value,
-            detail={containment.REVIVAL_SEEN_CLOCK: seen_at},
-        )
+    if detail:
+        ctx.journal.append("containment", state=State.QUIESCE.value, detail=detail)
     raise SourceRevivedAfterStart(
         message,
         hint=containment.revived_after_start_hint(
@@ -192,7 +217,16 @@ def _watched_sources(ctx: MigrationContext) -> list[Watched]:
     ]
 
 
-async def _source_breaches(ctx: MigrationContext, *, checkpoint: str) -> list[Breach]:
+def _source_applications(ctx: MigrationContext) -> list[Watched]:
+    applications = {
+        r.snapshot.uuid for r in ctx.plan.resources if r.snapshot.collection == "applications"
+    }
+    return [w for w in _watched_sources(ctx) if w.uuid in applications]
+
+
+async def _source_breaches(
+    ctx: MigrationContext, *, checkpoint: str
+) -> tuple[list[Breach], History | None]:
     """The source side: the plan's label filter, then the probes no rename can hide from.
 
     The uuid probe and the migrated-volume probe are PREFLIGHT's
@@ -202,6 +236,11 @@ async def _source_breaches(ctx: MigrationContext, *, checkpoint: str) -> list[Br
     created and never started, and are left out. A container only the volume
     probe found has its mounts read: a read-only reader is no revival
     (``containment.source_breaches``).
+
+    Then every source application's deployment history, against the record
+    QUIESCE journalled at the stop (``containment.deployment_breaches``).
+    Returned with the breaches — ``None`` for a journal without that record —
+    so a block can journal what it showed.
     """
     host = ctx.source_host
     since = revival_clock(ctx)
@@ -243,10 +282,56 @@ async def _source_breaches(ctx: MigrationContext, *, checkpoint: str) -> list[Br
             checkpoint=checkpoint,
             server=ctx.plan.source_server.name,
             complete_from=complete_from,
-            hint="the daemon keeps its last 256 events: a source container that started and "
-            "was removed again before then cannot be ruled out; one still there is found",
+            empty=events is not None and events.oldest is None,
+            hint="the daemon keeps its last 256 events, and none across a restart: a source "
+            "container that started and was removed again before then cannot be ruled out; "
+            "one still there is found, and an application's deployment history still counts",
         )
-    return containment.source_breaches(watched, seen, events, since=since, stack=stack)
+    breaches = containment.source_breaches(watched, seen, events, since=since, stack=stack)
+    applications = _source_applications(ctx)
+    accounted = containment.accounted_deployments(ctx.journal.undo_info(State.QUIESCE.value))
+    if accounted is None:
+        if applications:
+            log.warning(
+                "containment.no_deployment_record",
+                checkpoint=checkpoint,
+                hint="the journal predates the stop's deployment record: an application's "
+                "deployment history is not compared",
+            )
+        return breaches, None
+    history: History = {
+        a.uuid: await _deployment_history(ctx, a) for a in applications if a.uuid in accounted
+    }
+    breaches.extend(containment.deployment_breaches(applications, accounted, history))
+    return breaches, history
+
+
+async def _deployment_history(ctx: MigrationContext, application: Watched) -> list[Deployment]:
+    """One source application's newest deployment rows, uuid and status only.
+
+    Never silently: a history that cannot be read cannot say nothing deployed
+    the source, the rule of the event log (``quiesce.start_events``). A 404 is
+    Coolify saying the application is gone — no answer either.
+    """
+    why: str
+    try:
+        rows = await ctx.api.application_deployments(application.uuid)
+    except MigrationError as exc:
+        why = (str(exc).splitlines() or [type(exc).__name__])[0][:200]
+    else:
+        if rows is not None:
+            return rows
+        why = "Coolify has no such application any more (404)"
+    raise QuiesceError(
+        f"could not read the deployment history of {application.name} to check that "
+        "nothing deployed the stopped source",
+        hint=(
+            "A deploy of the source that came up and was removed again - a failed "
+            "redeploy - leaves its row there long after the daemon's event log has "
+            "forgotten it, so without it this check cannot say that nothing started.\n"
+            f"Coolify said: {why}"
+        ),
+    )
 
 
 async def _target_breaches(ctx: MigrationContext) -> tuple[list[Breach], list[str]]:
@@ -287,6 +372,46 @@ async def _target_breaches(ctx: MigrationContext) -> tuple[list[Breach], list[st
         watched, seen, await quiesce.start_events(host, since=0)
     )
     return breaches, sorted({b.uuid for b in breaches if b.uuid})
+
+
+async def deployments_before_stop(ctx: MigrationContext) -> dict[str, list[str]]:
+    """QUIESCE, just before the stop: the deployments each source application had ENDED.
+
+    Journalled beside the stop clock (``containment.SOURCE_DEPLOYMENTS``); every
+    later source checkpoint reports a row this does not hold. Read after
+    ``deploy_triggers.await_source_deployments`` waited them out, so every row
+    queued from here on is someone else's. Read-only, and BEFORE anything is
+    stopped, while the source still serves: a history that cannot be read
+    refuses the stop (:func:`_deployment_history`), and so does a deployment
+    queued since that wait — Coolify's stop would not cancel it, and it would
+    start the source again after it.
+
+    Raises:
+        QuiesceError: A history could not be read.
+        SourceDeploymentPending: A source deployment is queued or running.
+    """
+    record: dict[str, list[str]] = {}
+    pending: list[str] = []
+    for application in _source_applications(ctx):
+        rows = await _deployment_history(ctx, application)
+        pending.extend(
+            f"{application.name}: deployment {d.uuid} is {d.status or 'of unknown status'}"
+            for d in containment.unsettled(rows)
+        )
+        record[application.uuid] = containment.ended_deployments(rows)
+    if pending:
+        raise SourceDeploymentPending(
+            "a source deployment has not ended, so the stop is refused:\n" + "\n".join(pending),
+            hint=(
+                "It was queued after this run waited for the source's deployments to end. "
+                "Coolify's stop cancels no deployment, and its queue starts what is waiting: "
+                "the source would come back up after the stop, beside a copy that never sees "
+                "its writes. Let it finish, or cancel it in Coolify, then run the migration "
+                "again - this tool never cancels one. Nothing was stopped: the source keeps "
+                "serving, its auto-deploy is switched back on and the created target is deleted."
+            ),
+        )
+    return record
 
 
 async def assert_separate_daemons(ctx: MigrationContext) -> None:

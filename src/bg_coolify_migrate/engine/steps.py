@@ -37,7 +37,12 @@ from bg_coolify_migrate.dns.gate import (
 from bg_coolify_migrate.domain import binds, domains, fidelity
 from bg_coolify_migrate.domain.binds import BindPair
 from bg_coolify_migrate.domain.compose import MountClass
-from bg_coolify_migrate.domain.containment import STOP_CLOCK, STOPPED_CLOCK, TARGET_HINT
+from bg_coolify_migrate.domain.containment import (
+    SOURCE_DEPLOYMENTS,
+    STOP_CLOCK,
+    STOPPED_CLOCK,
+    TARGET_HINT,
+)
 from bg_coolify_migrate.domain.deployments import (
     Progress,
     deployment_uuid_of,
@@ -1140,6 +1145,10 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
     # moment nothing references the source's volumes - which is all Coolify's
     # `docker volume prune -af` asks. A failure here costs nothing.
     source_pins = await _pin_source(ctx)
+    # What each source application had deployed by now: the checkpoints report
+    # any deployment this does not hold (containment.SOURCE_DEPLOYMENTS). A
+    # refusal here comes while the source still serves.
+    deployed = await containment.deployments_before_stop(ctx)
 
     try:
         # The source's clock, not ours: it is the window for the event-log check
@@ -1151,7 +1160,9 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
         # without ever completing. The marker makes the rollback owe the restart
         # anyway (statemachine.source_was_stopped).
         ctx.journal.append(
-            "step_started", state="quiesce", detail={STOP_REQUESTED: True, STOP_CLOCK: since}
+            "step_started",
+            state="quiesce",
+            detail={STOP_REQUESTED: True, STOP_CLOCK: since, SOURCE_DEPLOYMENTS: deployed},
         )
         await _request_stop(ctx)
 
