@@ -11,7 +11,20 @@ source, never deleted before FINALIZE, keeps whatever it wrote. Once START has
 asked for a target, a revived source BLOCKS the run instead
 (``SourceRevivedAfterStart``): the target may have served users since, and the
 rollback would delete what they wrote. A check that cannot be answered — the
-event log, a deployment history — raises ``QuiesceError``: it never passes.
+event log, a deployment history — never passes: it raises ``QuiesceError``. An
+unread deployment history once START asked blocks instead
+(``SourceUncheckedAfterStart``), for the revival's reason — a Coolify API that
+does not answer for a while must not roll a cutover back — and a breach found in
+the same check is raised first, with the unread histories beside it.
+
+An application Coolify says it no longer has (its own 404: the row is
+soft-deleted) has no history left to compare, and nothing queues a deployment
+of it any more: every lookup behind ``/deploy``, the webhooks and the dashboard
+skips trashed rows; only the cancel route reads them, so that a deployment
+already in flight during the delete stays cancellable (DeployController
+v4.7.2:239-240) — and such a one may still start a container. Its containers
+carry its uuid and are still looked for. An application FINALIZE journalled as
+deleted is not asked at all: the delete is this run's own.
 
 Also here, because they guard the same claim: the deployment record QUIESCE
 journals before its stop (:func:`deployments_before_stop`), and PREFLIGHT's
@@ -40,6 +53,7 @@ from bg_coolify_migrate.errors import (
     SourceDeploymentPending,
     SourceRevived,
     SourceRevivedAfterStart,
+    SourceUncheckedAfterStart,
     TargetStartedEarly,
 )
 from bg_coolify_migrate.transfer.ssh import RemoteHost
@@ -51,6 +65,12 @@ DAEMON_ID_COMMAND = "docker info --format '{{.ID}}'"
 
 #: Each source application's deployment history, by uuid, as one check read it.
 History = dict[str, list[Deployment]]
+
+#: ``(application name, why)`` for each history a check could not read.
+Unread = list[tuple[str, str]]
+
+#: What a 404 from Coolify itself means at the stop: no history to record.
+_GONE = "Coolify has no such application any more (404)"
 
 
 async def assert_contained(
@@ -72,20 +92,28 @@ async def assert_contained(
         TargetStartedEarly: A target container runs, or ever started, before
             START asked for it. Journalled first under START's state, so the
             rollback owes STOP_TARGET for it (``statemachine.target_may_run``).
-        QuiesceError: The event log or a deployment history could not be read.
+        SourceUncheckedAfterStart: Nothing of the above, but a source
+            application's deployment history could not be read, once START has
+            asked for a target: the run blocks.
+        QuiesceError: The event log could not be read, or a deployment history
+            could not be read before START asked for any target.
     """
     found_source: list[Breach] = []
     history: History | None = None
+    unread: Unread = []
     if source:
-        found_source, history = await _source_breaches(ctx, checkpoint=checkpoint)
+        found_source, history, unread = await _source_breaches(ctx, checkpoint=checkpoint)
     found_target, early = await _target_breaches(ctx) if target else ([], [])
     if early:
         journal_started_early(ctx, early)
+    # What was found goes first, whatever could not be read beside it: an unread
+    # history must not turn a revival found after START into a rollback.
+    also = containment.unread_breaches(unread)
     if found_source:
         message = containment.breach_message(
             "the source was started again after QUIESCE stopped it",
             checkpoint,
-            [*found_source, *found_target],
+            [*found_source, *found_target, *also],
         )
         if _start_asked(ctx):
             await _block_after_start(ctx, message, history)
@@ -93,10 +121,24 @@ async def assert_contained(
     if found_target:
         raise TargetStartedEarly(
             containment.breach_message(
-                "a target was started before START asked for it", checkpoint, found_target
+                "a target was started before START asked for it",
+                checkpoint,
+                [*found_target, *also],
             ),
             hint=containment.TARGET_HINT,
         )
+    if unread:
+        message = containment.unread_history_message(unread, checkpoint)
+        if _start_asked(ctx):
+            raise SourceUncheckedAfterStart(
+                message,
+                hint=containment.unchecked_after_start_hint(
+                    policy=ctx.plan.finalize_policy.value,
+                    migration_id=ctx.migration_id,
+                    unread=unread,
+                ),
+            )
+        raise QuiesceError(message, hint=containment.unread_history_hint(unread))
     log.debug("containment.ok", checkpoint=checkpoint, source=source, target=target)
 
 
@@ -137,18 +179,16 @@ async def _block_after_start(
     judges from the old instant and blocks again until the source's daemon has
     forgotten those starts; the operator can roll back by hand.
 
-    The deployments this check read go in the same record
-    (``containment.REVIVAL_SEEN_DEPLOYMENTS``), for the same reason, clock or no
-    clock: they are named above, and the resume reports only one that came after,
-    or one still queued or running.
+    The deployments this check read go in the same record, for the same reason,
+    clock or no clock (``containment.block_record``): those that had ended are
+    accounted from now on; one still queued or running is reported while it is,
+    and once more after it ended, because it ran after this check. A history
+    this check could not read records nothing — the resume reads it again.
     """
     detail: dict[str, Any] = {}
     if history is not None:
-        previous = ctx.journal.undo_info(State.QUIESCE.value).get(
-            containment.REVIVAL_SEEN_DEPLOYMENTS
-        )
-        detail[containment.REVIVAL_SEEN_DEPLOYMENTS] = containment.seen_deployments(
-            previous, history
+        detail.update(
+            containment.block_record(ctx.journal.undo_info(State.QUIESCE.value), history)
         )
     try:
         detail[containment.REVIVAL_SEEN_CLOCK] = await quiesce.now_on(ctx.source_host)
@@ -226,7 +266,7 @@ def _source_applications(ctx: MigrationContext) -> list[Watched]:
 
 async def _source_breaches(
     ctx: MigrationContext, *, checkpoint: str
-) -> tuple[list[Breach], History | None]:
+) -> tuple[list[Breach], History | None, Unread]:
     """The source side: the plan's label filter, then the probes no rename can hide from.
 
     The uuid probe and the migrated-volume probe are PREFLIGHT's
@@ -240,7 +280,8 @@ async def _source_breaches(
     Then every source application's deployment history, against the record
     QUIESCE journalled at the stop (``containment.deployment_breaches``).
     Returned with the breaches — ``None`` for a journal without that record —
-    so a block can journal what it showed.
+    so a block can journal what it showed, and with the histories that could
+    not be read, which never pass (:func:`assert_contained` decides how).
     """
     host = ctx.source_host
     since = revival_clock(ctx)
@@ -289,7 +330,8 @@ async def _source_breaches(
         )
     breaches = containment.source_breaches(watched, seen, events, since=since, stack=stack)
     applications = _source_applications(ctx)
-    accounted = containment.accounted_deployments(ctx.journal.undo_info(State.QUIESCE.value))
+    detail = ctx.journal.undo_info(State.QUIESCE.value)
+    accounted = containment.accounted_deployments(detail)
     if accounted is None:
         if applications:
             log.warning(
@@ -298,39 +340,72 @@ async def _source_breaches(
                 hint="the journal predates the stop's deployment record: an application's "
                 "deployment history is not compared",
             )
-        return breaches, None
-    history: History = {
-        a.uuid: await _deployment_history(ctx, a) for a in applications if a.uuid in accounted
-    }
-    breaches.extend(containment.deployment_breaches(applications, accounted, history))
-    return breaches, history
+        return breaches, None, []
+    deleted = _deleted_by_finalize(ctx)
+    history: History = {}
+    unread: Unread = []
+    for application in applications:
+        if application.uuid not in accounted:
+            continue
+        if application.uuid in deleted:
+            log.debug("containment.history_skipped", application=application.name)
+            continue
+        rows, why = await _read_history(ctx, application)
+        if rows is not None:
+            history[application.uuid] = rows
+        elif why is not None:
+            unread.append((application.name, why))
+        else:
+            log.warning(
+                "containment.source_application_gone",
+                checkpoint=checkpoint,
+                application=application.name,
+                hint="Coolify no longer has it (deleted in Coolify): no history to compare; "
+                "its containers are still looked for",
+            )
+    breaches.extend(
+        containment.deployment_breaches(
+            applications, accounted, history, pending=containment.pending_at_block(detail)
+        )
+    )
+    return breaches, history, unread
 
 
-async def _deployment_history(ctx: MigrationContext, application: Watched) -> list[Deployment]:
+def _deleted_by_finalize(ctx: MigrationContext) -> set[str]:
+    """The source uuids FINALIZE(delete) journalled as deleted (``steps._delete_source``)."""
+    raw = ctx.journal.undo_info(State.FINALIZE.value).get("deleted")
+    return {u for u in raw if isinstance(u, str)} if isinstance(raw, list) else set()
+
+
+async def _read_history(
+    ctx: MigrationContext, application: Watched
+) -> tuple[list[Deployment] | None, str | None]:
     """One source application's newest deployment rows, uuid and status only.
 
-    Never silently: a history that cannot be read cannot say nothing deployed
-    the source, the rule of the event log (``quiesce.start_events``). A 404 is
-    Coolify saying the application is gone — no answer either.
+    ``(rows, None)`` when read; ``(None, None)`` when Coolify says it has no such
+    application (``client.application_deployments``); ``(None, why)`` when it
+    could not be read — which never means that nothing deployed the source, the
+    rule of the event log (``quiesce.start_events``).
     """
-    why: str
     try:
         rows = await ctx.api.application_deployments(application.uuid)
     except MigrationError as exc:
-        why = (str(exc).splitlines() or [type(exc).__name__])[0][:200]
-    else:
-        if rows is not None:
-            return rows
-        why = "Coolify has no such application any more (404)"
+        return None, (str(exc).splitlines() or [type(exc).__name__])[0][:200]
+    return rows, None
+
+
+async def _deployment_history(ctx: MigrationContext, application: Watched) -> list[Deployment]:
+    """QUIESCE: one source application's history, or the stop is refused.
+
+    Before the stop a source Coolify no longer has cannot be recorded either:
+    its 404 refuses like any unread history.
+    """
+    rows, why = await _read_history(ctx, application)
+    if rows is not None:
+        return rows
+    unread = [(application.name, why or _GONE)]
     raise QuiesceError(
-        f"could not read the deployment history of {application.name} to check that "
-        "nothing deployed the stopped source",
-        hint=(
-            "A deploy of the source that came up and was removed again - a failed "
-            "redeploy - leaves its row there long after the daemon's event log has "
-            "forgotten it, so without it this check cannot say that nothing started.\n"
-            f"Coolify said: {why}"
-        ),
+        containment.unread_history_message(unread), hint=containment.unread_history_hint(unread)
     )
 
 

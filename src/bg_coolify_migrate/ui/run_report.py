@@ -18,7 +18,7 @@ from rich.text import Text
 
 from bg_coolify_migrate.domain.statemachine import Outcome, State
 from bg_coolify_migrate.engine.executor import RunResult
-from bg_coolify_migrate.errors import SourceRevivedAfterStart
+from bg_coolify_migrate.errors import SourceRevivedAfterStart, SourceUncheckedAfterStart
 from bg_coolify_migrate.ui.console import human_duration
 
 _OUTCOME_STYLE = {
@@ -74,13 +74,15 @@ def outcome_panel(result: RunResult, *, migration_id: str, elapsed: float | None
     if elapsed is not None:
         lines.append(Text(f"\nElapsed: {human_duration(elapsed)}", style="muted"))
 
+    if isinstance(result.error, SourceUncheckedAfterStart):
+        title = "Stopped - the source could not be checked, and nothing was undone"
+    elif isinstance(result.error, SourceRevivedAfterStart):
+        title = "Stopped - the source was started again, and needs your decision"
+    else:
+        title = _OUTCOME_TITLE[result.outcome]
     return Panel(
         Group(*lines),
-        title=(
-            "Stopped - the source was started again, and needs your decision"
-            if isinstance(result.error, SourceRevivedAfterStart)
-            else _OUTCOME_TITLE[result.outcome]
-        ),
+        title=title,
         border_style=_OUTCOME_STYLE[result.outcome],
         title_align="left",
     )
@@ -137,8 +139,16 @@ def _where_blocked(result: RunResult) -> str:
     (``engine/containment.py``) — the claim it may make is that one, as of that
     check: nothing guards either while the run waits. And a source found running
     again once START asked for a target blocks too: the target is up, the
-    source is NOT stopped, and the error above says the two ways on.
+    source is NOT stopped, and the error above says the two ways on. So does
+    a source whose deployment history Coolify did not give then — not found
+    running, but not proven stopped either.
     """
+    if isinstance(result.error, SourceUncheckedAfterStart):
+        return (
+            "Nothing has been undone: the target is started and keeps what it\n"
+            "received. Whether anything started your source again could not be\n"
+            "checked (above). Resume once Coolify answers, or roll back to give up the target."
+        )
     if isinstance(result.error, SourceRevivedAfterStart):
         return (
             "Nothing has been undone: the target is started and keeps what it\n"

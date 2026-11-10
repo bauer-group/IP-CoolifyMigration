@@ -115,11 +115,18 @@ REVIVAL_SEEN_CLOCK = "revival_seen_clock"
 SOURCE_DEPLOYMENTS = "source_deployments"
 
 #: Journalled with :data:`REVIVAL_SEEN_CLOCK` at a block after START: every
-#: source deployment that check read, added to an earlier block's
-#: (:func:`seen_deployments`). The operator was shown them, so a resume does not
-#: block on them again; one queued after the block still counts, and one still
-#: queued or running counts until it ends.
+#: source deployment that check read and that had ENDED, added to an earlier
+#: block's (:func:`block_record`). The operator was shown them, so a resume does
+#: not block on them again; one queued after the block still counts.
 REVIVAL_SEEN_DEPLOYMENTS = "revival_seen_deployments"
+
+#: Journalled beside :data:`REVIVAL_SEEN_DEPLOYMENTS`: the deployments a block
+#: after START showed while they were still queued, running or unread. Never
+#: accounted, for the reason the stop's record holds ended rows only: one that
+#: had not ended at the block runs after it. Each counts while it is pending, and
+#: ONCE more after it ended, whatever row sorts above it — a newer row the block
+#: saw ended (:func:`deployment_breaches`); the next block then accounts for it.
+REVIVAL_PENDING_DEPLOYMENTS = "revival_pending_deployments"
 
 #: COPY journals ``{source volume: CreatedAt}`` for every source volume it copied,
 #: once the end-of-copy checkpoint passed. A rollback after FINALIZE(keep/rename)
@@ -571,7 +578,7 @@ def accounted_deployments(
     """Per source application, the deployments a checkpoint need not report.
 
     Those that had ended at the stop (:data:`SOURCE_DEPLOYMENTS`) and those a
-    block after START has shown (:data:`REVIVAL_SEEN_DEPLOYMENTS`). ``None``
+    block after START has shown ended (:data:`REVIVAL_SEEN_DEPLOYMENTS`). ``None``
     when the journal holds no stop record: then there is nothing to compare with.
     """
     base = _uuid_lists(quiesce_detail.get(SOURCE_DEPLOYMENTS))
@@ -581,21 +588,53 @@ def accounted_deployments(
     return {app: frozenset({*uuids, *shown.get(app, ())}) for app, uuids in base.items()}
 
 
-def seen_deployments(
-    previous: object, history: Mapping[str, Sequence[Deployment]]
-) -> dict[str, list[str]]:
-    """What a block after START journals: every row this check read, added to an
-    earlier block's record (``previous``, :data:`REVIVAL_SEEN_DEPLOYMENTS`)."""
-    out = {app: set(uuids) for app, uuids in (_uuid_lists(previous) or {}).items()}
+def pending_at_block(quiesce_detail: Mapping[str, object]) -> dict[str, frozenset[str]]:
+    """Per source application, what a block after START showed still pending
+    (:data:`REVIVAL_PENDING_DEPLOYMENTS`); empty before any block."""
+    pending = _uuid_lists(quiesce_detail.get(REVIVAL_PENDING_DEPLOYMENTS)) or {}
+    return {app: frozenset(uuids) for app, uuids in pending.items()}
+
+
+def block_record(
+    quiesce_detail: Mapping[str, object], history: Mapping[str, Sequence[Deployment]]
+) -> dict[str, dict[str, list[str]]]:
+    """What a block after START journals of the rows its check read. PURE.
+
+    Merged with an earlier block's record, because each record replaces the
+    last (``Journal.undo_info``):
+
+    * :data:`REVIVAL_SEEN_DEPLOYMENTS` gains every row that had ENDED — shown,
+      so accounted from now on. That includes a row an earlier block showed
+      pending: this check reported it ended (:func:`deployment_breaches`).
+    * :data:`REVIVAL_PENDING_DEPLOYMENTS` holds every row still queued, running
+      or unread, and keeps an earlier block's pending row this read did not list.
+      A row the stop or a block already saw ended is never pending again: an
+      unread status for it is a read that failed, not a deployment that resumed.
+
+    An application this check did not read keeps what it had.
+    """
+    shown = _uuid_lists(quiesce_detail.get(REVIVAL_SEEN_DEPLOYMENTS)) or {}
+    seen = {app: set(uuids) for app, uuids in shown.items()}
+    pending = {app: set(uuids) for app, uuids in pending_at_block(quiesce_detail).items()}
+    stopped = _uuid_lists(quiesce_detail.get(SOURCE_DEPLOYMENTS)) or {}
     for app, rows in history.items():
-        out.setdefault(app, set()).update(d.uuid for d in rows if d.uuid)
-    return {app: sorted(uuids) for app, uuids in sorted(out.items())}
+        ended = {d.uuid for d in rows if d.uuid and d.status not in _PENDING}
+        known = seen.setdefault(app, set())
+        known.update(ended)
+        still = {d.uuid for d in rows if d.uuid and d.status in _PENDING}
+        pending[app] = (pending.get(app, set()) | still) - known - set(stopped.get(app, ()))
+    return {
+        REVIVAL_SEEN_DEPLOYMENTS: {app: sorted(u) for app, u in sorted(seen.items())},
+        REVIVAL_PENDING_DEPLOYMENTS: {app: sorted(u) for app, u in sorted(pending.items())},
+    }
 
 
 def deployment_breaches(
     applications: Sequence[Watched],
     accounted: Mapping[str, frozenset[str]],
     history: Mapping[str, Sequence[Deployment]],
+    *,
+    pending: Mapping[str, frozenset[str]] | None = None,
 ) -> list[Breach]:
     """Every deployment of a source application the stop did not see ended.
 
@@ -606,6 +645,10 @@ def deployment_breaches(
 
     * is still queued or running, or could not be read — it starts the source,
       or is starting it, and nothing here may wait for it; or
+    * was ``pending`` when a block after START showed it (:func:`pending_at_block`)
+      and has ended since — it may have started the source after that check,
+      and its container may be gone. Wherever it sorts: the block may have seen
+      a NEWER row ended, which is accounted and sits above it; or
     * is not ``accounted`` and no accounted row sorts above it: queued after the
       stop, or not ended by it. A row BELOW an accounted one is older than it,
       so it existed at the stop: one the stop's read did not reach (its page
@@ -622,6 +665,7 @@ def deployment_breaches(
         rows = history.get(application.uuid)
         if known is None or rows is None:
             continue
+        was_pending = (pending or {}).get(application.uuid, frozenset())
         below_known = False
         for row in rows:
             fresh = row.uuid not in known and not below_known
@@ -634,6 +678,12 @@ def deployment_breaches(
                     if row.status
                     else "has a status Coolify did not report (Coolify's deployment "
                     "history): it may still start the source"
+                )
+            elif row.uuid in was_pending and row.uuid not in known:
+                why = (
+                    f"had not ended when this run last blocked, and is {row.status} "
+                    "now (Coolify's deployment history): it may have started the source "
+                    "after that check, and whatever it started may be gone"
                 )
             elif fresh:
                 why = (
@@ -717,10 +767,75 @@ def revived_after_start_hint(*, policy: str, migration_id: str) -> str:
         "queued or in progress, and hold pushes and CI deploys of it, then "
         f"coolify-migrate resume {migration_id} - FINALIZE then {fate}. The resume "
         "refuses again while a source container runs or a source deployment has not "
-        "ended, or if one starts after this check.\n"
+        "ended, or if one starts after this check - and once more for a deployment "
+        "still queued or running here, after it ends, cancelled or not: it may have "
+        "started the source after this check.\n"
         f"To give up the target instead: coolify-migrate rollback {migration_id} - it "
         "deletes the target and everything written to it since START, and restarts "
         "the source."
+    )
+
+
+_HISTORY_WITNESS = (
+    "A deploy of the source that came up and was removed again - a failed redeploy - "
+    "leaves its row in Coolify's deployment history long after the daemon's event log "
+    "has forgotten it, so without that history this check cannot say that nothing "
+    "started the source."
+)
+
+
+def unread_history_message(unread: Sequence[tuple[str, str]], checkpoint: str = "") -> str:
+    """A check whose deployment histories (``(application, why)``) could not be read."""
+    names = ", ".join(name for name, _ in unread)
+    where = f" (at {checkpoint})" if checkpoint else ""
+    return (
+        f"could not read the deployment history of {names} to check that nothing "
+        f"deployed the stopped source{where}"
+    )
+
+
+def _coolify_said(unread: Sequence[tuple[str, str]]) -> str:
+    return "\n".join(f"Coolify said of {name}: {why}" for name, why in unread)
+
+
+def unread_history_hint(unread: Sequence[tuple[str, str]]) -> str:
+    """Why an unread history never passes — before START: the run rolls back."""
+    return f"{_HISTORY_WITNESS}\n{_coolify_said(unread)}"
+
+
+def unread_breaches(unread: Sequence[tuple[str, str]]) -> list[Breach]:
+    """Unread histories as lines under a breach found in the same check, so a
+    revival already found is reported with what could not be checked beside it."""
+    return [
+        Breach(name, "its deployment history", f"could not be read either ({why})")
+        for name, why in unread
+    ]
+
+
+def unchecked_after_start_hint(
+    *, policy: str, migration_id: str, unread: Sequence[tuple[str, str]]
+) -> str:
+    """An unread history once START asked for a target: a block, like a revival.
+
+    Not proof that anything started the source — a check that cannot say that
+    nothing did. Before START that rolls back (:func:`unread_history_hint`);
+    after it the target may hold users' writes, which the rollback deletes, so
+    a Coolify that does not answer for a while (a restart, its own update) must
+    not decide that. Nothing is journalled: nothing was shown.
+    """
+    fate = _FINALIZE_FATE.get(policy, "applies the finalize policy to the source")
+    return (
+        f"{_HISTORY_WITNESS}\n{_coolify_said(unread)}\n"
+        "START has already asked Coolify to start the target, and the DNS gate let it: it "
+        "may have served users since then, and what they wrote is on the target only. A "
+        "rollback would delete that with the target, so this run does not roll back over a "
+        "check it could not finish. Nothing has been undone, and FINALIZE has not touched "
+        "the source.\n"
+        f"Once Coolify answers again: coolify-migrate resume {migration_id} - it checks "
+        f"again, and FINALIZE then {fate}.\n"
+        f"To give up the target instead: coolify-migrate rollback {migration_id} - it "
+        "deletes the target and everything written to it since START, and restarts the "
+        "source."
     )
 
 

@@ -150,6 +150,19 @@ class SourceRevivedAfterStart(SourceRevived):
     """
 
 
+class SourceUncheckedAfterStart(SourceRevivedAfterStart):
+    """A source check that could not be answered, once START had asked for a target.
+
+    Not a revival found: a check that cannot say there was none — a source
+    application's deployment history that Coolify did not give. Before START
+    that is a plain :class:`QuiesceError` and the run rolls back; after START it
+    BLOCKS, for the reason a revival does: the rollback deletes a target that
+    may have served users since, and a Coolify restarting for a while must not
+    decide that. A subclass so the executor blocks on it; nothing is journalled
+    for the resume, which checks again from where it was.
+    """
+
+
 class TargetStartedEarly(ContainmentBreach):
     """A target ran before START asked for it: invariant 7, and a writer during the copy."""
 

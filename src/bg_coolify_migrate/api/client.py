@@ -636,7 +636,7 @@ class CoolifyClient:
         return read_active_deployments(await self.get("/deployments"))
 
     async def application_deployments(self, uuid: str) -> list[Deployment] | None:
-        """An application's newest deployments, uuid and status only. ``None`` on a 404.
+        """An application's newest deployments, uuid and status only.
 
         ``GET /deployments/applications/{uuid}`` (ability ``read``, routes/api.php
         v4.1.2:82 .. v4.7.2:166) answers ``{"count", "deployments"}``, newest
@@ -645,11 +645,19 @@ class CoolifyClient:
         rows included. Every row carries ``logs`` — up to 4.6 even for a token
         that cannot read sensitive data — so each is reduced HERE, like
         :meth:`get_deployment`.
+
+        ``None`` when Coolify says it has no such application: its own 404,
+        "Application not found" (DeployController v4.1.2:692-695 .. v4.7.2:754-757),
+        which a deleted one gets at once — applications soft-delete
+        (Application.php v4.1.2:120, v4.7.2:146) and the lookup skips trashed
+        rows. Any other 404 raises: a proxy in front of an instance that is
+        restarting answers "404 page not found", which says nothing of the
+        application.
         """
         try:
             answer = await self.get(f"/deployments/applications/{uuid}", take=_DEPLOYMENTS_TAKE)
         except CoolifyApiError as exc:
-            if exc.status_code == 404:
+            if exc.status_code == 404 and "application not found" in str(exc.body).lower():
                 return None
             raise
         rows = answer.get("deployments") if isinstance(answer, dict) else None

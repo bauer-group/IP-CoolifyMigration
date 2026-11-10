@@ -30,6 +30,7 @@ from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.discovery import quiesce
 from bg_coolify_migrate.domain import containment as c
 from bg_coolify_migrate.domain.containment import (
+    REVIVAL_PENDING_DEPLOYMENTS,
     REVIVAL_SEEN_CLOCK,
     REVIVAL_SEEN_DEPLOYMENTS,
     SOURCE_DEPLOYMENTS,
@@ -89,11 +90,12 @@ class TestTheRecord:
 
     def test_each_block_keeps_the_earlier_ones(self) -> None:
         history = {"app1": [_d("d5"), _d("d3"), _d("")]}
-        assert c.seen_deployments({"app1": ["d4"], "app2": ["d9"]}, history) == {
+        detail = {REVIVAL_SEEN_DEPLOYMENTS: {"app1": ["d4"], "app2": ["d9"]}}
+        assert c.block_record(detail, history)[REVIVAL_SEEN_DEPLOYMENTS] == {
             "app1": ["d3", "d4", "d5"],
             "app2": ["d9"],
         }
-        assert c.seen_deployments(None, history) == {"app1": ["d3", "d5"]}
+        assert c.block_record({}, history)[REVIVAL_SEEN_DEPLOYMENTS] == {"app1": ["d3", "d5"]}
 
 
 class TestDeploymentBreaches:
@@ -248,21 +250,33 @@ class TestTheCheckpoint:
         assert record[REVIVAL_SEEN_CLOCK] == SEEN
         # The operator was shown d3 and stopped the source: the resume goes on.
         await containment.assert_contained(ctx, checkpoint="FINALIZE", target=False)
-        # A deploy after the block still counts — and the next block keeps d3.
+        # A deploy after the block still counts — and the next block keeps d3. d4
+        # had not ended: it is held apart, never accounted.
         route.mock(return_value=_rows(("d4", "queued"), ("d3", "finished")))
         with pytest.raises(SourceRevivedAfterStart, match="web: deployment d4 is queued"):
             await containment.assert_contained(ctx, checkpoint="FINALIZE", target=False)
-        assert _quiesce(ctx)[REVIVAL_SEEN_DEPLOYMENTS] == {"app1": ["d2", "d3", "d4"]}
+        assert _quiesce(ctx)[REVIVAL_SEEN_DEPLOYMENTS] == {"app1": ["d2", "d3"]}
+        assert _quiesce(ctx)[REVIVAL_PENDING_DEPLOYMENTS] == {"app1": ["d4"]}
 
-    async def test_a_deploy_still_running_blocks_until_it_ends(
+    async def test_a_deploy_still_running_blocks_until_it_ends_and_once_more(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
+        # Shown running at a block, it then ran: it may have started the source
+        # after that check and been removed again, which no container shows.
         _started(ctx)
         route = respx_mock.get(HISTORY).mock(return_value=_rows(("d3", "in_progress")))
         for _ in range(2):
             with pytest.raises(SourceRevivedAfterStart, match="d3 is in_progress"):
                 await containment.assert_contained(ctx, checkpoint="FINALIZE", target=False)
+        assert _quiesce(ctx)[REVIVAL_PENDING_DEPLOYMENTS] == {"app1": ["d3"]}
         route.mock(return_value=_rows(("d3", "cancelled-by-user")))
+        with pytest.raises(
+            SourceRevivedAfterStart, match="d3 had not ended when this run last blocked"
+        ):
+            await containment.assert_contained(ctx, checkpoint="FINALIZE", target=False)
+        assert _quiesce(ctx)[REVIVAL_SEEN_DEPLOYMENTS] == {"app1": ["d3"]}
+        assert _quiesce(ctx)[REVIVAL_PENDING_DEPLOYMENTS] == {"app1": []}
+        # Shown ended now: the next resume goes on.
         await containment.assert_contained(ctx, checkpoint="FINALIZE", target=False)
 
     async def test_the_block_records_the_history_without_a_clock(
@@ -281,7 +295,8 @@ class TestTheCheckpoint:
         ("answer", "said"),
         [
             (httpx.Response(500, json={"message": "Server Error"}), "500"),
-            (httpx.Response(404, json={"message": "Application not found"}), "no such application"),
+            # A proxy in front of a restarting Coolify: not Coolify saying it is gone.
+            (httpx.Response(404, text="404 page not found"), "failed"),
         ],
     )
     async def test_a_history_that_cannot_be_read_never_passes(
