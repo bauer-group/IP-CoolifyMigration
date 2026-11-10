@@ -207,10 +207,6 @@ _PRECEDENCE: dict[Compensation, Compensation] = {
     Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS: Compensation.RESTART_SOURCE,
 }
 
-#: States after which the source is no longer running. Used to decide whether a
-#: rollback must restart it.
-_STOPS_SOURCE = State.QUIESCE
-
 #: The only state that cannot be undone. Reached only after an explicit typed
 #: confirmation, and only with FinalizePolicy.DELETE.
 _IRREVERSIBLE = State.FINALIZE
@@ -484,11 +480,6 @@ def source_copy_unproven(markers: Mapping[str, Mapping[str, Any]]) -> bool:
     """
     finalize = markers.get(State.FINALIZE.value) or {}
     return finalize.get("policy") in (FinalizePolicy.KEEP.value, FinalizePolicy.RENAME.value)
-
-
-def requires_source_restart(completed: Sequence[State]) -> bool:
-    """True if a rollback must restart the source because we stopped it."""
-    return _STOPS_SOURCE in set(completed)
 
 
 def is_irreversible(state: State) -> bool:

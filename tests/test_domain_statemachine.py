@@ -22,7 +22,6 @@ from bg_coolify_migrate.domain.statemachine import (
     is_irreversible,
     is_terminal,
     next_state,
-    requires_source_restart,
     rollback_plan,
     states_through,
 )
@@ -187,15 +186,8 @@ class TestRollbackPlan:
         assert Compensation.RESTORE_SOURCE_FQDN in comps
 
 
-class TestSourceRestart:
-    def test_not_required_before_quiesce(self) -> None:
-        assert requires_source_restart([State.CREATE_TARGET]) is False
-
-    def test_required_after_quiesce(self) -> None:
-        assert requires_source_restart([State.CREATE_TARGET, State.QUIESCE]) is True
-
-    def test_required_after_copy(self) -> None:
-        assert requires_source_restart([State.QUIESCE, State.COPY, State.VERIFY]) is True
+# Whether a rollback restarts the source is statemachine.source_was_stopped -
+# QUIESCE completed OR its stop request journalled: tests/test_failed_quiesce.py.
 
 
 class TestIrreversibility:
