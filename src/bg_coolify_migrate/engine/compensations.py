@@ -21,8 +21,8 @@ import structlog
 from bg_coolify_migrate.api import resources as api_resources
 from bg_coolify_migrate.discovery import docker, pins
 from bg_coolify_migrate.domain import binds, domains
-from bg_coolify_migrate.domain.containment import unsettled, volume_recreated
 from bg_coolify_migrate.domain.compose import MountClass
+from bg_coolify_migrate.domain.containment import unsettled, volume_recreated
 from bg_coolify_migrate.domain.deployments import (
     Deployment,
     Progress,
@@ -45,7 +45,7 @@ from bg_coolify_migrate.engine.context import (
     deserialise_bind_pairs,
     deserialise_volume_pairs,
 )
-from bg_coolify_migrate.errors import CoolifyApiError, MigrationError
+from bg_coolify_migrate.errors import CoolifyApiError, MigrationError, TransferError
 from bg_coolify_migrate.journal.store import JournalRecord
 from bg_coolify_migrate.settings.base import Settings
 from bg_coolify_migrate.transfer import binds as transfer_binds
@@ -712,7 +712,14 @@ async def _remove_bind_targets(ctx: MigrationContext) -> None:
             log.error("compensate.bind_target_unsafe", path=target.path)
             kept.append(f"{target.path} (not a path a rollback may delete)")
             continue
-        await transfer_binds.remove_created(ctx.target_host, target, removable=allowed)
+        try:
+            await transfer_binds.remove_created(ctx.target_host, target, removable=allowed)
+        except TransferError as exc:
+            # A path that resolves elsewhere now is not deleted; the others still
+            # are, and every removal so far is journalled below.
+            log.error("compensate.bind_target_redirected", path=target.path)
+            kept.append(f"{target.path} ({exc.args[0] if exc.args else exc})")
+            continue
         removed.append(target.path)
 
     if removed:

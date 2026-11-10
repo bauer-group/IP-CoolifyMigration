@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import shutil
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +16,7 @@ from bg_coolify_migrate.domain.binds import BindTarget, HostBind
 from bg_coolify_migrate.errors import TransferError, VerificationError
 from bg_coolify_migrate.transfer import binds as transfer_binds
 from bg_coolify_migrate.transfer import rsync, verify
+from bg_coolify_migrate.transfer.ssh import CommandResult, SshTarget
 from tests.conftest import FakeHost
 
 
@@ -117,25 +122,163 @@ class TestProbes:
             await transfer_binds.host_binds(host)  # type: ignore[arg-type]
 
 
+def _args(command: str) -> list[str]:
+    """The quoted arguments a fixed script received: ``sh -c SCRIPT sh ARGS...``."""
+    return shlex.split(command)[4:]
+
+
 class TestWrites:
-    async def test_prepare_a_directory_and_a_file(self) -> None:
+    async def test_prepare_passes_the_path_as_an_argument_never_spliced(self) -> None:
         host = FakeHost()
-        host.on(r"mkdir|rmdir")
+        host.on(r"^sh -c ")
         await transfer_binds.prepare_target(host, "/srv/a", kind=binds.KIND_DIR, prior="missing")  # type: ignore[arg-type]
         await transfer_binds.prepare_target(  # type: ignore[arg-type]
             host, "/srv/b/f.db", kind=binds.KIND_FILE, prior=binds.STATE_EMPTY_DIR
         )
-        assert host.commands == [
-            "mkdir -p -- /srv/a",
-            "mkdir -p -- /srv/b && rmdir -- /srv/b/f.db",
+        assert [shlex.split(c)[2] for c in host.commands] == [transfer_binds.PREPARE_SCRIPT] * 2
+        assert [_args(c) for c in host.commands] == [
+            ["/srv/a", "dir", "missing"],
+            ["/srv/b/f.db", "file", "empty-directory"],
         ]
 
     async def test_remove_only_what_is_allowed_deepest_first(self) -> None:
         host = FakeHost()
-        host.on(r"^rm -rf|^rmdir")
+        host.on(r"^sh -c ")
         target = BindTarget("/srv/a/b", "missing", ("/srv/a", "/srv/a/b"))
         await transfer_binds.remove_created(host, target, removable={"/srv/a", "/srv/a/b"})  # type: ignore[arg-type]
-        assert host.commands == ["rm -rf -- /srv/a/b", "rmdir -- /srv/a 2>/dev/null"]
+        assert [shlex.split(c)[2] for c in host.commands] == [transfer_binds.REMOVE_SCRIPT] * 2
+        assert [_args(c) for c in host.commands] == [["rm", "/srv/a/b"], ["rmdir", "/srv/a"]]
         host.commands.clear()
         await transfer_binds.remove_created(host, target, removable=set())  # type: ignore[arg-type]
         assert host.commands == []
+
+    async def test_a_redirected_removal_raises_and_names_the_path(self) -> None:
+        host = FakeHost()
+        host.on(r"^sh -c ", exit_status=transfer_binds.EXIT_REDIRECTED)
+        target = BindTarget("/srv/a/b", "missing", ("/srv/a/b",))
+        with pytest.raises(TransferError, match=r"/srv/a/b.*symbolic link"):
+            await transfer_binds.remove_created(host, target, removable={"/srv/a/b"})  # type: ignore[arg-type]
+
+    async def test_a_redirected_prepare_raises_before_anything_is_copied(self) -> None:
+        host = FakeHost()
+        host.on(r"^sh -c ", exit_status=transfer_binds.EXIT_REDIRECTED)
+        with pytest.raises(TransferError, match="resolves somewhere"):
+            await transfer_binds.prepare_target(host, "/srv/a", kind=binds.KIND_DIR, prior="missing")  # type: ignore[arg-type]
+
+
+def _posix(path: Path) -> str:
+    """A local path as the ``sh`` running the scripts spells it, canonical.
+
+    On Windows (Git's sh) ``C:/x`` is ``/c/x``; realpath first, so an 8.3 short
+    name or a symlinked temp dir cannot make ``pwd -P`` disagree with it.
+    """
+    real = os.path.realpath(path)
+    if os.name == "nt":
+        return "/" + real[0].lower() + real[2:].replace("\\", "/")
+    return real
+
+
+class _LocalSh:
+    """Runs the commands in a real local ``sh``: the scripts' own behaviour, not a model."""
+
+    target = SshTarget(host="local")
+
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+
+    async def run(
+        self, command: str, *, timeout: float | None = None, input_text: str | None = None
+    ) -> CommandResult:
+        self.commands.append(command)
+        done = subprocess.run(["sh", "-c", command], capture_output=True, text=True, check=False)
+        return CommandResult(command, done.returncode, done.stdout, done.stderr)
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX sh")
+class TestSymlinkSafety:
+    """A parent swapped for a symlink between the check and the root write or delete.
+
+    A user who owns a pre-existing parent (``/home/alice``) can rename the
+    directory the copy created and put ``app -> /etc`` in its place; a plain
+    ``rm -rf /home/alice/app/data`` would then delete ``/etc/data`` as root.
+    """
+
+    @staticmethod
+    def _link(link: Path, to: Path) -> None:
+        try:
+            os.symlink(to, link, target_is_directory=True)
+        except OSError as exc:  # Windows without symlink rights
+            pytest.skip(f"cannot create symlinks here: {exc}")
+
+    async def test_removes_the_tree_it_created_and_its_empty_parents(self, tmp_path: Path) -> None:
+        (tmp_path / "srv" / "a" / "b").mkdir(parents=True)
+        (tmp_path / "srv" / "a" / "b" / "f").write_text("x")
+        root = _posix(tmp_path)
+        target = BindTarget(f"{root}/srv/a/b", "missing", (f"{root}/srv/a", f"{root}/srv/a/b"))
+        await transfer_binds.remove_created(  # type: ignore[arg-type]
+            _LocalSh(), target, removable=set(target.created)
+        )
+        assert not (tmp_path / "srv" / "a").exists()
+        assert (tmp_path / "srv").is_dir()
+
+    async def test_a_parent_in_use_by_someone_else_is_left(self, tmp_path: Path) -> None:
+        (tmp_path / "srv" / "a" / "b").mkdir(parents=True)
+        (tmp_path / "srv" / "a" / "other").write_text("theirs")
+        root = _posix(tmp_path)
+        target = BindTarget(f"{root}/srv/a/b", "missing", (f"{root}/srv/a", f"{root}/srv/a/b"))
+        await transfer_binds.remove_created(  # type: ignore[arg-type]
+            _LocalSh(), target, removable=set(target.created)
+        )
+        assert not (tmp_path / "srv" / "a" / "b").exists()
+        assert (tmp_path / "srv" / "a" / "other").read_text() == "theirs"
+
+    async def test_a_parent_swapped_for_a_symlink_is_not_followed(self, tmp_path: Path) -> None:
+        victim = tmp_path / "etc" / "data"
+        victim.mkdir(parents=True)
+        (victim / "keep").write_text("system")
+        (tmp_path / "home" / "alice").mkdir(parents=True)
+        self._link(tmp_path / "home" / "alice" / "app", tmp_path / "etc")
+        root = _posix(tmp_path)
+        path = f"{root}/home/alice/app/data"
+        target = BindTarget(path, "missing", (path,))
+        with pytest.raises(TransferError, match="symbolic link"):
+            await transfer_binds.remove_created(_LocalSh(), target, removable={path})  # type: ignore[arg-type]
+        assert (victim / "keep").read_text() == "system"
+
+    async def test_the_target_itself_swapped_for_a_symlink_is_not_followed(
+        self, tmp_path: Path
+    ) -> None:
+        victim = tmp_path / "etc"
+        victim.mkdir()
+        (victim / "keep").write_text("system")
+        (tmp_path / "srv").mkdir()
+        self._link(tmp_path / "srv" / "data", victim)
+        root = _posix(tmp_path)
+        path = f"{root}/srv/data"
+        target = BindTarget(path, "missing", (path,))
+        with pytest.raises(TransferError, match="symbolic link"):
+            await transfer_binds.remove_created(_LocalSh(), target, removable={path})  # type: ignore[arg-type]
+        assert (victim / "keep").read_text() == "system"
+
+    async def test_prepare_makes_a_directory_and_frees_a_file_slot(self, tmp_path: Path) -> None:
+        root = _posix(tmp_path)
+        await transfer_binds.prepare_target(  # type: ignore[arg-type]
+            _LocalSh(), f"{root}/srv/a", kind=binds.KIND_DIR, prior="missing"
+        )
+        assert (tmp_path / "srv" / "a").is_dir()
+        (tmp_path / "srv" / "b" / "f.db").mkdir(parents=True)
+        await transfer_binds.prepare_target(  # type: ignore[arg-type]
+            _LocalSh(), f"{root}/srv/b/f.db", kind=binds.KIND_FILE, prior=binds.STATE_EMPTY_DIR
+        )
+        assert (tmp_path / "srv" / "b").is_dir()
+        assert not (tmp_path / "srv" / "b" / "f.db").exists()
+
+    async def test_prepare_refuses_a_symlinked_parent(self, tmp_path: Path) -> None:
+        (tmp_path / "etc").mkdir()
+        (tmp_path / "home" / "alice").mkdir(parents=True)
+        self._link(tmp_path / "home" / "alice" / "app", tmp_path / "etc")
+        root = _posix(tmp_path)
+        with pytest.raises(TransferError, match="resolves somewhere"):
+            await transfer_binds.prepare_target(  # type: ignore[arg-type]
+                _LocalSh(), f"{root}/home/alice/app/data", kind=binds.KIND_DIR, prior="missing"
+            )

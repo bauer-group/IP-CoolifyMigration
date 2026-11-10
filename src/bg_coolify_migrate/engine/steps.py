@@ -64,7 +64,13 @@ from bg_coolify_migrate.domain.statemachine import (
     State,
 )
 from bg_coolify_migrate.domain.versions import parse_version
-from bg_coolify_migrate.engine import compensations, containment, deploy_triggers, env_recovery, keys
+from bg_coolify_migrate.engine import (
+    compensations,
+    containment,
+    deploy_triggers,
+    env_recovery,
+    keys,
+)
 from bg_coolify_migrate.engine.context import (
     MigrationContext,
     deserialise_bind_pairs,

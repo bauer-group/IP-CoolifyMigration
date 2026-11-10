@@ -36,6 +36,7 @@ from bg_coolify_migrate.engine.executor import Saga
 from bg_coolify_migrate.errors import PreflightError, TransferError
 from bg_coolify_migrate.journal.store import Journal
 from bg_coolify_migrate.settings.base import Settings
+from bg_coolify_migrate.transfer import binds as transfer_binds
 from bg_coolify_migrate.transfer.ssh import CommandResult, SshTarget
 from tests.conftest import FakeHost
 from tests.test_engine_steps import BASE, HOST, _plan, _snapshot
@@ -69,6 +70,32 @@ class FsHost(FakeHost):
     def _children(self, path: str) -> list[str]:
         return [p for p in self.paths if p.startswith(f"{path}/")]
 
+    def _prepare(self, command: str, path: str, kind: str, prior: str) -> CommandResult:
+        """transfer_binds.PREPARE_SCRIPT, on this model of the filesystem."""
+        ok = CommandResult(command=command, exit_status=0, stdout="", stderr="")
+        if kind == binds.KIND_DIR:
+            self._mkdir(path)
+            return ok
+        self._mkdir(path.rsplit("/", 1)[0] or "/")
+        if prior == binds.STATE_EMPTY_DIR:
+            return self._remove(command, "rmdir", path, strict=True)
+        return ok
+
+    def _remove(
+        self, command: str, mode: str, path: str, *, strict: bool = False
+    ) -> CommandResult:
+        """transfer_binds.REMOVE_SCRIPT (``rm`` or ``rmdir``), on this model."""
+        ok = CommandResult(command=command, exit_status=0, stdout="", stderr="")
+        if mode == "rm":
+            for p in [path, *self._children(path)]:
+                self.paths.pop(p, None)
+            return ok
+        if self._children(path) or self.state(path) not in (binds.STATE_EMPTY_DIR, binds.STATE_DIR):
+            busy = CommandResult(command=command, exit_status=1, stdout="", stderr="busy")
+            return busy if strict else ok  # the script's rmdir of a parent never fails
+        self.paths.pop(path, None)
+        return ok
+
     def _mkdir(self, path: str) -> None:
         for p in (*binds.ancestors(path), path):
             if self.state(p) == binds.STATE_MISSING:
@@ -86,13 +113,20 @@ class FsHost(FakeHost):
         ok = CommandResult(command=command, exit_status=0, stdout="", stderr="")
         if command.startswith("sh -c "):
             argv = shlex.split(command)
-            out = "\n".join(self.state(p) for p in argv[4:])
+            script, args = argv[2], argv[4:]
+            if script == transfer_binds.PREPARE_SCRIPT:
+                return self._prepare(command, *args)
+            if script == transfer_binds.REMOVE_SCRIPT:
+                return self._remove(command, *args)
+            out = "\n".join(self.state(p) for p in args)
             return CommandResult(command=command, exit_status=0, stdout=out, stderr="")
         if command.startswith("docker ps -aq"):
             out = "\n".join(json.dumps(c) for c in self.containers)
             return CommandResult(command=command, exit_status=0, stdout=out, stderr="")
         if command.startswith("docker ps -a "):
             return ok  # no volume pins on this host
+        if "docker events" in command:
+            return ok  # the containment checkpoints find nothing started
 
         if command.startswith("rsync"):
             self.rsyncs.append(command)
@@ -379,7 +413,7 @@ class TestCopy:
         original = target.run
 
         async def spy(command: str, **kw: Any) -> CommandResult:
-            if command.startswith("mkdir"):
+            if command.startswith("sh -c ") and transfer_binds.PREPARE_SCRIPT in command:
                 journalled_at_mkdir.append(len(_journalled_targets(ctx)))
             return await original(command, **kw)
 
