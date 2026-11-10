@@ -27,10 +27,20 @@ arbitrary ``rm -rf``. Each of these questions therefore has an explicit answer:
   (LocalFileVolume v4.7.2:333-405), a deploy writes only non-directory rows
   (ApplicationDeploymentJob v4.7.2:1546-1550), a service start writes only its
   compose and ``.env`` (Service::saveComposeConfigs v4.7.2:1648-1695). A file
-  row WITH content is rewritten from that content (``tee``, LocalFileVolume
-  v4.7.2:390-392), so that one is regenerated; everything else in the
-  directory is the application's own data, and Coolify recreates it EMPTY on a
-  new resource. Skipping all of ``/data/coolify`` lost it.
+  row WITH content is written from that content (``tee``, LocalFileVolume
+  v4.7.2:390-392; a service start writes it where it is missing,
+  EnsureContentFilesOnServer v4.7.2:51); everything else in the directory
+  is the application's own data, and Coolify recreates it EMPTY on a new
+  resource. Skipping all of ``/data/coolify`` lost it.
+* **Does the TARGET's row hold that content?** Only where CREATE gives it one
+  (:class:`StorageCarry`): a plain app's rows are POSTed with it, a compose
+  app re-reads its compose (``content:`` included) from git, a template
+  service is created from the catalog first. A raw-compose service is created
+  from the source's stored ``docker_compose_raw``, which Coolify keeps WITHOUT
+  ``content:`` (parsers.php v4.1.2:2740 .. v4.7.2:3709), so its target row is
+  a contentless directory (v4.7.2:3051-3058): that file is mirrored instead. A
+  database's rows are not carried at all. The rest is read back at the end of
+  CREATE (:func:`content_problem`): a template or a repository can drop a file.
 * **May we write there?** Only into a path that is absent, or an empty
   directory or file (Coolify's own storage job may have created it). Anything
   else may be another resource's data.
@@ -131,8 +141,15 @@ class StorageCarry(StrEnum):
     """How a resource's storage rows reach its target."""
 
     COMPOSE = "compose"
-    """Recreated by the target's own parse of the same compose (services carry
-    the source's ``docker_compose_raw``; a compose app loads it from git)."""
+    """Recreated by the target's own parse of a compose that keeps ``content:``:
+    a compose app loads it from git; a template service is created from the
+    catalog first, and the source's compose then keeps the catalog's rows."""
+    RAW_COMPOSE = "raw_compose"
+    """A raw-compose service: recreated by parsing the source's stored
+    ``docker_compose_raw``, which Coolify keeps without ``content:`` and
+    ``isDirectory`` (parsers.php v4.1.2:2740, v4.5.0:3638, v4.7.2:3701-3718).
+    Every row is recreated, none holds content, and a bind the compose does not
+    flag otherwise becomes a directory row (v4.7.2:3051-3058)."""
     API = "api"
     """POSTed by CREATE (``resources.copy_storages``) — except a file whose
     content the API shows as a placeholder, which it skips."""
@@ -321,11 +338,9 @@ def carry_for(kind: ResourceKind | None) -> StorageCarry:
     """How this kind's storage rows reach the target. PURE."""
     if kind is ResourceKind.DATABASE:
         return StorageCarry.NONE
-    if kind in (
-        ResourceKind.APP_GIT_COMPOSE,
-        ResourceKind.SERVICE_TEMPLATE,
-        ResourceKind.SERVICE_COMPOSE,
-    ):
+    if kind is ResourceKind.SERVICE_COMPOSE:
+        return StorageCarry.RAW_COMPOSE
+    if kind in (ResourceKind.APP_GIT_COMPOSE, ResourceKind.SERVICE_TEMPLATE):
         return StorageCarry.COMPOSE
     return StorageCarry.API
 
@@ -382,7 +397,14 @@ def classify(
         )
 
     inside_own = own_dir_of(path, uuid) is not None
-    if not inside_own and is_system_path(path, uuid=uuid):
+    system = not inside_own and is_system_path(path, uuid=uuid)
+    match = _matching_row(rows, destination=destination, path=path)
+    if match is not None and match.writes_content:
+        # Before the system-path rule: Coolify writes such a file wherever the
+        # compose put it (isAdminControlledComposeMount, LocalFileVolume
+        # v4.7.2:319-330), so it is the resource's, not the host's.
+        return _content_file(path, carry=carry, system=system)
+    if system:
         if read_only:
             return BindAction.PASSTHROUGH, (
                 f"read-only bind of the host's own {path}: the target server supplies its own"
@@ -394,12 +416,6 @@ def classify(
             "server's. Make it read-only if the container only reads it"
         )
 
-    match = _matching_row(rows, destination=destination, path=path)
-    if match is not None and match.writes_content:
-        return BindAction.SKIP, (
-            f"{path} is a file Coolify writes from the content kept in its file-storage "
-            "row at every deploy"
-        )
     if carry is StorageCarry.NONE:
         if inside_own and match is None:
             return BindAction.SKIP, (
@@ -428,6 +444,83 @@ def classify(
             )
         return BindAction.MIGRATE, _PLACEHOLDER.format(path=path)
     return BindAction.MIGRATE, (_OWN_DATA if inside_own else _MIRRORED).format(path=path)
+
+
+def _content_file(path: str, *, carry: StorageCarry, system: bool) -> tuple[BindAction, str]:
+    """A file Coolify writes from its storage row's content: does the TARGET get it? PURE."""
+    if carry is StorageCarry.NONE:
+        return BindAction.REFUSE, (
+            f"{path} is a file mount whose content Coolify keeps in the database's storage "
+            "row, and CREATE carries no storage row of a database, so the target would start "
+            "without it. Remove the file mount on the source and add it to the target after "
+            "the migration, or move the setting into the database's own configuration"
+        )
+    if carry is StorageCarry.RAW_COMPOSE:
+        if system:
+            return BindAction.REFUSE, (
+                f"{path} is a file Coolify writes from its storage row's content, but the "
+                "target service is created from the source's compose, which Coolify keeps "
+                "without `content:`, so the target's row holds none - and a migration never "
+                "writes the host's own paths on the target server. Mount it from the "
+                "service's directory (./ in the compose) instead"
+            )
+        return BindAction.MIGRATE, (
+            f"{path} is a file Coolify wrote from its storage row's content, but the target "
+            "service is created from the source's compose, which Coolify keeps without "
+            "`content:` - the target's row holds none, so the file is mirrored with rsync"
+        )
+    origin = (
+        "CREATE recreates its storage row with the content"
+        if carry is StorageCarry.API
+        else "the target's own parse gives its row the content (the repository's compose "
+        "for an application, the template for a service)"
+    )
+    return BindAction.SKIP, (
+        f"{path} is a file Coolify writes from its storage row's content: {origin}, and "
+        "Coolify writes it on the target from there (CREATE reads that row back)"
+    )
+
+
+def regenerated_content(
+    rows: Sequence[StorageRow] | None, *, source: str, destination: str
+) -> bool:
+    """Is this bind a file Coolify writes from the content of its own row? PURE."""
+    path = normalise(source)
+    match = _matching_row(rows, destination=destination, path=path) if path else None
+    return match is not None and match.writes_content
+
+
+def content_problem(
+    *,
+    source: str,
+    mount_path: str,
+    target_rows: Sequence[StorageRow],
+    source_uuid: str,
+    target_uuid: str,
+) -> str | None:
+    """Why the target will not write a content file the source has, or None. PURE.
+
+    The plan skips such a file because Coolify writes it on the target from the
+    content of the TARGET's row — so that row is read back at the end of CREATE,
+    while the source still serves. Paired as :func:`pair_binds` pairs: by mount
+    path, narrowed by place where two parts of a service share it.
+    """
+    src, mount = normalise(source), normalise(mount_path)
+    candidates = [r for r in target_rows if r.mount_path == mount]
+    if len({r.host_path for r in candidates}) > 1 and src is not None:
+        where = _location(src, source_uuid)
+        candidates = [
+            r for r in candidates if _location(r.host_path, target_uuid) == where
+        ] or candidates
+    if any(r.writes_content for r in candidates):
+        return None
+    held = "has no storage row there" if not candidates else "has a row there without content"
+    return (
+        f"{mount_path} is a file Coolify writes from its storage row's content ({source} on "
+        f"the source), but the target {held}: the template or the repository's compose no "
+        "longer declares it with its content, so the target would mount an empty directory "
+        "there"
+    )
 
 
 def _matching_row(

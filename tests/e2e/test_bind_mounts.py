@@ -15,6 +15,11 @@ container — the only place that proves the target mounts what was copied.
 The rig runs Coolify 4.7.2, where a plain application's host-path storage can
 no longer be created through the API (fidelity.storage_refusals), so the
 absolute bind comes from a compose file, as it does in the estate.
+
+A third bind is a file Coolify writes from ``content:``. Coolify keeps the
+service's stored compose WITHOUT that content (parsers.php v4.7.2:3701-3718)
+and the target is created from it, so the target's row is a contentless
+directory: the plan mirrors the file instead of skipping it as "regenerated".
 """
 
 from __future__ import annotations
@@ -45,6 +50,8 @@ pytestmark = [pytest.mark.e2e, pytest.mark.asyncio]
 
 #: Umlauts and a space, so a byte-level mangle or a split path cannot pass.
 SEED = "Grüße aus der Bindung\n"
+#: The content of the file Coolify writes from its storage row.
+CONTENT = "greeting=hello from the row"
 
 
 def _compose(host_dir: str) -> str:
@@ -56,6 +63,11 @@ services:
     volumes:
       - {host_dir}:/files
       - ./data:/data
+      - type: bind
+        source: ./app.conf
+        target: /etc/app.conf
+        content: |
+          {CONTENT}
 """
 
 
@@ -159,6 +171,9 @@ async def test_bind_mount_data_survives_migration(
     assert by_mount["/files"].source_path == bind_stack["host_dir"]
     assert by_mount["/data"].decision is Decision.MIGRATE, by_mount["/data"].reason
     assert by_mount["/data"].source_path.endswith(f"{bind_stack['service_uuid']}/data")
+    # Not "regenerated": the target's row will hold no content to write it from.
+    conf = by_mount["/etc/app.conf"]
+    assert conf.decision is Decision.MIGRATE and not conf.content_file, conf.reason
     assert not plan.is_blocked, [r.blocking_reasons for r in plan.resources]
 
     result = await run_migration(api, settings, plan)
@@ -179,6 +194,8 @@ async def test_bind_mount_data_survives_migration(
         assert await _read(target_host, container, "/files/a.txt") == SEED
         assert await _read(target_host, container, "/data/b.txt") == SEED
         assert (await _read(target_host, container, "/data/deep/er/c")).strip() == "x"
+        # A file, not the empty directory Docker makes for a missing bind source.
+        assert (await _read(target_host, container, "/etc/app.conf")).strip() == CONTENT
         # The relative bind landed in the TARGET's own directory - read back
         # from its storage row, never the source path with the uuid swapped.
         own = await target_host.run(f"cat /data/coolify/services/{target_uuid}/data/b.txt")

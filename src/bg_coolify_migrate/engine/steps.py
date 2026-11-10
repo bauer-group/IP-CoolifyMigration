@@ -1936,29 +1936,18 @@ async def _assert_source_binds_safe(ctx: MigrationContext) -> None:
         )
 
 
-async def _read_target_bind_pairs(
-    ctx: MigrationContext,
-    snapshot: ResourceSnapshot,
-    sources: list[tuple[str, str]],
-    *,
-    target_uuid: str,
-    consequence: str,
-) -> list[BindPair]:
-    """Pair the source's binds with the storage rows Coolify made for the target.
+async def _target_rows(
+    ctx: MigrationContext, snapshot: ResourceSnapshot, mounts: list[str], *, target_uuid: str
+) -> list[binds.StorageRow]:
+    """The host-path storage rows Coolify made for the target, once ``mounts`` have one.
 
     A compose app's rows come from the same asynchronous LoadComposeFile parse
     as its volumes, so they are waited for (:func:`_await_target_volumes`'s
     reason); a service parses inline and a plain app's rows are POSTed by
     ``copy_storages``, so theirs exist when CREATE returns.
-
-    Raises:
-        TransferError: A bind with no single row at its mount path: its data
-            would be left behind.
     """
-    if not sources:
-        return []
     base = binds.workdir(snapshot.kind, target_uuid)
-    expected = {binds.normalise(mount) for _, mount in sources}
+    expected = {binds.normalise(mount) for mount in mounts}
     compose_app = snapshot.kind is ResourceKind.APP_GIT_COMPOSE
     deadline = ctx.settings.target_storage_timeout if compose_app else 0.0
     waited = 0.0
@@ -1966,9 +1955,34 @@ async def _read_target_bind_pairs(
         storages = await ctx.api.get_storages(snapshot.collection, target_uuid)
         rows = binds.storage_rows(storages, base=base)
         if expected <= {r.mount_path for r in rows} or waited >= deadline:
-            break
+            return rows
         await asyncio.sleep(3.0)
         waited += 3.0
+
+
+async def _read_target_bind_pairs(
+    ctx: MigrationContext,
+    snapshot: ResourceSnapshot,
+    sources: list[tuple[str, str]],
+    *,
+    target_uuid: str,
+    consequence: str,
+    rows: list[binds.StorageRow] | None = None,
+) -> list[BindPair]:
+    """Pair the source's binds with the storage rows Coolify made for the target.
+
+    ``rows`` when the caller already read them (:func:`_target_rows`).
+
+    Raises:
+        TransferError: A bind with no single row at its mount path: its data
+            would be left behind.
+    """
+    if not sources:
+        return []
+    if rows is None:
+        rows = await _target_rows(
+            ctx, snapshot, [mount for _, mount in sources], target_uuid=target_uuid
+        )
     try:
         return binds.pair_binds(sources, rows, source_uuid=snapshot.uuid, target_uuid=target_uuid)
     except binds.BindPairingError as exc:
@@ -2023,15 +2037,58 @@ async def _assert_target_binds_safe(ctx: MigrationContext) -> None:
     empty — Coolify's storage job may have made it — no parent is a symlink,
     and no container there mounts it. Anything else may be another resource's
     data, and a copy with ``--delete`` would replace it.
+
+    And the files the plan skipped because Coolify writes them on the target
+    from its row's content: that row must hold the content (``binds.content_problem``).
     """
     per_resource: dict[str, list[BindPair]] = {}
+    missing_content: list[str] = []
     for resource in ctx.plan.resources:
+        snapshot = resource.snapshot
         sources = _source_binds(resource.manifest)
-        target_uuid = ctx.target_uuids.get(resource.snapshot.uuid)
-        if sources and target_uuid:
-            per_resource[resource.snapshot.uuid] = await _read_target_bind_pairs(
-                ctx, resource.snapshot, sources, target_uuid=target_uuid, consequence=_NEVER_STOPPED
+        contents = [i for i in resource.manifest.skipped if i.content_file]
+        target_uuid = ctx.target_uuids.get(snapshot.uuid)
+        if not target_uuid or not (sources or contents):
+            continue
+        rows = await _target_rows(
+            ctx,
+            snapshot,
+            [mount for _, mount in sources] + [i.mount_path for i in contents],
+            target_uuid=target_uuid,
+        )
+        missing_content.extend(
+            f"{snapshot.name}: {problem}"
+            for item in contents
+            if (
+                problem := binds.content_problem(
+                    source=item.source_path,
+                    mount_path=item.mount_path,
+                    target_rows=rows,
+                    source_uuid=snapshot.uuid,
+                    target_uuid=target_uuid,
+                )
             )
+        )
+        if sources:
+            per_resource[snapshot.uuid] = await _read_target_bind_pairs(
+                ctx,
+                snapshot,
+                sources,
+                target_uuid=target_uuid,
+                consequence=_NEVER_STOPPED,
+                rows=rows,
+            )
+    if missing_content:
+        raise TransferError(
+            "file mount(s) the target would start without:\n"
+            + "\n".join(f"  {p}" for p in missing_content),
+            hint=(
+                "Coolify writes such a file from the content kept in the resource's own "
+                "storage row, and the target's row has none. Keep the file in a directory "
+                "the compose mounts instead (it is then copied as data), or move this "
+                f"resource by hand. {_NEVER_STOPPED}"
+            ),
+        )
     if not per_resource:
         return
     pairs = _merged_bind_pairs(per_resource, consequence=_NEVER_STOPPED)

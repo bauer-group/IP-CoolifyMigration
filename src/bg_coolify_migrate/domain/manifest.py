@@ -131,6 +131,10 @@ class VolumeItem(BaseModel):
     bytes: int | None = None
     file_count: int | None = None
     discovered_from: frozenset[DiscoverySource] = Field(default_factory=frozenset)
+    content_file: bool = False
+    """A bind Coolify writes from the content kept in its storage row, skipped
+    because the TARGET's row carries that content: CREATE reads it back
+    (``binds.content_problem``) before anything is stopped."""
 
     @property
     def moves_data(self) -> bool:
@@ -182,6 +186,15 @@ def _storage_host_path(s: ApiStorage, context: _BindContext) -> str | None:
     if s.kind == "file":
         return binds.resolve_fs_path(s.fs_path, context.base)
     return binds.normalise(s.host_path)
+
+
+def _is_content_skip(
+    source: str, destination: str, decision: Decision, context: _BindContext
+) -> bool:
+    """A skipped bind whose file Coolify writes on the target from its row. PURE."""
+    return decision is Decision.SKIP and binds.regenerated_content(
+        context.rows, source=source, destination=destination
+    )
 
 
 _BIND_CLASSES: dict[binds.BindAction, tuple[MountClass, Decision]] = {
@@ -350,6 +363,9 @@ def reconcile(
                 mount_path=m.destination,
                 container=m.container,
                 discovered_from=frozenset({DiscoverySource.DOCKER_INSPECT}),
+                content_file=_is_content_skip(m.source, m.destination, decision, bind_context)
+                if m.type == "bind"
+                else False,
             )
         )
         if decision is Decision.MIGRATE and m.name:
@@ -436,6 +452,7 @@ def reconcile(
                     source_path=host,
                     mount_path=s.mount_path,
                     discovered_from=frozenset({DiscoverySource.COOLIFY_API}),
+                    content_file=_is_content_skip(host, s.mount_path, decision, bind_context),
                 )
             )
             continue

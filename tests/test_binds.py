@@ -9,6 +9,8 @@ though Coolify only ever ``mkdir -p``s such a directory and never refills it.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from bg_coolify_migrate.domain import binds
@@ -473,8 +475,8 @@ class TestManifest:
         assert item.mount_class is MountClass.BIND
         assert item.source_path == f"{SVC}/data"
 
-    def test_a_content_file_is_skipped_and_a_socket_passed_through(self) -> None:
-        manifest = reconcile(
+    def _content_manifest(self, kind: ResourceKind) -> Any:
+        return reconcile(
             docker_mounts=[
                 self._mount(f"{SVC}/nginx.conf", "/etc/nginx/nginx.conf", rw=False),
                 self._mount("/var/run/docker.sock", "/var/run/docker.sock"),
@@ -488,10 +490,24 @@ class TestManifest:
                 )
             ],
             resource_uuid="u1",
-            kind=ResourceKind.SERVICE_COMPOSE,
+            kind=kind,
         )
+
+    def test_a_template_s_content_file_is_skipped_and_flagged_for_the_read_back(self) -> None:
+        manifest = self._content_manifest(ResourceKind.SERVICE_TEMPLATE)
         assert [i.decision for i in manifest.items] == [Decision.SKIP, Decision.SKIP]
+        assert manifest.items[0].content_file and "template" in manifest.items[0].reason
         assert manifest.items[1].mount_class is MountClass.PASSTHROUGH
+        assert not manifest.items[1].content_file
+
+    def test_a_raw_compose_service_s_content_file_is_mirrored(self) -> None:
+        # Its target is created from the stored compose, kept without content:
+        # (parsers.php v4.7.2:3701-3718): the target row is an empty directory.
+        manifest = self._content_manifest(ResourceKind.SERVICE_COMPOSE)
+        assert [i.decision for i in manifest.items] == [Decision.MIGRATE, Decision.SKIP]
+        assert manifest.items[0].mount_class is MountClass.BIND
+        assert not manifest.items[0].content_file
+        assert "mirrored with rsync" in manifest.items[0].reason
 
     def test_a_refused_bind_blocks_once(self) -> None:
         manifest = reconcile(
@@ -513,8 +529,25 @@ class TestManifest:
             kind=ResourceKind.SERVICE_COMPOSE,
         )
         decisions = {i.mount_path: i.decision for i in manifest.items}
-        assert decisions == {"/data": Decision.MIGRATE, "/etc/x": Decision.SKIP, "/hp": Decision.SKIP}
+        # /etc/x: a raw-compose service's content file, which its target's row lacks.
+        assert decisions == {
+            "/data": Decision.MIGRATE,
+            "/etc/x": Decision.MIGRATE,
+            "/hp": Decision.SKIP,
+        }
         assert manifest.to_migrate[0].source_path == f"{SVC}/data"
+
+    def test_an_already_stopped_template_flags_its_content_file(self) -> None:
+        manifest = reconcile(
+            docker_mounts=[],
+            api_storages=[
+                ApiStorage(kind="file", mount_path="/etc/x", fs_path="./x", has_content=True)
+            ],
+            resource_uuid="u1",
+            kind=ResourceKind.SERVICE_TEMPLATE,
+        )
+        (item,) = manifest.items
+        assert item.decision is Decision.SKIP and item.content_file
 
     def test_a_running_stack_s_unmounted_row_is_stale_not_data(self) -> None:
         manifest = reconcile(
