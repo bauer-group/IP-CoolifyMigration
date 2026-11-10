@@ -32,10 +32,11 @@ said. Three kinds of evidence, because Coolify's stop REMOVES containers
   window may no longer reach back to the stop: :func:`event_log_gap` says when.
 
 Times are the host's own clock throughout — ``date +%s`` read on the source
-before the stop, ``StartedAt`` and event times written by that daemon — so a
-skewed workstation cannot narrow the window.
+once the stop gate passed, ``StartedAt`` and event times written by that
+daemon — so a skewed workstation cannot narrow the window.
 
-The SOURCE is judged from the stop on; the TARGET from its creation: its uuid
+The SOURCE is judged from the moment the stop gate proved it down
+(:func:`judged_from`); the TARGET from its creation: its uuid
 did not exist before CREATE, so any start of a container carrying it, at any
 time, is a start nobody here asked for. Containers found only by the target's
 NAME labels count only while they run, because the names are not unique the
@@ -52,9 +53,26 @@ from datetime import UTC, datetime
 
 #: QUIESCE journals the SOURCE host's clock (unix seconds, ``date +%s``), read just
 #: before it asks Coolify to stop anything, beside ``statemachine.STOP_REQUESTED``.
-#: A resumed run judges the source from it; a journal without it gets the
-#: state check alone.
+#: The window of ``quiesce.killed_since``; revivals are judged from it only when
+#: :data:`STOPPED_CLOCK` is missing. A journal without either gets the state
+#: check alone.
 STOP_CLOCK = "stop_clock"
+
+#: QUIESCE journals the source's clock again once its stop gate saw every
+#: container of the stack stopped (``quiesce.wait_until_stopped``) and no data
+#: holder was SIGKILLed. Revivals are judged from HERE, not from
+#: :data:`STOP_CLOCK`: Coolify's stop is no single act. StopApplication stops a
+#: compose application's containers one at a time, one SSH call and one grace
+#: period each (StopApplication v4.1.2:38-42, v4.7.2:47-58), QUIESCE stops the plan's
+#: resources one after another, and every Coolify container runs
+#: ``restart: unless-stopped`` (constants.php v4.1.2:37, v4.7.2:62; parsers.php
+#: v4.7.2:1508,2918). A container that exits on its own while it waits its turn
+#: (its database went first, a periodic job) is restarted by Docker, then
+#: stopped and removed by Coolify: a ``start`` after the stop request, in a
+#: stack the gate then saw end stopped. Judged from the request, that read as a
+#: revival at the end of COPY and rolled back a healthy migration, on every
+#: attempt. Whatever ran before the gate passed wrote before the copy read.
+STOPPED_CLOCK = "stopped_clock"
 
 #: COPY journals ``{source volume: CreatedAt}`` for every source volume it copied,
 #: once the end-of-copy checkpoint passed. A rollback after FINALIZE(keep/rename)
@@ -207,6 +225,22 @@ def parse_volume_created(stdout: str) -> dict[str, str]:
 # ── deciding ────────────────────────────────────────────────────────────────
 
 
+def _clock_of(detail: Mapping[str, object], key: str) -> int | None:
+    raw = detail.get(key)
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) else None
+
+
+def judged_from(quiesce_detail: Mapping[str, object]) -> int | None:
+    """From when a source start counts as a revival, given QUIESCE's merged journal detail.
+
+    :data:`STOPPED_CLOCK`, the stop gate's proof. Without it, the stop
+    request's (:data:`STOP_CLOCK`): stricter, never looser. ``None`` when the
+    journal holds neither.
+    """
+    proven = _clock_of(quiesce_detail, STOPPED_CLOCK)
+    return proven if proven is not None else _clock_of(quiesce_detail, STOP_CLOCK)
+
+
 def carries(name: str, image: str, labels: Mapping[str, str], uuid: str) -> bool:
     """Does a container advertise ``uuid`` where a rename cannot reach it?
 
@@ -246,8 +280,9 @@ def source_breaches(
 
     ``seen`` comes from the plan's label filter (``stack``), the uuid probe and
     the migrated-volume probe, pins already left out. ``since`` is the source's
-    clock just before the stop; without it (a journal older than the record) only
-    a container running NOW counts.
+    clock :func:`judged_from` gives — once the stop gate proved the stack down;
+    without it (a journal older than the record) only a container running NOW
+    counts.
     """
     breaches: list[Breach] = []
     reported: set[str] = set()

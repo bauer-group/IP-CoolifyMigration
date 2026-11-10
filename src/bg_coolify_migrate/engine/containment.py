@@ -67,10 +67,9 @@ async def assert_contained(
     log.debug("containment.ok", checkpoint=checkpoint, source=source, target=target)
 
 
-def stop_clock(ctx: MigrationContext) -> int | None:
-    """The source's clock QUIESCE read just before its stop request, from the journal."""
-    raw = ctx.journal.undo_info(State.QUIESCE.value).get(containment.STOP_CLOCK)
-    return raw if isinstance(raw, int) and not isinstance(raw, bool) else None
+def revival_clock(ctx: MigrationContext) -> int | None:
+    """From when a source start counts as a revival (``containment.judged_from``)."""
+    return containment.judged_from(ctx.journal.undo_info(State.QUIESCE.value))
 
 
 def start_requested(ctx: MigrationContext) -> list[str]:
@@ -117,7 +116,7 @@ async def _source_breaches(ctx: MigrationContext, *, checkpoint: str) -> list[Br
     created and never started, and are left out.
     """
     host = ctx.source_host
-    since = stop_clock(ctx)
+    since = revival_clock(ctx)
     stack = observed_labels(ctx.plan)
     watched = [
         Watched(

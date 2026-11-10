@@ -35,7 +35,7 @@ from bg_coolify_migrate.dns.gate import (
     is_definitive,
 )
 from bg_coolify_migrate.domain import domains, fidelity
-from bg_coolify_migrate.domain.containment import STOP_CLOCK, TARGET_HINT
+from bg_coolify_migrate.domain.containment import STOP_CLOCK, STOPPED_CLOCK, TARGET_HINT
 from bg_coolify_migrate.domain.deployments import (
     Progress,
     deployment_uuid_of,
@@ -1144,6 +1144,9 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
             label_filters=observed_labels(ctx.plan),
             timeout=ctx.settings.stop_timeout,
         )
+        # The gate saw the stack down: from here a start is a revival, before it
+        # one of the stop's own restart-policy restarts (containment.STOPPED_CLOCK).
+        stopped = await quiesce.now_on(ctx.source_host)
 
         # "Every container is gone" is not "every container shut down cleanly", and
         # after a Coolify stop the containers are always gone. The exit codes only
@@ -1153,6 +1156,7 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
         )
         if killed:
             _refuse_if_killed_data_holder(ctx, killed)
+        ctx.journal.append("step_started", state="quiesce", detail={STOPPED_CLOCK: stopped})
     except MigrationError as exc:
         _name_source_pins(ctx, exc, source_pins)
         raise
