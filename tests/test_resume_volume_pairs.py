@@ -98,8 +98,8 @@ async def ctx(tmp_path: Path):  # type: ignore[no-untyped-def]
         plan=_plan(),
         journal=Journal.create(tmp_path, "m1"),
         migration_id="m1",
-        source_host=FakeHost(),  # type: ignore[arg-type]
-        target_host=FakeHost(),  # type: ignore[arg-type]
+        source_host=FakeHost().quiet_docker(),  # type: ignore[arg-type]
+        target_host=FakeHost().quiet_docker(),  # type: ignore[arg-type]
     )
     yield context
     await api.aclose()

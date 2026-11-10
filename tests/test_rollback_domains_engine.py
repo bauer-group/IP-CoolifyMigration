@@ -73,6 +73,7 @@ def _host() -> FakeHost:
         .on(r"label=bg-coolify-migrate\.role=pin", stdout="")
         .on(r"authorized_keys\.bak", exit_status=0)
         .on(r"rm -rf /root/\.coolify-migrate/", exit_status=0)
+        .quiet_docker()
     )
 
 

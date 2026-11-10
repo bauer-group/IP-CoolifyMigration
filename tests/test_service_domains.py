@@ -781,8 +781,9 @@ class TestFinalize:
         target = FakeHost()
         target.on(r"sed -i", exit_status=0)
         # FINALIZE also releases the volume pins (discovery/pins.py); none here.
+        # And its containment checkpoint finds the source still stopped.
         for host in (source, target):
-            host.on(r"label=bg-coolify-migrate\.role=pin", stdout="")
+            host.on(r"label=bg-coolify-migrate\.role=pin", stdout="").quiet_docker()
         ctx.source_host = source  # type: ignore[assignment]
         ctx.target_host = target  # type: ignore[assignment]
 

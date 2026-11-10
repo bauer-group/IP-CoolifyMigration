@@ -37,12 +37,14 @@ Postgres data directory.
 from __future__ import annotations
 
 import asyncio
+import shlex
 import time
 from dataclasses import dataclass
 
 import structlog
 
 from bg_coolify_migrate.discovery.docker import Container, inspect_state, list_containers
+from bg_coolify_migrate.domain.containment import EventLog, parse_event_log, started_at_of
 from bg_coolify_migrate.errors import QuiesceError
 from bg_coolify_migrate.transfer.ssh import RemoteHost
 
@@ -327,3 +329,64 @@ async def killed_since(
         if name and code.isdigit() and int(code) == SIGKILL_EXIT:
             killed.append((name, int(code)))
     return killed
+
+
+def start_events_command(*, since: int) -> str:
+    """One SSH round trip: the oldest event the daemon holds, then every container
+    ``start`` since ``since``. PURE.
+
+    Both ends are the host's own clock. The first query exists because the
+    daemon keeps only its last 256 events (moby daemon/events/events.go:12): its
+    oldest surviving event says whether the second one can still see back to
+    ``since`` (``containment.event_log_gap``). ``head`` ends that query early;
+    the exit status is the second query's, so a daemon that does not answer
+    fails the command.
+    """
+    if since < 0:
+        raise ValueError(f"since must be a unix time, not {since}")
+    return (
+        'u="$(date +%s)" && '
+        "docker events --since 0 --until \"$u\" --format 'oldest {{.Time}}' | head -n 1 && "
+        f"docker events --since {since} --until \"$u\" "
+        "--filter type=container --filter event=start --format '{{json .}}'"
+    )
+
+
+async def start_events(host: RemoteHost, *, since: int) -> EventLog:
+    """Every container start the daemon's event log still holds since ``since``.
+
+    The event log is the only witness of a container that started and was
+    removed again — Coolify removes the container of a deploy whose health
+    check failed, and its stop is ``docker rm -f``. Read the way
+    :func:`killed_since` reads it, and never silently: a checkpoint that cannot
+    read it cannot say nothing started.
+    """
+    result = await host.run(start_events_command(since=since))
+    if not result.ok:
+        raise QuiesceError(
+            "could not read the docker event log to check that nothing was started",
+            hint=(
+                "A container that came up and was removed again - a deploy whose health "
+                "check failed - leaves no trace but the event log, so without it this "
+                "check cannot say that nothing started.\n"
+                f"docker events said: {result.stderr.strip()[:200]}"
+            ),
+        )
+    return parse_event_log(result.stdout)
+
+
+async def started_at(host: RemoteHost, container: str) -> int | None:
+    """When a container last started, on its host's clock; ``None`` if never, or gone.
+
+    The same ``docker inspect`` as :func:`~bg_coolify_migrate.discovery.docker.inspect_state`.
+    A container removed since it was listed has no start to report — the event
+    log is where that one shows.
+    """
+    result = await host.run(
+        f"docker inspect --format '{{{{json .State}}}}' {shlex.quote(container)}"
+    )
+    if not result.ok:
+        if "no such object" in (result.stderr + result.stdout).lower():
+            return None
+        result.check()
+    return started_at_of(result.stdout)

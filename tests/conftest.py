@@ -30,8 +30,30 @@ class FakeHost:
     def __init__(self, target: SshTarget | None = None) -> None:
         self.target = target or SshTarget(host="10.0.0.1")
         self._routes: list[tuple[re.Pattern[str], Callable[[str], CommandResult]]] = []
+        #: Consulted only when no route matched: see :meth:`quiet_docker`.
+        self._fallbacks: list[tuple[re.Pattern[str], Callable[[str], CommandResult]]] = []
         self.commands: list[str] = []
         self.forwards: list[tuple[str, int]] = []
+
+    def quiet_docker(self) -> FakeHost:
+        """A daemon with no containers and no events — unless a route says otherwise.
+
+        For tests about something else that pass a containment checkpoint
+        (``engine/containment.py``): it lists containers and reads the event log
+        on both servers. Registered as FALLBACKS, so every ``.on()`` a test adds,
+        before or after, still wins.
+        """
+        for pattern in (r"^docker ps", r"docker events"):
+            compiled = re.compile(pattern)
+            self._fallbacks.append(
+                (
+                    compiled,
+                    lambda command: CommandResult(
+                        command=command, exit_status=0, stdout="", stderr=""
+                    ),
+                )
+            )
+        return self
 
     def on(
         self,
@@ -76,7 +98,7 @@ class FakeHost:
         self, command: str, *, timeout: float | None = None, input_text: str | None = None
     ) -> CommandResult:
         self.commands.append(command)
-        for pattern, responder in self._routes:
+        for pattern, responder in (*self._routes, *self._fallbacks):
             if pattern.search(command):
                 return responder(command)
         raise AssertionError(

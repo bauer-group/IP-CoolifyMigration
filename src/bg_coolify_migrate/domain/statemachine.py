@@ -320,6 +320,36 @@ def source_was_stopped(completed: Collection[str], markers: Mapping[str, Any]) -
     return State.QUIESCE.value in {str(s) for s in completed} or markers.get(STOP_REQUESTED) is True
 
 
+#: Journalled by START (a ``step_started`` detail): every target uuid it is about
+#: to ask Coolify to start, written BEFORE the request. From that moment the
+#: target may come up whatever the step does next.
+START_REQUESTED = "start_requested"
+
+#: Journalled under START's state by a containment checkpoint (or by START on a
+#: refused or skipped start): the target uuids it found started by someone else.
+STARTED_EARLY = "started_early"
+
+
+def target_may_run(completed: Collection[str], markers: Mapping[str, Any]) -> bool:
+    """True if a target may be running, so a rollback owes STOP_TARGET.
+
+    ``markers`` is START's merged journal detail. START completing is not the
+    only way: it fails part-way when a later target's start is refused, and the
+    starts it already asked for still land — they serve the custom hosts CREATE
+    claimed, while the rollback restores and restarts the source. And a target
+    someone ELSE started (a push, a CI deploy) runs although START never ran.
+    Stopping a target that never started is harmless: an application's stop
+    finds no container (StopApplication v4.1.2:35-36, v4.7.2:43-45), a service's
+    or database's answers 400 "already stopped" and dispatches nothing
+    (ServicesController v4.7.2:2278-2280, DatabasesController v4.7.2:3692-3694).
+    """
+    return (
+        State.START_TARGET.value in {str(s) for s in completed}
+        or bool(markers.get(START_REQUESTED))
+        or bool(markers.get(STARTED_EARLY))
+    )
+
+
 def owed_states(
     completed: Sequence[str],
     *,
@@ -345,6 +375,10 @@ def owed_states(
     QUIESCE is never owed merely for being in flight or flagged: a crash before
     the stop request leaves the source running, and restarting it then would be
     an outage this tool caused. Only the stop marker makes it owed.
+
+    START_TARGET is owed, in a failing run as in the explicit command, once a
+    target may run (:func:`target_may_run`): START asked for one, or a
+    checkpoint found one someone else started.
     """
     owed = dict.fromkeys(str(s) for s in completed)
     for state in (in_flight, *undo_incomplete):
@@ -352,6 +386,8 @@ def owed_states(
             owed.setdefault(str(state))
     if source_was_stopped(owed, (markers or {}).get(State.QUIESCE.value) or {}):
         owed.setdefault(State.QUIESCE.value)
+    if target_may_run(owed, (markers or {}).get(State.START_TARGET.value) or {}):
+        owed.setdefault(State.START_TARGET.value)
     return tuple(owed)
 
 

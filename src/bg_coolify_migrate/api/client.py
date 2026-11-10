@@ -34,7 +34,7 @@ import structlog
 
 from bg_coolify_migrate.domain.deploy_triggers import ActiveDeployment, read_active_deployments
 from bg_coolify_migrate.domain.deployments import Deployment, read_deployment
-from bg_coolify_migrate.errors import CoolifyApiError, InsufficientTokenScope
+from bg_coolify_migrate.errors import AlreadyRunning, CoolifyApiError, InsufficientTokenScope
 
 log = structlog.get_logger(__name__)
 
@@ -555,7 +555,26 @@ class CoolifyClient:
         return await self.post(f"/{collection}/{uuid}/storages", body)
 
     async def start(self, collection: str, uuid: str) -> Any:
-        return await self.post(f"/{collection}/{uuid}/start")
+        """Ask Coolify to start a resource; the answer of an application names its deployment.
+
+        Raises:
+            AlreadyRunning: A service or database answered 400 "already running"
+                and started nothing (ServicesController v4.1.2:1724-1726,
+                v4.7.2:2183-2185; DatabasesController v4.1.2:2762-2764,
+                v4.7.2:3588-3590). A distinct type because it is never a
+                success, and for a target never started by this run it means
+                someone else started it: the caller decides what that says.
+        """
+        try:
+            return await self.post(f"/{collection}/{uuid}/start")
+        except CoolifyApiError as exc:
+            if exc.status_code == 400 and "already running" in str(exc.body).lower():
+                raise AlreadyRunning(
+                    f"Coolify refused to start {collection} {uuid}: it reads it as already running",
+                    status_code=exc.status_code,
+                    body=exc.body,
+                ) from exc
+            raise
 
     async def restart(self, collection: str, uuid: str) -> Any:
         """Bring a resource up, whatever Coolify believes its state is.

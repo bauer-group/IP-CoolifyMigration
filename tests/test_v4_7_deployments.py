@@ -107,8 +107,9 @@ async def ctx(tmp_path: Path):  # type: ignore[no-untyped-def]
         plan=_plan(),
         journal=Journal.create(tmp_path, "m47"),
         migration_id="m47",
-        source_host=FakeHost(),  # type: ignore[arg-type]
-        target_host=target,  # type: ignore[arg-type]
+        # Nothing started either, at START's containment checkpoint.
+        source_host=FakeHost().quiet_docker(),  # type: ignore[arg-type]
+        target_host=target.quiet_docker(),  # type: ignore[arg-type]
     )
     yield context
     await api.aclose()

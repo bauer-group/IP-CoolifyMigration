@@ -122,6 +122,25 @@ class SourceDeploymentPending(QuiesceError):
     """
 
 
+class ContainmentBreach(QuiesceError):
+    """Something started a stack this run holds still. Exit code 5, like the stop
+    gate: the stack did not stay stopped.
+
+    Raised by the checkpoints of ``engine/containment.py`` from QUIESCE to
+    FINALIZE. Never a warning and with no override (the quiesce gate has no
+    ``--force``): the run rolls back, and the source — never deleted before
+    FINALIZE — keeps what it wrote.
+    """
+
+
+class SourceRevived(ContainmentBreach):
+    """The source ran again after QUIESCE stopped it: writes the copy does not have."""
+
+
+class TargetStartedEarly(ContainmentBreach):
+    """A target ran before START asked for it: invariant 7, and a writer during the copy."""
+
+
 class TransferError(MigrationError):
     """Data transfer failed. The run is resumable; the source is untouched."""
 
@@ -174,6 +193,17 @@ class CoolifyApiError(MigrationError):
             parts.append(f"body: {self.body!r}")
         out = " | ".join(parts)
         return f"{out}\n\nHint: {self.hint}" if self.hint else out
+
+
+class AlreadyRunning(CoolifyApiError):
+    """``POST /{services,databases}/{uuid}/start`` refused: 400 "already running".
+
+    Both controllers answer it whenever the resource's status column contains
+    'running', and dispatch nothing (ServicesController v4.1.2:1724-1726 ..
+    v4.7.2:2183-2185, DatabasesController v4.1.2:2762-2764 .. v4.7.2:3588-3590).
+    A target this run never started reads 'exited' there, so for a target this
+    is evidence that someone else started it — never a successful start.
+    """
 
 
 class InsufficientTokenScope(CoolifyApiError):

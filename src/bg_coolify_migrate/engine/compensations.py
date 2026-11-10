@@ -28,6 +28,8 @@ from bg_coolify_migrate.domain.deployments import (
     restart_blocked_notice,
 )
 from bg_coolify_migrate.domain.statemachine import (
+    START_REQUESTED,
+    STARTED_EARLY,
     STOP_REQUESTED,
     Compensation,
     State,
@@ -654,8 +656,19 @@ async def undo_start_target(ctx: MigrationContext, undo_info: dict[str, Any]) ->
 
     Ordering matters: a volume in use cannot be removed, and deleting the
     resource before dropping volumes would leak them.
+
+    Every target that may run, not only the ones a completed START lists: each
+    one START asked for (``START_REQUESTED``, journalled before the request, so
+    a START that failed part-way leaves none running) and each one a checkpoint
+    found started by someone else (``STARTED_EARLY``). Stopping one that never
+    started is harmless (``statemachine.target_may_run``).
     """
-    started: list[str] = undo_info.get("started") or []
+    started: list[str] = []
+    for key in ("started", START_REQUESTED, STARTED_EARLY):
+        raw = undo_info.get(key)
+        for uuid in raw if isinstance(raw, list) else []:
+            if isinstance(uuid, str) and uuid not in started:
+                started.append(uuid)
     for target_uuid in started:
         source_uuid = next((s for s, t in ctx.target_uuids.items() if t == target_uuid), None)
         collection = ctx.collection_of(source_uuid) if source_uuid else "applications"

@@ -35,6 +35,7 @@ from bg_coolify_migrate.dns.gate import (
     is_definitive,
 )
 from bg_coolify_migrate.domain import domains, fidelity
+from bg_coolify_migrate.domain.containment import STOP_CLOCK, TARGET_HINT
 from bg_coolify_migrate.domain.deployments import (
     Progress,
     deployment_uuid_of,
@@ -54,9 +55,14 @@ from bg_coolify_migrate.domain.naming import (
 )
 from bg_coolify_migrate.domain.plan import HostBaseline, ResourcePlan, ResourceSnapshot, ServerRef
 from bg_coolify_migrate.domain.schedules import armed_task_names
-from bg_coolify_migrate.domain.statemachine import STOP_REQUESTED, FinalizePolicy, State
+from bg_coolify_migrate.domain.statemachine import (
+    START_REQUESTED,
+    STOP_REQUESTED,
+    FinalizePolicy,
+    State,
+)
 from bg_coolify_migrate.domain.versions import parse_version
-from bg_coolify_migrate.engine import compensations, deploy_triggers, env_recovery, keys
+from bg_coolify_migrate.engine import compensations, containment, deploy_triggers, env_recovery, keys
 from bg_coolify_migrate.engine.context import (
     MigrationContext,
     dns_baseline_of,
@@ -72,6 +78,7 @@ from bg_coolify_migrate.engine.planner import (
     resource_labels,
 )
 from bg_coolify_migrate.errors import (
+    AlreadyRunning,
     CoolifyApiError,
     DnsGateBlocked,
     MigrationError,
@@ -79,6 +86,7 @@ from bg_coolify_migrate.errors import (
     QuiesceError,
     RebuildDriftBlocked,
     RollbackError,
+    TargetStartedEarly,
     TransferError,
     VerificationError,
 )
@@ -1126,7 +1134,9 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
         # can still fail (a SIGKILLed data holder, the stop gate timing out)
         # without ever completing. The marker makes the rollback owe the restart
         # anyway (statemachine.source_was_stopped).
-        ctx.journal.append("step_started", state="quiesce", detail={STOP_REQUESTED: True})
+        ctx.journal.append(
+            "step_started", state="quiesce", detail={STOP_REQUESTED: True, STOP_CLOCK: since}
+        )
         await _request_stop(ctx)
 
         report = await quiesce.wait_until_stopped(
@@ -1924,11 +1934,16 @@ def _assert_pairs_loaded(ctx: MigrationContext, *, step: str) -> None:
 async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
     """Mirror every volume, byte for byte, in parallel where it is safe."""
     _assert_pairs_loaded(ctx, step="copy")
+    # Nothing may have started a target before its volumes are written: a push
+    # or a tag deploy reaches it from CREATE on (engine/containment.py).
+    await containment.assert_contained(ctx, checkpoint="the start of COPY", source=False)
     # A stateless / rebuilt resource has no volume pairs. Skip the ephemeral-key
-    # setup and the restart re-check entirely: there is nothing to copy, and doing
-    # the work anyway only adds a way for a no-data migration to fail spuriously.
+    # setup entirely: there is nothing to copy, and doing the work anyway only
+    # adds a way for a no-data migration to fail spuriously. The source is still
+    # checked: it routes its custom hosts again if anything starts it.
     if not any(ctx.volume_pairs.get(r.snapshot.uuid) for r in ctx.plan.resources):
         log.info("copy.nothing", reason="no volumes to migrate")
+        await containment.assert_contained(ctx, checkpoint="COPY", target=False)
         return {"volumes_copied": [], "key_fingerprint": None}
 
     ctx.ephemeral_key = await keys.install(
@@ -1967,8 +1982,11 @@ async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
             await _copy_one(ctx, pair.source_path, pair.target_path)
             copied.append(pair.target.name)
 
-    # Nothing may have restarted mid-transfer. A `restart:` policy or a dashboard
-    # deploy would invalidate the whole copy, and neither raises on its own.
+    # Nothing may have restarted mid-transfer. A `restart:` policy, a push or a
+    # dashboard deploy would invalidate the whole copy, and none raises on its
+    # own. The checkpoint also sees what started and went again (the event log,
+    # StartedAt) and what a rename hides from the plan's labels.
+    await containment.assert_contained(ctx, checkpoint="the end of COPY")
     await quiesce.assert_still_stopped(
         ctx.source_host, label_filters=observed_labels(ctx.plan), since=before
     )
@@ -2093,6 +2111,9 @@ async def step_verify(ctx: MigrationContext) -> dict[str, Any]:
             ),
         )
 
+    # Identical when read - and only worth something while nothing writes to the
+    # source again, or starts the target, before START.
+    await containment.assert_contained(ctx, checkpoint="the end of VERIFY")
     return {"volumes_verified": verified, "differences": 0}
 
 
@@ -2162,7 +2183,13 @@ async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
     balancer — the origin may still be the source) and one that resolved at
     plan time but no longer does are accepted only one by one
     (--accept-dns-host HOST).
+
+    First, on every attempt — a resume after a block included, which can come
+    hours later: is the source still stopped, and the target still unstarted?
+    The gate is where a run waits, and a push or a CI deploy meanwhile revives
+    the source while DNS still points at it (engine/containment.py).
     """
+    await containment.assert_contained(ctx, checkpoint="the DNS gate")
     hostnames = []
     for resource in ctx.plan.resources:
         target_uuid = ctx.target_uuids[resource.snapshot.uuid]
@@ -2265,21 +2292,90 @@ async def step_dns_gate(ctx: MigrationContext) -> dict[str, Any]:
 
 
 async def step_start_target(ctx: MigrationContext) -> dict[str, Any]:
-    """Start every target, journalling each application's deployment uuid.
+    """Start every target, each request journalled before it is made.
 
-    The uuid is no secret, and journalled rather than kept on the context so a
-    resumed HEALTHCHECK still watches the deployment (:func:`step_healthcheck`).
+    First the containment checkpoint: the source still stopped, no target
+    started by someone else (engine/containment.py).
+
+    Every target uuid is journalled BEFORE its ``/start`` (``START_REQUESTED``):
+    from that moment it may come up whatever this step does next, so a rollback
+    owes STOP_TARGET (``statemachine.target_may_run``) — also when a later
+    target's start fails, which used to leave the started ones routing the
+    claimed custom hosts while the rollback restarted the source. Each
+    application's deployment uuid is journalled once Coolify accepted it: no
+    secret, and a resumed HEALTHCHECK watches it (:func:`step_healthcheck`).
+
+    Two answers mean someone else started a target, and neither is a success:
+
+    * a service's or database's 400 "already running" (``AlreadyRunning``): its
+      status column reads 'running', and a target this run never started reads
+      'exited';
+    * an application's 200 without a ``deployment_uuid``: Coolify skipped the
+      start because a deployment of the same commit is already queued or running
+      for it (applications.php v4.1.2:47-64, v4.7.2:65-78), and the answer drops
+      that deployment's uuid (ApplicationsController v4.1.2:3597-3604,
+      v4.7.2:4970-4977). HEALTHCHECK would have had nothing of ours to watch.
+
+    A resumed START asks again only what its journal does not show accepted: an
+    application whose deployment is journalled keeps it (asking again would be
+    skipped for that very deployment), and a service or database it asked for
+    before that answers "already running" is its own start.
     """
-    started = []
-    deployments: dict[str, str] = {}
+    requested = containment.start_requested(ctx)
+    asked_before = set(requested)
+    deployments = _start_deployments(ctx)
+    await containment.assert_contained(ctx, checkpoint="START")
+    started: list[str] = []
     for resource in ctx.plan.resources:
-        target_uuid = ctx.target_uuids[resource.snapshot.uuid]
-        answer = await ctx.api.start(resource.snapshot.collection, target_uuid)
+        snapshot = resource.snapshot
+        target_uuid = ctx.target_uuids[snapshot.uuid]
+        if target_uuid in asked_before and snapshot.uuid in deployments:
+            started.append(target_uuid)
+            continue
+        if target_uuid not in requested:
+            requested.append(target_uuid)
+            ctx.journal.append(
+                "step_started",
+                state=State.START_TARGET.value,
+                detail={START_REQUESTED: list(requested)},
+            )
+        try:
+            answer = await ctx.api.start(snapshot.collection, target_uuid)
+        except AlreadyRunning as exc:
+            if target_uuid in asked_before:
+                log.info("start.already_running_ours", resource=snapshot.name, uuid=target_uuid)
+                started.append(target_uuid)
+                continue
+            containment.journal_started_early(ctx, [target_uuid])
+            raise TargetStartedEarly(
+                f"the target of {snapshot.name} was started before START asked for it: "
+                "Coolify refused START's request, reading it as already running",
+                hint=TARGET_HINT,
+            ) from exc
         started.append(target_uuid)
-        if resource.snapshot.collection == "applications" and (
-            deployment := deployment_uuid_of(answer)
-        ):
-            deployments[resource.snapshot.uuid] = deployment
+        if snapshot.collection != "applications":
+            continue
+        deployment = deployment_uuid_of(answer)
+        if deployment is None:
+            containment.journal_started_early(ctx, [target_uuid])
+            ours = (
+                " - or this run's own request from before an interruption, which the "
+                "journal does not show accepted"
+                if target_uuid in asked_before
+                else ""
+            )
+            raise TargetStartedEarly(
+                f"Coolify skipped START's deployment of the target of {snapshot.name}: a "
+                "deployment of the same commit is already queued or running for it, one "
+                f"this run did not ask for{ours}",
+                hint=TARGET_HINT,
+            )
+        deployments[snapshot.uuid] = deployment
+        ctx.journal.append(
+            "step_started",
+            state=State.START_TARGET.value,
+            detail={"deployments": dict(deployments)},
+        )
     return {"started": started, "deployments": deployments}
 
 
@@ -2614,6 +2710,12 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
     policy = ctx.plan.finalize_policy
     stamp = ctx.migration_id.split("-")[-1]
     actions: list[str] = []
+    # The source must still be stopped before any policy applies to it: a revived
+    # source holds writes the target lacks, and a DELETE would destroy them. Asked
+    # BEFORE the policy is journalled, so a first attempt that finds one rolls
+    # back like every other checkpoint, instead of meeting rollback_refusal's
+    # "the source is deleted" when nothing of it has been touched.
+    await containment.assert_contained(ctx, checkpoint="FINALIZE", target=False)
     # On disk before anything is touched: after a DELETE has begun, no rollback
     # may run, even if this step dies part-way (statemachine.rollback_refusal).
     ctx.journal.append("step_started", state="finalize", detail={"policy": policy.value})

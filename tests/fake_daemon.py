@@ -29,6 +29,8 @@ class FakeContainer:
     state: str = "running"
     labels: dict[str, str] = field(default_factory=dict)
     volumes: list[str] = field(default_factory=list)
+    started_at: str = "0001-01-01T00:00:00Z"
+    """``State.StartedAt`` as docker prints it; docker's zero time = never started."""
 
     @property
     def id(self) -> str:
@@ -46,6 +48,9 @@ class FakeDaemon(FakeHost):
         self.rm_failures: list[tuple[int, str]] = []
         #: Called after every docker command we emulate, with the command.
         self.on_command: Callable[[str], None] | None = None
+        #: What the containment checkpoints' `docker events` prints: an `oldest N`
+        #: line and one JSON line per container start (``discovery.quiesce``).
+        self.events: str = ""
 
     def add(
         self,
@@ -101,7 +106,15 @@ class FakeDaemon(FakeHost):
     def _docker(self, command: str) -> CommandResult:
         if " && docker create " in command:
             return self._create(command, command.split(" && ", 1)[1])
+        if "docker events --since 0" in command and "event=start" in command:
+            return self._ok(command, self.events)
         argv = shlex.split(command)
+        if argv[:2] == ["docker", "inspect"] and "{{json .State}}" in argv:
+            container = self._find(argv[-1])
+            if container is None:
+                return self._err(command, f"Error: No such object: {argv[-1]}")
+            state = {"Status": container.state, "ExitCode": 0, "StartedAt": container.started_at}
+            return self._ok(command, json.dumps(state))
         if argv[:3] == ["docker", "ps", "-a"]:
             filters = [argv[i + 1] for i, a in enumerate(argv) if a == "--filter"]
             found = list(self.containers.values())

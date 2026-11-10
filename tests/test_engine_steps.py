@@ -188,7 +188,8 @@ def _source_host(*, probe: str = "REACH") -> FakeHost:
     # Narrow patterns, and last: a test's own route must keep winning.
     host.on(r"docker volume ls", stdout="")
     host.on(r"rm -rf /root/\.coolify-migrate/", exit_status=0)
-    return host
+    # The containment checkpoints (engine/containment.py) find nothing started.
+    return host.quiet_docker()
 
 
 def _target_host(*, free_kb: str = "99999999") -> FakeHost:
@@ -203,7 +204,9 @@ def _target_host(*, free_kb: str = "99999999") -> FakeHost:
     # matches in insertion order.
     host.on(r"label=bg-coolify-migrate\.role=pin", stdout="")
     host.on(r"authorized_keys\.bak", exit_status=0)
-    return host
+    # The containment checkpoints find nothing started: fallbacks, so the
+    # healthcheck tests' own `docker ps` routes still win.
+    return host.quiet_docker()
 
 
 def _relabelled_source_host() -> FakeHost:
@@ -1593,7 +1596,7 @@ class TestVerify:
             h.on(r"sha256sum", stdout="aaa  ./f\n")
             h.on(r"find --version", stdout="GNU findutils")
             h.on(r"find \. -printf", stdout="./f|f|644|999|999|\n")
-            return h
+            return h.quiet_docker()
 
         ctx.source_host = host()  # type: ignore[assignment]
         ctx.target_host = host()  # type: ignore[assignment]
