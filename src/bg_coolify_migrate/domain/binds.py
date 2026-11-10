@@ -803,14 +803,27 @@ def belongs_to(
 #: that resource is saved or deployed.
 _COOLIFY_ROOTS = frozenset({COOLIFY_BASE_DIR, *RESOURCE_ROOTS})
 
+#: The whole host. A container binding it is a host-wide agent (Portainer's
+#: agent runs with ``-v /:/host``, a host backup with ``/:/source``), not a
+#: resource sharing one path's data: :func:`host_wide_writers`.
+HOST_ROOT = "/"
+
 
 def shared_with(path: str, binds: Iterable[HostBind]) -> list[HostBind]:
     """The binds that share ``path``'s bytes with it. PURE.
 
     The same path or one inside it, read-only or not: that container sees the
     same data. A writable bind of a PARENT too — it can write into ``path`` —
-    except Coolify's own management roots. A read-only parent (cAdvisor's
-    ``/:/rootfs:ro``) only reads, and does not count.
+    except Coolify's own management roots and the whole host (:data:`HOST_ROOT`).
+    A read-only parent (cAdvisor's ``/:/rootfs:ro``) only reads, and does not
+    count.
+
+    A writable bind of ``/`` reaches every path of the server, so counting it
+    here refused every bind migration on a server running such an agent, with
+    a remedy ("migrate the resources that share it together") that does not
+    fit. It is warned about instead (:func:`host_wide_writers`). Every other
+    parent still refuses, ``/data``, ``/srv`` or ``/home`` included: such a bind
+    is a container keeping its data in a tree that holds this path.
     """
     out: list[HostBind] = []
     for bind in binds:
@@ -818,10 +831,42 @@ def shared_with(path: str, binds: Iterable[HostBind]) -> list[HostBind]:
         if other is None:
             continue
         sees_it = is_within(other, path)
-        writes_into_it = is_within(path, other) and bind.rw and other not in _COOLIFY_ROOTS
+        writes_into_it = (
+            is_within(path, other)
+            and bind.rw
+            and other not in _COOLIFY_ROOTS
+            and other != HOST_ROOT
+        )
         if sees_it or writes_into_it:
             out.append(bind)
     return out
+
+
+def host_wide_writers(binds: Iterable[HostBind]) -> list[HostBind]:
+    """The containers that mount the whole host writable, once each. PURE.
+
+    :func:`shared_with` leaves them out; the run warns about each instead
+    (:func:`host_wide_notice`). A read-only ``/`` is no writer.
+    """
+    seen: dict[str, HostBind] = {}
+    for bind in binds:
+        if bind.rw and normalise(bind.source) == HOST_ROOT:
+            seen.setdefault(bind.container, bind)
+    return list(seen.values())
+
+
+def host_wide_notice(bind: HostBind, *, paths: Sequence[str], server: str) -> str:
+    """The run notice for one container that mounts the whole host writable. PURE."""
+    shown = ", ".join(paths[:5]) + (f" and {len(paths) - 5} more" if len(paths) > 5 else "")
+    return (
+        f"{bind.container} on {server} mounts the whole host writable ({HOST_ROOT}), so it "
+        f"can write the bind mount(s) {shown} while the migration copies them. It looks "
+        "like a host agent (Portainer's agent, a host backup) rather than a resource "
+        "sharing that data, so the migration goes on - but what it writes there while "
+        "the data is copied and verified can fail VERIFY or go missing from the copy. "
+        "Make that mount read-only, or stop the container until the migration has "
+        "finished."
+    )
 
 
 # ── rollback ─────────────────────────────────────────────────────────────────

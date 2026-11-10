@@ -1917,6 +1917,9 @@ async def _assert_source_binds_safe(ctx: MigrationContext) -> None:
     plan may share its bytes: QUIESCE stops only the plan's resources, so such
     a container keeps writing during the copy — no consistent copy — and after
     the cutover it and the target hold two diverging copies of shared state.
+
+    A container that mounts the whole host writable (``binds.host_wide_writers``)
+    is an agent, not a sharer, and gets a run notice instead of a refusal.
     """
     paths = _plan_binds(ctx)
     if not paths:
@@ -1942,6 +1945,7 @@ async def _assert_source_binds_safe(ctx: MigrationContext) -> None:
             f"{'' if other.rw else ', read-only'}), which this migration does not stop"
             for other in binds.shared_with(path, others)
         )
+    _note_host_wide_writers(ctx, others, paths=paths, server=ctx.plan.source_server.name)
     if problems:
         raise PreflightError(
             "bind mount(s) cannot be copied safely:\n" + "\n".join(f"  {p}" for p in problems),
@@ -1954,6 +1958,15 @@ async def _assert_source_binds_safe(ctx: MigrationContext) -> None:
                 "Nothing has been changed and the source is untouched."
             ),
         )
+
+
+def _note_host_wide_writers(
+    ctx: MigrationContext, mounts: list[binds.HostBind], *, paths: list[str], server: str
+) -> None:
+    """A run notice for each container that mounts the whole host writable."""
+    for bind in binds.host_wide_writers(mounts):
+        log.warning("binds.host_wide_writer", container=bind.container, server=server)
+        ctx.notices.append(binds.host_wide_notice(bind, paths=paths, server=server))
 
 
 async def _target_rows(
@@ -2129,6 +2142,9 @@ async def _assert_target_binds_safe(ctx: MigrationContext) -> None:
             f"({other.source})"
             for other in binds.shared_with(pair.target_path, in_use)
         )
+    _note_host_wide_writers(
+        ctx, in_use, paths=[p.target_path for p in pairs], server=ctx.plan.target_server.name
+    )
     if problems:
         raise TransferError(
             "bind mount(s) have no free place on the target:\n"
