@@ -19,7 +19,7 @@ from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.dns.gate import is_definitive
 from bg_coolify_migrate.domain.domains import dns_rollback_note, parking_tag
 from bg_coolify_migrate.domain.plan import MigrationPlan, ServerRef, TransferMode
-from bg_coolify_migrate.domain.statemachine import Outcome, State
+from bg_coolify_migrate.domain.statemachine import Outcome, State, source_was_stopped
 from bg_coolify_migrate.engine.compensations import (
     build_compensations,
     settle_window,
@@ -34,7 +34,7 @@ from bg_coolify_migrate.engine.context import (
 from bg_coolify_migrate.engine.executor import RunResult, Saga
 from bg_coolify_migrate.engine.steps import build_steps
 from bg_coolify_migrate.errors import MigrationError
-from bg_coolify_migrate.journal.store import Journal
+from bg_coolify_migrate.journal.store import Journal, JournalError
 from bg_coolify_migrate.settings.base import Settings
 from bg_coolify_migrate.transfer import ssh
 from bg_coolify_migrate.transfer.ssh import HostKeyPrompt, RemoteHost, SshTarget
@@ -91,6 +91,25 @@ def make_migration_id(project: str, environment: str, when: datetime | None = No
     """
     stamp = (when or datetime.now(UTC)).strftime("%Y%m%d-%H%M%S")
     return f"{stamp}-{parking_tag(project, environment)}"
+
+
+def run_stopped_source(state_dir: Path, migration_id: str) -> bool:
+    """Did run ``migration_id`` (possibly) stop its source? Read from its JOURNAL.
+
+    Exactly then the run owns the source's restart: its rollback owes
+    RESTART_SOURCE, a block or an interruption leaves it to ``resume`` or
+    ``rollback``, and a success keeps it stopped on purpose. The rule is
+    :func:`statemachine.source_was_stopped`, never the state a run reached: a
+    QUIESCE that refuses before its stop request (a failed disarm, a source
+    deployment still pending, a pin that could not be made) REACHED QUIESCE,
+    stopped nothing, and its rollback restarts nothing. A run whose journal was
+    never written failed before its saga began and stopped nothing either.
+    """
+    try:
+        journal = Journal.open(state_dir, migration_id)
+    except JournalError:
+        return False
+    return source_was_stopped(journal.completed_states(), journal.undo_info(State.QUIESCE.value))
 
 
 async def ssh_target_for(api: CoolifyClient, server: ServerRef) -> SshTarget:

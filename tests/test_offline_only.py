@@ -29,8 +29,6 @@ from bg_coolify_migrate.domain.plan import (
     ServerRef,
     Strategy,
 )
-from bg_coolify_migrate.domain.statemachine import Outcome, State
-from bg_coolify_migrate.engine.executor import RunResult
 from bg_coolify_migrate.settings.base import Settings
 
 ANON = "a09bdb674c95b3e3888c26c355c3fe0e7ff59b5f83821d60bfab257d09f9d312"
@@ -198,36 +196,19 @@ class TestRestartStopped:
         await cli._restart_stopped(_Broken(), stopped)
         assert stopped == []
 
-
-class TestExecuteHandsOver:
-    @pytest.mark.parametrize(
-        ("reached", "kept"),
-        [(State.CREATE_TARGET, True), (State.QUIESCE, False), (State.DONE, False)],
-    )
-    async def test_the_saga_owns_the_source_from_quiesce_on(
-        self, monkeypatch: pytest.MonkeyPatch, settings: Settings, reached: State, kept: bool
-    ) -> None:
-        """Before QUIESCE the up-front stop is ours to undo; from it on, the saga
-        stops the source itself and its rollback restarts it."""
+    async def test_start_again_takes_only_the_given_resources(self) -> None:
         from bg_coolify_migrate import cli
-        from bg_coolify_migrate.engine import runner
 
-        async def _accept(*args: object, **kwargs: object) -> None:
-            return None
+        other = ("applications", "app2", "web")
+        api, stopped = _Api(), [("applications", "app1", "sonar"), other]
+        started = await cli._start_again(api, stopped, {"app1"})
+        assert [s.name for s in started] == ["sonar"] and started[0].error is None
+        assert api.calls == [("restart", "applications", "app1")]
+        assert stopped == [other]
 
-        async def _run(*args: object, **kwargs: object) -> RunResult:
-            outcome = Outcome.SUCCEEDED if reached is State.DONE else Outcome.FAILED
-            return RunResult(outcome=outcome, reached=reached)
 
-        monkeypatch.setattr(cli, "_accept_host_key", _accept)
-        monkeypatch.setattr(runner, "run_migration", _run)
-        stopped = [("applications", "app1", "sonar")]
-        await cli._execute_plans(
-            _Api(), settings, [_plan(_resource())], stopped,
-            accept_drift=True, accept_dns=True, accept_hosts=frozenset(),
-            delete_previews=False, trust_host_key=False,
-        )
-        assert bool(stopped) is kept
+# Who restarts the stack once a run has begun - the run or the CLI - is decided
+# from the run's journal: tests/test_offline_restart_owner.py.
 
 
 async def _no_sleep(_: float) -> None:

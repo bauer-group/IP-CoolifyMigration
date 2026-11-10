@@ -29,7 +29,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import typer
 from rich.markup import escape
@@ -44,6 +44,9 @@ from bg_coolify_migrate.errors import EmptyEnvironment, MigrationError, Prefligh
 from bg_coolify_migrate.observability.logging_setup import setup_logging
 from bg_coolify_migrate.settings.base import Settings
 from bg_coolify_migrate.ui.console import get_console, is_interactive
+
+if TYPE_CHECKING:
+    from bg_coolify_migrate.ui.run_report import StartedAgain
 
 app = typer.Typer(
     name="coolify-migrate",
@@ -1023,7 +1026,8 @@ async def _run(
             return 2
 
         #: Sources this run stopped up front (offline-only stacks), as (collection,
-        #: uuid, name). Started again unless the migration got as far as stopping them.
+        #: uuid, name). Started again unless the migration itself may have stopped
+        #: them - its journal says (``runner.run_stopped_source``).
         stopped: list[tuple[str, str, str]] = []
 
         if not assume_yes:
@@ -1062,8 +1066,9 @@ async def _run(
                 delete_previews=delete_previews, trust_host_key=trust_host_key,
             )
         finally:
-            # Whatever the saga never took over (it does at QUIESCE) is still down
-            # because of the up-front stop: bring it back.
+            # Whatever no migration took over is still down because of the
+            # up-front stop: an environment that never ran after an earlier one
+            # failed, or a run that raised. Bring it back.
             await _restart_stopped(api, stopped)
 
 
@@ -1079,7 +1084,6 @@ async def _execute_plans(
     delete_previews: bool,
     trust_host_key: bool,
 ) -> int:
-    from bg_coolify_migrate.domain.statemachine import ORDER, State
     from bg_coolify_migrate.engine.runner import make_migration_id, run_migration
     from bg_coolify_migrate.ui import dashboard, run_report
 
@@ -1091,37 +1095,47 @@ async def _execute_plans(
     worst = 0
     for migration_plan in plans:
         migration_id = make_migration_id(migration_plan.project, migration_plan.environment)
+        uuids = {r.snapshot.uuid for r in migration_plan.resources}
         started = time.monotonic()
         reporter = dashboard.build(
             title=f"{migration_plan.project}/{migration_plan.environment}"
         )
-        with reporter:
-            result = await run_migration(
-                api,
-                settings,
-                migration_plan,
-                migration_id=migration_id,
-                accept_drift=accept_drift,
-                accept_dns=accept_dns,
-                accept_hosts=accept_hosts,
-                delete_previews=delete_previews,
-                trust_host_key=trust_host_key,
-                host_key_prompt=None,  # keys pre-accepted; never prompt under Live
-                on_state=reporter.on_state,
-            )
+        try:
+            with reporter:
+                result = await run_migration(
+                    api,
+                    settings,
+                    migration_plan,
+                    migration_id=migration_id,
+                    accept_drift=accept_drift,
+                    accept_dns=accept_dns,
+                    accept_hosts=accept_hosts,
+                    delete_previews=delete_previews,
+                    trust_host_key=trust_host_key,
+                    host_key_prompt=None,  # keys pre-accepted; never prompt under Live
+                    on_state=reporter.on_state,
+                )
+        finally:
+            # Also when the run raised (a refused rollback, Ctrl-C): a source it
+            # may have stopped is its own, never the finally's to restart.
+            _hand_over(settings, migration_id, uuids, stopped)
         elapsed = time.monotonic() - started
-        # From QUIESCE on the saga owns the source: it stops it itself, and its
-        # rollback restarts it (stop_requested marker). Before that, a source
-        # stopped up front stays ours to start again.
-        if ORDER.index(result.reached) >= ORDER.index(State.QUIESCE):
-            owned = {r.snapshot.uuid for r in migration_plan.resources}
-            stopped[:] = [s for s in stopped if s[1] not in owned]
+        # Down only because of the up-front stop, and the run never took it
+        # over: start it again now, so the report can say how that went.
+        started_again = await _start_again(api, stopped, uuids)
         if is_interactive():
             console.print(
-                run_report.outcome_panel(result, migration_id=migration_id, elapsed=elapsed)
+                run_report.outcome_panel(
+                    result, migration_id=migration_id, elapsed=elapsed,
+                    started_again=started_again,
+                )
             )
         else:
-            console.print(run_report.plain_result(result, migration_id=migration_id))
+            console.print(
+                run_report.plain_result(
+                    result, migration_id=migration_id, started_again=started_again
+                )
+            )
 
         if result.exit_code != 0:
             worst = result.exit_code
@@ -1190,22 +1204,92 @@ async def _await_offline(
         await asyncio.sleep(5)
 
 
-async def _restart_stopped(api: Any, stopped: list[tuple[str, str, str]]) -> None:
-    """Start again what ``_offer_offline`` stopped and no migration took over.
+def _hand_over(
+    settings: Settings,
+    migration_id: str,
+    uuids: set[str],
+    stopped: list[tuple[str, str, str]],
+) -> None:
+    """Take out of ``stopped`` what run ``migration_id`` owns now.
 
-    ``/restart``, not ``/start``: the start endpoint refuses on Coolify's stale
-    status column (AGENTS.md). Failures are reported, never raised — this runs on
-    the way out of an abort or a failure that already has its own message.
+    The run owns its source's restart exactly when its JOURNAL says it may have
+    stopped the source (``runner.run_stopped_source``): its rollback restarts
+    it, a resume or a rollback finishes the run, a finished migration keeps it
+    stopped on purpose. Never decided from the state the run reached: a QUIESCE
+    refused before its stop request reached QUIESCE, stopped nothing and
+    restarts nothing, and the stack stopped up front stayed down.
+
+    A journal that cannot be read leaves the stack to the run, and says so.
+    Restarting a source the run may have stopped - finalized, or refused a
+    rollback because its data is gone - cannot be taken back; leaving a stopped
+    stack down can.
     """
-    console = get_console()
-    while stopped:
-        collection, uuid, name = stopped.pop(0)
+    from bg_coolify_migrate.engine.runner import run_stopped_source
+
+    mine = [entry for entry in stopped if entry[1] in uuids]
+    if not mine:
+        return
+    try:
+        owned = run_stopped_source(settings.resolved_state_dir(), migration_id)
+    except Exception as exc:
+        owned = True
+        names = ", ".join(name for _, _, name in mine)
+        get_console().print(
+            Text(
+                f"not starting {names} again: stopped before the run, but whether the "
+                f"migration stopped it too could not be read from its journal ({exc}). "
+                f"Check it in Coolify (coolify-migrate status {migration_id}).",
+                style="err",
+            )
+        )
+    if owned:
+        stopped[:] = [entry for entry in stopped if entry[1] not in uuids]
+
+
+async def _start_again(
+    api: Any, stopped: list[tuple[str, str, str]], uuids: set[str] | None = None
+) -> "list[StartedAgain]":
+    """Ask Coolify to start again what ``_offer_offline`` stopped and no run took over.
+
+    Takes the entries of ``uuids`` - every entry with ``None`` - out of
+    ``stopped``, each before its request, so nothing is asked twice.
+    ``/restart``, not ``/start``: the start endpoint refuses on Coolify's stale
+    status column (AGENTS.md). Failures are returned, never raised: this runs
+    after a run that has its own outcome, and on the way out of an abort.
+    """
+    from bg_coolify_migrate.ui.run_report import StartedAgain
+
+    out: list[StartedAgain] = []
+    for entry in [e for e in stopped if uuids is None or e[1] in uuids]:
+        stopped.remove(entry)
+        collection, uuid, name = entry
         try:
             await api.restart(collection, uuid)
-            console.print(Text(f"started {name} again", style="muted"))
         except Exception as exc:
+            out.append(StartedAgain(name=name, error=(str(exc).splitlines() or [repr(exc)])[0]))
+        else:
+            out.append(StartedAgain(name=name))
+    return out
+
+
+async def _restart_stopped(api: Any, stopped: list[tuple[str, str, str]]) -> None:
+    """Start again everything left in ``stopped``, and say how it went.
+
+    The way out of an abort before any run, and of environments that never ran
+    (or a run that raised); after a run, ``_execute_plans`` starts what that run
+    did not take over itself and puts it in the run's report.
+    """
+    console = get_console()
+    for entry in await _start_again(api, stopped):
+        if entry.error is None:
+            console.print(Text(f"asked Coolify to start {entry.name} again", style="muted"))
+        else:
             console.print(
-                Text(f"could not start {name} again ({exc}) - start it in Coolify", style="err")
+                Text(
+                    f"could not start {entry.name} again ({entry.error}) - it is DOWN: "
+                    "start it in Coolify",
+                    style="err",
+                )
             )
 
 

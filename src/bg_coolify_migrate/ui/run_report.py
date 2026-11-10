@@ -11,6 +11,9 @@ trains people to reach for `--force` flags that do not exist.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
+
 from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.table import Table
@@ -40,12 +43,37 @@ _OUTCOME_TITLE = {
 }
 
 
-def outcome_panel(result: RunResult, *, migration_id: str, elapsed: float | None = None) -> Panel:
+@dataclass(frozen=True)
+class StartedAgain:
+    """A resource the CLI stopped BEFORE the run, and asked Coolify to start again after it.
+
+    ``run`` stops an offline-only stack up front, on the operator's yes. When
+    the migration never stopped its source itself (``runner.run_stopped_source``)
+    nothing in the run restarts it, so the CLI asks Coolify to (``/restart``)
+    before this report is shown. ``error`` is ``None`` when Coolify accepted
+    that request - a request, not proof: for an application it queues a
+    deployment - and why it failed otherwise. The resource is then DOWN.
+    """
+
+    name: str
+    error: str | None = None
+
+
+def outcome_panel(
+    result: RunResult,
+    *,
+    migration_id: str,
+    elapsed: float | None = None,
+    started_again: Sequence[StartedAgain] = (),
+) -> Panel:
     lines: list[RenderableType] = []
 
     if result.error is not None:
         lines.append(Text(str(result.error)))
         lines.append(Text(""))
+
+    if started_again:
+        lines.extend(_started_again_lines(started_again))
 
     if result.compensations_run:
         lines.append(Text("Undone:", style="bold"))
@@ -69,7 +97,7 @@ def outcome_panel(result: RunResult, *, migration_id: str, elapsed: float | None
         lines.extend(Text(f"  - {note}", style="warn") for note in result.notes)
         lines.append(Text(""))
 
-    lines.append(Text(_next_step(result, migration_id), style="muted"))
+    lines.append(Text(_next_step(result, migration_id, started_again), style="muted"))
 
     if elapsed is not None:
         lines.append(Text(f"\nElapsed: {human_duration(elapsed)}", style="muted"))
@@ -88,8 +116,62 @@ def outcome_panel(result: RunResult, *, migration_id: str, elapsed: float | None
     )
 
 
-def _next_step(result: RunResult, migration_id: str) -> str:
-    """What to actually do now. Every path ends with a command or a reassurance."""
+def _started_again_lines(started_again: Sequence[StartedAgain]) -> list[RenderableType]:
+    """What the CLI stopped before the run, and whether Coolify took the restart.
+
+    Shown right under the error because it qualifies the error's hint: a
+    refusal before the stop says nothing was stopped and the source keeps
+    serving - true of the migration, which never stopped it, and not of a
+    stack the run had already stopped up front.
+    """
+    lines: list[RenderableType] = [
+        Text("Stopped before the run, on your yes to migrate offline:", style="bold warn"),
+        Text(
+            "  The migration itself never stopped these: where it says above that nothing was\n"
+            "  stopped or that the source keeps serving, it speaks of the migration alone."
+        ),
+    ]
+    for entry in started_again:
+        if entry.error is None:
+            lines.append(
+                Text(
+                    f"  - {entry.name}: asked Coolify to start it again - check in Coolify "
+                    "that it is back"
+                )
+            )
+        else:
+            lines.append(
+                Text(
+                    f"  - {entry.name} is DOWN: starting it again failed ({entry.error}) - "
+                    "start it in Coolify",
+                    style="err",
+                )
+            )
+    lines.append(Text(""))
+    return lines
+
+
+def _next_step(
+    result: RunResult, migration_id: str, started_again: Sequence[StartedAgain] = ()
+) -> str:
+    """What to actually do now. Every path ends with a command or a reassurance.
+
+    A resource the CLI stopped before the run and could not start again comes
+    first, whatever the outcome: it is down, and nothing else will start it.
+    """
+    step = _outcome_step(result, migration_id, started_again)
+    down = [entry.name for entry in started_again if entry.error is not None]
+    if not down:
+        return step
+    return (
+        f"Still DOWN: {', '.join(down)} - stopped before the run, and starting it again\n"
+        f"failed (above). Start it in Coolify.\n\n{step}"
+    )
+
+
+def _outcome_step(
+    result: RunResult, migration_id: str, started_again: Sequence[StartedAgain]
+) -> str:
     if result.outcome is Outcome.SUCCEEDED:
         return f"Migration id: {migration_id}\nRollback is still possible: coolify-migrate rollback {migration_id}"
 
@@ -109,6 +191,14 @@ def _next_step(result: RunResult, migration_id: str) -> str:
             return (
                 "Everything we changed has been undone, but read what was left in place\n"
                 "above: it says what may not be back yet.\n"
+                "Your data was never at risk: the source is only destroyed at finalize."
+            )
+        # Not "running again": no step of the run restarted what the CLI stopped
+        # up front, and the CLI's own restart is a request, not a proven start.
+        if started_again:
+            return (
+                "Everything the migration changed has been undone. What this run stopped\n"
+                "before it is listed above, with whether Coolify took the restart.\n"
                 "Your data was never at risk: the source is only destroyed at finalize."
             )
         return (
@@ -202,7 +292,9 @@ def verification_table(result_context: object) -> Table | None:
     return table
 
 
-def plain_result(result: RunResult, *, migration_id: str) -> str:
+def plain_result(
+    result: RunResult, *, migration_id: str, started_again: Sequence[StartedAgain] = ()
+) -> str:
     """Line-oriented outcome for pipes and CI."""
     lines = [
         f"migration: {migration_id}",
@@ -212,6 +304,14 @@ def plain_result(result: RunResult, *, migration_id: str) -> str:
     ]
     if result.error is not None:
         lines.append(f"error: {str(result.error).splitlines()[0]}")
+    for entry in started_again:
+        if entry.error is None:
+            lines.append(f"stopped_before_run: {entry.name}: asked Coolify to start it again")
+        else:
+            lines.append(
+                f"stopped_before_run: {entry.name}: DOWN - could not start it again "
+                f"({entry.error}); start it in Coolify"
+            )
     for compensation in result.compensations_run:
         lines.append(f"undone: {compensation.value}")
     for compensation, error in result.compensations_failed:

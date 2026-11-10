@@ -554,10 +554,30 @@ Stop <name> now and migrate offline?
 ```
 
 Yes stops the stack through Coolify, waits until its containers are gone, plans
-again and continues; the downtime starts then instead of at QUIESCE. If the run
-ends before it would have stopped the source itself (an abort, a failure in
-CREATE), the source is started again. Unattended (`--yes`) runs do not stop
-anything: stop the stack in Coolify, then run again.
+again and continues; the downtime starts then instead of at QUIESCE. Unattended
+(`--yes`) runs do not stop anything: stop the stack in Coolify, then run again.
+
+Who starts it again is read from the run's journal. Once the migration has asked
+Coolify to stop the source itself, the source is the migration's: its rollback
+restarts it, as in any run (or `resume` / `rollback`, if it blocked or was
+interrupted). If the migration ends without having asked for that stop — an
+abort, a failure in CREATE, or a refusal in QUIESCE before the stop (a source
+deployment still pending, a failed auto-deploy switch-off) — `run` asks Coolify
+to start the stack again before it shows the report, which lists it under:
+
+```text
+Stopped before the run, on your yes to migrate offline:
+```
+
+There, where the error's hint says that nothing was stopped and the source keeps
+serving, it speaks of the migration alone. `<name> is DOWN: starting it again
+failed` (plain output: `stopped_before_run: <name>: DOWN`) means that request
+failed: start the stack in Coolify. `not starting <name> again: … could not be
+read from its journal` means `run` could not tell whose the stack is, and leaves
+it as it is rather than start a source the migration may have stopped: check it
+in Coolify and with `coolify-migrate status <id>`. If `run` itself is killed
+before it gets there, start the stack in Coolify: a later `rollback` restarts only
+what the migration stopped.
 
 Not offered for databases — there an anonymous volume can be the data itself
 (an image whose data path moved, like Postgres 18's `/var/lib/postgresql`).

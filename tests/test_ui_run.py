@@ -12,12 +12,17 @@ from rich.console import Console
 
 from bg_coolify_migrate.domain.statemachine import Compensation, Outcome, State
 from bg_coolify_migrate.engine.executor import RunResult
-from bg_coolify_migrate.errors import DnsGateBlocked, RollbackError, TransferError
+from bg_coolify_migrate.errors import (
+    DnsGateBlocked,
+    QuiesceError,
+    RollbackError,
+    TransferError,
+)
 from bg_coolify_migrate.server.inventory import ServerInventory
 from bg_coolify_migrate.ui import server_report
 from bg_coolify_migrate.ui.console import THEME
 from bg_coolify_migrate.ui.dashboard import LiveDashboard, PlainReporter, build
-from bg_coolify_migrate.ui.run_report import outcome_panel, plain_result
+from bg_coolify_migrate.ui.run_report import StartedAgain, outcome_panel, plain_result
 
 
 def render(renderable: object) -> str:
@@ -73,6 +78,70 @@ class TestOutcomePanel:
     def test_elapsed_is_shown(self) -> None:
         result = RunResult(outcome=Outcome.SUCCEEDED, reached=State.DONE)
         assert "1m 30s" in render(outcome_panel(result, migration_id="m1", elapsed=90))
+
+
+class TestStartedAgain:
+    """A stack the CLI stopped before the run, that the migration never took over.
+
+    A refusal before the stop says nothing was stopped and the source keeps
+    serving - of the migration. The report must not let that, or "your source
+    is running again", stand for a stack the run stopped up front.
+    """
+
+    @staticmethod
+    def _refused() -> RunResult:
+        return RunResult(
+            outcome=Outcome.ROLLED_BACK,
+            reached=State.QUIESCE,
+            error=QuiesceError(
+                "a source deployment has not ended",
+                hint="Nothing was stopped: the source keeps serving.",
+            ),
+            compensations_run=[Compensation.DELETE_TARGET_RESOURCE],
+        )
+
+    def test_a_restart_asked_for_is_said_and_qualifies_the_hint(self) -> None:
+        out = render(
+            outcome_panel(
+                self._refused(), migration_id="m1", started_again=[StartedAgain("sonar")]
+            )
+        )
+        assert "Stopped before the run" in out
+        assert "speaks of the migration alone" in out
+        assert "sonar: asked Coolify to start it again" in out
+        assert "running again" not in out  # a request is no proven start
+        assert "never at risk" in out
+        assert "DOWN" not in out
+
+    def test_a_failed_restart_says_plainly_that_it_is_down(self) -> None:
+        down = StartedAgain("sonar", error="HTTP 503")
+        out = render(outcome_panel(self._refused(), migration_id="m1", started_again=[down]))
+        assert "sonar is DOWN: starting it again failed (HTTP 503)" in out
+        assert "Still DOWN: sonar" in out
+        assert "running again" not in out
+
+    def test_down_leads_whatever_the_outcome(self) -> None:
+        result = RunResult(outcome=Outcome.FAILED, reached=State.PREFLIGHT)
+        down = StartedAgain("sonar", error="boom")
+        out = render(outcome_panel(result, migration_id="m1", started_again=[down]))
+        assert out.index("Still DOWN: sonar") < out.index("Nothing was changed")
+
+    def test_without_it_the_report_is_unchanged(self) -> None:
+        out = render(outcome_panel(self._refused(), migration_id="m1"))
+        assert "Stopped before the run" not in out
+        assert "running again" in out
+
+    def test_plain_output_names_both(self) -> None:
+        out = plain_result(
+            self._refused(),
+            migration_id="m1",
+            started_again=[StartedAgain("sonar"), StartedAgain("web", error="boom")],
+        )
+        assert "stopped_before_run: sonar: asked Coolify to start it again" in out
+        assert (
+            "stopped_before_run: web: DOWN - could not start it again (boom); "
+            "start it in Coolify"
+        ) in out
 
 
 class TestPlainResult:

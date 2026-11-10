@@ -396,6 +396,12 @@ shipped inside a green unit suite. `tests/e2e/README.md` has the full table.
   completes. QUIESCE journals `stop_requested` before the request; the rollback
   owes RESTART_SOURCE from it (`statemachine.source_was_stopped` — reuse it, never
   `"quiesce" in completed`).
+  The same rule, read from the journal (`runner.run_stopped_source`), decides who
+  restarts an offline-only stack `run` stopped BEFORE the run: the run once it
+  may have stopped the source, the CLI otherwise — never the state it reached.
+  QUIESCE refuses before its stop request (a failed disarm, a source deployment
+  still pending, an unreadable history, a pin) and its rollback restarts nothing,
+  so the CLI does, before the report, which says so (`run_report.StartedAgain`).
 - **Exit code 137 cannot be polled for**, for the same reason: both commands go
   out in one SSH invocation, so a SIGKILLed container exists for milliseconds.
   The guard that makes invariant 9 mean anything reads the **daemon event log**
