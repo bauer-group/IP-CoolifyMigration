@@ -132,8 +132,19 @@ from bg_coolify_migrate.domain.versions import Version
 #: labels, volume names, DeleteResourceJob, CleanupDocker and the DNS release path
 #: are unchanged. v4.7.1 and v4.7.2 touch nothing this tool depends on. The e2e
 #: rig is green on a live 4.7.2 (43 tests, tests/e2e/test_template_service.py new).
+#:
+#: 2026-11-10: v4.7.3 through v4.7.5 read against v4.7.2 (16 commits, 34 files in
+#: app/, bootstrap/, routes/, config/ and migrations): no API controller, route,
+#: Stop/Start action, label, volume or DeleteResourceJob change. The deploy job's
+#: env changes are preview-only (ApplicationDeploymentJob v4.7.5:2185-2205 sit in
+#: the pull-request branch; production's .env, which locked-variable recovery
+#: reads, is unchanged), the new server settings are image-scanner limits
+#: (ServerSetting v4.7.5:117-127), queryDatabaseByUuidWithinTeam now hides the
+#: instance database (shared.php v4.7.5:1834-1847), and CleanupDatabase prunes
+#: failed backup executions, which the client drops anyway. Canaries green against
+#: v4.7.5.
 VALIDATED_MIN: Version = (4, 1, 2)
-VALIDATED_MAX: Version = (4, 7, 2)
+VALIDATED_MAX: Version = (4, 7, 5)
 
 
 def format_version(version: Version) -> str:

@@ -121,8 +121,8 @@ decision, the decision is in the wrong layer.
 
 First checked against `coollabsio/coolify@main`; re-checked against the release
 tags v4.1.2 through v4.5.0 (2026-10-26), v4.5.1 against v4.5.0 (2026-10-28),
-v4.6.0 against v4.5.2 (2026-11-05), and v4.7.0 through v4.7.2 against v4.6.0
-(2026-11-09).
+v4.6.0 against v4.5.2 (2026-11-05), v4.7.0 through v4.7.2 against v4.6.0
+(2026-11-09), and v4.7.3 through v4.7.5 against v4.7.2 (2026-11-10).
 Read upstream at a **release tag**, never `main` — see the 2.5.6 tags regression.
 What differs between releases lives in `domain/coolify_versions.py`, not here.
 
@@ -595,6 +595,20 @@ Nothing to answer:
 - **`GET /servers/{uuid}/validate` answers 405** ("changed to a POST request")
   since at least 4.6.0 (routes/api.php v4.6.0:199-200). Only the e2e rig called
   it, now with POST.
+
+### v4.7.2 -> v4.7.5 (release tags): nothing to answer
+
+Sixteen commits, 34 files in the paths this tool reads; no API controller, route,
+Stop/Start action, label, volume name or DeleteResourceJob change. The deploy
+job's environment changes sit in its pull-request branch only
+(ApplicationDeploymentJob v4.7.5:2185-2205, `previewGetsProductionRuntimeFallback`):
+production's `.env`, which locked-variable recovery reads, is written as before.
+The rest is image-scanner limits (new `server_settings` columns, ServerSetting
+v4.7.5:117-127, never carried), the instance database hidden from
+`queryDatabaseByUuidWithinTeam` (shared.php v4.7.5:1834-1847), failed backup
+executions pruned after the retention days (CleanupDatabase v4.7.5:51-53; the
+client drops executions anyway), IPv6 SFTP hosts and the token page. Canaries
+green against v4.7.5. `VALIDATED_MAX` = 4.7.5.
 
 ### Learned from the v4.5.2 -> v4.6.0 audit (release tags; e2e green on a live 4.6.0)
 
