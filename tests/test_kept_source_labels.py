@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -362,7 +363,7 @@ class TestPreflight:
 
 class TestPlanFinalizeOption:
     @pytest.fixture(autouse=True)
-    def _clean(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def _clean(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
         from bg_coolify_migrate.observability.logging_setup import reset_logging
         from bg_coolify_migrate.settings.base import reset_settings_cache
 
@@ -371,6 +372,10 @@ class TestPlanFinalizeOption:
         monkeypatch.chdir(tmp_path)
         for var in ("COOLIFY_URL", "COOLIFY_TOKEN", "STATE_DIR"):
             monkeypatch.delenv(var, raising=False)
+        yield
+        # The CLI configures structlog to cache each logger on first use; left
+        # configured, a later test's capture_logs() misses a cached logger.
+        reset_logging()
 
     def _invoke(self, monkeypatch: pytest.MonkeyPatch, *argv: str) -> Any:
         from typer.testing import CliRunner
