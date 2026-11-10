@@ -1113,6 +1113,17 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
     # undo but the disarm.
     await deploy_triggers.disarm_sources(ctx)
     await deploy_triggers.await_source_deployments(ctx)
+    # What each source application had deployed by now, read RIGHT after the
+    # wait: the checkpoints report any deployment this does not hold
+    # (containment.SOURCE_DEPLOYMENTS). Before the capture, the pins and the
+    # preview delete, for the wait's reason: a deploy queued after the wait's
+    # last read that ended while they ran was recorded as ENDED - no later
+    # checkpoint reported it - while the capture, data_containers and the pins
+    # described the container its rolling update replaced. Read here, whatever
+    # ends before it ended before the capture too; what ends after it is not in
+    # the record. A refusal here comes while the source still serves, and
+    # before anything is captured or pinned.
+    deployed = await containment.deployments_before_stop(ctx)
 
     if ctx.delete_previews:
         for resource in ctx.plan.resources:
@@ -1146,10 +1157,6 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
     # moment nothing references the source's volumes - which is all Coolify's
     # `docker volume prune -af` asks. A failure here costs nothing.
     source_pins = await _pin_source(ctx)
-    # What each source application had deployed by now: the checkpoints report
-    # any deployment this does not hold (containment.SOURCE_DEPLOYMENTS). A
-    # refusal here comes while the source still serves.
-    deployed = await containment.deployments_before_stop(ctx)
 
     try:
         # The source's clock, not ours: it is the window for the event-log check

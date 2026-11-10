@@ -25,7 +25,10 @@ import respx
 from bg_coolify_migrate.api import resources as api_resources
 from bg_coolify_migrate.api.client import CoolifyClient
 from bg_coolify_migrate.api.resources import Placement
+from bg_coolify_migrate.domain import containment as containment_rules
 from bg_coolify_migrate.domain import deploy_triggers as dt
+from bg_coolify_migrate.domain.containment import SOURCE_DEPLOYMENTS
+from bg_coolify_migrate.domain.deployments import Deployment
 from bg_coolify_migrate.domain.kinds import DatabaseEngine, GitAuth, ResourceKind
 from bg_coolify_migrate.domain.plan import (
     MigrationPlan,
@@ -159,6 +162,17 @@ class App:
         respx_mock.get(f"{BASE}/applications/{self.uuid}").mock(side_effect=self.get)
         respx_mock.patch(f"{BASE}/applications/{self.uuid}").mock(side_effect=self.patch)
         return self
+
+
+def _history(*rows: tuple[str, str]) -> httpx.Response:
+    """``GET /deployments/applications/{uuid}``: newest first, ``(uuid, status)``."""
+    return httpx.Response(
+        200,
+        json={
+            "count": len(rows),
+            "deployments": [{"deployment_uuid": u, "status": s} for u, s in rows],
+        },
+    )
 
 
 def _queue(*rows: tuple[str, str, str]) -> httpx.Response:
@@ -569,6 +583,91 @@ class TestStepQuiesce:
         assert app.patches == [
             {"is_auto_deploy_enabled": False, "is_preview_deployments_enabled": False}
         ]
+
+    async def test_the_deployment_record_is_read_right_after_the_wait(
+        self,
+        ctx: MigrationContext,
+        respx_mock: respx.Router,
+        stubbed: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Before the preview delete, the capture and the pins: what it holds as
+        # ended had ended before anything read the containers.
+        ctx.plan = _plan(_app(has_previews=True))
+        ctx.delete_previews = True
+        App("app1", previews=True).mount(respx_mock)
+
+        def queue(_request: httpx.Request) -> httpx.Response:
+            stubbed.append("queue")
+            return _queue()
+
+        def record(_request: httpx.Request) -> httpx.Response:
+            stubbed.append("record")
+            return _history()
+
+        def delete(_request: httpx.Request) -> httpx.Response:
+            stubbed.append("delete preview")
+            return httpx.Response(200, json={})
+
+        async def containers(*_a: Any, **_kw: Any) -> list[Any]:
+            return [
+                steps.docker.Container(
+                    id="c1", name="app1-pr-7", state="running", labels={steps.docker.LABEL_PR_ID: "7"}
+                )
+            ]
+
+        respx_mock.get(f"{BASE}/deployments").mock(side_effect=queue)
+        respx_mock.get(f"{BASE}/deployments/applications/app1").mock(side_effect=record)
+        respx_mock.delete(f"{BASE}/applications/app1/previews/7").mock(side_effect=delete)
+        monkeypatch.setattr(steps, "resource_containers", containers)
+
+        await steps.step_quiesce(ctx)
+
+        assert stubbed == [
+            "queue",
+            "record",
+            "delete preview",
+            "capture",
+            "pin",
+            "stop marked=True",
+        ]
+
+    async def test_a_deployment_that_ends_during_the_capture_stays_reported(
+        self,
+        ctx: MigrationContext,
+        respx_mock: respx.Router,
+        stubbed: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Queued just after the wait's last read, its rolling update ends while
+        # the mounts are captured: the capture names the container it removed.
+        # Read after the capture, the record held it ENDED and no checkpoint
+        # ever reported it.
+        App("app1").mount(respx_mock)
+        respx_mock.get(f"{BASE}/deployments").mock(return_value=_queue())
+        history = respx_mock.get(f"{BASE}/deployments/applications/app1").mock(
+            return_value=_history()
+        )
+
+        async def capture(_ctx: Any) -> dict[str, list[str]]:
+            stubbed.append("capture")
+            history.mock(return_value=_history(("d1", "finished")))
+            return {}
+
+        monkeypatch.setattr(steps, "_capture_mounts", capture)
+
+        await steps.step_quiesce(ctx)
+
+        detail = ctx.journal.undo_info("quiesce")
+        assert detail[SOURCE_DEPLOYMENTS] == {"app1": []}
+        accounted = containment_rules.accounted_deployments(detail)
+        assert accounted is not None
+        (breach,) = containment_rules.deployment_breaches(
+            [containment_rules.Watched(name="shop", uuid="app1", labels={})],
+            accounted,
+            {"app1": [Deployment(uuid="d1", status="finished")]},
+        )
+        assert breach.describe().startswith("shop: deployment d1 came after the stop")
 
 
 # ── R1/R2/R8: FINALIZE arms the target, a kept source stays disarmed ─────────

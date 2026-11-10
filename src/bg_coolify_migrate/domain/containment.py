@@ -107,9 +107,9 @@ REVIVAL_SEEN_CLOCK = "revival_seen_clock"
 
 #: QUIESCE journals, with :data:`STOP_CLOCK`, the deployments every source
 #: APPLICATION had ENDED by then: ``{source app uuid: [deployment uuid, ...]}``
-#: (:func:`ended_deployments`). Read just before the stop request, after the
-#: wait for its deployments to end; one still queued or running then refuses
-#: the stop (``engine/containment.deployments_before_stop``). A row the record
+#: (:func:`ended_deployments`). Read right after the wait for its deployments
+#: to end, before the mount capture and the pins; one still queued or running
+#: then refuses the stop (``engine/containment.deployments_before_stop``). A row the record
 #: does not hold is a deployment of the stopped source (:func:`deployment_breaches`).
 #: A journal without the record (from before it) gets no deployment check.
 SOURCE_DEPLOYMENTS = "source_deployments"

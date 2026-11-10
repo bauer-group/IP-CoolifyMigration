@@ -592,13 +592,17 @@ async def _target_breaches(
 
 
 async def deployments_before_stop(ctx: MigrationContext) -> dict[str, list[str]]:
-    """QUIESCE, just before the stop: the deployments each source application had ENDED.
+    """QUIESCE, right after the wait: the deployments each source application had ENDED.
 
     Journalled beside the stop clock (``containment.SOURCE_DEPLOYMENTS``); every
-    later source checkpoint reports a row this does not hold. Read after
+    later source checkpoint reports a row this does not hold. Read right after
     ``deploy_triggers.await_source_deployments`` waited them out, so every row
-    queued from here on is someone else's. Read-only, and BEFORE anything is
-    stopped, while the source still serves: a history that cannot be read
+    queued from here on is someone else's — and BEFORE the preview delete, the
+    mount capture and the pins: a deployment that ends replaces the container
+    (a rolling update starts ``{uuid}-{Ymd\\THis}``, docker.php v4.7.2:670-686),
+    so one this record holds as ended must have ended before the capture read
+    the containers, or the capture and the pins describe the one it removed.
+    Read-only, while the source still serves: a history that cannot be read
     refuses the stop (:func:`_deployment_history`), and so does a deployment
     queued since that wait — Coolify's stop would not cancel it, and it would
     start the source again after it.

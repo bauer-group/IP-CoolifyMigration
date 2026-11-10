@@ -116,11 +116,13 @@ decision, the decision is in the wrong layer.
   data-integrity change.
 - **Touching quiesce?** It has no `--force` and must not grow one.
 - **Touching QUIESCE's order?** The sources are disarmed and their queued or
-  running deployments waited out FIRST, then the preview delete, the mount
-  capture, the pins, the deployment record
-  (`containment.deployments_before_stop`) and the stop. A deployment that ends
-  replaces the containers (facts below), so anything that names containers reads
-  them after the wait, or the SIGKILL guard checks names that no longer exist.
+  running deployments waited out FIRST, the deployment record read right after
+  the wait (`containment.deployments_before_stop`), then the preview delete, the
+  mount capture, the pins and the stop. A deployment that ends replaces the
+  containers (facts below), so anything that names containers reads them after
+  the wait, or the SIGKILL guard checks names that no longer exist — and after
+  the record: one that ended between them would be recorded ENDED, reported by
+  no checkpoint, while the capture and the pins name the container it removed.
 - **Touching what can deploy a source or a target?** `domain/deploy_triggers.py`
   decides, `engine/deploy_triggers.py` performs. A target is CREATED with
   auto-deploy off (`TARGET_CREATE`) and without tags — CREATE only reads the
