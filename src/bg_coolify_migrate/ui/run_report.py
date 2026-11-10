@@ -140,14 +140,16 @@ def _where_blocked(result: RunResult) -> str:
     check: nothing guards either while the run waits. And a source found running
     again once START asked for a target blocks too: the target is up, the
     source is NOT stopped, and the error above says the two ways on. So does
-    a source whose deployment history Coolify did not give then — not found
-    running, but not proven stopped either.
+    a check that could not be finished then — a deployment history Coolify did
+    not give, a server whose Docker daemon did not answer: not found running,
+    but not proven stopped either.
     """
     if isinstance(result.error, SourceUncheckedAfterStart):
         return (
             "Nothing has been undone: the target is started and keeps what it\n"
             "received. Whether anything started your source again could not be\n"
-            "checked (above). Resume once Coolify answers, or roll back to give up the target."
+            f"checked (above). Resume {result.error.resume_when}, or roll back to give up "
+            "the target."
         )
     if isinstance(result.error, SourceRevivedAfterStart):
         return (

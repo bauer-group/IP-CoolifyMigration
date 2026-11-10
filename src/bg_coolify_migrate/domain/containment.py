@@ -204,6 +204,27 @@ class Breach:
         return f"{self.resource}: {self.container} {self.why}"
 
 
+@dataclass(frozen=True, slots=True)
+class Unanswered:
+    """One read a check sent a server's Docker daemon that got no answer.
+
+    Not a breach: a check that cannot say there was none. It never passes —
+    before START the run rolls back, after START it blocks
+    (``engine/containment.assert_contained``).
+    """
+
+    side: str
+    """``source`` or ``target``."""
+    server: str
+    what: str
+    """What was asked, e.g. ``its docker event log``."""
+    why: str
+    """What the failed read said, one line."""
+
+    def describe(self) -> str:
+        return f"the {self.side} server {self.server!r}: {self.what} ({self.why})"
+
+
 # ── parsing what the daemon printed ─────────────────────────────────────────
 
 _FRACTION = re.compile(r"\.\d+")
@@ -812,26 +833,87 @@ def unread_breaches(unread: Sequence[tuple[str, str]]) -> list[Breach]:
     ]
 
 
-def unchecked_after_start_hint(
-    *, policy: str, migration_id: str, unread: Sequence[tuple[str, str]]
-) -> str:
-    """An unread history once START asked for a target: a block, like a revival.
+def unanswered_breaches(unanswered: Sequence[Unanswered]) -> list[Breach]:
+    """Server reads that got no answer, as lines under a breach found in the same
+    check — the rule of :func:`unread_breaches`."""
+    return [
+        Breach(f"the {u.side} server {u.server!r}", u.what, f"could not be read either ({u.why})")
+        for u in unanswered
+    ]
 
-    Not proof that anything started the source — a check that cannot say that
-    nothing did. Before START that rolls back (:func:`unread_history_hint`);
-    after it the target may hold users' writes, which the rollback deletes, so
-    a Coolify that does not answer for a while (a restart, its own update) must
-    not decide that. Nothing is journalled: nothing was shown.
+
+_SIDES = (("source", "the stopped source"), ("target", "an unstarted target"))
+
+
+def unchecked_message(
+    unanswered: Sequence[Unanswered],
+    unread: Sequence[tuple[str, str]] = (),
+    checkpoint: str = "",
+) -> str:
+    """A check that could not be finished: the server reads that got no answer,
+    and the deployment histories Coolify did not give beside them. Histories
+    alone keep their own message (:func:`unread_history_message`)."""
+    if not unanswered:
+        return unread_history_message(unread, checkpoint)
+    sides = {u.side for u in unanswered}
+    subject = " or ".join(text for side, text in _SIDES if side in sides)
+    where = f" (at {checkpoint})" if checkpoint else ""
+    lines = [u.describe() for u in unanswered] + [b.describe() for b in unread_breaches(unread)]
+    return f"could not check that nothing started {subject}{where} - a server did not answer:\n" + (
+        "\n".join(f"  {line}" for line in lines)
+    )
+
+
+def resume_when(
+    unanswered: Sequence[Unanswered], unread: Sequence[tuple[str, str]] = ()
+) -> str:
+    """Who must answer again before a resume can finish the check: the words of a block."""
+    sides = [side for side, _ in _SIDES if any(u.side == side for u in unanswered)]
+    parties = [f"the {' and '.join(sides)} server{'s' if len(sides) > 1 else ''}"] if sides else []
+    if unread or not parties:
+        parties.append("Coolify")
+    verb = "answer" if len(parties) > 1 or len(sides) > 1 else "answers"
+    return f"once {' and '.join(parties)} {verb} again"
+
+
+_DAEMON_WITNESS = (
+    "Only a server's Docker daemon shows what started there since the stop - a container "
+    "running now, the StartedAt of one stopped again, the start in its event log of one "
+    "that came and went - so without its answer this check cannot say that nothing started."
+)
+
+
+def unchecked_after_start_hint(
+    *,
+    policy: str,
+    migration_id: str,
+    unread: Sequence[tuple[str, str]] = (),
+    unanswered: Sequence[Unanswered] = (),
+) -> str:
+    """A check that could not be finished once START asked for a target: a block.
+
+    An unread deployment history, or a server read that got no answer — the
+    container listings, a container's inspect, the event log, on the source or
+    on a target START has not asked for yet. Not proof that anything started:
+    a check that cannot say that nothing did. Before START that rolls back
+    (:func:`unread_history_hint`, or the read's own error); after it the target
+    may hold users' writes, which the rollback deletes, so a Coolify or an SSH
+    connection that does not answer for a while (a restart, an update, a
+    network blip) must not decide that. Nothing is journalled: nothing was shown.
     """
     fate = _FINALIZE_FATE.get(policy, "applies the finalize policy to the source")
+    witness = [_DAEMON_WITNESS] if unanswered else []
+    if unread:
+        witness.append(f"{_HISTORY_WITNESS}\n{_coolify_said(unread)}")
+    when = resume_when(unanswered, unread)
     return (
-        f"{_HISTORY_WITNESS}\n{_coolify_said(unread)}\n"
+        "\n".join(witness) + "\n"
         "START has already asked Coolify to start the target, and the DNS gate let it: it "
         "may have served users since then, and what they wrote is on the target only. A "
         "rollback would delete that with the target, so this run does not roll back over a "
         "check it could not finish. Nothing has been undone, and FINALIZE has not touched "
         "the source.\n"
-        f"Once Coolify answers again: coolify-migrate resume {migration_id} - it checks "
+        f"{when[0].upper()}{when[1:]}: coolify-migrate resume {migration_id} - it checks "
         f"again, and FINALIZE then {fate}.\n"
         f"To give up the target instead: coolify-migrate rollback {migration_id} - it "
         "deletes the target and everything written to it since START, and restarts the "

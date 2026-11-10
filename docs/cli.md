@@ -136,11 +136,12 @@ Code 5 covers everything that says the stack is not held still:
   (`SourceRevived`) or a target before START asked for it
   (`TargetStartedEarly`). The run rolls back;
 - the same found **once START has asked Coolify to start a target**: a revived
-  source (`SourceRevivedAfterStart`), or a source whose deployment history
-  Coolify did not give (`SourceUncheckedAfterStart`). This is a **block**, like
+  source (`SourceRevivedAfterStart`), or a check that could not be finished — a
+  deployment history Coolify did not give, a server's Docker daemon that did not
+  answer over SSH (`SourceUncheckedAfterStart`). This is a **block**, like
   code 3: resumable, nothing rolled back, because the target may already hold
-  users' writes. Stop the source (or wait until Coolify answers) and `resume`, or
-  `rollback` by hand.
+  users' writes. Stop the source (or wait until Coolify or the server answers)
+  and `resume`, or `rollback` by hand.
 
 See [troubleshooting](troubleshooting.md) for each message.
 

@@ -10,12 +10,15 @@ A breach is never a warning and has no override — the quiesce gate has no
 source, never deleted before FINALIZE, keeps whatever it wrote. Once START has
 asked for a target, a revived source BLOCKS the run instead
 (``SourceRevivedAfterStart``): the target may have served users since, and the
-rollback would delete what they wrote. A check that cannot be answered — the
-event log, a deployment history — never passes: it raises ``QuiesceError``. An
-unread deployment history once START asked blocks instead
-(``SourceUncheckedAfterStart``), for the revival's reason — a Coolify API that
-does not answer for a while must not roll a cutover back — and a breach found in
-the same check is raised first, with the unread histories beside it.
+rollback would delete what they wrote. A check that cannot be answered — a
+daemon read over SSH (the listings, an inspect, the event log), a deployment
+history — never passes. Before START it rolls back: the read's own error is
+raised, or ``QuiesceError`` for a history. Once START asked it blocks instead
+(``SourceUncheckedAfterStart``), for the revival's reason — a Coolify API or an
+SSH connection that does not answer for a while must not roll a cutover back.
+Every read of a check is asked even when one fails (:class:`_Reads`), so a
+breach found in the same check is raised first, with what could not be read
+beside it.
 
 An application Coolify says it no longer has (its own 404: the row is
 soft-deleted) has no history left to compare, and nothing queues a deployment
@@ -34,14 +37,15 @@ refusal of two server records that are one daemon (:func:`assert_separate_daemon
 from __future__ import annotations
 
 import shlex
-from collections.abc import Sequence
-from typing import Any, NoReturn
+from collections.abc import Awaitable, Sequence
+from dataclasses import dataclass, field
+from typing import Any, NoReturn, TypeVar
 
 import structlog
 
 from bg_coolify_migrate.discovery import docker, pins, quiesce
 from bg_coolify_migrate.domain import containment
-from bg_coolify_migrate.domain.containment import Breach, Seen, Watched
+from bg_coolify_migrate.domain.containment import Breach, Seen, Unanswered, Watched
 from bg_coolify_migrate.domain.deployments import Deployment
 from bg_coolify_migrate.domain.statemachine import START_REQUESTED, STARTED_EARLY, State
 from bg_coolify_migrate.engine.context import MigrationContext
@@ -72,6 +76,54 @@ Unread = list[tuple[str, str]]
 #: What a 404 from Coolify itself means at the stop: no history to record.
 _GONE = "Coolify has no such application any more (404)"
 
+#: What the source's event-log read is called in a message.
+_EVENT_LOG = "its docker event log"
+
+_T = TypeVar("_T")
+
+
+@dataclass
+class _Reads:
+    """One check's daemon reads that got no answer, and the first error itself.
+
+    A read that fails is noted and the check goes on, so whatever the other
+    reads found is still reported. :func:`assert_contained` decides what the
+    failures mean: before START the first error is raised as it came — the
+    rollback it always was — and after START the run blocks.
+    """
+
+    failed: list[Unanswered] = field(default_factory=list)
+    first: Exception | None = None
+
+    async def ask(self, side: str, server: str, what: str, read: Awaitable[_T]) -> _T | None:
+        """``read``'s answer, or ``None`` with the failure noted. Any exception counts:
+        after START, a rollback over a read that broke would be the worst answer."""
+        try:
+            return await read
+        except Exception as exc:  # noted, never passed: assert_contained decides
+            self.note(side, server, what, exc)
+            return None
+
+    def note(self, side: str, server: str, what: str, exc: Exception) -> None:
+        self.failed.append(Unanswered(side=side, server=server, what=what, why=_reason(exc)))
+        if self.first is None:
+            self.first = exc
+
+    def complete(self, side: str) -> bool:
+        """Did every read of ``side`` answer?"""
+        return not any(u.side == side for u in self.failed)
+
+
+def _reason(exc: Exception) -> str:
+    """One line of what a failed read said: its message, and the last line of its
+    hint — for a failed command, what the daemon wrote to stderr."""
+    message = str(exc.args[0]) if exc.args else ""
+    lines = message.strip().splitlines()
+    first = lines[0].strip()[:200] if lines else type(exc).__name__
+    hint = getattr(exc, "hint", None)
+    said = [line.strip() for line in hint.splitlines() if line.strip()] if isinstance(hint, str) else []
+    return f"{first} - {said[-1][:200]}" if said else first
+
 
 async def assert_contained(
     ctx: MigrationContext, *, checkpoint: str, source: bool = True, target: bool = True
@@ -92,23 +144,30 @@ async def assert_contained(
         TargetStartedEarly: A target container runs, or ever started, before
             START asked for it. Journalled first under START's state, so the
             rollback owes STOP_TARGET for it (``statemachine.target_may_run``).
-        SourceUncheckedAfterStart: Nothing of the above, but a source
-            application's deployment history could not be read, once START has
-            asked for a target: the run blocks.
-        QuiesceError: The event log could not be read, or a deployment history
-            could not be read before START asked for any target.
+        SourceUncheckedAfterStart: Nothing of the above, but a daemon read got
+            no answer or a source application's deployment history could not be
+            read, once START has asked for a target: the run blocks, and
+            nothing is journalled.
+        QuiesceError: A deployment history could not be read before START
+            asked for any target.
+        Exception: A daemon read that got no answer before START asked for any
+            target: its own error (``SshError``, or ``QuiesceError`` for the
+            event log), and the run rolls back.
     """
+    reads = _Reads()
     found_source: list[Breach] = []
     history: History | None = None
     unread: Unread = []
     if source:
-        found_source, history, unread = await _source_breaches(ctx, checkpoint=checkpoint)
-    found_target, early = await _target_breaches(ctx) if target else ([], [])
+        found_source, history, unread = await _source_breaches(
+            ctx, checkpoint=checkpoint, reads=reads
+        )
+    found_target, early = await _target_breaches(ctx, reads=reads) if target else ([], [])
     if early:
         journal_started_early(ctx, early)
-    # What was found goes first, whatever could not be read beside it: an unread
-    # history must not turn a revival found after START into a rollback.
-    also = containment.unread_breaches(unread)
+    # What was found goes first, whatever could not be read beside it: a read
+    # that got no answer must not turn a revival found after START into a rollback.
+    also = [*containment.unanswered_breaches(reads.failed), *containment.unread_breaches(unread)]
     if found_source:
         message = containment.breach_message(
             "the source was started again after QUIESCE stopped it",
@@ -116,7 +175,9 @@ async def assert_contained(
             [*found_source, *found_target, *also],
         )
         if _start_asked(ctx):
-            await _block_after_start(ctx, message, history)
+            await _block_after_start(
+                ctx, message, history, complete=reads.complete("source")
+            )
         raise SourceRevived(message, hint=containment.source_hint())
     if found_target:
         raise TargetStartedEarly(
@@ -127,17 +188,21 @@ async def assert_contained(
             ),
             hint=containment.TARGET_HINT,
         )
-    if unread:
-        message = containment.unread_history_message(unread, checkpoint)
+    if reads.failed or unread:
         if _start_asked(ctx):
             raise SourceUncheckedAfterStart(
-                message,
+                containment.unchecked_message(reads.failed, unread, checkpoint),
                 hint=containment.unchecked_after_start_hint(
                     policy=ctx.plan.finalize_policy.value,
                     migration_id=ctx.migration_id,
                     unread=unread,
+                    unanswered=reads.failed,
                 ),
+                resume_when=containment.resume_when(reads.failed, unread),
             )
+        if reads.first is not None:
+            raise reads.first
+        message = containment.unread_history_message(unread, checkpoint)
         raise QuiesceError(message, hint=containment.unread_history_hint(unread))
     log.debug("containment.ok", checkpoint=checkpoint, source=source, target=target)
 
@@ -167,7 +232,7 @@ def _start_asked(ctx: MigrationContext) -> bool:
 
 
 async def _block_after_start(
-    ctx: MigrationContext, message: str, history: History | None
+    ctx: MigrationContext, message: str, history: History | None, *, complete: bool
 ) -> NoReturn:
     """Stop the run, roll nothing back, and say what the operator decides.
 
@@ -177,7 +242,10 @@ async def _block_after_start(
     after it still does. A clock that cannot be read is no reason to give up the
     block — a rollback is exactly what must not happen here — so the resume then
     judges from the old instant and blocks again until the source's daemon has
-    forgotten those starts; the operator can roll back by hand.
+    forgotten those starts; the operator can roll back by hand. Nor is it
+    journalled when a source daemon read of this check got no answer
+    (``complete`` false): the starts that read would have shown were not shown,
+    and the clock would forgive them. The resume reads them from the old instant.
 
     The deployments this check read go in the same record, for the same reason,
     clock or no clock (``containment.block_record``): those that had ended are
@@ -190,10 +258,16 @@ async def _block_after_start(
         detail.update(
             containment.block_record(ctx.journal.undo_info(State.QUIESCE.value), history)
         )
-    try:
-        detail[containment.REVIVAL_SEEN_CLOCK] = await quiesce.now_on(ctx.source_host)
-    except Exception as exc:  # the block itself must not become a rollback
-        log.warning("containment.revival_clock_unread", error=str(exc)[:200])
+    if not complete:
+        log.warning(
+            "containment.revival_clock_withheld",
+            hint="a source read got no answer: the resume judges from the earlier instant",
+        )
+    else:
+        try:
+            detail[containment.REVIVAL_SEEN_CLOCK] = await quiesce.now_on(ctx.source_host)
+        except Exception as exc:  # the block itself must not become a rollback
+            log.warning("containment.revival_clock_unread", error=str(exc)[:200])
     if detail:
         ctx.journal.append("containment", state=State.QUIESCE.value, detail=detail)
     raise SourceRevivedAfterStart(
@@ -220,20 +294,34 @@ async def _seen(
     container: docker.Container,
     *,
     inspect: bool,
+    reads: _Reads,
+    side: str,
+    server: str,
     volumes: Sequence[str] | None = None,
-) -> Seen:
+) -> Seen | None:
     """What the daemon says of one container. ``volumes`` only for one found by
-    the volume probe alone: whether it mounts one of them writable."""
+    the volume probe alone: whether it mounts one of them writable.
+
+    ``None`` when an inspect got no answer: noted in ``reads``, so the check
+    cannot pass; neither a start nor a reader is concluded from silence.
+    """
     handle = container.id or container.name
+    failed = len(reads.failed)
     started = None
     if inspect and container.is_stopped:
-        started = await quiesce.started_at(host, handle)
+        started = await reads.ask(
+            side, server, f"when {container.name} last started", quiesce.started_at(host, handle)
+        )
     writes = None
     if volumes is not None:
-        mounts = await quiesce.mounts_of(host, handle)
+        mounts = await reads.ask(
+            side, server, f"what {container.name} mounts", quiesce.mounts_of(host, handle)
+        )
         writes = None if mounts is None else containment.mounts_writable(mounts, volumes)
         if writes is False:
             log.debug("containment.read_only_reader", container=container.name)
+    if len(reads.failed) > failed:
+        return None
     return Seen(
         name=container.name,
         state=container.state,
@@ -265,7 +353,7 @@ def _source_applications(ctx: MigrationContext) -> list[Watched]:
 
 
 async def _source_breaches(
-    ctx: MigrationContext, *, checkpoint: str
+    ctx: MigrationContext, *, checkpoint: str, reads: _Reads
 ) -> tuple[list[Breach], History | None, Unread]:
     """The source side: the plan's label filter, then the probes no rename can hide from.
 
@@ -281,16 +369,28 @@ async def _source_breaches(
     QUIESCE journalled at the stop (``containment.deployment_breaches``).
     Returned with the breaches — ``None`` for a journal without that record —
     so a block can journal what it showed, and with the histories that could
-    not be read, which never pass (:func:`assert_contained` decides how).
+    not be read, which never pass (:func:`assert_contained` decides how). A
+    daemon read that gets no answer goes into ``reads`` and the others are
+    still asked; it never passes either.
     """
     host = ctx.source_host
+    server = ctx.plan.source_server.name
     since = revival_clock(ctx)
     stack = observed_labels(ctx.plan)
     watched = _watched_sources(ctx)
     found: dict[str, docker.Container] = {}
-    for container in await docker.list_containers(host, label_filters=stack):
+    labelled = await reads.ask(
+        "source",
+        server,
+        "its containers under the stack's labels",
+        docker.list_containers(host, label_filters=stack),
+    )
+    for container in labelled or []:
         found.setdefault(container.id or container.name, container)
-    for container in await docker.managed_containers(host):
+    managed = await reads.ask(
+        "source", server, "its Coolify-managed containers", docker.managed_containers(host)
+    )
+    for container in managed or []:
         if any(docker.carries_uuid(container, w.uuid) for w in watched):
             found.setdefault(container.id or container.name, container)
     volumes = sorted(
@@ -298,7 +398,13 @@ async def _source_breaches(
         | {p.source.name for pairs in ctx.volume_pairs.values() for p in pairs}
     )
     if volumes:
-        for container in await docker.containers_mounting(host, volumes=volumes):
+        mounting = await reads.ask(
+            "source",
+            server,
+            "its containers mounting a migrated volume",
+            docker.containers_mounting(host, volumes=volumes),
+        )
+        for container in mounting or []:
             found.setdefault(container.id or container.name, container)
 
     inspect = since is not None
@@ -309,8 +415,24 @@ async def _source_breaches(
         alone = containment.volume_only(
             watched, stack, name=c.name, image=c.image, labels=c.labels
         )
-        seen.append(await _seen(host, c, inspect=inspect, volumes=volumes if alone else None))
-    events = await quiesce.start_events(host, since=since) if since is not None else None
+        one = await _seen(
+            host,
+            c,
+            inspect=inspect,
+            reads=reads,
+            side="source",
+            server=server,
+            volumes=volumes if alone else None,
+        )
+        if one is not None:
+            seen.append(one)
+    events = (
+        await reads.ask(
+            "source", server, _EVENT_LOG, quiesce.start_events(host, since=since)
+        )
+        if since is not None
+        else None
+    )
     if since is None:
         log.warning(
             "containment.no_stop_clock",
@@ -409,13 +531,17 @@ async def _deployment_history(ctx: MigrationContext, application: Watched) -> li
     )
 
 
-async def _target_breaches(ctx: MigrationContext) -> tuple[list[Breach], list[str]]:
+async def _target_breaches(
+    ctx: MigrationContext, *, reads: _Reads
+) -> tuple[list[Breach], list[str]]:
     """The target side, and the target uuids it found started.
 
     By name labels, as HEALTHCHECK looks, and by uuid (``steps._containers_by_uuid``),
-    for every target START has not asked for yet.
+    for every target START has not asked for yet. A daemon read that gets no
+    answer goes into ``reads``, as on the source side.
     """
     host = ctx.target_host
+    server = ctx.plan.target_server.name
     requested = set(start_requested(ctx))
     watched: list[Watched] = []
     for r in ctx.plan.resources:
@@ -437,15 +563,31 @@ async def _target_breaches(ctx: MigrationContext) -> tuple[list[Breach], list[st
         return [], []
     found: dict[str, docker.Container] = {}
     for w in watched:
-        for container in await docker.list_containers(host, label_filters=dict(w.labels)):
+        labelled = await reads.ask(
+            "target",
+            server,
+            f"the containers of {w.name}'s target under its labels",
+            docker.list_containers(host, label_filters=dict(w.labels)),
+        )
+        for container in labelled or []:
             found.setdefault(container.id or container.name, container)
-    for container in await docker.managed_containers(host):
+    managed = await reads.ask(
+        "target", server, "its Coolify-managed containers", docker.managed_containers(host)
+    )
+    for container in managed or []:
         if any(docker.carries_uuid(container, w.uuid) for w in watched):
             found.setdefault(container.id or container.name, container)
-    seen = [await _seen(host, c, inspect=True) for c in found.values() if not pins.is_pin(c)]
-    breaches = containment.target_breaches(
-        watched, seen, await quiesce.start_events(host, since=0)
+    seen: list[Seen] = []
+    for c in found.values():
+        if pins.is_pin(c):
+            continue
+        one = await _seen(host, c, inspect=True, reads=reads, side="target", server=server)
+        if one is not None:
+            seen.append(one)
+    events = await reads.ask(
+        "target", server, _EVENT_LOG, quiesce.start_events(host, since=0)
     )
+    breaches = containment.target_breaches(watched, seen, events)
     return breaches, sorted({b.uuid for b in breaches if b.uuid})
 
 

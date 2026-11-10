@@ -416,6 +416,32 @@ The hint quotes Coolify's answer for each application. The usual cause is a
 Coolify that is restarting or updating, or a proxy in front of it answering
 for it.
 
+## "could not check that nothing started the stopped source … - a server did not answer" (exit 5)
+
+`SourceUncheckedAfterStart`, once START has asked Coolify to start a target. A
+containment check could not read a server's Docker daemon — over SSH, or the
+daemon answered with an error: its containers (`its containers under the
+stack's labels`, `its Coolify-managed containers`, `its containers mounting a
+migrated volume`), one container's inspect (`when … last started`, `what …
+mounts`) or `its docker event log`. Each line names the server, what was asked
+and what came back; a deployment history Coolify did not give is listed beside
+them. With "an unstarted target" it was the target server, asked about a target
+START has not asked for yet.
+
+Only the daemon shows a container that started since the stop, so the check
+does not pass — but nothing was found either. "Stopped - the source could not be
+checked, and nothing was undone": a **block**, journalling nothing, because a
+rollback would delete the target and what users wrote to it since START.
+
+- **Once the server answers again** (SSH reachable, `docker ps` works there),
+  `coolify-migrate resume <id>` checks again from the stop;
+- or `coolify-migrate rollback <id>` gives up the target.
+
+Before START the same failure rolls the run back, with the read's own error
+(`remote command failed …`, `could not read the docker event log …`). A breach
+found in the same check is reported first, with the reads that got no answer
+beside it (`… could not be read either`).
+
 ## "Left in place: ... still pins ..."
 
 A run or a rollback ended with a pin it deliberately did not remove:

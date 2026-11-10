@@ -151,16 +151,31 @@ class SourceRevivedAfterStart(SourceRevived):
 
 
 class SourceUncheckedAfterStart(SourceRevivedAfterStart):
-    """A source check that could not be answered, once START had asked for a target.
+    """A containment check that could not be answered, once START had asked for a target.
 
     Not a revival found: a check that cannot say there was none — a source
-    application's deployment history that Coolify did not give. Before START
-    that is a plain :class:`QuiesceError` and the run rolls back; after START it
-    BLOCKS, for the reason a revival does: the rollback deletes a target that
-    may have served users since, and a Coolify restarting for a while must not
-    decide that. A subclass so the executor blocks on it; nothing is journalled
-    for the resume, which checks again from where it was.
+    application's deployment history that Coolify did not give, or a read of a
+    server's Docker daemon that got no answer (a container listing, an
+    inspect, the event log; over SSH or from the daemon). Before START the
+    read's own error, or a plain :class:`QuiesceError` for a history, rolls the
+    run back; after START it BLOCKS, for the reason a revival does: the
+    rollback deletes a target that may have served users since, and a Coolify
+    or a connection down for a while must not decide that. A subclass so the
+    executor blocks on it; nothing is journalled for the resume, which checks
+    again from where it was.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        hint: str | None = None,
+        resume_when: str = "once Coolify answers again",
+    ) -> None:
+        super().__init__(message, hint=hint)
+        #: Who must answer before a resume can finish the check, for the run report
+        #: (``containment.resume_when``).
+        self.resume_when = resume_when
 
 
 class TargetStartedEarly(ContainmentBreach):

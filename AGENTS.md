@@ -155,14 +155,21 @@ decision, the decision is in the wrong layer.
   first `/start`, and FINALIZE (source) BEFORE its policy is journalled — after
   it, `rollback_refusal` would answer a revived source under DELETE with "the
   source is deleted". The rules live in `domain/containment.py`. A check that
-  cannot be answered (the event log, a deployment history) never passes.
+  cannot be answered (any daemon read over SSH — a listing, an inspect, the
+  event log — or a deployment history) never passes. Ask every read through
+  `engine/containment._Reads`, which notes a failure and lets the check go on:
+  a read that raises past it is a rollback after START.
 - **A breach?** Before START asked for any target the run rolls back
   (`SourceRevived`, `TargetStartedEarly`; a target found started is journalled
-  `started_early`, so STOP_TARGET is owed, `statemachine.target_may_run`). Once
-  START asked (`start_requested`, or START completed), a revived source BLOCKS
-  (`SourceRevivedAfterStart`) and so does an unread deployment history
-  (`SourceUncheckedAfterStart`): the executor rolls nothing back, because the
-  target may hold users' writes. Judge revivals from `stopped_clock`, the stop
+  `started_early`, so STOP_TARGET is owed, `statemachine.target_may_run`), and a
+  read that got no answer raises its own error. Once START asked
+  (`start_requested`, or START completed), a revived source BLOCKS
+  (`SourceRevivedAfterStart`) and so does a check that could not be finished —
+  an unread deployment history, a daemon read that failed, on either side
+  (`SourceUncheckedAfterStart`, nothing journalled): the executor rolls nothing
+  back, because the target may hold users' writes. A breach is raised first,
+  with what could not be read beside it, and journals the revival clock only
+  when every source read answered. Judge revivals from `stopped_clock`, the stop
   gate's proof (`containment.judged_from`), never from the stop request.
 - **Stopping a target in a rollback?** End its deployments first
   (`compensations._settle_target_deployments`): an application's `/stop` cancels

@@ -267,8 +267,11 @@ START asked for it. A breach is never a warning and has no flag:
   DNS gate let the target start, it may have served users, and a rollback would
   delete what they wrote. Stop the source, cancel its pending deployments, then
   `resume` — or `rollback` by hand;
-- a check that cannot be answered — the event log, a deployment history Coolify
-  does not give — never passes: it rolls back before START and blocks after it.
+- a check that cannot be answered — a server's Docker daemon that does not
+  answer over SSH (its containers, an inspect, the event log), a deployment
+  history Coolify does not give — never passes: it rolls back before START and
+  blocks after it. Every read of a check is still asked, so a breach found beside
+  it is reported first.
 
 Coolify's scheduled volume backup (4.3+) reads a source volume on its schedule
 whatever the source's status. A container that only **reads** a migrated volume
