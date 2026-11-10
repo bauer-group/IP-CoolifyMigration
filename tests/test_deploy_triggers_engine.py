@@ -414,16 +414,20 @@ class TestAwaitDeployments:
 
 
 class TestStepQuiesce:
-    """The insertion point: after the pins, before the stop marker and the stop."""
+    """The insertion point: FIRST - before the preview delete, the mount capture,
+    the pins, the stop marker and the stop. A deployment that ends replaces the
+    containers, so everything that names them must read them after the wait."""
 
     @pytest.fixture
     def stubbed(self, ctx: MigrationContext, monkeypatch: pytest.MonkeyPatch) -> list[str]:
         order: list[str] = []
 
         async def capture(_ctx: Any) -> dict[str, list[str]]:
+            order.append("capture")
             return {}
 
         async def no_pins(_ctx: Any) -> list[str]:
+            order.append("pin")
             return []
 
         async def now_on(_host: Any) -> str:
@@ -466,7 +470,27 @@ class TestStepQuiesce:
 
         await steps.step_quiesce(ctx)
 
-        assert stubbed == ["disarm", "queue", "stop marked=True"]
+        assert stubbed == ["disarm", "queue", "capture", "pin", "stop marked=True"]
+
+    async def test_the_mounts_are_captured_after_the_deployment_ended(
+        self, ctx: MigrationContext, respx_mock: respx.Router, stubbed: list[str]
+    ) -> None:
+        # The rolling update a running deployment finishes starts a container
+        # under a NEW name and removes the old one. Captured before the wait,
+        # the SIGKILL guard would match the killed new container against the
+        # old name and let a torn volume through.
+        App("app1").mount(respx_mock)
+        answers = iter([_queue(("d1", "app1", "in_progress")), _queue()])
+
+        def queue(_request: httpx.Request) -> httpx.Response:
+            stubbed.append("queue")
+            return next(answers)
+
+        respx_mock.get(f"{BASE}/deployments").mock(side_effect=queue)
+
+        await steps.step_quiesce(ctx)
+
+        assert stubbed == ["queue", "queue", "capture", "pin", "stop marked=True"]
 
     async def test_a_pending_deployment_refuses_before_anything_is_stopped(
         self, ctx: MigrationContext, respx_mock: respx.Router, stubbed: list[str]
@@ -475,10 +499,67 @@ class TestStepQuiesce:
         respx_mock.get(f"{BASE}/deployments").mock(
             return_value=_queue(("d1", "app1", "in_progress"))
         )
-        with pytest.raises(SourceDeploymentPending):
+        with pytest.raises(SourceDeploymentPending) as err:
             await steps.step_quiesce(ctx)
+        # Not even captured or pinned: so no pin note follows the "nothing was
+        # stopped" hint to promise a restart that is not owed.
         assert stubbed == []
         assert STOP_REQUESTED not in ctx.journal.undo_info("quiesce")
+        assert "pinned by" not in str(err.value.hint)
+
+    async def test_previews_are_deleted_only_after_the_disarm_and_the_wait(
+        self,
+        ctx: MigrationContext,
+        respx_mock: respx.Router,
+        stubbed: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Disarmed first, a pull request can no longer bring a deleted preview back.
+        ctx.plan = _plan(_app(has_previews=True))
+        ctx.delete_previews = True
+        app = App("app1", previews=True)
+
+        def patch(request: httpx.Request) -> httpx.Response:
+            stubbed.append("disarm")
+            return app.patch(request)
+
+        def queue(_request: httpx.Request) -> httpx.Response:
+            stubbed.append("queue")
+            return _queue()
+
+        def delete(_request: httpx.Request) -> httpx.Response:
+            stubbed.append("delete preview")
+            return httpx.Response(200, json={})
+
+        async def containers(*_a: Any, **_kw: Any) -> list[Any]:
+            return [
+                steps.docker.Container(
+                    id="c1",
+                    name="app1-pr-7",
+                    state="running",
+                    labels={steps.docker.LABEL_PR_ID: "7"},
+                )
+            ]
+
+        respx_mock.get(f"{BASE}/applications/app1").mock(side_effect=app.get)
+        respx_mock.patch(f"{BASE}/applications/app1").mock(side_effect=patch)
+        respx_mock.get(f"{BASE}/deployments").mock(side_effect=queue)
+        respx_mock.delete(f"{BASE}/applications/app1/previews/7").mock(side_effect=delete)
+        monkeypatch.setattr(steps, "resource_containers", containers)
+
+        await steps.step_quiesce(ctx)
+
+        assert stubbed == [
+            "disarm",
+            "queue",
+            "delete preview",
+            "capture",
+            "pin",
+            "stop marked=True",
+        ]
+        assert app.patches == [
+            {"is_auto_deploy_enabled": False, "is_preview_deployments_enabled": False}
+        ]
 
 
 # ── R1/R2/R8: FINALIZE arms the target, a kept source stays disarmed ─────────

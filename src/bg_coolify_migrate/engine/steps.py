@@ -1065,6 +1065,22 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
     We never trust the stop endpoint: it is async, it does not touch previews,
     and for services it works off DB rows rather than labels.
     """
+    # FIRST, the first write to the source: its push-driven deploys go off
+    # (originals journalled first, given back by a rollback), then what is
+    # already queued or building must end - Coolify's stop cancels nothing, and
+    # its queue would start the source again after it. Before everything below,
+    # because a deployment that ends REPLACES the containers: a rolling update
+    # starts `{uuid}-{Ymd\THis}` and removes the old one before the row reads
+    # finished (generateApplicationContainerName, docker.php v4.7.2:670-686;
+    # ApplicationDeploymentJob v4.7.2:3084-3090, then :718-725). A capture taken
+    # before the wait names containers that are gone: the SIGKILL check matches
+    # the killed new one against no holder, and a volume only it mounts stays
+    # unpinned. Before the preview delete too, or a pull request in between
+    # brings one back. A refusal here comes before any pin or stop: nothing to
+    # undo but the disarm.
+    await deploy_triggers.disarm_sources(ctx)
+    await deploy_triggers.await_source_deployments(ctx)
+
     if ctx.delete_previews:
         for resource in ctx.plan.resources:
             if not resource.snapshot.has_previews:
@@ -1099,13 +1115,6 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
     source_pins = await _pin_source(ctx)
 
     try:
-        # Before the stop, the first write to the source: its push-driven deploys
-        # go off (originals journalled first, given back by a rollback), then what
-        # is already queued or building must end - Coolify's stop cancels nothing,
-        # and its queue would start the source again after it.
-        await deploy_triggers.disarm_sources(ctx)
-        await deploy_triggers.await_source_deployments(ctx)
-
         # The source's clock, not ours: it is the window for the event-log check
         # below, and a skewed workstation would silently shrink it.
         since = await quiesce.now_on(ctx.source_host)

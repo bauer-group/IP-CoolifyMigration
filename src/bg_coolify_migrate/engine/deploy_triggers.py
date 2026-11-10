@@ -2,10 +2,12 @@
 
 IO shell: what to switch, and back to what, is ``domain/deploy_triggers.py``'s.
 
-* :func:`disarm_sources` — QUIESCE, before the stop: every source application's
+* :func:`disarm_sources` — QUIESCE, first: every source application's
   auto-deploy (and previews, where on) goes off, its originals journalled first.
-* :func:`await_source_deployments` — QUIESCE, before the stop: what is already
-  queued or building must end, or the run refuses while the source serves.
+* :func:`await_source_deployments` — QUIESCE, next: what is already queued or
+  building must end, or the run refuses while the source serves. Both run
+  before the preview delete, the mount capture and the pins, because a
+  deployment that ends replaces the containers those name.
 * :func:`arm_targets` — FINALIZE: each target gets its source's auto-deploy and
   its tags. :func:`note_kept_sources` says which kept source stays disarmed.
 * :func:`restore_sources` — the rollback's RESTORE_SOURCE_DEPLOY_TRIGGERS.
