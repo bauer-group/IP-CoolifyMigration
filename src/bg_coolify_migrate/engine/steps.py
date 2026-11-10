@@ -1969,6 +1969,15 @@ def _note_host_wide_writers(
         ctx.notices.append(binds.host_wide_notice(bind, paths=paths, server=server))
 
 
+def _target_uuid_of(ctx: MigrationContext, source_uuid: str) -> str | None:
+    """The target CREATE made for ``source_uuid``: the context's, or its journal's."""
+    journalled = ctx.journal.undo_info(State.CREATE_TARGET.value).get("target_uuids")
+    found = ctx.target_uuids.get(source_uuid) or (
+        journalled.get(source_uuid) if isinstance(journalled, dict) else None
+    )
+    return found if isinstance(found, str) and found else None
+
+
 async def _target_rows(
     ctx: MigrationContext, snapshot: ResourceSnapshot, mounts: list[str], *, target_uuid: str
 ) -> list[binds.StorageRow]:
@@ -2073,8 +2082,14 @@ async def _assert_target_binds_safe(ctx: MigrationContext) -> None:
 
     And the files the plan skipped because Coolify writes them on the target
     from its row's content: that row must hold the content (``binds.content_problem``).
+
+    And the plan's host-path rules once more, on the pair the read-back made
+    (``binds.pair_problem``): the target's row can name a path the source's
+    does not. COPY applies the same rule, so it is refused here, before the
+    stop, rather than there.
     """
     per_resource: dict[str, list[BindPair]] = {}
+    foreign: list[str] = []
     missing_content: list[str] = []
     for resource in ctx.plan.resources:
         snapshot = resource.snapshot
@@ -2111,6 +2126,28 @@ async def _assert_target_binds_safe(ctx: MigrationContext) -> None:
                 consequence=_NEVER_STOPPED,
                 rows=rows,
             )
+            foreign.extend(
+                f"{snapshot.name}: {problem}"
+                for pair in per_resource[snapshot.uuid]
+                if (
+                    problem := binds.pair_problem(
+                        pair, source_uuid=snapshot.uuid, target_uuid=target_uuid
+                    )
+                )
+            )
+    if foreign:
+        raise TransferError(
+            "bind mount(s) the target would place on a host path that is not its own:\n"
+            + "\n".join(f"  {p}" for p in foreign),
+            hint=(
+                "A bind mount is copied to the host path the target's own storage row "
+                "names at the same mount path, and a migration writes only paths that "
+                "belong to the resource: never a system path, Coolify's own state or "
+                "another resource's directory. The target was created from a different "
+                "compose (the branch HEAD moved), or its storage row names such a path. "
+                f"{_NEVER_STOPPED}"
+            ),
+        )
     if missing_content:
         raise TransferError(
             "file mount(s) the target would start without:\n"
@@ -2245,10 +2282,38 @@ async def _copy_binds(ctx: MigrationContext) -> list[str]:
     written (``binds.BIND_TARGET``): that record is all a rollback may delete.
     A target the journal already holds is this run's own partial copy, from an
     attempt that did not finish, and is copied over.
+
+    Before any of that, every pair passes the plan's host-path rules again
+    (``binds.pair_problem``): a resumed COPY reloads DISCOVER's pairs from the
+    journal, and a run begun under an earlier version had neither its pairs
+    nor its end-of-CREATE check vetted by this version's rules. Nothing is
+    written, not even for the pairs that pass.
     """
-    pairs = [p for r in ctx.plan.resources for p in _first_sightings(ctx, r)]
+    per_resource = [(r, p) for r in ctx.plan.resources for p in _first_sightings(ctx, r)]
+    pairs = [p for _, p in per_resource]
     if not pairs:
         return []
+    foreign = [
+        f"{r.snapshot.name}: {problem}"
+        for r, p in per_resource
+        if (
+            problem := binds.pair_problem(
+                p, source_uuid=r.snapshot.uuid, target_uuid=_target_uuid_of(ctx, r.snapshot.uuid)
+            )
+        )
+    ]
+    if foreign:
+        raise TransferError(
+            "bind mount(s) this version never copies:\n" + "\n".join(f"  {p}" for p in foreign),
+            hint=(
+                "No plan of this version would copy them: the run began under an earlier "
+                "version of coolify-migrate, whose journal and checks did not apply the "
+                "current rules for host paths. Nothing has been written to them. "
+                f"{_ROLLED_BACK} If that rollback does not finish, run "
+                f"`coolify-migrate rollback {ctx.migration_id}`. Then plan the migration "
+                "again with this version."
+            ),
+        )
     with_kinds = await _bind_kinds(ctx, pairs)
     owed = binds.owed_bind_targets((r.event, r.detail) for r in ctx.journal.read())
     states = await transfer_binds.path_states(ctx.target_host, _target_probe(pairs))

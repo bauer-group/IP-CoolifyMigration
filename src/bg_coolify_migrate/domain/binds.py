@@ -655,6 +655,42 @@ def merge_pairs(per_resource: Mapping[str, Sequence[BindPair]]) -> list[BindPair
     return merged
 
 
+def pair_problem(pair: BindPair, *, source_uuid: str, target_uuid: str | None) -> str | None:
+    """Why no plan of this version would copy ``pair``, or None. PURE.
+
+    :func:`classify`'s host-path rule, applied again to a pair whatever made it.
+    Above all to a pair DISCOVER journalled under an EARLIER version, which a
+    resumed COPY reloads (``context.deserialise_bind_pairs``) and no PLAN of
+    this version vetted: up to 2.14.0 every bind that was neither passed
+    through nor under ``/data/coolify`` was journalled path-to-path, writable
+    ``/etc/...``, ``/usr/...`` and ``/var/lib/docker/...`` included, and COPY
+    would create and fill such a path on the target server. And to a target
+    row naming a path the source's does not (a branch HEAD that moved since
+    PLAN): the target is read back, never predicted, so only this keeps the
+    copy out of the target host's own paths.
+
+    The source must be the resource's: no system path, or strictly inside its
+    own Coolify directory. The target must be the TARGET resource's by the same
+    rule with ``target_uuid``: under ``/data/coolify`` only inside the target's
+    own directory — not Coolify's state, another resource's directory or a tree
+    named after the source's uuid — and nowhere there while its uuid is unknown.
+    """
+    for side, path, uuid in (
+        ("source", pair.source_path, source_uuid),
+        ("target", pair.target_path, target_uuid),
+    ):
+        if normalise(path) != path:
+            return f"bind {pair.source_path} -> {pair.target_path}: its {side} is not canonical"
+        if own_dir_of(path, uuid) is None and is_system_path(path, uuid=uuid):
+            whose = "the resource's" if side == "source" else "the target resource's"
+            return (
+                f"bind {pair.source_path} -> {pair.target_path}: the {side} {path} is not "
+                f"{whose} to {'copy' if side == 'source' else 'write'} (a system path, "
+                "Coolify's own state or another resource's directory)"
+            )
+    return None
+
+
 # ── host states ──────────────────────────────────────────────────────────────
 
 
