@@ -103,9 +103,15 @@ class SshSettingsMixin(BaseSettings):
         default=900.0,
         ge=10.0,
         description=(
-            "How long to wait for the target to come up after start. Much longer than "
-            "stop_timeout because a git-built application clones and BUILDS on the "
-            "target first, which can take many minutes."
+            "How long to wait for a deployment. Above all for the target to come up "
+            "after start: much longer than stop_timeout because a git-built "
+            "application clones and BUILDS on the target first, which can take many "
+            "minutes. It also bounds QUIESCE's wait, before the stop, for a source "
+            "deployment already queued or building (one still pending then refuses "
+            "the run while the source serves; none is ever cancelled), and a "
+            "rollback's waits: for the source's restart deployment, for target "
+            "deployments to settle before the targets are stopped, and for the "
+            "restarted source to mount its volumes before their pins go."
         ),
     )
     target_storage_timeout: float = Field(
