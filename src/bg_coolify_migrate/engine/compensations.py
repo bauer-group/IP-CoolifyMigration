@@ -21,8 +21,9 @@ import structlog
 from bg_coolify_migrate.api import resources as api_resources
 from bg_coolify_migrate.discovery import docker, pins
 from bg_coolify_migrate.domain import domains
-from bg_coolify_migrate.domain.containment import volume_recreated
+from bg_coolify_migrate.domain.containment import unsettled, volume_recreated
 from bg_coolify_migrate.domain.deployments import (
+    Deployment,
     Progress,
     deployment_uuid_of,
     judge,
@@ -39,7 +40,7 @@ from bg_coolify_migrate.domain.statemachine import (
 )
 from bg_coolify_migrate.engine import containment, deploy_triggers, keys
 from bg_coolify_migrate.engine.context import MigrationContext, deserialise_volume_pairs
-from bg_coolify_migrate.errors import CoolifyApiError
+from bg_coolify_migrate.errors import CoolifyApiError, MigrationError
 from bg_coolify_migrate.journal.store import JournalRecord
 from bg_coolify_migrate.settings.base import Settings
 
@@ -663,6 +664,17 @@ async def undo_start_target(ctx: MigrationContext, undo_info: dict[str, Any]) ->
     a START that failed part-way leaves none running) and each one a checkpoint
     found started by someone else (``STARTED_EARLY``). Stopping one that never
     started is harmless (``statemachine.target_may_run``).
+
+    An application's ``/stop`` holds back no deployment: StopApplication runs on
+    the 'high' queue and cancels none (v4.7.2:17), so one still queued or
+    building — START's own, when a later target's start failed a moment after,
+    or someone else's, when Coolify skipped START's — lands after the stop and
+    serves the claimed hosts beside the restarted source; DeleteResourceJob then
+    cancels a preview's deployments only (v4.7.2:234-278). So every target
+    application's deployments are brought to an end first
+    (:func:`_settle_target_deployments`). One still unsettled at
+    ``deploy_timeout`` fails this compensation — after the stops are sent, so
+    the rest of the rollback still runs.
     """
     started: list[str] = []
     for key in ("started", START_REQUESTED, STARTED_EARLY):
@@ -670,15 +682,140 @@ async def undo_start_target(ctx: MigrationContext, undo_info: dict[str, Any]) ->
         for uuid in raw if isinstance(raw, list) else []:
             if isinstance(uuid, str) and uuid not in started:
                 started.append(uuid)
+    collections = {t: _collection_of_target(ctx, t) for t in started}
+    applications = [t for t in started if collections[t] == "applications"]
+    left = (
+        await _settle_target_deployments(ctx, applications, _start_deployments(ctx, undo_info))
+        if applications
+        else []
+    )
     for target_uuid in started:
-        source_uuid = next((s for s, t in ctx.target_uuids.items() if t == target_uuid), None)
-        collection = ctx.collection_of(source_uuid) if source_uuid else "applications"
         try:
-            await ctx.api.stop(collection, target_uuid)
+            await ctx.api.stop(collections[target_uuid], target_uuid)
             log.info("compensate.target_stopped", uuid=target_uuid)
         except Exception as exc:
             log.error("compensate.target_stop_failed", uuid=target_uuid, error=str(exc)[:200])
             raise
+    if left:
+        names = _target_names(ctx)
+        listed = "; ".join(
+            f"{names.get(t, t)}: "
+            + (f"deployment {d.uuid}" if d.uuid else "its deployments could not be read")
+            for t, d in left
+        )
+        raise RuntimeError(
+            f"still queued or running after {ctx.settings.deploy_timeout:.0f}s - {listed}. "
+            "A stop cannot hold a deployment back, so it may still bring that target up: "
+            "cancel it in the target's Deployments in Coolify, then stop the target there"
+        )
+
+
+#: How many times a rollback re-reads a target's deployments at once, after it
+#: asked to cancel one it had not seen, before it waits between reads. A cancel marks
+#: the row before it answers (DeployController v4.7.2:268-279), but it also
+#: lets Coolify start the next queued deployment (next_after_cancel, :317).
+_QUICK_SETTLE_ROUNDS = 3
+
+
+def _collection_of_target(ctx: MigrationContext, target_uuid: str) -> str:
+    source_uuid = next((s for s, t in ctx.target_uuids.items() if t == target_uuid), None)
+    return ctx.collection_of(source_uuid) if source_uuid else "applications"
+
+
+def _target_names(ctx: MigrationContext) -> dict[str, str]:
+    """Target uuid -> the name of the source it belongs to."""
+    names = {r.snapshot.uuid: r.snapshot.name for r in ctx.plan.resources}
+    return {t: names.get(s, s) for s, t in ctx.target_uuids.items()}
+
+
+def _start_deployments(ctx: MigrationContext, undo_info: dict[str, Any]) -> dict[str, list[str]]:
+    """Target uuid -> the deployments START journalled for it (keyed by source uuid there)."""
+    raw = undo_info.get("deployments")
+    out: dict[str, list[str]] = {}
+    for source_uuid, deployment in (raw if isinstance(raw, dict) else {}).items():
+        target_uuid = ctx.target_uuids.get(str(source_uuid))
+        if target_uuid and isinstance(deployment, str) and deployment:
+            out.setdefault(target_uuid, []).append(deployment)
+    return out
+
+
+async def _settle_target_deployments(
+    ctx: MigrationContext, targets: list[str], known: Mapping[str, list[str]]
+) -> list[tuple[str, Deployment]]:
+    """Cancel every queued or running deployment of these target applications.
+
+    Returns what is still unsettled at ``deploy_timeout``. Each round reads every
+    target's deployments (``GET /deployments/applications/{uuid}``; START's own
+    journalled ones read one by one when the list misses them) and asks Coolify
+    to cancel each one still queued or in progress — again on later rounds,
+    because a cancel that failed can succeed, and one answered 400 has ended.
+    A read that fails counts as unsettled: a stop is safe only once nothing can
+    start the target after it. Targets of this run only; never a source.
+    """
+    seen: set[str] = set()
+    waited = 0.0
+    quick = 0
+    while True:
+        flight = await _unsettled_deployments(ctx, targets, known)
+        if not flight:
+            return []
+        fresh = any(d.uuid not in seen for _, d in flight)
+        for target_uuid, deployment in flight:
+            seen.add(deployment.uuid)
+            if deployment.uuid:
+                await _cancel_target_deployment(ctx, target_uuid, deployment.uuid)
+        if fresh and quick < _QUICK_SETTLE_ROUNDS:
+            quick += 1
+            continue
+        if waited >= ctx.settings.deploy_timeout:
+            for target_uuid, deployment in flight:
+                log.error(
+                    "compensate.target_deployment_unsettled",
+                    uuid=target_uuid,
+                    deployment=deployment.uuid or None,
+                )
+            return flight
+        await asyncio.sleep(_DEPLOYMENT_POLL_INTERVAL)
+        waited += _DEPLOYMENT_POLL_INTERVAL
+
+
+async def _unsettled_deployments(
+    ctx: MigrationContext, targets: list[str], known: Mapping[str, list[str]]
+) -> list[tuple[str, Deployment]]:
+    """Every target deployment still queued or running — or that could not be read."""
+    out: list[tuple[str, Deployment]] = []
+    for target_uuid in targets:
+        try:
+            rows = await ctx.api.application_deployments(target_uuid)
+        except MigrationError as exc:
+            log.warning(
+                "compensate.target_deployments_unread", uuid=target_uuid, error=str(exc)[:120]
+            )
+            rows = None
+            out.append((target_uuid, Deployment(uuid="", status="")))
+        listed = {d.uuid: d for d in rows or []}
+        for uuid in known.get(target_uuid, []):
+            if uuid in listed:
+                continue
+            try:
+                found = await ctx.api.get_deployment(uuid)
+            except MigrationError as exc:
+                log.warning("compensate.target_deployment_unread", uuid=uuid, error=str(exc)[:120])
+                found = Deployment(uuid=uuid, status="")
+            if found is not None:
+                listed[uuid] = found
+        out.extend((target_uuid, d) for d in unsettled(listed.values()))
+    return out
+
+
+async def _cancel_target_deployment(ctx: MigrationContext, target_uuid: str, uuid: str) -> None:
+    try:
+        cancelled = await ctx.api.cancel_deployment(uuid)
+    except MigrationError as exc:  # read again next round; the deadline decides
+        log.warning("compensate.target_deployment_cancel_failed", uuid=uuid, error=str(exc)[:120])
+        return
+    event = "cancelled" if cancelled else "ended"
+    log.info(f"compensate.target_deployment_{event}", target=target_uuid, deployment=uuid)
 
 
 async def undo_restore_source_name(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:

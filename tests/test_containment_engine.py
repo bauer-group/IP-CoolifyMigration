@@ -449,6 +449,9 @@ class TestStopTarget:
         app = respx_mock.post(f"{BASE}/applications/tgt1/stop").mock(
             return_value=httpx.Response(200, json={})
         )
+        respx_mock.get(f"{BASE}/deployments/applications/tgt1").mock(
+            return_value=httpx.Response(200, json={"count": 0, "deployments": []})
+        )
         await compensations.undo_start_target(
             ctx, {START_REQUESTED: ["tgt1"], STARTED_EARLY: ["db2", "tgt1"]}
         )

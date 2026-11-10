@@ -60,6 +60,12 @@ _THROTTLED = frozenset({429})
 #: says which throttle it is, and only this one deserves a warning and a hint.
 _TOKEN_BLOCKED = "Too many failed API requests"
 
+#: Rows one ``GET /deployments/applications/{uuid}`` asks for (``take``, ``min:1``
+#: and no maximum: DeployController v4.1.2:674-675, v4.7.2:738-739). Newest first,
+#: so a deployment still queued or running is on the first page of a target
+#: this run created, unless fifty newer ones were queued after it.
+_DEPLOYMENTS_TAKE = 50
+
 
 class CoolifyClient:
     """Async client for one Coolify instance.
@@ -628,6 +634,51 @@ class CoolifyClient:
         (``domain/deploy_triggers.read_active_deployments``).
         """
         return read_active_deployments(await self.get("/deployments"))
+
+    async def application_deployments(self, uuid: str) -> list[Deployment] | None:
+        """An application's newest deployments, uuid and status only. ``None`` on a 404.
+
+        ``GET /deployments/applications/{uuid}`` (ability ``read``, routes/api.php
+        v4.1.2:82 .. v4.7.2:166) answers ``{"count", "deployments"}``, newest
+        first, ``take`` rows (default 10; DeployController v4.1.2:671-704,
+        v4.7.2:735-768; Application::deployments v4.1.2:1084-1099). Previews'
+        rows included. Every row carries ``logs`` — up to 4.6 even for a token
+        that cannot read sensitive data — so each is reduced HERE, like
+        :meth:`get_deployment`.
+        """
+        try:
+            answer = await self.get(f"/deployments/applications/{uuid}", take=_DEPLOYMENTS_TAKE)
+        except CoolifyApiError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        rows = answer.get("deployments") if isinstance(answer, dict) else None
+        out: list[Deployment] = []
+        for row in rows if isinstance(rows, list) else []:
+            found = row.get("deployment_uuid") if isinstance(row, dict) else None
+            if isinstance(found, str) and found:
+                out.append(read_deployment(found, row))
+        return out
+
+    async def cancel_deployment(self, uuid: str) -> bool:
+        """Cancel a queued or running deployment. Whether Coolify cancelled it.
+
+        ``POST /deployments/{uuid}/cancel`` (ability ``deploy``, routes/api.php
+        v4.1.2:81 .. v4.7.2:165) marks it ``cancelled-by-user`` before it answers
+        and kills its helper container; a queued job checks that status before it
+        starts (ApplicationDeploymentJob v4.1.2:285-288, v4.7.2:453-456). False,
+        never an error, when there is nothing to cancel: 400 "cannot be
+        cancelled" for one already finished, failed or cancelled
+        (DeployController v4.1.2:238-242, v4.7.2:256-260, also the answer to a
+        cancel retried after a lost reply), 404 for no such deployment.
+        """
+        try:
+            await self.post(f"/deployments/{uuid}/cancel")
+        except CoolifyApiError as exc:
+            if exc.status_code in (400, 404):
+                return False
+            raise
+        return True
 
     async def stop(self, collection: str, uuid: str) -> bool:
         """Request a stop. Returns whether Coolify actually dispatched one.

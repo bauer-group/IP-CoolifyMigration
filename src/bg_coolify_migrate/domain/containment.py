@@ -51,6 +51,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from bg_coolify_migrate.domain.deployments import IN_PROGRESS, QUEUED, Deployment
+
 #: QUIESCE journals the SOURCE host's clock (unix seconds, ``date +%s``), read just
 #: before it asks Coolify to stop anything, beside ``statemachine.STOP_REQUESTED``.
 #: The window of ``quiesce.killed_since``; revivals are judged from it only when
@@ -395,6 +397,22 @@ def event_log_gap(events: EventLog | None, since: int | None) -> int | None:
     if events is None or since is None or events.oldest is None:
         return None
     return events.oldest if events.oldest > since else None
+
+
+def unsettled(deployments: Iterable[Deployment]) -> list[Deployment]:
+    """The deployments a stop cannot hold back: queued, in progress, or unread.
+
+    Queued and in progress are Coolify's own cancellable set
+    (DeployController::cancel_deployment v4.1.2:233-236, v4.7.2:251-254); an
+    empty status is a row that could not be read, which proves nothing ended.
+    StopApplication runs on the 'high' queue and cancels no deployment
+    (v4.7.2:17), so one of these that lands after a rollback's ``/stop`` brings
+    the target up again — serving the hosts it claimed beside the restarted
+    source — and DeleteResourceJob cancels deployments of a preview only
+    (v4.7.2:234-278), so its container can outlive the delete. A status this
+    tool does not know cannot be cancelled either, and does not count.
+    """
+    return [d for d in deployments if d.status in (QUEUED, IN_PROGRESS, "")]
 
 
 def volume_recreated(recorded: str, current: str) -> bool:

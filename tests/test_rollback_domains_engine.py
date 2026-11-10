@@ -320,6 +320,10 @@ class TestRollbackOrderAgainstTheApi:
         calls = Calls()
         _source(respx_mock, calls, SourceRow(calls, fqdn=""))
         respx_mock.post(f"{BASE}/applications/appT/stop").mock(side_effect=calls.mark("stop"))
+        # STOP_TARGET first ends the target's deployments: none are left here.
+        respx_mock.get(f"{BASE}/deployments/applications/appT").mock(
+            return_value=httpx.Response(200, json={"count": 0, "deployments": []})
+        )
         respx_mock.post(f"{BASE}/applications/app1/restart").mock(side_effect=calls.mark("restart"))
         respx_mock.delete(f"{BASE}/applications/appT").mock(side_effect=calls.mark("delete"))
 
