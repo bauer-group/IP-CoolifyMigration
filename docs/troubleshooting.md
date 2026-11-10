@@ -577,7 +577,7 @@ read from its journal` means `run` could not tell whose the stack is, and leaves
 it as it is rather than start a source the migration may have stopped: check it
 in Coolify and with `coolify-migrate status <id>`. If `run` itself is killed
 before it gets there, start the stack in Coolify: a later `rollback` restarts only
-what the migration stopped.
+what the migration stopped, and its confirmation says when that is nothing.
 
 Not offered for databases — there an anonymous volume can be the data itself
 (an image whose data path moved, like Postgres 18's `/var/lib/postgresql`).

@@ -252,11 +252,54 @@ class TestThePrompt:
     def test_a_started_target_says_its_writes_are_discarded(self) -> None:
         from bg_coolify_migrate.cli import _rollback_prompt
 
-        text = _rollback_prompt(MID, _plan(), {"start_target": {"started": ["db2"]}})
+        text = _rollback_prompt(
+            MID, _plan(), {"start_target": {"started": ["db2"]}}, source_stopped=True
+        )
         assert "DISCARDED" in text and "since the cutover" in text
 
     def test_before_the_start_it_does_not(self) -> None:
         from bg_coolify_migrate.cli import _rollback_prompt
 
-        text = _rollback_prompt(MID, _plan(), {"copy": {}})
+        text = _rollback_prompt(MID, _plan(), {"copy": {}}, source_stopped=True)
         assert "DISCARDED" not in text and "delete the target" in text
+        assert "and restart" in text
+
+    def test_a_run_that_never_stopped_the_source_promises_no_restart(self) -> None:
+        """The rollback owes RESTART_SOURCE only once the run may have stopped the
+        source (statemachine.source_was_stopped): a QUIESCE refused before its stop
+        request restarts nothing, also when the stack was stopped before the run."""
+        from bg_coolify_migrate.cli import _rollback_prompt
+
+        text = _rollback_prompt(MID, _plan(), {"quiesce": {}}, source_stopped=False)
+        assert "and restart" not in text
+        assert "never stopped the source" in text and "nothing is restarted" in text
+
+    async def test_the_prompt_reads_the_stop_from_the_journal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import questionary
+
+        from bg_coolify_migrate import cli
+
+        runner.save_plan(tmp_path, MID, _plan())
+        journal = Journal.create(tmp_path, MID)
+        journal.append("step_started", state="quiesce")
+        journal.append("step_failed", state="quiesce", detail={"error": "refused"})
+        shown: list[str] = []
+
+        class _Console:
+            def print(self, text: object, *_a: object, **_kw: object) -> None:
+                shown.append(str(text))
+
+        class _Declined:
+            def ask(self) -> bool:
+                return False
+
+        monkeypatch.setattr(cli, "get_console", lambda **_kw: _Console())
+        monkeypatch.setattr(cli, "is_interactive", lambda: True)
+        monkeypatch.setattr(questionary, "confirm", lambda *_a, **_kw: _Declined())
+        settings = Settings(
+            _env_file=None, state_dir=tmp_path, coolify_url=HOST, coolify_token="tok"
+        )
+        assert await cli._rollback(settings, MID, assume_yes=False) == 0
+        assert "nothing is restarted" in shown[0]

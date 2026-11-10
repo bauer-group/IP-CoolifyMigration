@@ -1470,18 +1470,33 @@ def rollback(
 
 
 def _rollback_prompt(
-    migration_id: str, plan: MigrationPlan, details: Mapping[str, Mapping[str, Any]]
+    migration_id: str,
+    plan: MigrationPlan,
+    details: Mapping[str, Mapping[str, Any]],
+    *,
+    source_stopped: bool,
 ) -> str:
     """What the confirmation says a rollback will do. ``details``: the journal's, per state.
+
+    ``source_stopped``: whether the run may have stopped the source
+    (``runner.run_stopped_source``) - exactly when the rollback owes its
+    restart. A run that never asked for the stop restarts nothing, even when
+    its source is down (a stack stopped before the run whose CLI was killed
+    before it could start it again), so the prompt does not promise it.
 
     Once the target was started it serves - from DNS_GATE on, through FINALIZE
     and after DONE - so the rollback throws away everything written to it since:
     the source comes back on its data as of the stop.
     """
+    source = f"[host]{escape(plan.source_server.name)}[/host]"
     text = (
         f"Rolling back [bold]{escape(migration_id)}[/bold] will delete the target "
-        f"resources created on [host]{escape(plan.target_server.name)}[/host] "
-        f"and restart [host]{escape(plan.source_server.name)}[/host]."
+        f"resources created on [host]{escape(plan.target_server.name)}[/host]"
+        + (
+            f" and restart {source}."
+            if source_stopped
+            else f". The run never stopped the source on {source}, so nothing is restarted."
+        )
     )
     if State.START_TARGET.value in details:
         text += (
@@ -1498,7 +1513,7 @@ async def _rollback(
     import questionary
 
     from bg_coolify_migrate.api.client import CoolifyClient
-    from bg_coolify_migrate.engine.runner import load_plan, rollback_migration
+    from bg_coolify_migrate.engine.runner import load_plan, rollback_migration, run_stopped_source
     from bg_coolify_migrate.journal.store import Journal
     from bg_coolify_migrate.ui import run_report
 
@@ -1510,8 +1525,16 @@ async def _rollback(
         if not is_interactive():
             console.print("[err]error:[/err] refusing to roll back unattended without --yes")
             return 2
-        journal = Journal.open(settings.resolved_state_dir(), migration_id)
-        console.print(_rollback_prompt(migration_id, migration_plan, journal.details()))
+        state_dir = settings.resolved_state_dir()
+        journal = Journal.open(state_dir, migration_id)
+        console.print(
+            _rollback_prompt(
+                migration_id,
+                migration_plan,
+                journal.details(),
+                source_stopped=run_stopped_source(state_dir, migration_id),
+            )
+        )
         if not await _off_loop(questionary.confirm("Proceed?", default=False).ask):
             return 0
 
