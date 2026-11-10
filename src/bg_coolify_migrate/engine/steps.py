@@ -479,10 +479,10 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
             if snapshot.collection == "applications":
                 await _refuse_multi_server(ctx, snapshot, source_full)
 
-            # NO TAG TRANSFER. Tags are deliberately not carried — see the note on
-            # SERVICE_CREATE in api/fields.py. Coolify's tag endpoints and the `tags`
-            # create field exist only on unreleased `main`; on every published release
-            # the read 404s and the create 422s.
+            # NO TAGS here: POST /deploy?tag deploys every tagged application and
+            # service whatever auto-deploy says (DeployController v4.7.2:488-538),
+            # so a tag CI run would start the target before the DNS gate. FINALIZE
+            # copies them (engine/deploy_triggers.arm_targets).
 
             # The way back for FINALIZE's release, journalled before any write for
             # this resource. A service's includes the route-key rows its images
@@ -606,15 +606,6 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
                 target_uuid=target_uuid,
                 kind=snapshot.kind,
                 version=version,
-            )
-            # Cosmetic metadata: copy_tags never raises, so a missing tag route
-            # (Coolify <4.2) or a rejected name degrades to "no tags" instead of
-            # taking down a target that is otherwise complete.
-            await api_resources.copy_tags(
-                ctx.api,
-                collection=snapshot.collection,
-                source_uuid=snapshot.uuid,
-                target_uuid=target_uuid,
             )
 
             # STILL inside CREATE, deliberately: the next step stops the source.
@@ -2658,9 +2649,9 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
     if policy is not FinalizePolicy.DELETE:
         domains_released = await _release_source_domains(ctx)
 
-    # After the cutover, never fatally: each target gets its source's auto-deploy,
-    # kept off it so no push could start it before the DNS gate
-    # (engine/deploy_triggers.py).
+    # After the cutover, never fatally: each target gets its source's auto-deploy
+    # and its tags, both kept off it so nothing could start it before the DNS
+    # gate (engine/deploy_triggers.py).
     target_armed = await deploy_triggers.arm_targets(ctx)
     return {
         "policy": policy.value,

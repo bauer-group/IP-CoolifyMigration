@@ -1263,55 +1263,18 @@ class TestCreateTarget:
         result = await steps.step_create_target(ctx)
         assert result["target_uuids"] == {"svc1": "tgt1"}
 
-    async def test_a_missing_tags_endpoint_never_fails_the_create(
+    async def test_create_reads_and_copies_no_tags(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
-        """REGRESSION (2.5.6): tags must never sit on the critical path.
+        """Tags are FINALIZE's now (engine/deploy_triggers.arm_targets).
 
-        2.5.6 read /tags on the critical path, so every migration against a real
-        Coolify died at create_target with a 404 — no released version had the
-        route. The endpoint DOES exist from 4.2 onward and we now read it (to copy
-        tags), so "never call it" is no longer the property to protect.
-
-        The property that actually mattered then, and still does, is this one: a
-        404 from /tags must cost the tags and nothing else. The resource is still
-        created, and `tags` still never enters the create body — where an unlisted
+        POST /deploy?tag deploys every tagged application and service whatever
+        auto-deploy says (DeployController v4.7.2:488-538), so tags copied at
+        CREATE let a tag CI run start the target before the DNS gate. And still
+        the 2.5.6 lesson: `tags` never enters the create body, where an unlisted
         field would 422 the whole resource on 4.1.2.
         """
         tags_route = respx_mock.get(f"{BASE}/databases/db1/tags").mock(
-            return_value=httpx.Response(404, json={"message": "Not found."})
-        )
-        respx_mock.get(f"{BASE}/projects").mock(
-            return_value=httpx.Response(200, json=[{"uuid": "p1", "name": "shop"}])
-        )
-        respx_mock.get(f"{BASE}/projects/p1").mock(
-            return_value=httpx.Response(200, json={"environments": [{"name": "production"}]})
-        )
-        respx_mock.get(f"{BASE}/servers/s2/destinations").mock(
-            return_value=httpx.Response(200, json=[{"uuid": "d1", "network": "coolify"}])
-        )
-        respx_mock.get(f"{BASE}/databases/db1").mock(
-            return_value=httpx.Response(200, json={"uuid": "db1", "postgres_password": "s3cret"})
-        )
-        respx_mock.get(f"{BASE}/databases/db1/envs").mock(return_value=httpx.Response(200, json=[]))
-        respx_mock.get(f"{BASE}/databases/db1/backups").mock(
-            return_value=httpx.Response(200, json=[])
-        )
-        route = respx_mock.post(f"{BASE}/databases/postgresql").mock(
-            return_value=httpx.Response(201, json={"uuid": "db2"})
-        )
-
-        result = await steps.step_create_target(ctx)
-
-        assert tags_route.called, "tags are read post-create; this asserts the 404 path"
-        assert result["target_uuids"] == {"db1": "db2"}, "a 404 on /tags must not fail the create"
-        assert "tags" not in json.loads(route.calls[0].request.read().decode())
-
-    async def test_source_tags_are_copied_to_the_target(
-        self, ctx: MigrationContext, respx_mock: respx.Router
-    ) -> None:
-        """Tags reach the target by their own call, not by the create body."""
-        respx_mock.get(f"{BASE}/databases/db1/tags").mock(
             return_value=httpx.Response(
                 200, json=[{"uuid": "t1", "name": "prod"}, {"uuid": "t2", "name": "billing"}]
             )
@@ -1339,13 +1302,10 @@ class TestCreateTarget:
             return_value=httpx.Response(201, json={"uuid": "db2"})
         )
 
-        await steps.step_create_target(ctx)
+        result = await steps.step_create_target(ctx)
 
-        assert tag_post.called
-        assert json.loads(tag_post.calls[0].request.read().decode()) == {
-            "tag_names": ["prod", "billing"]
-        }
-        # The create body stays clean — that is the 2.5.6 lesson.
+        assert result["target_uuids"] == {"db1": "db2"}
+        assert not tags_route.called and not tag_post.called
         assert "tags" not in json.loads(create.calls[0].request.read().decode())
 
 

@@ -215,6 +215,12 @@ class TestSettingsPatch:
 # ── R1: FINALIZE arms the target ─────────────────────────────────────────────
 
 
+def _no_tags(respx_mock: respx.Router, collection: str, uuid: str) -> None:
+    respx_mock.get(f"{BASE}/{collection}/{uuid}/tags").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+
 class TestArmTargets:
     @pytest.mark.parametrize("auto", [True, False])
     async def test_the_target_gets_the_sources_value(
@@ -223,6 +229,7 @@ class TestArmTargets:
         ctx.target_uuids["app1"] = "appT"
         App("app1", auto=auto, previews=True).mount(respx_mock)
         target = App("appT", auto=False).mount(respx_mock)
+        _no_tags(respx_mock, "applications", "app1")
 
         assert await engine.arm_targets(ctx) == ["appT"]
 
@@ -235,6 +242,7 @@ class TestArmTargets:
         ctx.target_uuids["app1"] = "appT"
         App("app1", auto=None).mount(respx_mock)
         target = App("appT", auto=None).mount(respx_mock)
+        _no_tags(respx_mock, "applications", "app1")
 
         await engine.arm_targets(ctx)
 
@@ -246,6 +254,7 @@ class TestArmTargets:
         ctx.target_uuids["app1"] = "appT"
         respx_mock.get(f"{BASE}/applications/app1").mock(return_value=httpx.Response(500))
         target = App("appT").mount(respx_mock)
+        _no_tags(respx_mock, "applications", "app1")
 
         assert await engine.arm_targets(ctx) == ["appT"]
 
@@ -257,6 +266,7 @@ class TestArmTargets:
         ctx.target_uuids["app1"] = "appT"
         respx_mock.get(f"{BASE}/applications/app1").mock(side_effect=App("app1").get)
         respx_mock.patch(f"{BASE}/applications/appT").mock(return_value=httpx.Response(500))
+        _no_tags(respx_mock, "applications", "app1")
 
         assert await engine.arm_targets(ctx) == []
 
@@ -264,13 +274,65 @@ class TestArmTargets:
         assert notice.startswith("the target of shop (appT) was created with auto-deploy off")
         assert "switch 'Auto Deploy' on" in notice
 
-    async def test_a_database_has_no_switch(
+    async def test_the_tags_follow_after_the_cutover(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        # POST /deploy?tag ignores auto-deploy: tags copied at CREATE let a tag
+        # CI run start the target before the DNS gate.
+        ctx.target_uuids["app1"] = "appT"
+        App("app1").mount(respx_mock)
+        App("appT", auto=False).mount(respx_mock)
+        respx_mock.get(f"{BASE}/applications/app1/tags").mock(
+            return_value=httpx.Response(200, json=[{"name": "prod"}, {"name": "x"}])
+        )
+        tags = respx_mock.post(f"{BASE}/applications/appT/tags").mock(
+            return_value=httpx.Response(201, json=[])
+        )
+
+        await engine.arm_targets(ctx)
+
+        # A one-character name would 422 the whole call: dropped (copy_tags).
+        assert json.loads(tags.calls[0].request.read()) == {"tag_names": ["prod"]}
+
+    async def test_a_missing_tag_route_costs_the_tags_and_nothing_else(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        # The 2.5.6 lesson: on 4.1.x the route does not exist.
+        ctx.target_uuids["app1"] = "appT"
+        App("app1").mount(respx_mock)
+        target = App("appT", auto=False).mount(respx_mock)
+        respx_mock.get(f"{BASE}/applications/app1/tags").mock(
+            return_value=httpx.Response(404, json={"message": "Not found."})
+        )
+
+        assert await engine.arm_targets(ctx) == ["appT"]
+        assert target.patches == [{"is_auto_deploy_enabled": True}] and ctx.notices == []
+
+    async def test_a_database_gets_its_tags_and_no_settings(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
         ctx.plan = _plan(_db())
         ctx.target_uuids["db1"] = "db2"
+        respx_mock.get(f"{BASE}/databases/db1/tags").mock(
+            return_value=httpx.Response(200, json=[{"name": "prod"}])
+        )
+        tags = respx_mock.post(f"{BASE}/databases/db2/tags").mock(
+            return_value=httpx.Response(201, json=[])
+        )
         assert await engine.arm_targets(ctx) == []
-        assert not respx_mock.calls
+        assert tags.called
+
+    async def test_a_tag_copy_that_breaks_never_fails_finalize(
+        self, ctx: MigrationContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx.plan = _plan(_db())
+        ctx.target_uuids["db1"] = "db2"
+
+        async def broken(*_a: Any, **_kw: Any) -> int:
+            raise ValueError("unexpected shape")
+
+        monkeypatch.setattr(engine.api_resources, "copy_tags", broken)
+        assert await engine.arm_targets(ctx) == []
 
 
 class TestStepFinalize:
@@ -281,6 +343,7 @@ class TestStepFinalize:
         ctx.target_uuids["app1"] = "appT"
         source = App("app1", auto=True).mount(respx_mock)
         target = App("appT", auto=False).mount(respx_mock)
+        _no_tags(respx_mock, "applications", "app1")
 
         result = await steps.step_finalize(ctx)
 
