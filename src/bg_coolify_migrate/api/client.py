@@ -32,6 +32,7 @@ from typing import Any, Self
 import httpx
 import structlog
 
+from bg_coolify_migrate.domain.deploy_triggers import ActiveDeployment, read_active_deployments
 from bg_coolify_migrate.domain.deployments import Deployment, read_deployment
 from bg_coolify_migrate.errors import CoolifyApiError, InsufficientTokenScope
 
@@ -596,6 +597,18 @@ class CoolifyClient:
                 return None
             raise
         return read_deployment(uuid, row)
+
+    async def list_active_deployments(self) -> tuple[ActiveDeployment, ...]:
+        """The team's queued and running application deployments, reduced HERE.
+
+        ``GET /deployments`` (ability ``read``; routes/api.php v4.1.2:79,
+        v4.5.0:153, v4.7.2:163) answers every QUEUED and IN_PROGRESS row of the
+        team. Each row carries ``logs`` — the full deployment log, for a token that
+        reads sensitive data — so only uuid, status and the application uuid of
+        its ``deployment_url`` leave this method
+        (``domain/deploy_triggers.read_active_deployments``).
+        """
+        return read_active_deployments(await self.get("/deployments"))
 
     async def stop(self, collection: str, uuid: str) -> bool:
         """Request a stop. Returns whether Coolify actually dispatched one.

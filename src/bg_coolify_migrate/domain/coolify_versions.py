@@ -1002,13 +1002,19 @@ _SERVICE_APPLICATION_UPDATE: tuple[Field, ...] = (
 )
 
 #: PATCH /v1/applications/{uuid} with these fields ONLY (domain/deploy_triggers.py):
-#: the target's arming at FINALIZE. Such a PATCH deploys nothing without
-#: instant_deploy (ApplicationsController v4.1.2:2680, v4.7.2:4130) and rebuilds no
-#: labels without domains (v4.1.2:2668, v4.7.2:4107).
+#: the source's disarm at QUIESCE and its restore on rollback, the target's arming
+#: at FINALIZE. Such a PATCH deploys nothing without instant_deploy
+#: (ApplicationsController v4.1.2:2680, v4.7.2:4130) and rebuilds no labels without
+#: domains (v4.1.2:2668, v4.7.2:4107).
 _APPLICATION_SETTINGS_UPDATE: tuple[Field, ...] = (
     # In the update array at every tag (v4.1.2:2368, v4.7.2:3662), applied when
     # set (v4.1.2:2613/2634-2637, v4.7.2:4008/4036-4039).
     Field("is_auto_deploy_enabled"),
+    # Joins the update array in v4.2.0 (:2695, applied :2973; absent at v4.1.2:2368
+    # and v4.1.3, a 422 there). Column-gated in effect: it is only ever sent where
+    # the source's value was READ, and `settings` is in the GET exactly from the
+    # same release (application_by_uuid v4.2.0:2277; not at v4.1.2:1973, v4.1.3).
+    Field("is_preview_deployments_enabled", Gate(since=(4, 2, 0)), column_gated=True),
 )
 
 #: Per follow-up PATCH, the fields this tool sends. ``services.update``: PATCH

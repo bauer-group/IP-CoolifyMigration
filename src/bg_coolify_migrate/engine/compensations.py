@@ -34,7 +34,7 @@ from bg_coolify_migrate.domain.statemachine import (
     source_copy_unproven,
     source_was_stopped,
 )
-from bg_coolify_migrate.engine import keys
+from bg_coolify_migrate.engine import deploy_triggers, keys
 from bg_coolify_migrate.engine.context import MigrationContext, deserialise_volume_pairs
 from bg_coolify_migrate.errors import CoolifyApiError
 from bg_coolify_migrate.journal.store import JournalRecord
@@ -147,6 +147,23 @@ async def _source_lacks_its_hosts(
     if missing:
         return "its source does not hold " + ", ".join(missing)
     return None
+
+
+async def undo_restore_source_deploy_triggers(
+    ctx: MigrationContext, undo_info: dict[str, Any]
+) -> None:
+    """Switch back on the source deploy switches QUIESCE switched off.
+
+    Owed to CREATE_TARGET, which has always completed by the time QUIESCE runs —
+    the reasoning of RESTORE_SOURCE_FQDN and RELEASE_SOURCE_PINS — so it is owed
+    even when QUIESCE refuses before the stop or fails after it. It reads
+    QUIESCE's journal itself (``undo_info`` is CREATE's) and is a no-op when that
+    holds no originals. ``statemachine._PRECEDENCE`` runs it after the domain
+    restore and before RESTART_SOURCE. A rollback after a SUCCEEDED keep or rename
+    run owes it too: FINALIZE left that source disarmed on purpose. Idempotent
+    (``deploy_triggers.restore_sources``), since ``rollback <id>`` replays it.
+    """
+    await deploy_triggers.restore_sources(ctx)
 
 
 async def undo_restore_source_fqdn(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
@@ -879,5 +896,6 @@ def build_compensations() -> dict[Any, Any]:
         Compensation.STOP_TARGET: undo_start_target,
         Compensation.RESTORE_SOURCE_NAME: undo_restore_source_name,
         Compensation.RESTORE_SOURCE_FQDN: undo_restore_source_fqdn,
+        Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS: undo_restore_source_deploy_triggers,
         Compensation.RELEASE_SOURCE_PINS: undo_release_source_pins,
     }

@@ -1,7 +1,8 @@
 """The deploy switches of sources and targets: the pure decisions.
 
-domain/deploy_triggers.py decides what FINALIZE arms on a target. No mocks:
-every decision is a function of a GET.
+domain/deploy_triggers.py decides what QUIESCE switches off on a source, what a
+rollback gives back, what FINALIZE arms on a target, and which queued
+deployments block the stop. No mocks: every decision is a function of a GET.
 """
 
 from __future__ import annotations
@@ -12,7 +13,14 @@ import pytest
 
 from bg_coolify_migrate.domain import coolify_versions as cv
 from bg_coolify_migrate.domain import deploy_triggers as dt
-from bg_coolify_migrate.domain.deploy_triggers import Triggers
+from bg_coolify_migrate.domain.deploy_triggers import ActiveDeployment, Triggers
+from bg_coolify_migrate.domain.statemachine import (
+    ORDER,
+    Compensation,
+    State,
+    rollback_plan,
+    states_through,
+)
 
 ON = Triggers(auto_deploy=True, previews=False)
 OFF = Triggers(auto_deploy=False, previews=False)
@@ -43,6 +51,55 @@ class TestReadTriggers:
         assert dt.read_triggers(_app(is_auto_deploy_enabled=1)).auto_deploy is None
 
 
+class TestDisarm:
+    def test_auto_deploy_on_goes_off(self) -> None:
+        assert dt.disarm_body(ON) == {"is_auto_deploy_enabled": False}
+
+    def test_previews_on_go_off_too(self) -> None:
+        assert dt.disarm_body(BOTH) == {
+            "is_auto_deploy_enabled": False,
+            "is_preview_deployments_enabled": False,
+        }
+
+    def test_nothing_on_means_nothing_to_send(self) -> None:
+        assert dt.disarm_body(OFF) == {}
+
+    def test_an_unreadable_auto_deploy_is_switched_off_anyway(self) -> None:
+        # 4.1.x: a push revives the stopped source just the same. Previews are
+        # never sent there: the update array refuses them before 4.2.
+        assert dt.disarm_body(UNREAD) == {"is_auto_deploy_enabled": False}
+
+    def test_a_resumed_quiesce_sends_only_what_is_still_on(self) -> None:
+        half = Triggers(auto_deploy=False, previews=True)
+        assert dt.disarm_body(BOTH, half) == {"is_preview_deployments_enabled": False}
+        assert dt.disarm_body(BOTH, OFF) == {}
+
+
+class TestRestore:
+    def test_gives_back_what_the_disarm_took(self) -> None:
+        assert dt.restore_body(BOTH, OFF) == {
+            "is_auto_deploy_enabled": True,
+            "is_preview_deployments_enabled": True,
+        }
+
+    def test_a_replay_sends_nothing(self) -> None:
+        # `rollback <id>` replays every compensation.
+        assert dt.restore_body(BOTH, BOTH) == {}
+
+    def test_never_touches_what_this_run_did_not_switch(self) -> None:
+        # The source had auto-deploy off; the operator switched it on since.
+        assert dt.restore_body(OFF, ON) == {}
+        assert dt.restore_body(OFF, Triggers(auto_deploy=True, previews=True)) == {}
+
+    def test_an_unreadable_original_comes_back_as_coolifys_default(self) -> None:
+        assert dt.restore_body(UNREAD, UNREAD) == {"is_auto_deploy_enabled": True}
+
+    def test_only_the_missing_part_is_sent(self) -> None:
+        assert dt.restore_body(BOTH, Triggers(auto_deploy=True, previews=False)) == {
+            "is_preview_deployments_enabled": True
+        }
+
+
 class TestTargets:
     def test_created_with_auto_deploy_off(self) -> None:
         assert dict(dt.TARGET_CREATE) == {"is_auto_deploy_enabled": False}
@@ -55,7 +112,106 @@ class TestTargets:
         assert dt.target_arm_body(original) == {"is_auto_deploy_enabled": armed}
 
 
+class TestJournal:
+    def test_round_trip(self) -> None:
+        originals = {"app1": BOTH, "app2": UNREAD}
+        raw = dt.serialise(originals)
+        assert raw == {
+            "app1": {"auto_deploy": True, "previews": True},
+            "app2": {"auto_deploy": None, "previews": None},
+        }
+        assert dt.deserialise(raw) == originals
+
+    def test_tolerates_garbage(self) -> None:
+        assert dt.deserialise(None) == {}
+        assert dt.deserialise(["app1"]) == {}
+        assert dt.deserialise({"app1": "on", 3: {}}) == {}
+
+    def test_the_journal_accepts_it(self, tmp_path: Any) -> None:
+        # No forbidden key, no secret shape: booleans and uuids only.
+        from bg_coolify_migrate.journal.store import Journal
+
+        journal = Journal.create(tmp_path, "m1")
+        journal.append(
+            "step_started", state="quiesce", detail={dt.JOURNAL_KEY: dt.serialise({"a": BOTH})}
+        )
+        assert dt.deserialise(journal.undo_info("quiesce")[dt.JOURNAL_KEY]) == {"a": BOTH}
+
+
+URL = "/project/p1/environment/e1/application/{app}/deployment/{dep}"
+
+
+def _row(dep: str, app: str, status: str = "queued", **extra: Any) -> dict[str, Any]:
+    return {
+        "deployment_uuid": dep,
+        "status": status,
+        "deployment_url": URL.format(app=app, dep=dep),
+        "logs": '[{"output": "DB_PASSWORD=hunter2"}]',
+        "application_id": "42",
+        **extra,
+    }
+
+
+class TestDeploymentQueue:
+    def test_the_application_comes_from_the_url(self) -> None:
+        assert dt.application_uuid_in(URL.format(app="app1", dep="d1")) == "app1"
+        assert dt.application_uuid_in("https://x" + URL.format(app="a", dep="d")) == "a"
+        assert dt.application_uuid_in("/project/p/environment/e/service/s1") is None
+        assert dt.application_uuid_in(None) is None
+
+    def test_rows_are_reduced_and_lose_their_logs(self) -> None:
+        rows = dt.read_active_deployments([_row("d1", "app1", "in_progress")])
+        assert rows == (ActiveDeployment(uuid="d1", status="in_progress", application_uuid="app1"),)
+        assert "hunter2" not in repr(rows)
+
+    def test_an_object_keyed_by_position_is_read_too(self) -> None:
+        # ->sortBy('id') keeps the keys: once a row moved, Laravel answers an object.
+        rows = dt.read_active_deployments({"1": _row("d2", "app2"), "0": _row("d1", "app1")})
+        assert {r.uuid for r in rows} == {"d1", "d2"}
+
+    def test_garbage_is_nothing(self) -> None:
+        assert dt.read_active_deployments(None) == ()
+        assert dt.read_active_deployments(["x", 3]) == ()
+
+    def test_only_the_sources_queued_or_running_rows_count(self) -> None:
+        rows = dt.read_active_deployments(
+            [
+                _row("d1", "app1", "queued"),
+                _row("d2", "app1", "finished"),
+                _row("d3", "other", "in_progress"),
+                {"deployment_uuid": "d4", "status": "queued"},
+                _row("d5", "app2", "in_progress"),
+            ]
+        )
+        pending = dt.pending_for(rows, {"app1", "app2"})
+        assert [d.uuid for d in pending] == ["d1", "d5"]
+
+
 class TestNotes:
+    def test_the_run_note_names_what_still_deploys(self) -> None:
+        note = dt.run_note()
+        assert "POST /deploy" in note and "pause them from QUIESCE until FINALIZE" in note
+        assert "keep or rename" in note
+
+    def test_a_41_source_is_told_its_setting_is_unreadable(self) -> None:
+        [line] = dt.application_warnings({"uuid": "app1"})
+        assert "before 4.2" in line and "Coolify's default" in line
+
+    def test_previews_on_are_named(self) -> None:
+        [line] = dt.application_warnings(
+            _app(is_auto_deploy_enabled=True, is_preview_deployments_enabled=True)
+        )
+        assert line.startswith("preview deployments are on")
+
+    def test_a_plain_source_is_not_warned_about(self) -> None:
+        assert dt.application_warnings(_app(is_auto_deploy_enabled=True)) == []
+        assert dt.application_warnings(_app(is_auto_deploy_enabled=False)) == []
+
+    def test_the_kept_source_notice_names_the_way_back(self) -> None:
+        notice = dt.kept_source_notice(["shop", "api"], migration_id="m1")
+        assert notice.startswith("shop, api (the kept source)")
+        assert "coolify-migrate rollback m1" in notice and "POST /deploy" in notice
+
     def test_a_failed_arm_says_what_to_set(self) -> None:
         on = dt.arm_failed_notice("shop", "appT", True, reason="HTTP 500")
         off = dt.arm_failed_notice("shop", "appT", False, reason="HTTP 500")
@@ -75,5 +231,55 @@ class TestRegistry:
         for version in ((4, 1, 2), (4, 2, 0), (4, 7, 2), None):
             assert cv.carries("applications.settings", "is_auto_deploy_enabled", version)
 
+    def test_previews_only_from_42(self) -> None:
+        # Not in the update array at v4.1.2:2368 or v4.1.3: a 422 there.
+        assert not cv.carries("applications.settings", "is_preview_deployments_enabled", (4, 1, 3))
+        assert cv.carries("applications.settings", "is_preview_deployments_enabled", (4, 2, 0))
+        # Only ever sent where it was READ, i.e. where settings exist (4.2.0+).
+        assert cv.carries("applications.settings", "is_preview_deployments_enabled", None)
+
     def test_nothing_else_rides_the_settings_patch(self) -> None:
-        assert cv.known_fields("applications.settings") == {"is_auto_deploy_enabled"}
+        assert cv.known_fields("applications.settings") == {
+            "is_auto_deploy_enabled",
+            "is_preview_deployments_enabled",
+        }
+
+
+class TestRollbackOrder:
+    """RESTORE_SOURCE_DEPLOY_TRIGGERS: after the domains, before the restart."""
+
+    def _comps(self, state: State) -> list[Compensation]:
+        return [s.compensation for s in rollback_plan(list(states_through(state)))]
+
+    def test_owed_from_create_target(self) -> None:
+        plan = rollback_plan(list(states_through(State.CREATE_TARGET)))
+        owed = [s for s in plan if s.compensation is Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS]
+        assert [s.because_of for s in owed] == [State.CREATE_TARGET.value]
+
+    def test_without_a_restart_it_still_runs_before_the_unpin(self) -> None:
+        assert self._comps(State.CREATE_TARGET) == [
+            Compensation.DELETE_TARGET_RESOURCE,
+            Compensation.RESTORE_SOURCE_FQDN,
+            Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS,
+            Compensation.RELEASE_SOURCE_PINS,
+        ]
+
+    def test_full_rollback_order(self) -> None:
+        assert self._comps(State.FINALIZE) == [
+            Compensation.RESTORE_SOURCE_NAME,
+            Compensation.STOP_TARGET,
+            Compensation.DROP_TARGET_VOLUMES,
+            Compensation.REVOKE_EPHEMERAL_KEY,
+            Compensation.RESTORE_SOURCE_FQDN,
+            Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS,
+            Compensation.RESTART_SOURCE,
+            Compensation.DELETE_TARGET_RESOURCE,
+            Compensation.RELEASE_SOURCE_PINS,
+        ]
+
+    @pytest.mark.parametrize("state", ORDER[ORDER.index(State.QUIESCE) : ORDER.index(State.DONE)])
+    def test_between_the_domains_and_the_restart_for_every_prefix(self, state: State) -> None:
+        comps = self._comps(state)
+        triggers = comps.index(Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS)
+        assert comps.index(Compensation.RESTORE_SOURCE_FQDN) == triggers - 1
+        assert comps.index(Compensation.RESTART_SOURCE) == triggers + 1

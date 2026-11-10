@@ -39,7 +39,7 @@ from bg_coolify_migrate.dns import managed as dns_managed
 from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.dns import wildcard as dns_wildcard
 from bg_coolify_migrate.domain import compose as compose_mod
-from bg_coolify_migrate.domain import domains, fidelity
+from bg_coolify_migrate.domain import deploy_triggers, domains, fidelity
 from bg_coolify_migrate.domain.coolify_versions import supports
 from bg_coolify_migrate.domain.deployments import image_scan_gate_warnings
 from bg_coolify_migrate.domain.drift import RebuildDriftReport, assess_rebuild_drift
@@ -1002,6 +1002,7 @@ async def build_plan(
                 )
             )
             warnings.extend(image_scan_gate_warnings(version=coolify_version))
+            warnings.extend(deploy_triggers.application_warnings(full))
             if fidelity.unshareable_image_name(full, version=coolify_version):
                 if team_applications is None:
                     team_applications = await _team_applications(api)
@@ -1130,6 +1131,9 @@ async def build_plan(
             api, served, source=source_ref, target=target_ref, version=coolify_version
         )
     )
+    # What still deploys a source or a target during the run, and what does not.
+    if any(p.snapshot.collection == "applications" for p in plans):
+        notes.append(deploy_triggers.run_note())
 
     return MigrationPlan(
         project=project_name,

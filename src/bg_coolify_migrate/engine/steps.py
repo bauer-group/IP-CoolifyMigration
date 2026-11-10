@@ -1099,6 +1099,13 @@ async def step_quiesce(ctx: MigrationContext) -> dict[str, Any]:
     source_pins = await _pin_source(ctx)
 
     try:
+        # Before the stop, the first write to the source: its push-driven deploys
+        # go off (originals journalled first, given back by a rollback), then what
+        # is already queued or building must end - Coolify's stop cancels nothing,
+        # and its queue would start the source again after it.
+        await deploy_triggers.disarm_sources(ctx)
+        await deploy_triggers.await_source_deployments(ctx)
+
         # The source's clock, not ours: it is the window for the event-log check
         # below, and a skewed workstation would silently shrink it.
         since = await quiesce.now_on(ctx.source_host)
@@ -2651,8 +2658,9 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
 
     # After the cutover, never fatally: each target gets its source's auto-deploy
     # and its tags, both kept off it so nothing could start it before the DNS
-    # gate (engine/deploy_triggers.py).
+    # gate. A kept or renamed source stays disarmed (engine/deploy_triggers.py).
     target_armed = await deploy_triggers.arm_targets(ctx)
+    sources_disarmed = deploy_triggers.note_kept_sources(ctx)
     return {
         "policy": policy.value,
         "actions": actions,
@@ -2661,6 +2669,7 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
         "pins_left": left,
         "domains_released": domains_released,
         "target_armed": target_armed,
+        "sources_left_disarmed": sources_disarmed,
     }
 
 

@@ -99,18 +99,22 @@ class TestRollbackPlan:
         # Delete first: from 4.3.11 the soft-delete releases the target's domains
         # at once, so the restore needs no override. RELEASE_SOURCE_PINS is owed
         # from CREATE_TARGET on; with no pins yet it finds none and does nothing.
+        # So is the deploy-switch restore: a no-op without QUIESCE's record.
         assert [s.compensation for s in plan] == [
             Compensation.DELETE_TARGET_RESOURCE,
             Compensation.RESTORE_SOURCE_FQDN,
+            Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS,
             Compensation.RELEASE_SOURCE_PINS,
         ]
 
     def test_failure_after_quiesce_restores_domains_restarts_then_deletes(self) -> None:
         plan = rollback_plan([State.CREATE_TARGET, State.QUIESCE])
         # The domains go back BEFORE the restart: the restart's deploy bakes the
-        # stored labels into the container. Otherwise reverse order.
+        # stored labels into the container; so do its deploy switches. Otherwise
+        # reverse order.
         assert [s.compensation for s in plan] == [
             Compensation.RESTORE_SOURCE_FQDN,
+            Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS,
             Compensation.RESTART_SOURCE,
             Compensation.DELETE_TARGET_RESOURCE,
             Compensation.RELEASE_SOURCE_PINS,
@@ -122,6 +126,7 @@ class TestRollbackPlan:
             Compensation.DROP_TARGET_VOLUMES,
             Compensation.REVOKE_EPHEMERAL_KEY,
             Compensation.RESTORE_SOURCE_FQDN,
+            Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS,
             Compensation.RESTART_SOURCE,
             Compensation.DELETE_TARGET_RESOURCE,
             Compensation.RELEASE_SOURCE_PINS,

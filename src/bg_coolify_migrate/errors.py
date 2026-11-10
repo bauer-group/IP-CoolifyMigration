@@ -112,6 +112,16 @@ class QuiesceError(MigrationError):
     exit_code = 5
 
 
+class SourceDeploymentPending(QuiesceError):
+    """A source application still has a deployment queued or running.
+
+    Raised by QUIESCE BEFORE the stop: Coolify's stop cancels no deployment and
+    the queue starts what is waiting, so the source would come back up after the
+    stop, beside a copy that never sees its writes. The run rolls back with the
+    source still serving. This tool never cancels a deployment.
+    """
+
+
 class TransferError(MigrationError):
     """Data transfer failed. The run is resumable; the source is untouched."""
 

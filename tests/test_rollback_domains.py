@@ -41,6 +41,7 @@ class TestRollbackOrder:
         # old map RESTORE was missing here entirely.
         assert _comps(states_through(State.QUIESCE)) == [
             R,
+            Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS,
             Compensation.RESTART_SOURCE,
             Compensation.DELETE_TARGET_RESOURCE,
             Compensation.RELEASE_SOURCE_PINS,
@@ -54,6 +55,7 @@ class TestRollbackOrder:
             Compensation.DROP_TARGET_VOLUMES,
             Compensation.REVOKE_EPHEMERAL_KEY,
             R,
+            Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS,
             Compensation.RESTART_SOURCE,
             Compensation.DELETE_TARGET_RESOURCE,
             Compensation.RELEASE_SOURCE_PINS,

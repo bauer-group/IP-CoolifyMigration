@@ -104,6 +104,9 @@ class Compensation(StrEnum):
     RELEASE_SOURCE_PINS = "release_source_pins"
     """Remove the containers that keep Coolify's Docker cleanup off the stopped
     source's volumes (``discovery/pins.py``) — once the source mounts them again."""
+    RESTORE_SOURCE_DEPLOY_TRIGGERS = "restore_source_deploy_triggers"
+    """Switch back on the source applications' auto-deploy and preview deployments
+    that QUIESCE switched off before the stop (``domain/deploy_triggers.py``)."""
 
     # ── F2 (instance migration) ──────────────────────────────────────────────
     START_SOURCE_DOCKER = "start_source_docker"
@@ -146,10 +149,17 @@ ORDER: tuple[State, ...] = (
 #: source to mount its volumes again, and running the delete behind that wait
 #: would only hold the target's resources longer. Pins are found by label, so
 #: it is a no-op when none exist.
+#:
+#: RESTORE_SOURCE_DEPLOY_TRIGGERS hangs off CREATE_TARGET too, although QUIESCE
+#: switches the source's deploys off, by the same first reason: QUIESCE can fail
+#: after the disarm — before the stop (a source deployment that does not end) or
+#: after it — and is then never completed. It reads QUIESCE's journal, so it is
+#: a no-op where nothing was switched off.
 _COMPENSATION: dict[State, tuple[Compensation, ...]] = {
     State.CREATE_TARGET: (
         Compensation.DELETE_TARGET_RESOURCE,
         Compensation.RESTORE_SOURCE_FQDN,
+        Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS,
         Compensation.RELEASE_SOURCE_PINS,
     ),
     State.QUIESCE: (Compensation.RESTART_SOURCE,),
@@ -169,8 +179,15 @@ _COMPENSATION: dict[State, tuple[Compensation, ...]] = {
 #: alone runs RESTART (owed to QUIESCE) before anything owed to CREATE, so the
 #: source came back serving only its parked ``old-<tag>.`` hosts, and its custom
 #: domain 404'd until someone redeployed it by hand.
+#:
+#: The source's deploy switches come back right after its domains and before the
+#: restart (applied in this order, so they land between the two): the restart is
+#: the deploy that ends the outage, and a source that comes back up should come
+#: back as it was configured. A settings-only PATCH deploys nothing
+#: (ApplicationsController v4.1.2:2680, v4.7.2:4130).
 _PRECEDENCE: dict[Compensation, Compensation] = {
     Compensation.RESTORE_SOURCE_FQDN: Compensation.RESTART_SOURCE,
+    Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS: Compensation.RESTART_SOURCE,
 }
 
 #: States after which the source is no longer running. Used to decide whether a

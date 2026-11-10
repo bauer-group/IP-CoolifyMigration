@@ -230,6 +230,7 @@ class TestRollbackAfterACrash:
         assert result.compensations_run == [
             Compensation.DELETE_TARGET_RESOURCE,
             Compensation.RESTORE_SOURCE_FQDN,
+            Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS,
             Compensation.RELEASE_SOURCE_PINS,
         ]
 

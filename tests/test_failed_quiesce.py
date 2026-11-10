@@ -54,6 +54,7 @@ class TestOwedAfterAStopRequest:
         plan = rollback_plan([State(s) for s in owed])
         assert [s.compensation for s in plan] == [
             Compensation.RESTORE_SOURCE_FQDN,
+            Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS,
             Compensation.RESTART_SOURCE,
             Compensation.DELETE_TARGET_RESOURCE,
             Compensation.RELEASE_SOURCE_PINS,
@@ -106,6 +107,7 @@ class TestTheRunRestartsTheSource:
         assert result.outcome is Outcome.ROLLED_BACK
         assert ran == [
             Compensation.RESTORE_SOURCE_FQDN,
+            Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS,
             Compensation.RESTART_SOURCE,
             Compensation.DELETE_TARGET_RESOURCE,
             Compensation.RELEASE_SOURCE_PINS,
@@ -120,9 +122,12 @@ class TestTheRunRestartsTheSource:
             journal=journal, context=None, steps=_steps(journal, mark=False), compensations=comps
         ).run()
         assert Compensation.RESTART_SOURCE not in ran
+        # The deploy switches come back all the same: QUIESCE switched them off
+        # before anything was stopped.
         assert ran == [
             Compensation.DELETE_TARGET_RESOURCE,
             Compensation.RESTORE_SOURCE_FQDN,
+            Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS,
             Compensation.RELEASE_SOURCE_PINS,
         ]
 
@@ -177,8 +182,13 @@ class TestStepQuiesceMarksTheRequest:
         async def no_pins(_ctx: Any) -> list[str]:
             return []
 
+        async def nothing(_ctx: Any) -> None:
+            return None
+
         monkeypatch.setattr(steps, "_capture_mounts", capture)
         monkeypatch.setattr(steps, "_pin_source", no_pins)
+        monkeypatch.setattr(steps.deploy_triggers, "disarm_sources", nothing)
+        monkeypatch.setattr(steps.deploy_triggers, "await_source_deployments", nothing)
         monkeypatch.setattr(steps.quiesce, "now_on", now_on)
         monkeypatch.setattr(steps, "_request_stop", request_stop)
         monkeypatch.setattr(steps, "observed_labels", lambda _plan: {})

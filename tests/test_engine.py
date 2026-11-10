@@ -113,9 +113,11 @@ class TestFailureRollsBack:
         assert result.outcome is Outcome.ROLLED_BACK
         assert isinstance(result.error, TransferError)
         # CREATE_TARGET and QUIESCE completed; COPY failed before completing.
-        # The source's domains go back before the restart that deploys it.
+        # The source's domains and deploy switches go back before the restart
+        # that deploys it.
         assert rec.compensations == [
             Compensation.RESTORE_SOURCE_FQDN,
+            Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS,
             Compensation.RESTART_SOURCE,
             Compensation.DELETE_TARGET_RESOURCE,
             Compensation.RELEASE_SOURCE_PINS,
