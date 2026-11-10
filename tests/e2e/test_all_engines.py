@@ -89,9 +89,13 @@ ENGINES: list[Engine] = [
         seed_argv="mysql -uroot -prootpw shopdb",
         seed_stdin="CREATE TABLE orders(id int auto_increment primary key, customer varchar(64), "
         f"cents int); INSERT INTO orders(customer,cents) VALUES {_sql_rows()};",
+        # SHA2, not MD5: the source is created without an image, so it runs
+        # Coolify's default — mysql:9.7 from 4.7.0 (migration
+        # 2026_11_06_083240), which has no MD5() ("FUNCTION shopdb.md5 does not
+        # exist"). SHA2 exists on mysql 8 and 9 alike.
         fingerprint_argv=(
             "mysql -uroot -prootpw shopdb -N -e "
-            "\"SELECT concat(count(*),':',sum(cents),':',md5(group_concat(customer ORDER BY id))) "
+            "\"SELECT concat(count(*),':',sum(cents),':',sha2(group_concat(customer ORDER BY id),256)) "
             'FROM orders"'
         ),
         expect="2:134100:",
