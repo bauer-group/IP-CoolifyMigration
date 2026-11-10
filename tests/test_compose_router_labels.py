@@ -339,6 +339,8 @@ def _finalize_ctx(tmp_path: Path, api: CoolifyClient, snapshot: ResourceSnapshot
         .on(r"label=bg-coolify-migrate\.role=pin", stdout="")
         .on(r"authorized_keys\.bak", exit_status=0)
         .on(r"rm -rf /root/\.coolify-migrate/", exit_status=0)
+        # The containment checkpoints (engine/containment.py) find nothing started.
+        .quiet_docker()
     )
     plan = MigrationPlan(
         project="shop",
@@ -378,6 +380,13 @@ class TestFinalizeReport:
             )
         )
         _recording(respx_mock, "applications/a1")
+        # FINALIZE also arms the target (engine/deploy_triggers.arm_targets).
+        respx_mock.patch(f"{BASE}/applications/tT").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        respx_mock.get(f"{BASE}/applications/a1/tags").mock(
+            return_value=httpx.Response(200, json=[])
+        )
 
         result = await steps.step_finalize(ctx)
 

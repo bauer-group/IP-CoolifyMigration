@@ -44,6 +44,10 @@ def _source_routes(respx_mock: respx.Router, source: dict[str, Any]) -> list[dic
         return_value=httpx.Response(200, json={"uuid": "aT", "fqdn": SHOP})
     )
     respx_mock.patch(f"{BASE}/applications/a1").mock(side_effect=patch)
+    # FINALIZE also arms the target (engine/deploy_triggers.arm_targets): its
+    # auto-deploy PATCH and the tag copy, neither of which this report is about.
+    respx_mock.patch(f"{BASE}/applications/aT").mock(return_value=httpx.Response(200, json={}))
+    respx_mock.get(f"{BASE}/applications/a1/tags").mock(return_value=httpx.Response(200, json=[]))
     return bodies
 
 
@@ -119,6 +123,8 @@ async def finalize_ctx(tmp_path: Path):  # type: ignore[no-untyped-def]
         .on(r"label=bg-coolify-migrate\.role=pin", stdout="")
         .on(r"authorized_keys\.bak", exit_status=0)
         .on(r"rm -rf /root/\.coolify-migrate/", exit_status=0)
+        # The containment checkpoints (engine/containment.py) find nothing started.
+        .quiet_docker()
     )
     plan = _plan(FinalizePolicy.KEEP).model_copy(
         update={
