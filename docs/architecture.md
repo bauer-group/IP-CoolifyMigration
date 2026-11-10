@@ -31,7 +31,7 @@ cli (Typer)  ->  wizard / dashboard (Rich)
 | `domain/` | **PURE** | Every decision. No IO, ever. |
 | `api/` | IO | Coolify REST, with per-endpoint request whitelists |
 | `discovery/` | IO | Docker facts; the label-based quiesce gate |
-| `transfer/` | IO | asyncssh, rsync, checksum manifests |
+| `transfer/` | IO | asyncssh, rsync, checksum manifests, bind-mount paths |
 | `dns/` | IO | Authoritative resolution |
 | `journal/` | IO | Append-only crash-safe state |
 | `engine/` | Executor | Walks the state machine, compensates on failure |
@@ -48,8 +48,17 @@ If you need a mock to test a decision, the decision is in the wrong layer.
 | `naming.py` | Which source volume maps to which target volume? |
 | `manifest.py` | What are we copying, what are we skipping, and why? |
 | `drift.py` | Would the rebuild ship different code? |
-| `plan.py` | What is the strategy, and is anything blocking? |
+| `plan.py` | What is the strategy, and is anything blocking — under this finalize policy, between these two servers? |
 | `statemachine.py` | What happens next, and what undoes it? |
+| `deploy_triggers.py` | What can deploy a source or a target during the run, what is switched off when, and what a rollback switches back? |
+| `containment.py` | Did anything start the stopped source or an unstarted target? Are the two servers one Docker daemon? |
+| `binds.py` | Which bind mounts are copied, where do they land on the target, and what may a rollback delete? |
+
+The IO behind those three is as thin as everywhere else: `engine/deploy_triggers.py`
+(the switches, around the stop and the cutover), `engine/containment.py` (the
+checkpoints from COPY to FINALIZE, and PREFLIGHT's daemon comparison) and
+`transfer/binds.py` (path states, who mounts a path, and the fixed scripts that
+create and remove a bind's target).
 
 ## Why "does it build?" is not a property of the kind
 
@@ -69,23 +78,32 @@ the drift gate for every compose stack that builds from source.
 
 ```text
 PREFLIGHT      token scope; reachability; rsync/docker present; disk vs REAL size;
-               previews detected; images resolvable; REBUILD-DRIFT GATE
+               previews detected; images resolvable; REBUILD-DRIFT GATE;
+               two daemons; bind sources shared with no one
    |
 PLAN           build the plan + provisional manifest   [dry-run stops here]
    |
-CREATE_TARGET  API only, instant_deploy=false          undo: delete target,
+CREATE_TARGET  API only, instant_deploy=false,         undo: delete target,
+               auto-deploy off, no tags; bind places         restore source domains
+               checked on the target                         and deploy switches,
                                                              then unpin source (last)
    |
-QUIESCE        pin source volumes; stop, then POLL     undo: restart source
-               the daemon by label
+QUIESCE        disarm source deploys, await queued     undo: restart source
+               ones; pin source volumes; stop, then
+               POLL the daemon by label
    |
 DISCOVER       authoritative post-stop reconciliation;
                pair old->new by mount_path
    |
 COPY           pin target volumes;                     undo: drop target volumes
-               parallel rsync -aHAXS --numeric-ids
+               parallel rsync -aHAXS --numeric-ids;          and bind copies
+               bind mounts path to path
    |
 VERIFY         content + metadata manifests both sides
+   |
+               (COPY, VERIFY, DNS_GATE, START, FINALIZE: containment checkpoints -
+                a revived source or an early target rolls back before START,
+                blocks after it)
    |
 DNS_GATE       custom domain -> source, neither server, or vanished
                since PLAN?  STOP, exit 3, resumable
@@ -93,12 +111,15 @@ DNS_GATE       custom domain -> source, neither server, or vanished
                 --accept-dns accepts a cutover, --accept-dns-host HOST
                 one host on neither server, vanished or unanswered)
    |
-START_TARGET   deploy                                  undo: stop target
+START_TARGET   deploy                                  undo: end target deployments,
+                                                             stop target
    |
-HEALTHCHECK    per resource: one serving, none broken
-               (a one-shot service at exit 0 does not block)
+HEALTHCHECK    per resource: one serving, none broken, START's own deployment
+               finished (a one-shot service at exit 0 does not block)
    |
-FINALIZE       unpin; keep | rename | delete           <- the only irreversible step
+FINALIZE       unpin; keep | rename | delete;          <- the only irreversible step
+               arm targets (auto-deploy, tags)         undo: disarm targets,
+                                                             restore source name
 ```
 
 Three orderings are deliberate and worth the argument:

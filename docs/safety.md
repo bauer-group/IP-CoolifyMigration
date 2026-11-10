@@ -200,6 +200,159 @@ are pinned again until a resume finishes the step.
 The tool never changes the server's cleanup setting: a crash would leave it
 changed, and a manual run overrides it anyway.
 
+## Nothing deploys a stack the run holds still
+
+From QUIESCE to FINALIZE the run holds two stacks still: the stopped source, and
+the target CREATE made but START has not started. Coolify asks none of its
+deploy triggers whether a migration is running. A git push deploys every
+application with auto-deploy on, a pull request a preview wherever previews are
+on, `POST /deploy` by uuid or tag whatever it names, and a deployment queued or
+building when the stop runs starts after it — Coolify's stop cancels none. A
+target shares its source's repository (a GitHub App's repository id, a manual
+webhook's secrets), so one push reaches both: a revived source writes what the
+copy never sees, an early target serves hosts that still resolve to the source.
+
+**What is switched off, and when.**
+
+- **CREATE**: every target application is created with auto-deploy off, and no
+  target gets tags yet — CREATE only reads the source's tag names.
+- **QUIESCE, first**: every source application's auto-deploy goes off, and its
+  preview deployments where they are on — from Coolify 4.2; before, the API shows
+  neither setting, and the plan says to switch previews off by hand. The
+  original values are journalled before the switch. Then the run waits, up to
+  `DEPLOY_TIMEOUT`,
+  for every source deployment still queued or building; one that does not end
+  refuses the run before anything is stopped. The tool never cancels a source
+  deployment.
+- **FINALIZE, after the cutover**: each target gets its source's original
+  auto-deploy and its tags. Never fatally: a target that could not be switched
+  is named in the report with what to set by hand. Preview deployments are not
+  carried; the plan says so where the source has them on.
+- **Under `keep` and `rename` the kept source stays disarmed** — auto-deploy and
+  previews off, for good, and FINALIZE says so: it shares its repository and
+  webhook with the target, so a push would deploy the stale copy beside it.
+
+**What it does not switch off.** A CI call to `POST /deploy` by uuid or tag, a
+manual deploy, the dashboard, the API and MCP bypass auto-deploy. The plan says
+so: pause them from QUIESCE until FINALIZE. A kept source keeps its tags, so
+after the run a tag deploy still reaches it — and nothing checks the source any
+more.
+
+**What a rollback gives back.**
+
+- After FINALIZE, **first**: each target's auto-deploy goes off again, and the
+  tag names FINALIZE attached are detached — exactly those, so a tag someone
+  added since stays. FINALIZE journals every target before it arms it, so this
+  holds after a crash mid-FINALIZE too. An armed target would be redeployed by a
+  push between its stop and its delete, on the volumes the rollback drops.
+- Before a target is stopped, its own deployments still queued or building are
+  cancelled: a stop holds none back, and one landing later would serve the
+  claimed hosts beside the restarted source.
+- Right before the source's restart, its auto-deploy and previews come back —
+  only what the disarm took, and **once per disarm**: running
+  `rollback <id>` again does not switch back on what you switched off since.
+
+**Checked, not assumed.** At the start of COPY (target), its end, the end of
+VERIFY, the DNS gate on every attempt, START before its first request and
+FINALIZE before it touches the source, the run asks both daemons again. A source
+breach is a container running, one that started after the stop gate proved the
+stack down (its `StartedAt`, or a `start` in the daemon's event log), or — for an
+application — a row in its Coolify deployment history the stop did not see
+ended. A target breach is any container carrying a target's uuid that ran before
+START asked for it. A breach is never a warning and has no flag:
+
+- before START has asked for a target, the run **rolls back**. The source, never
+  deleted before FINALIZE, keeps what it wrote;
+- once START has asked, it **blocks** (exit 5, resumable) and undoes nothing: the
+  DNS gate let the target start, it may have served users, and a rollback would
+  delete what they wrote. Stop the source, cancel its pending deployments, then
+  `resume` — or `rollback` by hand;
+- a check that cannot be answered — the event log, a deployment history Coolify
+  does not give — never passes: it rolls back before START and blocks after it.
+
+Coolify's scheduled volume backup (4.3+) reads a source volume on its schedule
+whatever the source's status. A container that only **reads** a migrated volume
+and carries no label or uuid of the stack is no revival; every writer is.
+
+The daemon keeps only its last 256 events, and none across a restart. A source
+container that started and was removed again before that window cannot be ruled
+out: for an application the deployment history still shows its deploy, for a
+service or database nothing does (`containment.event_log_gap` in the log says
+when the window fell short).
+
+## Source and target are two servers, and two machines
+
+- **One server record on both sides is refused** at plan time. The DNS gate
+  places a host by the addresses only one side answers as; on one server every
+  address is both sides', labels kept verbatim would declare the source's
+  routers twice on one proxy, and bind mounts would be copied onto themselves.
+- **One machine known twice** (localhost and its public IP, or two SSH ports) is
+  two server records. PREFLIGHT compares the Docker engine ID of both daemons and
+  refuses when they match: every source check would see the running target as
+  the source started again. A daemon that does not answer refuses nothing (the
+  log says `preflight.daemon_id_unread`). Two machines cloned together with
+  Docker's data root share the ID: remove `engine-id` there and restart Docker.
+- **Every resource runs on the source server.** The run discovers, stops and
+  copies an environment on ONE server, its first resource's. A resource on
+  another would be looked for there and not found — nothing copied, an empty
+  container list read as stopped — so the plan refuses it, and one whose server
+  the API does not name.
+
+## Bind mounts are copied path to path, on the servers
+
+A named volume can only ever touch itself; a bind mount is an arbitrary host
+path, so copying one is an arbitrary write on the target server and removing it
+an arbitrary `rm -rf`. Each of those has an explicit rule.
+
+**What is copied.** A directory or file in the resource's own Coolify directory
+(a compose's `./data` resolves under `/data/coolify/{applications|services}/{uuid}`),
+and an absolute host path outside the server's own trees, when a Coolify storage
+declares it. Coolify only *creates* such a directory on a new resource, so what
+is in it is data. A file Coolify writes from content kept in its storage row is
+not copied where the target's row gets that content — a plain application, a
+git compose application, a template service; CREATE reads the row back — and
+copied where it arrives without (a service created from a raw compose). The
+Docker socket and read-only system paths are the target server's own.
+
+**Where it lands.** On the host path the **target's own storage row** names at
+the same mount path, read back after CREATE — never the source's path with its
+uuid replaced. rsync runs on the servers with the volumes' flags
+(`--numeric-ids`, never `chown`; nothing through your workstation), and VERIFY
+compares content and metadata like a volume's.
+
+**What is checked first.** At PREFLIGHT, each source path must be a directory or
+a regular file, and no container outside the plan may share it: QUIESCE does not
+stop that container, so it would keep writing during the copy. At the end of
+CREATE, while the source still serves, every target path must be absent or
+empty, with no symlinked parent, mounted by no container, and the target
+resource's own — never a system path, Coolify's state or another resource's
+directory. Anything else refuses with the source never stopped.
+
+**Refused at plan time**: a writable bind of the server's own paths (`/etc`,
+`/usr`, `/var/lib/docker`, `/root` … and `/`, `/data`, `/home`, `/srv`, `/opt`
+themselves); a writable bind of the resource's whole Coolify directory; a bind no
+Coolify storage declares (custom docker run options,
+`bind.create_host_path: false`); a database's host-path, directory and file
+storages (CREATE carries none — what Coolify writes from the database's settings
+is skipped); a plain application's binary or over-5-MiB file mount.
+
+**A host-wide agent** — a container that mounts `/` writable, like Portainer's
+agent — could write into a bind path during the copy. It is a warning, in the
+plan and again in the run: make that mount read-only or stop the container until
+the migration has finished. Every other container sharing a path refuses.
+
+**What a rollback removes, and never removes.** It removes on the target only
+the paths COPY created, each journalled before it was written, each removal
+journalled the moment it is gone, so a second rollback never deletes again. It
+never removes a path that was already there, empty — inside the target's own
+directory Coolify's delete of the target takes it, outside it the report names
+it for you to empty — nor a system path or Coolify's own state, nor, after a
+`keep` or `rename` finalize, a copy whose source bind is gone (kept, and the
+rollback fails loudly). After such a finalize the rollback guard refuses up front
+when a copied bind source is lost. Coolify's `delete` never removes a host path
+outside the resource's directory either: a `delete` finalize leaves the source's
+absolute bind paths on the source server.
+
 ## Security invariants
 
 Enforced in code. See `AGENTS.md` for the authoritative list.
@@ -256,24 +409,32 @@ with enough information to run after a total crash of your machine.
 
 ```text
 CREATE_TARGET  -> delete the target (only once its source holds its domains);
-                  give the source its own domains back; then, last of all,
-                  unpin the source's volumes
+                  give the source its own domains back, then its auto-deploy
+                  and preview deployments; then, last of all, unpin the
+                  source's volumes
 QUIESCE        -> restart the source
-COPY           -> drop the target's volumes, revoke the ephemeral key
-START_TARGET   -> stop the target
-FINALIZE       -> restore the source's name
+COPY           -> drop the target's volumes and remove what COPY created for a
+                  bind mount; revoke the ephemeral key
+START_TARGET   -> end the target's deployments, then stop the target
+FINALIZE       -> switch the target's auto-deploy off and detach the tags
+                  finalize gave it; restore the source's name
 ```
 
 Compensations run in reverse: the target must be stopped before its volumes are
 dropped, and its volumes dropped before the resource is deleted, or we leak
-volumes nothing references.
+volumes nothing references. A full rollback after a finished run therefore goes:
+disarm the targets, restore the source's name, stop the targets, drop their
+volumes and bind copies, revoke the key, restore the source's domains and deploy
+switches, restart the source, delete the targets, unpin the source.
 
-One step is moved forward: **the source's domains are restored before the
-source is restarted.** A domain change in Coolify only writes its database; the
-proxy labels are baked into the container at deploy time, and the restart is a
-deploy. Restarting first brought the source back without its custom hosts. The
-restore overrides a domain conflict (`force_domain_override`) only when every
-holder Coolify names is this migration's own — never a third party's resource.
+Two steps are moved forward: **the source's domains and deploy switches are
+restored before the source is restarted.** A domain change in Coolify only
+writes its database; the proxy labels are baked into the container at deploy
+time, and the restart is a deploy. Restarting first brought the source back
+without its custom hosts. The restore overrides a domain conflict
+(`force_domain_override`) only when every holder Coolify names is this
+migration's own — never a third party's resource. A settings-only change
+deploys nothing, so the source comes back up as it was configured.
 
 ## Domains change hands make-before-break
 
@@ -301,17 +462,15 @@ A custom domain (`shop.example.com`) always has a live holder of this migration:
   source (`delete` removes it); one switched to hand-kept labels after the plan
   is released all the same but reported as still routing, never as released.
   A router written into a compose is added to every deploy as well — of a
-  dockercompose application and of a service alike — so one naming a moved host
-  is a plan warning under `keep` and `rename`, and its source is reported as
-  still routing at finalize.
-* **Source and target are two servers.** A plan whose target is its source's
-  own server is refused: the DNS gate places a host by the address only one
-  side answers as, and on one server every address is both sides'.
-* **Every resource runs on the source server.** The run discovers, stops and
-  copies an environment on ONE server, its first resource's. A resource on
-  another would be looked for there and not found — nothing copied, an empty
-  container list read as stopped — so the plan refuses it, and one whose server
-  the API does not name.
+  dockercompose application and of a service alike, whatever its readonly
+  labels — so the plan refuses `keep` and `rename` where the proxy still serves
+  one naming a moved host: a Caddy site label, or a Traefik router on a compose
+  service that sets `traefik.enable=true` or keeps a domain after finalize
+  (Coolify's Traefik serves only containers labelled so). What the plan cannot
+  see — a host built from a variable, a proxy edited to expose every container,
+  the env rows minio, logto, garage and silo are routed from — is a warning.
+  Finalize checks again, against the hosts the source held before the release,
+  and reports such a source as still routing, never as released.
 * **A rollback before FINALIZE writes nothing to the source's domains**: it never
   lost them. After FINALIZE the source gets them back BEFORE it is restarted, and
   a target that holds them is deleted only once the source holds them again. If
@@ -336,10 +495,13 @@ After a `keep` or `rename` finalize the source still exists, but nothing
 protects its data any more: its pins are released, and on a server that prunes
 unused volumes the next cleanup deletes them; a kept source can also be deleted
 by hand. So a rollback that follows first **looks**: every source resource must
-still exist in Coolify and every volume the migration copied must still be on
-the source server. If anything is missing it is refused, nothing undone — the
-target holds the only copy. If all is there, the volumes are pinned again
-before anything else runs, so no cleanup can take them before the restart
+still exist in Coolify; every volume the migration copied must still be on the
+source server, and still the volume COPY read — one pruned and recreated empty by
+a redeploy keeps its name but not its creation time; and every bind mount it
+copied must still hold what was copied (present, a directory or file as before,
+not empty where it held data). If anything is missing it is refused, nothing
+undone — the target holds the only copy. If all is there, the volumes are pinned
+again before anything else runs, so no cleanup can take them before the restart
 mounts them. A rollback after the target was started always discards what was
 written to the target since; the confirmation prompt says so.
 
@@ -397,9 +559,10 @@ Stated plainly rather than papered over.
   question we owe you is a concrete one: not "may pull a newer image" but "may
   cross a major version and refuse to start on the copied data". See
   [drift](troubleshooting.md#drift-needs-my-decision-exit-4).
-- **~25 `ApplicationSetting` fields are unreadable over the API.**
-  `GET /applications/{uuid}` does not eager-load the `settings` relation, yet
-  several of those fields are settable — a write-only asymmetry. We recover what
+- **~25 `ApplicationSetting` fields cannot be compared.** Before Coolify 4.2
+  `GET /applications/{uuid}` does not load the `settings` relation; from 4.2 it
+  does, nested under `settings`, where the drift check sees one opaque value —
+  yet several of those fields are settable, a write-only asymmetry. We recover what
   Docker can prove (Traefik labels expose `is_force_https_enabled`,
   `is_gzip_enabled`, `is_stripprefix_enabled`; networks expose
   `connect_to_docker_network`) and surface the rest as explicit questions. We
@@ -420,6 +583,11 @@ Stated plainly rather than papered over.
   logged in to and the target is not, and up to 4.5 about the image name a build
   pushes to (CREATE carries it there, and a failed push fails the deploy). Only a
   warning: a public image needs no login at all.
+- **A deploy by uuid or tag still reaches a stack mid-run.** CI calls to
+  `POST /deploy`, manual, dashboard, API and MCP deploys bypass every switch.
+  The containment checks find what they start and stop the run, but cannot
+  prevent it — pause them from QUIESCE until FINALIZE. After FINALIZE nothing
+  checks a kept source, and it keeps its tags.
 - **Anonymous volumes are refused.** Docker names them with a random 64-hex id
   that cannot be reproduced on the target, and there is no stable key to pair
   them by. Refusing beats silently starting with an empty volume.

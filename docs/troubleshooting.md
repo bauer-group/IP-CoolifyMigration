@@ -298,6 +298,124 @@ The hint carries Docker's own error. The pin needs no registry: it imports an
 empty image with `head -c 10240 /dev/zero | docker import -`, so check that the
 daemon answers and has disk space, then re-run.
 
+## "could not switch off the auto-deploy of … before the stop" (exit 5)
+
+QUIESCE's first write to the source failed: switching off its auto-deploy (and
+preview deployments) so that a push cannot deploy the stopped source, or its
+target before the DNS gate. **Nothing was stopped**: what was already switched
+off is switched back on and the created target is deleted. The message carries
+Coolify's answer; usually the token cannot write applications. Fix that, then
+run again.
+
+## "a source deployment has not ended, so the stop is refused" (exit 5)
+
+`SourceDeploymentPending`, raised **before anything is stopped**. Coolify's stop
+cancels no deployment, and its queue starts what is waiting, so the source would
+come back up after the stop, beside a copy that never sees its writes. The lines
+under it say which:
+
+- **"…: deployment … is still in_progress after 900s"** — QUIESCE waited
+  `DEPLOY_TIMEOUT` for it. Let it finish (or raise `DEPLOY_TIMEOUT` for long
+  builds), or cancel it in the application's Deployments in Coolify;
+- **"…: deployment … is queued"**, with a hint that says it was queued after the
+  wait — something deployed the source in the seconds before the stop (auto-deploy
+  is off by then: a CI call, the dashboard);
+- **"Coolify's deployment queue could not be read for 900s"** — the API did not
+  answer; check it.
+
+Then run the migration again. This tool never cancels a source deployment. The
+source keeps serving, its auto-deploy is switched back on and the created target
+is deleted.
+
+## "the source was started again after QUIESCE stopped it" (exit 5)
+
+A containment check (the message says where: `found at the end of COPY`, `the
+DNS gate`, `START`, `FINALIZE` …) found the stopped source running again. Each
+line names the resource and the evidence:
+
+- `… is running` — a container runs now;
+- `… was started at …, after the stop, and has stopped again` — its `StartedAt`;
+- `… (the daemon's event log; the container is gone)` — it came and went;
+- `deployment … came after the stop, or had not ended by it` / `deployment … is
+  queued (Coolify's deployment history)` — an application's deployment the stop
+  did not see ended.
+
+The usual causes: a CI job calling Coolify's `/deploy` with the source's uuid or
+one of its tags, a deploy or restart from the dashboard, the API or MCP — none of
+which auto-deploy being off stops — or a deployment queued just before the stop.
+
+### Before START: rolled back
+
+The run rolls back by itself: the target is stopped and deleted with its copied
+volumes, and the source restarted. Nothing deletes the source before FINALIZE, so
+what it wrote survives. Hold pushes and CI deploys of it, then migrate again.
+
+### After START: "Stopped - the source was started again, and needs your decision"
+
+Found by a resumed START or by FINALIZE, once START had asked Coolify to start a
+target. A **block**, not a failure, and **nothing has been undone**: the DNS
+gate let the target start, it may have served users since, and a rollback would
+delete what they wrote. FINALIZE has not touched the source. Two ways on:
+
+- **finish the migration**: stop the source in Coolify, cancel any of its
+  deployments still queued or in progress, hold pushes and CI deploys of it,
+  then `coolify-migrate resume <id>`. FINALIZE then applies its policy — under
+  `delete` that deletes whatever the revived source wrote. The resume blocks
+  again while a source container runs or a source deployment has not ended, and
+  once more for a deployment that was still queued or running at the block,
+  after it ends: it may have started the source after that check;
+- **give up the target**: `coolify-migrate rollback <id>` deletes the target and
+  everything written to it since START, and restarts the source.
+
+### `containment.event_log_gap` in the run log
+
+A warning, not a refusal. The Docker daemon keeps its last 256 events, and none
+across a restart; on a busy server that window often does not reach back to the
+stop. A source container that started and was removed again before it cannot be
+ruled out — one that still exists is found, and an application's Coolify
+deployment history still counts. A service or a database has no such history:
+if one may have been deployed in that time, check it before you resume.
+
+## "a target was started before START asked for it" (exit 5)
+
+`TargetStartedEarly`. A target ran before the DNS gate let it: it served custom
+hosts that still resolve to the source, asked ACME for their certificates, and may
+have written to volumes being copied. START says the same in its own words:
+
+- **"the target of … was started before START asked for it: Coolify refused
+  START's request, reading it as already running"** — a service or database
+  answered "already running", which a target this run never started cannot be;
+- **"Coolify skipped START's deployment of the target of …: a deployment of the
+  same commit is already queued or running for it"** — someone else deployed it.
+  With "- or this run's own request from before an interruption" the run was
+  killed right after START asked, and the skip may be its own.
+
+The usual causes: a CI job calling `/deploy` with its uuid (or a tag someone gave
+it — the run attaches tags only at FINALIZE), a deploy from the dashboard, the
+API or MCP, or a git push after someone switched the target's auto-deploy on: it
+is created off, and shares its source's repository, so a GitHub App or a manual
+webhook delivers the same push to both. The run rolls back: the target is
+stopped and deleted with its volumes, the source restarted. Hold pushes and CI
+deploys of the stack, then migrate again.
+
+## "could not read the deployment history of … to check that nothing deployed the stopped source" (exit 5)
+
+A source application's deployment history is what shows a deploy whose container
+came and went, so a check that cannot read it never passes:
+
+- **at QUIESCE**, before the stop: the stop is refused and the run rolls back
+  with the source still serving. A source Coolify itself answers 404 for (it was
+  deleted in Coolify) refuses here too;
+- **at a later check before START**: the run rolls back;
+- **once START has asked for a target**: "Stopped - the source could not be
+  checked, and nothing was undone" — a block, for the reason a revival blocks.
+  Once Coolify answers again, `coolify-migrate resume <id>` checks again; or
+  `coolify-migrate rollback <id>` gives up the target.
+
+The hint quotes Coolify's answer for each application. The usual cause is a
+Coolify that is restarting or updating, or a proxy in front of it answering
+for it.
+
 ## "Left in place: ... still pins ..."
 
 A run or a rollback ended with a pin it deliberately did not remove:
@@ -520,6 +638,58 @@ A resume rebuilds the pairs from the journal, so this should not happen. If it
 does, please report it with the journal (`coolify-migrate status <id>`), then
 start a fresh run.
 
+## Bind mounts refused at the end of CREATE (exit 6)
+
+CREATE reads back where the target mounts each bind and checks the place on the
+target server **while the source still serves**: the source was never stopped,
+and the created target is deleted.
+
+- **"bind mount(s) have no free place on the target"** — the target path already
+  holds data ("may be another resource's"), is a symbolic link or a special file,
+  has a parent that is a symbolic link or a file, or is mounted by a container on
+  the target server. Free the path there, or bind a different one on the source.
+  A target whose `/data` or `/data/coolify` is a symlink (Coolify's data moved to
+  another disk) refuses every relative bind (`./data`): a known limit that fails
+  closed — migrate those resources by hand, or to another target;
+- **"bind mount(s) the target would place on a host path that is not its own"** —
+  the target's storage row names a system path, Coolify's own state or another
+  resource's directory, usually because the target was created from a different
+  compose (the branch HEAD moved);
+- **"file mount(s) the target would start without"** — Coolify writes such a file
+  from the content kept in its storage row, and the target's row has none: the
+  template or the repository's compose no longer declares it with its content.
+  Keep the file in a directory the compose mounts instead (it is then copied as
+  data), or move the resource by hand;
+- **"bind … has no counterpart on the target"** / **"… matches several target
+  storages"** — no single storage row of the target at that mount path, so the
+  target would not mount the copy; **"… would both be copied to …"** / **"… lies
+  inside …: one copy would delete the other"** — two binds collide on the target.
+  Give each resource its own host path.
+
+## Bind mounts refused at DISCOVER or COPY (exit 6)
+
+After the stop; the run rolls back (the source is restarted, the target deleted).
+
+- **"bind mount(s) cannot be copied"** — the source path is gone, a symbolic
+  link, or not a regular file or directory now;
+- **"bind target … already holds data on the target server"** (or another state
+  that changed since the end of CREATE) — something appeared there that is not
+  this migration's, and it is not overwritten. One case is known and harmless: a
+  COPY resumed between two nested binds (`./data` and `./data/uploads`) refuses
+  the inner one, which the outer copy filled. A new run copies both;
+- **"bind mount(s) this version never copies"** — the run began under an earlier
+  version, whose journal paired a system path. Nothing was written there. If the
+  rollback does not finish, run `coolify-migrate rollback <id>`; then plan again
+  with this version.
+
+## "the targets' containers are up, but the deployment START asked for did not finish within …s" (exit 6)
+
+HEALTHCHECK counts a target's containers only once the deployment START asked
+for has finished: a container that is up before then may be another
+deployment's — a push or a CI deploy of the target. Each line says what Coolify
+last read for that deployment, or that it could not be read. Check the deployment
+in Coolify. The run rolls back; the source is still intact.
+
 ## Rollback failed (exit 8)
 
 A compensating action could not run, so the system is in a state only you can
@@ -551,17 +721,72 @@ them. The journal named in the hint shows what FINALIZE recorded.
 ### "rollback refused: the source no longer holds its data"
 
 The migration finished (or got into FINALIZE) with `keep` or `rename`, and the
-source has since lost what a rollback would restart it on: a resource was
-deleted in Coolify, or a copied volume is gone from the source server —
-usually Coolify's Docker cleanup with *Delete unused volumes* on, which the plan
-warned about (FINALIZE released the source's pins). A rollback would stop the
-target, drop its volumes, delete it and restart the source on **empty**
-volumes, so nothing was undone: the target holds the only copy, including
-everything written since the cutover. Keep it. Run the rollback again only once
-the source's data is back (from a backup); otherwise the target is the migrated
-stack, and the source is yours to clean up. `could not be read` / `could not be
-checked` means the look itself failed (API or SSH): fix that and run the
-rollback again.
+source has since lost what a rollback would restart it on. The message lists
+what is missing:
+
+- **"… (no longer in Coolify)"** — a source resource was deleted;
+- **"volume …"** — a copied volume is gone from the source server, usually
+  Coolify's Docker cleanup with *Delete unused volumes* on, which the plan warned
+  about (FINALIZE released the source's pins);
+- **"volume … (created …, after the copy read the one created …: recreated
+  empty)"** — the volume was pruned and a redeploy created a new, empty one under
+  the same name;
+- **"bind … (gone)"**, **"(now a …)"**, **"(empty now, where it held data when it
+  was copied)"** — a copied bind mount's host path was removed, replaced, or
+  emptied (a start recreates a missing one as an empty directory).
+
+A rollback would stop the target, drop its volumes and bind copies, delete it
+and restart the source on **empty** volumes and directories, so nothing was
+undone: the target holds the only copy, including everything written since the
+cutover. Keep it. Run the rollback again only once the source's data is back
+(from a backup); otherwise the target is the migrated stack, and the source is
+yours to clean up. `could not be read` / `could not be checked` means the look
+itself failed (API or SSH): fix that and run the rollback again.
+
+### `bind target(s) KEPT on …: … - they may hold the only copy of the data`
+
+DROP_TARGET_VOLUMES removes on the target server only the bind paths COPY
+created, and kept these. The reason is in brackets: the source's bind is gone
+(after a `keep` or `rename` finalize the copy may be the only one), the path is
+not one a rollback may delete, or it resolves elsewhere now (a symbolic link
+appeared). The rest of the rollback still ran. Delete them by hand once you are
+sure the data exists elsewhere; a second `rollback` keeps them while the reason
+holds.
+
+### `… was empty before this migration and now holds a copy of the source's bind mount`
+
+Not an error: a rollback notice. The target path existed, empty, before COPY
+filled it, so it is not the rollback's to delete — inside the target's own
+directory Coolify's delete of the target takes it; this one is outside. Empty it
+by hand if the copy is not wanted.
+
+### `auto-deploy NOT switched off for: …` / `tags NOT removed from: …`
+
+The rollback's first step after a finalize, DISARM_TARGETS, could not take back
+what finalize gave a target: its auto-deploy, or the tags it attached. Until the
+target is deleted, a push (auto-deploy) or a CI deploy by tag can redeploy it —
+on empty volumes once the rollback has dropped them. The rest of the rollback
+still ran. Switch "Auto Deploy" off on each named target's Advanced page in
+Coolify, and remove the named tags from it; a target that is gone already needs
+nothing. A second `rollback <id>` retries both and sends nothing where they are
+off already.
+
+### `auto-deploy NOT switched back on for: …`
+
+RESTORE_SOURCE_DEPLOY_TRIGGERS could not give a source back the auto-deploy (and
+preview deployments) QUIESCE switched off. The source was still restarted. Switch
+"Auto Deploy" — and "Preview Deployments", if it had them — back on on each
+source's Advanced page in Coolify. A second `rollback <id>` retries only the
+sources not yet restored: one it already gave its switches back is left as you
+set it since.
+
+### `still queued or running after …s - …`
+
+STOP_TARGET cancels every queued or running deployment of a target application
+before it stops it, because a stop holds no deployment back. These did not end
+within `DEPLOY_TIMEOUT`, or could not be read: one may still bring the target up,
+serving the claimed hosts beside the restarted source. Cancel it in the target's
+Deployments in Coolify, then stop the target there.
 
 ### "point DNS for … back to …"
 
@@ -632,14 +857,35 @@ or delete the source, before anyone redeploys it.
 ### `... let go of its custom domains, but routers written into its compose still route ...`
 
 The source's compose declares a router of its own (a `traefik...rule=Host(...)`
-or `caddy` label) for a host finalize moved; the plan warned about it. Coolify
-adds a compose's own labels to every deploy, whatever the domains say, so the
-source's next deploy routes the named hosts again next to the target. The run
-still succeeds; the source is not listed as released. For a service, remove
-those routers from the source's compose in Coolify (the target runs its own
-copy). A dockercompose application's compose comes from git, which the target
-deploys too: never redeploy the source, and delete it once you no longer need it
-as a fallback.
+or `caddy` label) for a host finalize moved, where the proxy still serves it. The
+plan refuses `keep` and `rename` for such a source, so the router was added after
+the plan, or names a host the plan could not read (a variable, a route env row;
+it warned about those). Coolify adds a compose's own labels to every deploy,
+whatever the domains say, so the source's next deploy routes the named hosts
+again next to the target and requests their certificates. The run still
+succeeds; the source is not listed as released. Before anyone redeploys the
+source, remove those routers — from the compose file in git for a dockercompose
+application (its next deploy reloads the compose from there; the target routes
+these hosts from its domains), from the source's compose in Coolify for a
+service (the target runs its own copy) — or delete the source.
+
+### `… (the kept source) keep(s) auto-deploy and preview deployments OFF`
+
+Not an error: a `keep` or `rename` finalize leaves the source's push-driven
+deploys switched off, because it shares its repository and webhook with the
+target and a push would deploy the stale source beside it. What still reaches it
+— a CI call to `POST /deploy` by uuid or tag (it keeps its tags), a manual deploy,
+the dashboard — simply starts the copy from before the cutover beside the
+target: nothing checks the source after finalize. `coolify-migrate rollback <id>`
+switches them back on, once.
+
+### `the target of … was created with auto-deploy off, and switching it … as its source had it failed`
+
+A finalize notice; the run succeeded. Every target is created with auto-deploy
+off and given its source's setting at finalize, and that request failed (the
+reason is in brackets). Switch "Auto Deploy" on its Advanced page in Coolify to
+what the notice says; until then pushes do not deploy it (or, for a source that
+had it off, may).
 
 ### `target(s) KEPT, holding custom domains their source does not hold`
 
@@ -839,20 +1085,48 @@ Two ways out:
 API does not show the setting, the plan says **"does not show whether its
 readonly labels are on"** instead: check the setting on the source by hand.
 
-## "routers written into its compose route …"
+## "routers written into its compose route …, which finalize moves to the target"
 
-A warning under `--finalize keep` and `rename` only, for a dockercompose
+A refusal under `--finalize keep` and `rename` only, for a dockercompose
 application or a service. Its compose declares a router of its own for a custom
-domain finalize moves. Finalize releases the domains, but Coolify adds a
-compose's own labels to every deploy whatever the domains say, so the kept
-source's next deploy routes the host again next to the target and requests its
-certificate. For a service, remove those routers from the source's compose in
-Coolify once the run has finalized (the target runs its own copy). A
-dockercompose application's compose comes from git and the target deploys the
-same file, so it cannot be fixed on the source alone: finalize with `--finalize
-delete`, or never redeploy the kept source and delete it once it is no longer
-needed. Only literal hosts are seen: a rule built from a variable
-(`` Host(`${DOMAIN}`) ``) is not.
+domain finalize moves, and the proxy still serves it after finalize: a Caddy site
+label, or a Traefik router on a compose service that sets `traefik.enable=true`
+or keeps a domain once finalize released the custom ones (a generated or
+server-bound host, or one Coolify regenerates). Finalize releases the domains,
+but Coolify adds a compose's own labels to every deploy whatever the domains say,
+so the kept source's next deploy would route the host again next to the target
+and request its certificate.
+
+Remove those routers and plan again — Coolify generates the routers for these
+hosts from the domains, on the target as well:
+
+- a dockercompose application: from the compose file in git, then reload the
+  compose in Coolify ("Reload compose" on the source, or a redeploy) so the plan
+  sees it. The target deploys the same file, so hand-made middlewares or path
+  rules in those routers are gone on the target too;
+- a service: from the source service's compose in Coolify (the target runs a copy
+  of it).
+
+Or finalize with `--finalize delete`. A HostRegexp rule counts as routing every
+moved host: it cannot be enumerated.
+
+The plan **warns** instead where it cannot tell (under `keep` and `rename`
+only):
+
+- **"… on compose service …, which keeps no domain after finalize and sets no
+  traefik.enable"** — Coolify's Traefik serves only containers labelled
+  `traefik.enable=true`, so finalize stops this router, unless the server's
+  proxy was edited to expose every container;
+- **"routers written into its compose build their hosts from variables"** — a
+  `` Host(`${DOMAIN}`) `` or Caddy site filled in by docker compose at every
+  deploy, while the service's label escaping is off (or the API does not show
+  it); with escaping on, the rule routes nothing;
+- **"… and Coolify routes its parts from env rows (…) the plan does not read"** —
+  minio, logto, garage and silo are routed from env rows that finalize blanks
+  when they hold a custom host.
+
+If one of them does route a moved host, remove it the same way, or finalize with
+`delete`.
 
 ## "the target server '…' is the source server"
 
@@ -878,6 +1152,93 @@ coolify-migrate run shop/production/database --to <server>
 **"the API did not say which server this resource runs on"** is the same
 refusal for a resource whose GET names no server at all. Check the resource's
 server (its destination) in Coolify, then plan again.
+
+## "the source server '…' and the target server '…' are one Docker daemon" (exit 2)
+
+A PREFLIGHT refusal; nothing has been changed. Both servers' daemons report the
+same engine ID, so Coolify knows one machine twice — under localhost and its
+public IP, or under two SSH ports. A migration between them never leaves it: the
+checks that prove the source stays stopped would see the target's containers as
+the source started again, every custom domain resolves to both sides, and bind
+mounts would be copied onto themselves. Pick a target server on another machine.
+
+If they really are two machines, one was cloned from the other together with
+Docker's data root and kept its engine ID. Compare
+`docker info --format '{{.ID}}'` on both; on one of them remove the `engine-id`
+file in the data root (`/var/lib/docker` by default) and restart Docker, which
+writes a new ID. A daemon that does not answer refuses nothing; the log then
+says `preflight.daemon_id_unread`.
+
+## Bind mounts the plan refuses (exit 2)
+
+A bind mount is an arbitrary host path, so the plan copies only what is the
+resource's own and refuses the rest, naming the path:
+
+- **"writable bind of the host's own …"** — a system path, runtime state,
+  Docker's or Coolify's own data, or another resource's directory (`/etc`,
+  `/var/lib/docker`, `/root`, and `/`, `/data`, `/srv`, `/home` … themselves).
+  Copying it would overwrite the target server's. Make it read-only if the
+  container only reads it; the target server then supplies its own;
+- **"writable bind of the resource's whole Coolify directory …"** — it mixes the
+  generated compose and `.env` with data. Mount a subdirectory for the data;
+- **"bind mount of … at … is declared in no Coolify storage"** — custom docker
+  run options, or a compose bind with `bind.create_host_path: false`: where the
+  target mounts it cannot be read back. Declare it as a storage (a plain compose
+  bind does that) or move the data into a volume;
+- **"bind mount of …: a database's storages are not carried to the target"** and
+  **"… is a file mount whose content Coolify keeps in the database's storage
+  row"** — CREATE carries no storage of a database. Remove the mount on the
+  source and add it to the target after the migration, or move the setting into
+  the database's own configuration;
+- **"… is a file mount whose content the API cannot carry (binary or over 5
+  MiB)"** — a plain application's: CREATE cannot recreate it. Turn it into a
+  directory mount, or recreate it on the target by hand;
+- **"… is a file Coolify writes from its storage row's content, but the target
+  service is created from the source's compose …"** — a raw-compose service's
+  file at a system path; mount it from the service's directory (`./` in the
+  compose);
+- **"bind source … is not an absolute path"**.
+
+## "bind mount(s) cannot be copied safely" (exit 2)
+
+A PREFLIGHT refusal; nothing has been changed and the source is untouched. Each
+line names a path:
+
+- **"… is also mounted by … , which this migration does not stop"** — a container
+  outside the plan shares the path (the same path, one inside it, or a writable
+  parent). It would keep writing during the copy, and after the cutover the two
+  would hold diverging copies. Move the shared data into a volume of one
+  resource, or migrate the resources that share it together;
+- **"… does not exist on the source server"**, **"… is a symbolic link on the
+  source server; bind its target instead"**, **"… is not a regular file or
+  directory"** — nothing a copy can take.
+
+### Plan warning: "… mounts the whole host writable (/), so it can write the bind mount(s) …"
+
+Not a refusal. A container binds `/` writable — Portainer's agent (`-v /:/host`),
+a host backup — so it can reach every bind path while the migration copies and
+verifies it. It looks like a host agent rather than a resource sharing that data,
+so the run goes on, but what it writes there meanwhile can fail VERIFY or go
+missing from the copy. Make that mount read-only, or stop the container, before
+the migration starts and until it has finished. The run repeats the warning at
+PREFLIGHT for the source and at the end of CREATE for the target server, which
+the plan cannot see.
+
+### Plan notes about deploys
+
+- **"deploys during the run: QUIESCE switches each source application's
+  auto-deploy off …"** — on every plan that moves an application; it says what
+  the run switches off and what it cannot (a CI `POST /deploy`, manual, API and
+  MCP deploys). Pause those yourself from QUIESCE until FINALIZE. See
+  [safety](safety.md#nothing-deploys-a-stack-the-run-holds-still).
+- **"preview deployments are on: …"** — QUIESCE switches them off with
+  auto-deploy, and the target is created without them; switch them on for the
+  target afterwards if you want them.
+- **"Coolify before 4.2 does not return this application's settings …"** — the
+  run switches the source's auto-deploy off all the same, and gives the target
+  (and, on rollback, the source) Coolify's default, on. If the source had it off,
+  switch it off again there afterwards; switch its preview deployments off by
+  hand before the run.
 
 ## Coolify 4.6: image names and HTTPS git credentials
 

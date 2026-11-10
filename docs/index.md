@@ -37,6 +37,9 @@ coolify-migrate run  my-project/production/api --to target-server  # one resourc
   same way — see [Safety model](safety.md).
 - **Byte-exact.** `rsync -aHAXS --numeric-ids`. Never `chown`.
 - **Verified.** SHA-256 *and* metadata manifests on both sides.
+- **Held still.** Auto-deploy is off on the stopped source and the unstarted
+  target, and the run checks again from COPY to FINALIZE that nothing started
+  either — see [deploys during a run](cli.md#deploys-during-a-run).
 - **Reversible.** The source is never destroyed until you say so.
 - **Gated where it counts.** It refuses to start a target whose DNS still points
   at the old server — that one is not a judgement call. Where it *is* a judgement

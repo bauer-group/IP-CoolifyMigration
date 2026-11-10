@@ -48,7 +48,9 @@ server is refused: on one server every custom domain resolves to both sides, so
 the DNS gate cannot tell a cutover from none, labels kept verbatim would declare
 the source's routers twice on one proxy, and bind mounts would be copied onto
 themselves. When you pick an environment or a resource interactively, the target
-menu leaves the source's server out.
+menu leaves the source's server out. Coolify can also know **one machine as two
+servers** (localhost and its public IP, or two SSH ports): `run` compares the
+Docker engine ID of both at preflight and refuses when they are the same daemon.
 
 An environment is migrated **from one server**: the server of its first
 resource, where the run discovers, stops and copies every resource. A plan
@@ -112,7 +114,7 @@ These are a stable contract; script against them.
 | `2` | Preflight failed — **nothing was changed** |
 | `3` | DNS gate blocked — resumable |
 | `4` | Drift needs your decision — re-run interactively, or `--accept-drift` |
-| `5` | Quiesce failed — the stack would not stop cleanly |
+| `5` | Quiesce failed — the stack would not stop cleanly, or did not stay stopped (see below) |
 | `6` | Transfer failed — rolled back |
 | `7` | Verification failed — rolled back, target **not** started |
 | `8` | Rollback itself failed — human attention required |
@@ -123,6 +125,24 @@ These are a stable contract; script against them.
 Codes 3 and 4 are **not failures**. Code 3 is a deliberate, resumable stop: flip
 DNS, then `coolify-migrate resume <id>`. Code 4 only appears unattended — it means
 we had a question and no way to ask it.
+
+Code 5 covers everything that says the stack is not held still:
+
+- the stop could not be made safely or did not end cleanly (the source's volumes
+  could not be pinned first, a SIGKILLed data holder, the stop gate timed out);
+- a source deployment still queued or running when the stop was due — refused
+  before anything is stopped (`SourceDeploymentPending`);
+- a **containment breach** before START: something started the stopped source
+  (`SourceRevived`) or a target before START asked for it
+  (`TargetStartedEarly`). The run rolls back;
+- the same found **once START has asked Coolify to start a target**: a revived
+  source (`SourceRevivedAfterStart`), or a source whose deployment history
+  Coolify did not give (`SourceUncheckedAfterStart`). This is a **block**, like
+  code 3: resumable, nothing rolled back, because the target may already hold
+  users' writes. Stop the source (or wait until Coolify answers) and `resume`, or
+  `rollback` by hand.
+
+See [troubleshooting](troubleshooting.md) for each message.
 
 ## Why `plan` is worth running
 
@@ -141,8 +161,8 @@ healthy:
 
 | Policy | Effect |
 | --- | --- |
-| `keep` | Leave the source stopped. Only its custom domains are released (the target serves them), so a restart cannot claim them twice. Safest. |
-| `rename` | Rename to `{name}-old-{stamp}`, leave stopped. **Default.** |
+| `keep` | Leave the source stopped, with auto-deploy off. Only its custom domains are released (the target serves them), so a restart cannot claim them twice. Safest. |
+| `rename` | Rename to `{name}-old-{stamp}`, leave stopped with auto-deploy off. **Default.** |
 | `delete` | Delete the source and its volumes. **Irreversible** — requires typed confirmation. |
 
 `keep` and `rename` release the source's **custom** domains, as finalize's last
@@ -165,15 +185,44 @@ whose API does not show the setting, the plan warns instead.
 
 A dockercompose application or a service routes by the labels Coolify generates
 from its domains — and by any router **written into its compose**, which Coolify
-adds to every deploy whatever the domains say. A compose router naming a custom
-domain finalize moves is a plan **warning** under `keep` and `rename`: a
-service's can be removed from the source's compose once the run has finalized
-(the target runs its own copy), while a compose application's comes from git,
-which the target deploys too — finalize it with `delete`, or never redeploy the
-kept source. Finalize does not list such a source as released.
+adds to every deploy whatever the domains say. Under `keep` and `rename` the plan
+**refuses** a source whose compose routes a custom domain finalize moves where
+the proxy still serves it: a Caddy site label, or a Traefik router on a compose
+service that sets `traefik.enable=true` or keeps a domain after finalize. Remove
+those routers — from the compose file in git for a compose application (then
+reload the compose in Coolify), from the service's compose in Coolify for a
+service — and plan again, or use `--finalize delete`. What the plan cannot tell
+is a **warning** instead: a Traefik router on a service Coolify's proxy does not
+serve (unless it was edited to), a rule that builds its host from a variable, and
+the routes of minio, logto, garage or silo, which Coolify takes from env rows.
+Finalize checks the labels again and does not list a source that still routes a
+moved host as released.
 
 `plan` takes the same `--finalize` (default `rename`), so it judges the policy
-`run` will use.
+`run` will use; preflight judges the plan once more under the run's policy.
+
+Under `keep` and `rename` the stopped source also keeps its **auto-deploy and
+preview deployments off** after the run: it shares its repository and webhook
+with the target, so a push would deploy the stale copy beside it. A
+`rollback` switches them back on, once. See
+[deploys during a run](#deploys-during-a-run).
+
+## Deploys during a run
+
+Coolify asks no deploy trigger whether a migration is running. So from QUIESCE
+the source applications' auto-deploy (and their preview deployments) are
+switched off, and every target is created with auto-deploy off and gets its
+tags only at finalize, where it is given its source's auto-deploy setting. A
+deployment of the source already queued or building is waited for before the
+stop (up to `DEPLOY_TIMEOUT`, never cancelled); one that does not end refuses
+the run while the source still serves.
+
+What no setting stops — a CI call to `POST /deploy` by uuid or tag, a deploy
+from the dashboard, the API or MCP — **pause yourself from QUIESCE until
+finalize**. The run checks that nothing started either side at COPY, VERIFY, the
+DNS gate, START and FINALIZE, and exits `5` when something did (see
+[exit codes](#exit-codes)). After finalize nothing checks the kept source any
+more. Details: [safety](safety.md#nothing-deploys-a-stack-the-run-holds-still).
 
 ## Domains & DNS
 
@@ -211,12 +260,11 @@ domain-conflict check only over this migration's own resources. Under `keep` as
 well as `rename`, finalize then clears the custom domains from the stopped
 source as its last step, so restarting it by hand cannot put a second router on
 a hostname the target now serves — as long as Coolify generates its routers (see
-[Finalize policies](#finalize-policies): a source with readonly labels off is
-refused for `keep` and `rename`, a compose router naming a moved host is warned
-about, and a source either applies to at finalize is not reported as
-released). That order also keeps a DNS record Coolify (4.4+)
-manages at Cloudflare alive: Coolify deletes one only when its hostname loses
-its last holder.
+[Finalize policies](#finalize-policies): a source with readonly labels off, or
+whose compose routes a moved host itself, is refused for `keep` and `rename`, and
+a source either applies to at finalize is not reported as released). That order
+also keeps a DNS record Coolify (4.4+) manages at Cloudflare alive: Coolify
+deletes one only when its hostname loses its last holder.
 
 **Custom domains** — `shop.example.com` and the like. These are
 server-independent: they move *with* the app, by repointing their DNS record at
