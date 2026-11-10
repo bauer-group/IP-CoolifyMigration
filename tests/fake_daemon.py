@@ -51,6 +51,8 @@ class FakeDaemon(FakeHost):
         #: What the containment checkpoints' `docker events` prints: an `oldest N`
         #: line and one JSON line per container start (``discovery.quiesce``).
         self.events: str = ""
+        #: `docker volume inspect` CreatedAt per volume; a missing one reads a default.
+        self.volume_created: dict[str, str] = {}
 
     def add(
         self,
@@ -109,6 +111,13 @@ class FakeDaemon(FakeHost):
         if "docker events --since 0" in command and "event=start" in command:
             return self._ok(command, self.events)
         argv = shlex.split(command)
+        if argv[:3] == ["docker", "volume", "inspect"] and "--format" in argv:
+            names = argv[argv.index("--format") + 2 :]
+            missing = [n for n in names if n not in self.volumes]
+            if missing:
+                return self._err(command, f"Error: get {missing[0]}: no such volume")
+            created = (f"{n} {self.volume_created.get(n, '2026-01-01T00:00:00Z')}" for n in names)
+            return self._ok(command, "\n".join(created))
         if argv[:2] == ["docker", "inspect"] and "{{json .State}}" in argv:
             container = self._find(argv[-1])
             if container is None:

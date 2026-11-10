@@ -12,6 +12,9 @@ deleted before FINALIZE, keeps whatever it wrote.
 
 from __future__ import annotations
 
+import shlex
+from typing import Any
+
 import structlog
 
 from bg_coolify_migrate.discovery import docker, pins, quiesce
@@ -201,3 +204,40 @@ async def _target_breaches(ctx: MigrationContext) -> tuple[list[Breach], list[st
         watched, seen, await quiesce.start_events(host, since=0)
     )
     return breaches, sorted({b.uuid for b in breaches if b.uuid})
+
+
+async def record_source_volumes(ctx: MigrationContext) -> dict[str, str]:
+    """Journal the CreatedAt of every source volume COPY read, for the rollback guard.
+
+    Called once the end-of-copy checkpoint passed, so these are the volumes the
+    copy is a copy of. ``compensations.source_data_refusal`` compares them after
+    FINALIZE(keep/rename): a volume Coolify's cleanup pruned and a redeploy
+    recreated EMPTY keeps its name, never its CreatedAt.
+    """
+    volumes = sorted({p.source.name for pairs in ctx.volume_pairs.values() for p in pairs})
+    if not volumes:
+        return {}
+    created = await volumes_created(ctx.source_host, volumes)
+    ctx.journal.append(
+        "step_started",
+        state=State.COPY.value,
+        detail={containment.SOURCE_VOLUMES_CREATED: created},
+    )
+    return created
+
+
+async def volumes_created(host: RemoteHost, volumes: list[str]) -> dict[str, str]:
+    """``{volume: CreatedAt}`` in one ``docker volume inspect``. Raises if it fails."""
+    names = " ".join(shlex.quote(v) for v in volumes)
+    result = await host.run_checked(
+        f"docker volume inspect --format '{{{{.Name}}}} {{{{.CreatedAt}}}}' {names}"
+    )
+    return containment.parse_volume_created(result.stdout)
+
+
+def recorded_volumes(undo_info: dict[str, Any]) -> dict[str, str]:
+    """COPY's journalled ``{volume: CreatedAt}``; empty for a journal without the record."""
+    raw = undo_info.get(containment.SOURCE_VOLUMES_CREATED)
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if isinstance(v, str)}

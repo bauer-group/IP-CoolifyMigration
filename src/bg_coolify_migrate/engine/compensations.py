@@ -21,6 +21,7 @@ import structlog
 from bg_coolify_migrate.api import resources as api_resources
 from bg_coolify_migrate.discovery import docker, pins
 from bg_coolify_migrate.domain import domains
+from bg_coolify_migrate.domain.containment import volume_recreated
 from bg_coolify_migrate.domain.deployments import (
     Progress,
     deployment_uuid_of,
@@ -36,7 +37,7 @@ from bg_coolify_migrate.domain.statemachine import (
     source_copy_unproven,
     source_was_stopped,
 )
-from bg_coolify_migrate.engine import deploy_triggers, keys
+from bg_coolify_migrate.engine import containment, deploy_triggers, keys
 from bg_coolify_migrate.engine.context import MigrationContext, deserialise_volume_pairs
 from bg_coolify_migrate.errors import CoolifyApiError
 from bg_coolify_migrate.journal.store import JournalRecord
@@ -852,6 +853,15 @@ async def source_data_refusal(ctx: MigrationContext) -> str | None:
     anything runs, so Coolify's cleanup cannot take them between this look and
     the restart; RELEASE_SOURCE_PINS, the last compensation, removes the pin
     once the restarted source mounts them.
+
+    A name is not enough: a volume pruned after FINALIZE and recreated EMPTY by
+    a redeploy (ApplicationDeploymentJob v4.7.2:5010-5030, ``external: false``)
+    has the same one. So each volume's CreatedAt must still be the one COPY
+    journalled (``containment.record_source_volumes``); a local volume's is the
+    change time of its directory, new for every volume created under the name
+    (moby v27.5.1 volume/local/local.go:229-236). A journal without the record
+    gets the name check alone. A CreatedAt that cannot be read raises, and the
+    saga refuses on that as on any guard that cannot answer.
     """
     if not source_copy_unproven(ctx.journal.details()):
         return None
@@ -868,6 +878,7 @@ async def source_data_refusal(ctx: MigrationContext) -> str | None:
     if volumes:
         present = {v.name for v in await docker.list_volumes(ctx.source_host)}
         lost.extend(f"volume {name}" for name in sorted(set(volumes) - present))
+        lost.extend(await _recreated_volumes(ctx, sorted(set(volumes) & present)))
     if lost:
         return (
             f"the source no longer holds its data on {ctx.plan.source_server.name}: "
@@ -881,6 +892,21 @@ async def source_data_refusal(ctx: MigrationContext) -> str | None:
             ctx.source_host, migration_id=ctx.migration_id, side=pins.SOURCE, volumes=volumes
         )
     return None
+
+
+async def _recreated_volumes(ctx: MigrationContext, present: list[str]) -> list[str]:
+    """The present copied volumes that are not the ones COPY read, by CreatedAt."""
+    recorded = containment.recorded_volumes(ctx.journal.undo_info(State.COPY.value))
+    names = [name for name in present if name in recorded]
+    if not names:
+        return []
+    current = await containment.volumes_created(ctx.source_host, names)
+    return [
+        f"volume {name} (created {current.get(name, 'at an unknown time')}, after the copy "
+        f"read the one created {recorded[name]}: recreated empty)"
+        for name in names
+        if name not in current or volume_recreated(recorded[name], current[name])
+    ]
 
 
 def _copied_source_volumes(ctx: MigrationContext) -> list[str]:

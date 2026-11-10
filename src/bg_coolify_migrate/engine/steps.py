@@ -1990,6 +1990,8 @@ async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
     await quiesce.assert_still_stopped(
         ctx.source_host, label_filters=observed_labels(ctx.plan), since=before
     )
+    # What the copy is a copy of, for the rollback guard after FINALIZE.
+    await containment.record_source_volumes(ctx)
     return {
         "volumes_copied": copied,
         "key_fingerprint": ctx.ephemeral_key.fingerprint,

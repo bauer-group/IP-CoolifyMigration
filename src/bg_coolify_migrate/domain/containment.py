@@ -56,6 +56,12 @@ from datetime import UTC, datetime
 #: state check alone.
 STOP_CLOCK = "stop_clock"
 
+#: COPY journals ``{source volume: CreatedAt}`` for every source volume it copied,
+#: once the end-of-copy checkpoint passed. A rollback after FINALIZE(keep/rename)
+#: compares it (``compensations.source_data_refusal``): a volume pruned and
+#: recreated EMPTY by a redeploy keeps its name, never its CreatedAt.
+SOURCE_VOLUMES_CREATED = "source_volumes_created"
+
 #: Container states that cannot write. ``gone`` is the discovery layer's state
 #: for a container removed between ``docker ps`` and ``docker inspect``.
 _STOPPED = frozenset({"exited", "created", "dead", "gone"})
@@ -186,6 +192,16 @@ def parse_event_log(stdout: str) -> EventLog:
             continue
         starts.append(StartEvent(name=attributes.get("name", ""), time=when, attributes=attributes))
     return EventLog(starts=tuple(starts), oldest=oldest)
+
+
+def parse_volume_created(stdout: str) -> dict[str, str]:
+    """``docker volume inspect --format '{{.Name}} {{.CreatedAt}}'`` -> ``{name: CreatedAt}``."""
+    out: dict[str, str] = {}
+    for line in stdout.splitlines():
+        name, _, created = line.strip().partition(" ")
+        if name and created.strip():
+            out[name] = created.strip()
+    return out
 
 
 # ── deciding ────────────────────────────────────────────────────────────────
@@ -333,6 +349,21 @@ def event_log_gap(events: EventLog | None, since: int | None) -> int | None:
     if events is None or since is None or events.oldest is None:
         return None
     return events.oldest if events.oldest > since else None
+
+
+def volume_recreated(recorded: str, current: str) -> bool:
+    """Is this not the volume COPY read? Compared as instants, so a daemon whose
+    time zone changed is not mistaken for a new volume.
+
+    A local volume's CreatedAt is the change time of its directory
+    (``/var/lib/docker/volumes/<name>``, moby v27.5.1 volume/local/local.go:229-236),
+    so a volume removed and created again under the same name — what a prune
+    followed by a redeploy does — reads a new one.
+    """
+    before, now = parse_docker_time(recorded), parse_docker_time(current)
+    if before is None or now is None:
+        return recorded.strip() != current.strip()
+    return before != now
 
 
 # ── what the operator reads ─────────────────────────────────────────────────
