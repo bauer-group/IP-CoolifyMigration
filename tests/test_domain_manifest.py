@@ -8,6 +8,7 @@ bug.
 from __future__ import annotations
 
 from bg_coolify_migrate.domain.compose import MountClass
+from bg_coolify_migrate.domain.kinds import ResourceKind
 from bg_coolify_migrate.domain.manifest import (
     ApiStorage,
     Decision,
@@ -132,10 +133,51 @@ class TestBindMounts:
         assert item.decision is Decision.SKIP
         assert item.mount_class is MountClass.PASSTHROUGH
 
-    def test_coolify_config_dir_is_skipped(self) -> None:
-        # /data/coolify/applications/{uuid}/ is derived state: regenerated on
-        # every deploy and embedding the OLD uuid. Copying it plants stale
-        # container names and labels on the target.
+    def test_a_file_coolify_writes_from_its_row_is_skipped(self) -> None:
+        # A file storage WITH content is rewritten from the row at every deploy
+        # (LocalFileVolume v4.7.2:390-392): regenerated, not data.
+        manifest = reconcile(
+            docker_mounts=[
+                _m(
+                    type="bind",
+                    source="/data/coolify/applications/olduuid/app.conf",
+                    destination="/app/app.conf",
+                    name=None,
+                )
+            ],
+            api_storages=[
+                ApiStorage(
+                    kind="file",
+                    mount_path="/app/app.conf",
+                    fs_path="/data/coolify/applications/olduuid/app.conf",
+                    has_content=True,
+                )
+            ],
+            resource_uuid="olduuid",
+        )
+        (item,) = manifest.items
+        assert item.decision is Decision.SKIP
+        assert "content" in item.reason
+
+    def test_a_directory_in_the_resource_dir_is_data_not_regenerated(self) -> None:
+        # Skipping all of /data/coolify lost a service's ./data:/data: Coolify
+        # only mkdir -p's such a directory and never refills it.
+        manifest = reconcile(
+            docker_mounts=[
+                _m(
+                    type="bind",
+                    source="/data/coolify/services/olduuid/data",
+                    destination="/data",
+                    name=None,
+                )
+            ],
+            resource_uuid="olduuid",
+        )
+        (item,) = manifest.items
+        assert item.decision is Decision.MIGRATE
+        assert "never regenerates" in item.reason
+
+    def test_another_resources_coolify_dir_is_not_ours_to_copy(self) -> None:
         manifest = reconcile(
             docker_mounts=[
                 _m(
@@ -144,11 +186,11 @@ class TestBindMounts:
                     destination="/app/docker-compose.yml",
                     name=None,
                 )
-            ]
+            ],
+            resource_uuid="someone-else",
         )
         (item,) = manifest.items
-        assert item.decision is Decision.SKIP
-        assert "regenerates" in item.reason
+        assert item.decision is Decision.REFUSE
 
 
 class TestAnonymousVolumes:
@@ -196,21 +238,33 @@ class TestApiCrossCheck:
         )
         assert any("no container currently mounts" in w for w in manifest.warnings)
 
-    def test_placeholder_content_warns_so_it_is_rsynced_instead(self) -> None:
+    def test_placeholder_content_is_mirrored_with_rsync_where_it_is_mounted(self) -> None:
         # LocalFileVolume.content caps at 5 MiB and returns '[binary file]' /
         # '[file too large to display]'. Such a file cannot be recreated through
-        # the API, so it must be mirrored instead.
+        # the API, so it must be mirrored instead — which, until COPY learnt to
+        # copy binds, the plan promised and nothing did.
         manifest = reconcile(
-            docker_mounts=[_m(name="v1")],
+            docker_mounts=[
+                _m(
+                    type="bind",
+                    source="/data/coolify/services/u1/blob.bin",
+                    destination="/app/blob.bin",
+                    name=None,
+                )
+            ],
             api_storages=[
                 ApiStorage(
                     kind="file",
                     mount_path="/app/blob.bin",
+                    fs_path="./blob.bin",
                     content_is_placeholder=True,
                 )
             ],
+            resource_uuid="u1",
+            kind=ResourceKind.SERVICE_COMPOSE,
         )
-        assert any("5 MiB content cap" in w for w in manifest.warnings)
+        (item,) = manifest.to_migrate
+        assert "rsync" in item.reason
 
     def test_matching_storage_produces_no_warning(self) -> None:
         manifest = reconcile(

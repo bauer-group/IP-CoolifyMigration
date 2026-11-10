@@ -38,6 +38,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from bg_coolify_migrate.domain.binds import BIND_TARGET
+
 
 class State(StrEnum):
     """States of an F1 project migration, in execution order."""
@@ -379,6 +381,11 @@ def owed_states(
     START_TARGET is owed, in a failing run as in the explicit command, once a
     target may run (:func:`target_may_run`): START asked for one, or a
     checkpoint found one someone else started.
+
+    COPY is owed, likewise, as soon as it journalled a bind target
+    (``binds.BIND_TARGET``) — also when it then FAILED: a bind is copied onto a
+    host path outside the target resource, which no target delete removes, so
+    only DROP_TARGET_VOLUMES can take back what this run created there.
     """
     owed = dict.fromkeys(str(s) for s in completed)
     for state in (in_flight, *undo_incomplete):
@@ -388,6 +395,8 @@ def owed_states(
         owed.setdefault(State.QUIESCE.value)
     if target_may_run(owed, (markers or {}).get(State.START_TARGET.value) or {}):
         owed.setdefault(State.START_TARGET.value)
+    if ((markers or {}).get(State.COPY.value) or {}).get(BIND_TARGET):
+        owed.setdefault(State.COPY.value)
     return tuple(owed)
 
 

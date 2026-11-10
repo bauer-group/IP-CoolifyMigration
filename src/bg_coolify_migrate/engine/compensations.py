@@ -20,7 +20,7 @@ import structlog
 
 from bg_coolify_migrate.api import resources as api_resources
 from bg_coolify_migrate.discovery import docker, pins
-from bg_coolify_migrate.domain import domains
+from bg_coolify_migrate.domain import binds, domains
 from bg_coolify_migrate.domain.containment import unsettled, volume_recreated
 from bg_coolify_migrate.domain.deployments import (
     Deployment,
@@ -39,10 +39,15 @@ from bg_coolify_migrate.domain.statemachine import (
     source_was_stopped,
 )
 from bg_coolify_migrate.engine import containment, deploy_triggers, keys
-from bg_coolify_migrate.engine.context import MigrationContext, deserialise_volume_pairs
+from bg_coolify_migrate.engine.context import (
+    MigrationContext,
+    deserialise_bind_pairs,
+    deserialise_volume_pairs,
+)
 from bg_coolify_migrate.errors import CoolifyApiError, MigrationError
 from bg_coolify_migrate.journal.store import JournalRecord
 from bg_coolify_migrate.settings.base import Settings
+from bg_coolify_migrate.transfer import binds as transfer_binds
 
 log = structlog.get_logger(__name__)
 
@@ -634,6 +639,8 @@ async def undo_copy(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
 
     Unpinned first: Docker refuses to remove a volume a container references,
     even with ``-f``, and ``remove_volume`` only logs that refusal.
+
+    Then the bind mounts' targets (:func:`_remove_bind_targets`).
     """
     await pins.release(ctx.target_host, migration_id=ctx.migration_id, side=pins.TARGET)
     volumes: list[str] = undo_info.get("volumes_copied") or []
@@ -641,6 +648,87 @@ async def undo_copy(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
         await docker.remove_volume(ctx.target_host, name)
     if volumes:
         log.info("compensate.volumes_dropped", count=len(volumes))
+    await _remove_bind_targets(ctx)
+
+
+async def _remove_bind_targets(ctx: MigrationContext) -> None:
+    """Delete on the TARGET server only what COPY created for a bind mount.
+
+    Exactly the paths COPY journalled as absent before it wrote them
+    (``binds.BIND_TARGET``), each passing :func:`binds.removable`, and none a
+    previous rollback already removed (``binds.BINDS_REMOVED``): a replayed
+    rollback must not delete what someone created there since. A path that was
+    already there, empty, is not this run's to delete — inside the target's own
+    directory Coolify's delete of the target takes it (``deleteConfigurations``,
+    Application/Service v4.7.2:587-594/226-233); outside, the run says so.
+
+    After FINALIZE (keep or rename) the target may hold the only copy: a target
+    path is deleted only while the source still holds its bind
+    (:func:`statemachine.source_copy_unproven`), else it is kept and the
+    compensation fails loudly.
+    """
+    owed = binds.owed_bind_targets((r.event, r.detail) for r in ctx.journal.read())
+    if not owed:
+        return
+    target_uuids = set(ctx.target_uuids.values()) | set(
+        (ctx.journal.undo_info(State.CREATE_TARGET.value).get("target_uuids") or {}).values()
+    )
+    sources = {
+        pair.target_path: pair.source_path
+        for found in deserialise_bind_pairs(
+            ctx.journal.undo_info(State.DISCOVER.value).get("volume_pairs")
+        ).values()
+        for pair in found
+    }
+    guarded = source_copy_unproven(ctx.journal.details())
+    source_states: dict[str, str] = {}
+    if guarded:
+        source_states = await transfer_binds.path_states(
+            ctx.source_host, sorted({s for t, s in sources.items() if t in owed})
+        )
+
+    removed: list[str] = []
+    kept: list[str] = []
+    for target in owed.values():
+        if target.prior != binds.STATE_MISSING:
+            if not any(binds.own_dir_of(target.path, u) for u in target_uuids):
+                ctx.notices.append(
+                    f"{target.path} on {ctx.plan.target_server.name} was empty before this "
+                    "migration and now holds a copy of the source's bind mount. The rollback "
+                    "deletes only what the migration created, so it is left as it is: empty it "
+                    "by hand if the copy is not wanted."
+                )
+            continue
+        if guarded:
+            # No DISCOVER record of its source proves nothing: kept, like a gone one.
+            source = sources.get(target.path)
+            state = source_states.get(source, binds.STATE_MISSING) if source else None
+            if state in (None, binds.STATE_MISSING):
+                kept.append(f"{target.path} (the source's {source or 'bind'} is gone)")
+                continue
+        allowed = {p for p in target.created if binds.removable(p, target_uuids=target_uuids)}
+        if target.path not in allowed:
+            log.error("compensate.bind_target_unsafe", path=target.path)
+            kept.append(f"{target.path} (not a path a rollback may delete)")
+            continue
+        await transfer_binds.remove_created(ctx.target_host, target, removable=allowed)
+        removed.append(target.path)
+
+    if removed:
+        ctx.journal.append(
+            "rollback_step",
+            state=State.COPY.value,
+            detail={
+                "compensation": Compensation.DROP_TARGET_VOLUMES.value,
+                binds.BINDS_REMOVED: removed,
+            },
+        )
+        log.info("compensate.bind_targets_removed", count=len(removed))
+    if kept:
+        raise RuntimeError(
+            f"bind target(s) KEPT on {ctx.plan.target_server.name}: {', '.join(kept)} - they may "
+            "hold the only copy of the data; delete them by hand once it is safe"
+        )
 
 
 async def undo_revoke_key(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:

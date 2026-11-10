@@ -177,6 +177,34 @@ async def collect_metadata(host: RemoteHost, path: str) -> dict[str, str]:
     return out
 
 
+async def collect_file(host: RemoteHost, path: str) -> Manifest:
+    """Both manifests for ONE regular file (a file bind mount), keyed ``.``.
+
+    The same two halves as a tree — the sha256 of its bytes and its
+    ``type|mode|uid|gid|linktarget`` — so a file is verified exactly as
+    thoroughly as a volume. Keyed ``.`` on both sides, like a volume root.
+    """
+    quoted = shlex.quote(path)
+    if await _has_gnu_find(host):
+        stat_cmd = f"find {quoted} -maxdepth 0 -printf '%y|%m|%U|%G|%l\\n' 2>/dev/null"
+    else:
+        stat_cmd = (
+            f'f={quoted}; if [ -L "$f" ]; then printf "l|"; elif [ -d "$f" ]; then printf "d|"; '
+            f'else printf "f|"; fi; stat -c \'%a|%u|%g\' "$f" 2>/dev/null | tr -d \'\\n\'; '
+            f'printf "|"; if [ -L "$f" ]; then readlink "$f" | tr -d "\\n"; fi; printf "\\n"'
+        )
+    meta = await host.run(stat_cmd, timeout=None)
+    digest = await host.run(f"sha256sum {quoted} 2>/dev/null", timeout=None)
+    line = meta.stdout.strip()
+    hashed = digest.stdout.strip().split()
+    if not meta.ok or not digest.ok or not line or not hashed:
+        raise VerificationError(
+            f"could not hash and stat {path} on {host.target.host}",
+            hint=((meta.stderr or "") + (digest.stderr or "")).strip()[:400] or None,
+        )
+    return Manifest(content={".": hashed[0]}, metadata={".": line})
+
+
 async def build_manifest(host: RemoteHost, path: str, *, parallel: int = 4) -> Manifest:
     """Both manifests for one tree."""
     content = await collect_content(host, path, parallel=parallel)
@@ -242,16 +270,24 @@ async def verify_volume(
     source_path: str,
     target_path: str,
     parallel: int = 4,
+    single_file: bool = False,
 ) -> VerificationReport:
     """Build both manifests and compare them.
+
+    ``single_file``: both paths name one regular file (a file bind mount)
+    rather than a tree.
 
     Raises:
         VerificationError: Never — the caller decides. A report with
             ``ok == False`` is data, not an exception; the engine turns it into
             one so the failure carries the plan's context.
     """
-    source = await build_manifest(source_host, source_path, parallel=parallel)
-    target = await build_manifest(target_host, target_path, parallel=parallel)
+    if single_file:
+        source = await collect_file(source_host, source_path)
+        target = await collect_file(target_host, target_path)
+    else:
+        source = await build_manifest(source_host, source_path, parallel=parallel)
+        target = await build_manifest(target_host, target_path, parallel=parallel)
     diffs = compare(source, target)
     report = VerificationReport(
         source_path=source_path,

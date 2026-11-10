@@ -30,12 +30,15 @@ This is what makes the tool application-unaware: we never ask "is this Postgres?
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from bg_coolify_migrate.domain.compose import PASSTHROUGH_HOST_PATHS, MountClass
-from bg_coolify_migrate.domain.naming import COOLIFY_BASE_DIR, volume_data_path
+from bg_coolify_migrate.domain import binds
+from bg_coolify_migrate.domain.compose import MountClass
+from bg_coolify_migrate.domain.kinds import ResourceKind
+from bg_coolify_migrate.domain.naming import volume_data_path
 
 
 class DiscoverySource(StrEnum):
@@ -86,6 +89,11 @@ class ApiStorage(BaseModel):
     """True when the API returned ``[binary file]`` or ``[file too large to
     display]`` instead of real content (the 5 MiB cap). Such a file cannot be
     recreated through the API and must be rsynced instead."""
+    fs_path: str | None = None
+    """A file storage's host path, as stored (absolute, or relative to the
+    resource's directory)."""
+    has_content: bool = False
+    """A file storage Coolify writes from content kept in the row."""
 
 
 class DockerVolume(BaseModel):
@@ -158,13 +166,57 @@ class VolumeManifest(BaseModel):
         return bool(self.refused)
 
 
-def _is_coolify_config_dir(host_path: str) -> bool:
-    """True for /data/coolify/{applications,services,databases}/<uuid>/... paths.
+@dataclass(frozen=True, slots=True)
+class _BindContext:
+    """What a bind's classification needs beyond the mount itself."""
 
-    Derived state: regenerated on every deploy and embedding the OLD uuid.
-    Copying it would plant stale container names and labels on the target.
-    """
-    return host_path.startswith(f"{COOLIFY_BASE_DIR}/")
+    uuid: str | None
+    rows: tuple[binds.StorageRow, ...] | None
+    carry: binds.StorageCarry
+    base: str
+    """Where a relative ``fs_path`` of this resource resolves."""
+
+
+def _storage_host_path(s: ApiStorage, context: _BindContext) -> str | None:
+    """The host path a storage row mounts, or None for a named volume. PURE."""
+    if s.kind == "file":
+        return binds.resolve_fs_path(s.fs_path, context.base)
+    return binds.normalise(s.host_path)
+
+
+_BIND_CLASSES: dict[binds.BindAction, tuple[MountClass, Decision]] = {
+    binds.BindAction.MIGRATE: (MountClass.BIND, Decision.MIGRATE),
+    binds.BindAction.SKIP: (MountClass.BIND, Decision.SKIP),
+    binds.BindAction.PASSTHROUGH: (MountClass.PASSTHROUGH, Decision.SKIP),
+    binds.BindAction.REFUSE: (MountClass.BIND, Decision.REFUSE),
+}
+
+
+def _bind_context(
+    api_storages: list[ApiStorage] | None, *, uuid: str | None, kind: ResourceKind | None
+) -> _BindContext:
+    """The resource's host-path storage rows, resolved where Coolify mounts them. PURE."""
+    carry = binds.carry_for(kind)
+    base = binds.workdir(kind, uuid or "")
+    if api_storages is None:
+        return _BindContext(uuid=uuid, rows=None, carry=carry, base=base)
+    context = _BindContext(uuid=uuid, rows=(), carry=carry, base=base)
+    rows: list[binds.StorageRow] = []
+    for s in api_storages:
+        mount = binds.normalise(s.mount_path)
+        host = _storage_host_path(s, context)
+        if mount is None or host is None:
+            continue
+        is_file = s.kind == "file"
+        rows.append(
+            binds.StorageRow(
+                mount,
+                host,
+                writes_content=is_file and s.has_content and not s.content_is_placeholder,
+                placeholder=is_file and s.content_is_placeholder,
+            )
+        )
+    return _BindContext(uuid=uuid, rows=tuple(rows), carry=carry, base=base)
 
 
 #: Appended to an anonymous-volume refusal. Coolify removes every container on
@@ -179,23 +231,25 @@ _OFFLINE_HINT = (
 )
 
 
-def _classify_docker_mount(m: DockerMount) -> tuple[MountClass, Decision, str]:
+def _classify_docker_mount(
+    m: DockerMount, context: _BindContext
+) -> tuple[MountClass, Decision, str]:
     if m.type == "tmpfs":
         return MountClass.TMPFS, Decision.SKIP, "tmpfs is RAM-backed and empty by contract"
     if m.type == "bind":
-        if m.source in PASSTHROUGH_HOST_PATHS:
-            return (
-                MountClass.PASSTHROUGH,
-                Decision.SKIP,
-                f"{m.source} is supplied by the target host, not migrated",
-            )
-        if _is_coolify_config_dir(m.source):
-            return (
-                MountClass.BIND,
-                Decision.SKIP,
-                "Coolify regenerates this config dir on deploy; it embeds the old uuid",
-            )
-        return MountClass.BIND, Decision.MIGRATE, "bind mount: host data must be mirrored"
+        # domain/binds.py: a bind is an arbitrary host path, so whether it is
+        # data, where the target mounts it and whether it may be written are
+        # decided there, against the resource's own storage rows.
+        action, reason = binds.classify(
+            source=m.source,
+            destination=m.destination,
+            read_only=not m.rw,
+            uuid=context.uuid,
+            rows=context.rows,
+            carry=context.carry,
+        )
+        mount_class, decision = _BIND_CLASSES[action]
+        return mount_class, decision, reason
     if m.type == "volume":
         if not m.name:
             return (
@@ -227,6 +281,8 @@ def reconcile(
     api_storages: list[ApiStorage] | None = None,
     docker_volumes: list[DockerVolume] | None = None,
     uuid_prefixes: frozenset[str] = frozenset(),
+    resource_uuid: str | None = None,
+    kind: ResourceKind | None = None,
 ) -> VolumeManifest:
     """Merge the three discovery sources into one manifest.
 
@@ -236,14 +292,19 @@ def reconcile(
             This is the authority.
         api_storages: From ``GET /v1/{kind}/{uuid}/storages``. Used to detect
             intent that Docker does not show, and file-mounts whose content the
-            API cannot round-trip.
+            API cannot round-trip. ``None`` when the API could not be read: a
+            bind mount is then judged without its storage rows.
         docker_volumes: From ``docker volume ls``. Used only to surface orphans.
         uuid_prefixes: Resource uuids of the stack, used to recognise which
             unattached volumes are plausibly ours.
+        resource_uuid: The resource's uuid: which paths under ``/data/coolify``
+            are its own directory (domain/binds.py).
+        kind: The resource's kind: how its storage rows reach the target.
 
     Returns:
         A manifest whose every item carries a decision and a reason.
     """
+    bind_context = _bind_context(api_storages, uuid=resource_uuid, kind=kind)
     api_storages = api_storages or []
     docker_volumes = docker_volumes or []
 
@@ -255,7 +316,7 @@ def reconcile(
 
     # 1. Docker inspect — the truth.
     for m in docker_mounts:
-        mount_class, decision, reason = _classify_docker_mount(m)
+        mount_class, decision, reason = _classify_docker_mount(m, bind_context)
         # One item per payload, not per sighting. The same named volume mounted
         # into a second container (nginx and php-fpm sharing a WordPress web
         # root) — or at a second path — is the same bytes seen again, not a
@@ -267,11 +328,18 @@ def reconcile(
             if m.name in seen_volume_names:
                 continue
             seen_volume_names.add(m.name)
-        elif m.type == "bind" and decision is Decision.MIGRATE:
-            if m.source in seen_bind_sources:
+        elif m.type == "bind" and decision is not Decision.SKIP:
+            # Once per host path: the copy, the refusal and the plan row alike.
+            key = binds.normalise(m.source) or m.source
+            if key in seen_bind_sources:
                 continue
-            seen_bind_sources.add(m.source)
-        source_path = volume_data_path(m.name) if m.type == "volume" and m.name else m.source
+            seen_bind_sources.add(key)
+        if m.type == "volume" and m.name:
+            source_path = volume_data_path(m.name)
+        elif m.type == "bind":
+            source_path = binds.normalise(m.source) or m.source
+        else:
+            source_path = m.source
         items.append(
             VolumeItem(
                 mount_class=mount_class,
@@ -291,11 +359,9 @@ def reconcile(
     docker_paths = {m.destination for m in docker_mounts}
     volumes_by_name = {v.name: v for v in docker_volumes}
     for s in api_storages:
-        if s.content_is_placeholder:
-            warnings.append(
-                f"file mount at {s.mount_path!r} exceeds the API's 5 MiB content cap "
-                "(or is binary); it will be mirrored with rsync instead of recreated via the API"
-            )
+        # A file the API shows as a placeholder (binary, over the 5 MiB cap) is
+        # judged where a container mounts it — step 1 mirrors it with rsync, or
+        # refuses it where CREATE cannot recreate it (domain/binds.classify).
         if s.mount_path in docker_paths:
             continue  # a live mount already covers it (step 1 is the truth)
 
@@ -340,6 +406,38 @@ def reconcile(
             )
             if s.name:
                 migrating_names.add(s.name)
+            continue
+
+        # The same safety net for a host path. With no container at all (an
+        # already-stopped stack), Coolify's row is the only record of a bind,
+        # and its directory holds data no restart regenerates. While containers
+        # exist, an unmounted row is stale (the compose no longer declares it),
+        # and the target's parse would create no row to copy it to.
+        host = _storage_host_path(s, bind_context)
+        if not docker_mounts and host is not None:
+            action, reason = binds.classify(
+                source=host,
+                destination=s.mount_path,
+                read_only=True,  # no container to say otherwise: never copy a system path
+                uuid=bind_context.uuid,
+                rows=bind_context.rows,
+                carry=bind_context.carry,
+            )
+            mount_class, decision = _BIND_CLASSES[action]
+            if decision is not Decision.SKIP:
+                if host in seen_bind_sources:
+                    continue
+                seen_bind_sources.add(host)
+            items.append(
+                VolumeItem(
+                    mount_class=mount_class,
+                    decision=decision,
+                    reason=f"{reason} (declared by Coolify; no container mounts it now)",
+                    source_path=host,
+                    mount_path=s.mount_path,
+                    discovered_from=frozenset({DiscoverySource.COOLIFY_API}),
+                )
+            )
             continue
 
         warnings.append(

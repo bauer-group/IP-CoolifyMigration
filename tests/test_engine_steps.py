@@ -2019,7 +2019,7 @@ class TestDiscoverPairing:
         }
         object.__setattr__(ctx.settings, "target_storage_timeout", 0.0)
 
-        async def fake_manifest(host, *, mounts, api_storages, uuid, measure):  # type: ignore[no-untyped-def]
+        async def fake_manifest(host, *, mounts, api_storages, uuid, measure, **_kw):  # type: ignore[no-untyped-def]
             return _manifest()
 
         async def fake_read(api, *, collection, uuid):  # type: ignore[no-untyped-def]
@@ -2083,7 +2083,7 @@ class TestDiscoverPairing:
         }
         object.__setattr__(ctx.settings, "target_storage_timeout", 0.0)
 
-        async def fake_manifest(host, *, mounts, api_storages, uuid, measure):  # type: ignore[no-untyped-def]
+        async def fake_manifest(host, *, mounts, api_storages, uuid, measure, **_kw):  # type: ignore[no-untyped-def]
             return ctx.plan.resources[0].manifest
 
         async def fake_read(api, *, collection, uuid):  # type: ignore[no-untyped-def]
@@ -2158,7 +2158,7 @@ class TestDiscoverPairing:
         }
         object.__setattr__(ctx.settings, "target_storage_timeout", 0.0)
 
-        async def fake_manifest(host, *, mounts, api_storages, uuid, measure):  # type: ignore[no-untyped-def]
+        async def fake_manifest(host, *, mounts, api_storages, uuid, measure, **_kw):  # type: ignore[no-untyped-def]
             return manifest
 
         async def fake_read(api, *, collection, uuid):  # type: ignore[no-untyped-def]

@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from bg_coolify_migrate.api.client import CoolifyClient
+from bg_coolify_migrate.domain.binds import BindPair
 from bg_coolify_migrate.domain.compose import MountClass
 from bg_coolify_migrate.domain.kinds import DatabaseEngine, ResourceKind
 from bg_coolify_migrate.domain.manifest import Decision, VolumeItem, VolumeManifest
@@ -33,6 +34,7 @@ from bg_coolify_migrate.domain.statemachine import Outcome, State
 from bg_coolify_migrate.engine import runner, steps
 from bg_coolify_migrate.engine.context import (
     MigrationContext,
+    deserialise_bind_pairs,
     deserialise_volume_pairs,
     is_volume_row,
 )
@@ -126,6 +128,18 @@ class TestDeserialiseVolumePairs:
         only_bind = {"app1": [{"source": "/srv/x", "target": "/srv/x", "mount_path": "/x"}]}
         assert deserialise_volume_pairs(only_bind) == {"app1": []}
 
+    def test_bind_rows_rebuild_as_bind_pairs(self) -> None:
+        # The other half of the journal: what a resumed COPY and VERIFY move.
+        pairs = deserialise_bind_pairs(RECORDED)
+        assert pairs == {"db1": [BindPair("/srv/uploads", "/srv/uploads", "/uploads")]}
+
+    def test_a_bind_row_without_an_absolute_target_raises(self) -> None:
+        with pytest.raises(ValueError, match="absolute target"):
+            deserialise_bind_pairs({"db1": [{"source": "/srv/x", "target": "srv/x"}]})
+        with pytest.raises(ValueError, match="not a list"):
+            deserialise_bind_pairs({"db1": "nope"})
+        assert deserialise_bind_pairs(None) == {}
+
     def test_a_non_list_entry_raises_rather_than_reading_as_no_volumes(self) -> None:
         with pytest.raises(ValueError, match="not a list"):
             deserialise_volume_pairs({"db1": "postgres-data-db1"})
@@ -205,13 +219,16 @@ class TestPairsNotLoadedGuard:
         with pytest.raises(TransferError, match="verify"):
             await steps.step_verify(ctx)
 
-    async def test_a_bind_mount_only_resource_is_not_a_lost_pair(
+    async def test_a_bind_mount_only_resource_is_not_a_lost_pair_and_is_reloaded(
         self, ctx: MigrationContext
     ) -> None:
+        # Not a lost VOLUME pair — and not "nothing to copy" either: COPY used to
+        # take a binds-only journal as a stateless stack and copy no byte.
         self._discover_completed(
             ctx, {"db1": [{"source": "/srv/x", "target": "/srv/x", "mount_path": "/x"}]}
         )
-        assert (await steps.step_copy(ctx))["volumes_copied"] == []
+        steps._assert_pairs_loaded(ctx, step="copy")  # no raise
+        assert [p.target_path for p in steps._bind_pairs(ctx)["db1"]] == ["/srv/x"]
 
     async def test_loaded_pairs_pass_the_guard(self, ctx: MigrationContext) -> None:
         self._discover_completed(ctx, RECORDED)

@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import shlex
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import structlog
@@ -34,7 +34,9 @@ from bg_coolify_migrate.dns.gate import (
     explain_why_blocking_matters,
     is_definitive,
 )
-from bg_coolify_migrate.domain import domains, fidelity
+from bg_coolify_migrate.domain import binds, domains, fidelity
+from bg_coolify_migrate.domain.binds import BindPair
+from bg_coolify_migrate.domain.compose import MountClass
 from bg_coolify_migrate.domain.containment import STOP_CLOCK, STOPPED_CLOCK, TARGET_HINT
 from bg_coolify_migrate.domain.deployments import (
     Progress,
@@ -44,7 +46,7 @@ from bg_coolify_migrate.domain.deployments import (
 )
 from bg_coolify_migrate.domain.deployments import Verdict as DeploymentVerdict
 from bg_coolify_migrate.domain.kinds import GitAuth, ResourceKind
-from bg_coolify_migrate.domain.manifest import DockerMount
+from bg_coolify_migrate.domain.manifest import DockerMount, VolumeManifest
 from bg_coolify_migrate.domain.naming import (
     VolumeEndpoint,
     VolumePair,
@@ -65,8 +67,10 @@ from bg_coolify_migrate.domain.versions import parse_version
 from bg_coolify_migrate.engine import compensations, containment, deploy_triggers, env_recovery, keys
 from bg_coolify_migrate.engine.context import (
     MigrationContext,
+    deserialise_bind_pairs,
     dns_baseline_of,
     is_volume_row,
+    serialise_bind_pairs,
     serialise_dns_baseline,
     serialise_mounts,
 )
@@ -90,6 +94,7 @@ from bg_coolify_migrate.errors import (
     TransferError,
     VerificationError,
 )
+from bg_coolify_migrate.transfer import binds as transfer_binds
 from bg_coolify_migrate.transfer import rsync, ssh, verify
 from bg_coolify_migrate.transfer.partition import PathEntry, plan_transfer, suggest_parallelism
 from bg_coolify_migrate.transfer.ssh import LOOPBACK
@@ -401,6 +406,7 @@ async def step_preflight(ctx: MigrationContext) -> dict[str, Any]:
     if hard:
         raise PreflightError("the plan is blocked:\n" + "\n".join(hard))
 
+    await _assert_source_binds_safe(ctx)
     return {
         "free_bytes": free,
         "required_bytes": required,
@@ -672,6 +678,7 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
         # hosts to it. If a record moved or vanished since the plan, the premise
         # of this migration broke under it — stop with zero downtime.
         await _refuse_moved_dns(ctx)
+        await _assert_target_binds_safe(ctx)
     except Exception as exc:
         # The saga compensates only COMPLETED steps, so a refusal part-way
         # through CREATE — the compose gate, the service rehearsal, a claim
@@ -1772,6 +1779,7 @@ async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
     """
     pairs_recorded: dict[str, list[dict[str, str]]] = {}
     source_pins: set[str] = set()
+    bind_pairs: dict[str, list[BindPair]] = {}
 
     for resource in ctx.plan.resources:
         snapshot = resource.snapshot
@@ -1804,6 +1812,7 @@ async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
             api_storages=await _storages_or_none(ctx, snapshot.collection, snapshot.uuid),
             uuid=snapshot.uuid,
             measure=True,
+            kind=snapshot.kind,
         )
         if manifest.is_blocked:
             reasons = "; ".join(i.reason for i in manifest.refused)
@@ -1843,18 +1852,363 @@ async def step_discover(ctx: MigrationContext) -> dict[str, Any]:
             for p in pairs
         ]
 
-        # Bind mounts have no docker volume; mirror them path-to-path.
-        for item in manifest.to_migrate:
-            if item.source_name is None:
-                pairs_recorded[snapshot.uuid].append(
-                    {
-                        "source": item.source_path,
-                        "target": item.source_path,
-                        "mount_path": item.mount_path,
-                    }
-                )
+        # Bind mounts have no docker volume. Each pairs with the storage row
+        # Coolify made for the TARGET at its mount path — read back, never the
+        # source path with its uuid swapped (domain/binds.py, invariant 10).
+        bind_pairs[snapshot.uuid] = await _read_target_bind_pairs(
+            ctx,
+            snapshot,
+            _source_binds(manifest),
+            target_uuid=target_uuid,
+            consequence="The source will be restarted and the target deleted.",
+        )
 
+    await _record_bind_pairs(ctx, bind_pairs, pairs_recorded)
     return {"volume_pairs": pairs_recorded, "source_pins": sorted(source_pins)}
+
+
+# ── bind mounts (domain/binds.py decides; transfer/binds.py asks) ──────────
+
+_NEVER_STOPPED = (
+    "The source was never stopped and keeps serving; the created target will be deleted."
+)
+_ROLLED_BACK = "The source will be restarted and the target deleted."
+
+
+def _source_binds(manifest: VolumeManifest) -> list[tuple[str, str]]:
+    """``(host path, mount path)`` of every bind mount the manifest migrates. PURE."""
+    return [
+        (i.source_path, i.mount_path)
+        for i in manifest.to_migrate
+        if i.mount_class is MountClass.BIND
+    ]
+
+
+def _plan_binds(ctx: MigrationContext) -> list[str]:
+    """Every host path the plan migrates as a bind mount, once. PURE."""
+    return sorted({path for r in ctx.plan.resources for path, _ in _source_binds(r.manifest)})
+
+
+async def _assert_source_binds_safe(ctx: MigrationContext) -> None:
+    """PREFLIGHT, while the source serves: every bind to copy is copyable and ours alone.
+
+    A bind source must be a directory or a regular file (a socket or device
+    holds no data, a symlink is not followed). And no container OUTSIDE the
+    plan may share its bytes: QUIESCE stops only the plan's resources, so such
+    a container keeps writing during the copy — no consistent copy — and after
+    the cutover it and the target hold two diverging copies of shared state.
+    """
+    paths = _plan_binds(ctx)
+    if not paths:
+        return
+    states = await transfer_binds.path_states(ctx.source_host, paths)
+    problems = [p for path in paths if (p := binds.source_state_problem(path, states[path]))]
+    labels = [
+        resource_labels(
+            project=ctx.plan.project, environment=ctx.plan.environment, name=r.snapshot.name
+        )
+        for r in ctx.plan.resources
+    ]
+    others = [
+        bind
+        for bind in await transfer_binds.host_binds(ctx.source_host)
+        if not binds.belongs_to(
+            bind, uuids=[r.snapshot.uuid for r in ctx.plan.resources], label_sets=labels
+        )
+    ]
+    for path in paths:
+        problems.extend(
+            f"{path} is also mounted by {other.container} ({other.source}"
+            f"{'' if other.rw else ', read-only'}), which this migration does not stop"
+            for other in binds.shared_with(path, others)
+        )
+    if problems:
+        raise PreflightError(
+            "bind mount(s) cannot be copied safely:\n" + "\n".join(f"  {p}" for p in problems),
+            hint=(
+                "A bind mount is copied as the source's host path holds it once the plan's "
+                "resources are stopped. A path another container shares keeps changing "
+                "during the copy, and after the cutover the two would hold diverging copies. "
+                "Move the shared data into a volume of one resource, or migrate the "
+                "resources that share it together.\n"
+                "Nothing has been changed and the source is untouched."
+            ),
+        )
+
+
+async def _read_target_bind_pairs(
+    ctx: MigrationContext,
+    snapshot: ResourceSnapshot,
+    sources: list[tuple[str, str]],
+    *,
+    target_uuid: str,
+    consequence: str,
+) -> list[BindPair]:
+    """Pair the source's binds with the storage rows Coolify made for the target.
+
+    A compose app's rows come from the same asynchronous LoadComposeFile parse
+    as its volumes, so they are waited for (:func:`_await_target_volumes`'s
+    reason); a service parses inline and a plain app's rows are POSTed by
+    ``copy_storages``, so theirs exist when CREATE returns.
+
+    Raises:
+        TransferError: A bind with no single row at its mount path: its data
+            would be left behind.
+    """
+    if not sources:
+        return []
+    base = binds.workdir(snapshot.kind, target_uuid)
+    expected = {binds.normalise(mount) for _, mount in sources}
+    compose_app = snapshot.kind is ResourceKind.APP_GIT_COMPOSE
+    deadline = ctx.settings.target_storage_timeout if compose_app else 0.0
+    waited = 0.0
+    while True:
+        storages = await ctx.api.get_storages(snapshot.collection, target_uuid)
+        rows = binds.storage_rows(storages, base=base)
+        if expected <= {r.mount_path for r in rows} or waited >= deadline:
+            break
+        await asyncio.sleep(3.0)
+        waited += 3.0
+    try:
+        return binds.pair_binds(sources, rows, source_uuid=snapshot.uuid, target_uuid=target_uuid)
+    except binds.BindPairingError as exc:
+        raise TransferError(
+            f"{snapshot.name}: {exc}",
+            hint=(
+                "A bind mount is copied to the host path that Coolify's own storage row for "
+                "the TARGET names at the same mount path - read back, never the source's "
+                "path with its uuid replaced. Without such a row the target would not mount "
+                "the path and its data would be left behind: the target was created from a "
+                "different compose (the branch HEAD moved), or Coolify keeps no row for the "
+                f"mount. {consequence}"
+            ),
+        ) from exc
+
+
+def _merged_bind_pairs(
+    per_resource: dict[str, list[BindPair]], *, consequence: str
+) -> list[BindPair]:
+    try:
+        return binds.merge_pairs(per_resource)
+    except binds.BindPairingError as exc:
+        raise TransferError(
+            str(exc),
+            hint=(
+                "Two copies would overwrite each other on the target. Give each resource "
+                f"its own host path. {consequence}"
+            ),
+        ) from exc
+
+
+async def _source_bind_kinds(
+    ctx: MigrationContext, paths: list[str]
+) -> tuple[dict[str, str], list[str]]:
+    """``(path -> dir|file, problems)`` for the source's bind paths."""
+    states = await transfer_binds.path_states(ctx.source_host, paths)
+    kinds = {path: kind for path in paths if (kind := binds.source_kind(states[path]))}
+    problems = [p for path in paths if (p := binds.source_state_problem(path, states[path]))]
+    return kinds, problems
+
+
+def _target_probe(pairs: list[BindPair]) -> list[str]:
+    """Each target path and its parents: what a write there depends on. PURE."""
+    return [q for p in pairs for q in (*binds.ancestors(p.target_path), p.target_path)]
+
+
+async def _assert_target_binds_safe(ctx: MigrationContext) -> None:
+    """End of CREATE, while the source serves: every bind has a free place on the target.
+
+    The rehearsal of DISCOVER's pairing (as ``_pair_volumes`` is for services),
+    plus what only the target server can say: each target path is absent or
+    empty — Coolify's storage job may have made it — no parent is a symlink,
+    and no container there mounts it. Anything else may be another resource's
+    data, and a copy with ``--delete`` would replace it.
+    """
+    per_resource: dict[str, list[BindPair]] = {}
+    for resource in ctx.plan.resources:
+        sources = _source_binds(resource.manifest)
+        target_uuid = ctx.target_uuids.get(resource.snapshot.uuid)
+        if sources and target_uuid:
+            per_resource[resource.snapshot.uuid] = await _read_target_bind_pairs(
+                ctx, resource.snapshot, sources, target_uuid=target_uuid, consequence=_NEVER_STOPPED
+            )
+    if not per_resource:
+        return
+    pairs = _merged_bind_pairs(per_resource, consequence=_NEVER_STOPPED)
+    kinds, problems = await _source_bind_kinds(ctx, [p.source_path for p in pairs])
+    states = await transfer_binds.path_states(ctx.target_host, _target_probe(pairs))
+    in_use = await transfer_binds.host_binds(ctx.target_host)
+    for pair in pairs:
+        kind = kinds.get(pair.source_path)
+        if kind is None:
+            continue  # the source's own problem is listed
+        problem = binds.ancestor_problem(pair.target_path, states) or binds.target_state_problem(
+            pair.target_path, states[pair.target_path], kind=kind
+        )
+        if problem:
+            problems.append(problem)
+        problems.extend(
+            f"{pair.target_path} is mounted on the target server by {other.container} "
+            f"({other.source})"
+            for other in binds.shared_with(pair.target_path, in_use)
+        )
+    if problems:
+        raise TransferError(
+            "bind mount(s) have no free place on the target:\n"
+            + "\n".join(f"  {p}" for p in problems),
+            hint=(
+                "A bind mount is copied onto the host path the target mounts, which must "
+                "be absent or empty: anything already there may be another resource's "
+                "data, and the copy would replace it. Free the path on the target server, "
+                f"or bind a different one on the source. {_NEVER_STOPPED}"
+            ),
+        )
+
+
+async def _record_bind_pairs(
+    ctx: MigrationContext,
+    per_resource: dict[str, list[BindPair]],
+    recorded: dict[str, list[dict[str, str]]],
+) -> None:
+    """DISCOVER's bind pairs, with each payload's kind, into the context and the journal."""
+    if not any(per_resource.values()):
+        return
+    merged = _merged_bind_pairs(per_resource, consequence=_ROLLED_BACK)
+    kinds, problems = await _source_bind_kinds(ctx, [p.source_path for p in merged])
+    if problems:
+        raise TransferError(
+            "bind mount(s) cannot be copied:\n" + "\n".join(f"  {p}" for p in problems),
+            hint=_ROLLED_BACK,
+        )
+    for uuid, pairs in per_resource.items():
+        with_kind = [replace(p, kind=kinds[p.source_path]) for p in pairs]
+        ctx.bind_pairs[uuid] = with_kind
+        recorded.setdefault(uuid, []).extend(serialise_bind_pairs(with_kind))
+
+
+def _bind_pairs(ctx: MigrationContext) -> dict[str, list[BindPair]]:
+    """DISCOVER's bind pairs: from the context, or — a resumed run — its journal.
+
+    The runner rehydrates the volume pairs; this rehydrates the binds where
+    they are used, so a resumed COPY or VERIFY can never read an empty context
+    as "no bind mounts" while the journal holds them.
+    """
+    if not any(ctx.bind_pairs.values()) and State.DISCOVER.value in ctx.journal.completed_states():
+        ctx.bind_pairs.update(
+            deserialise_bind_pairs(ctx.journal.undo_info(State.DISCOVER.value).get("volume_pairs"))
+        )
+    return ctx.bind_pairs
+
+
+def _first_sightings(ctx: MigrationContext, resource: ResourcePlan) -> list[BindPair]:
+    """``resource``'s bind pairs that no earlier resource of the plan has. PURE.
+
+    Two resources binding one host path are one payload: copied and verified
+    once, under the first.
+    """
+    pairs = _bind_pairs(ctx)
+    seen: set[tuple[str, str]] = set()
+    for other in ctx.plan.resources:
+        mine: list[BindPair] = []
+        for pair in pairs.get(other.snapshot.uuid, []):
+            key = (pair.source_path, pair.target_path)
+            if key not in seen:
+                seen.add(key)
+                mine.append(pair)
+        if other.snapshot.uuid == resource.snapshot.uuid:
+            return mine
+    return []
+
+
+async def _bind_kinds(
+    ctx: MigrationContext, pairs: list[BindPair]
+) -> list[tuple[BindPair, str]]:
+    """Each pair with its payload kind; one the journal did not record is looked up."""
+    unknown = [p.source_path for p in pairs if p.kind is None]
+    kinds: dict[str, str] = {}
+    if unknown:
+        kinds, problems = await _source_bind_kinds(ctx, unknown)
+        if problems:
+            raise TransferError(
+                "bind mount(s) cannot be copied:\n" + "\n".join(f"  {p}" for p in problems),
+                hint=_ROLLED_BACK,
+            )
+    return [(p, p.kind or kinds[p.source_path]) for p in pairs]
+
+
+async def _copy_binds(ctx: MigrationContext) -> list[str]:
+    """Mirror every bind mount onto its target path, journalling each first.
+
+    A target this run has not yet filled must still be absent or empty — it
+    was at the end of CREATE, and anything that appeared since is not ours. Its
+    state and the paths the copy will create are journalled BEFORE anything is
+    written (``binds.BIND_TARGET``): that record is all a rollback may delete.
+    A target the journal already holds is this run's own partial copy, from an
+    attempt that did not finish, and is copied over.
+    """
+    pairs = [p for r in ctx.plan.resources for p in _first_sightings(ctx, r)]
+    if not pairs:
+        return []
+    with_kinds = await _bind_kinds(ctx, pairs)
+    owed = binds.owed_bind_targets((r.event, r.detail) for r in ctx.journal.read())
+    states = await transfer_binds.path_states(ctx.target_host, _target_probe(pairs))
+    copied: list[str] = []
+    for pair, kind in with_kinds:
+        current = states[pair.target_path]
+        problem = binds.ancestor_problem(pair.target_path, states) or (
+            binds.resumed_target_problem(pair.target_path, current, kind=kind)
+            if pair.target_path in owed
+            else binds.target_state_problem(pair.target_path, current, kind=kind)
+        )
+        if problem:
+            raise TransferError(
+                f"bind target {problem}",
+                hint=(
+                    "It was absent or empty at the end of CREATE; whatever is there now is "
+                    f"not this migration's, and it is not overwritten. {_ROLLED_BACK}"
+                ),
+            )
+        if pair.target_path not in owed:
+            ctx.journal.append(
+                "step_started",
+                state=State.COPY.value,
+                detail={
+                    binds.BIND_TARGET: {
+                        "path": pair.target_path,
+                        "prior": current,
+                        "created": binds.missing_paths(pair.target_path, states),
+                    }
+                },
+            )
+        await transfer_binds.prepare_target(
+            ctx.target_host, pair.target_path, kind=kind, prior=current
+        )
+        if kind == binds.KIND_FILE:
+            await _copy_file(ctx, pair.source_path, pair.target_path)
+        else:
+            await _copy_one(ctx, pair.source_path, pair.target_path)
+        copied.append(pair.target_path)
+    log.info("copy.binds", count=len(copied))
+    return copied
+
+
+async def _copy_file(ctx: MigrationContext, source_path: str, target_path: str) -> None:
+    """One file bind mount, with the same rsync flags as every volume."""
+    host, port, identity = _transfer_endpoint(ctx)
+    await rsync.run(
+        ctx.source_host,
+        rsync.RsyncSpec(
+            source_path=source_path,
+            target_path=target_path,
+            target_host=host,
+            target_user=ctx.plan.target_server.user,
+            target_port=port,
+            identity_file=identity,
+            single_file=True,
+            compress=ctx.settings.transfer_compress,
+            bandwidth_limit_kbps=ctx.settings.transfer_bandwidth_kbps,
+        ),
+    )
 
 
 def _transfer_endpoint(ctx: MigrationContext) -> tuple[str, int, str | None]:
@@ -1945,7 +2299,9 @@ async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
     # setup entirely: there is nothing to copy, and doing the work anyway only
     # adds a way for a no-data migration to fail spuriously. The source is still
     # checked: it routes its custom hosts again if anything starts it.
-    if not any(ctx.volume_pairs.get(r.snapshot.uuid) for r in ctx.plan.resources):
+    if not any(ctx.volume_pairs.get(r.snapshot.uuid) for r in ctx.plan.resources) and not any(
+        _bind_pairs(ctx).values()
+    ):
         log.info("copy.nothing", reason="no volumes to migrate")
         await containment.assert_contained(ctx, checkpoint="COPY", target=False)
         return {"volumes_copied": [], "key_fingerprint": None}
@@ -1985,6 +2341,8 @@ async def step_copy(ctx: MigrationContext) -> dict[str, Any]:
         for pair in ctx.volume_pairs.get(resource.snapshot.uuid, []):
             await _copy_one(ctx, pair.source_path, pair.target_path)
             copied.append(pair.target.name)
+    # Bind mounts, path to path, each target journalled before it is touched.
+    await _copy_binds(ctx)
 
     # Nothing may have restarted mid-transfer. A `restart:` policy, a push or a
     # dashboard deploy would invalidate the whole copy, and none raises on its
@@ -2100,6 +2458,19 @@ async def step_verify(ctx: MigrationContext) -> dict[str, Any]:
             reports.append(report)
             total_diffs += len(report.differences)
             verified.append(pair.target.name)
+        # Bind mounts, exactly as thoroughly: content and metadata, both sides.
+        for bind_pair, kind in await _bind_kinds(ctx, _first_sightings(ctx, resource)):
+            report = await verify.verify_volume(
+                ctx.source_host,
+                ctx.target_host,
+                source_path=bind_pair.source_path,
+                target_path=bind_pair.target_path,
+                parallel=ctx.settings.verify_parallel,
+                single_file=kind == binds.KIND_FILE,
+            )
+            reports.append(report)
+            total_diffs += len(report.differences)
+            verified.append(bind_pair.target_path)
         ctx.verifications[resource.snapshot.uuid] = reports
 
     if total_diffs:

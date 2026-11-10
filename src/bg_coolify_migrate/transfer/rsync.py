@@ -105,6 +105,10 @@ class RsyncSpec:
     directory mismatch stops a database from starting; this pass fixes it. The
     whole-tree transfer already carries the root (``rsync -a src/ dst/`` sets the
     destination directory), so it is only needed after a split."""
+    single_file: bool = False
+    """Both paths name ONE regular file (a file bind mount), copied onto that
+    exact name. No trailing slash on either side: ``file/`` is no path, and
+    ``dst/`` would put the file inside a directory of that name."""
     compress: bool = False
     dry_run: bool = False
     checksum: bool = False
@@ -186,6 +190,13 @@ def build_command(spec: RsyncSpec) -> str:
         flags.append("--info=progress2")
     if spec.bandwidth_limit_kbps:
         flags.append(f"--bwlimit={spec.bandwidth_limit_kbps}")
+
+    if spec.single_file:
+        # The same flags, one file: -a carries its owner, mode and times like
+        # any volume's, --numeric-ids keeps the owner a number.
+        parts = ["rsync", *flags, "-e", build_ssh_option(spec)]
+        parts += [spec.source_path, f"{spec.target_user}@{spec.target_host}:{spec.target_path}"]
+        return " ".join(shlex.quote(p) for p in parts)
 
     source = spec.source_path.rstrip("/") + "/"
     target = spec.target_path.rstrip("/") + "/"

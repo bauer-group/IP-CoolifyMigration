@@ -38,8 +38,8 @@ from bg_coolify_migrate.dns import gate as dns_gate
 from bg_coolify_migrate.dns import managed as dns_managed
 from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.dns import wildcard as dns_wildcard
+from bg_coolify_migrate.domain import binds, deploy_triggers, domains, fidelity
 from bg_coolify_migrate.domain import compose as compose_mod
-from bg_coolify_migrate.domain import deploy_triggers, domains, fidelity
 from bg_coolify_migrate.domain.coolify_versions import supports
 from bg_coolify_migrate.domain.deployments import image_scan_gate_warnings
 from bg_coolify_migrate.domain.drift import RebuildDriftReport, assess_rebuild_drift
@@ -662,6 +662,7 @@ async def build_manifest(
     api_storages: dict[str, Any] | None,
     uuid: str,
     measure: bool = True,
+    kind: ResourceKind | None = None,
 ) -> VolumeManifest:
     """Reconcile the three discovery sources into a manifest.
 
@@ -669,7 +670,9 @@ async def build_manifest(
     residue. Each alone misses something — see domain/manifest.py.
 
     Takes mounts rather than containers precisely because the caller may no
-    longer have any: see inspect_all_mounts.
+    longer have any: see inspect_all_mounts. ``api_storages`` None (the API
+    would not say) is passed on as unknown, not as "no storages": a bind mount
+    is judged against the resource's storage rows (domain/binds.py).
     """
 
     volumes: list[DockerVolume] = []
@@ -678,10 +681,13 @@ async def build_manifest(
     except Exception as exc:
         log.debug("planner.volume_ls_failed", error=str(exc)[:120])
 
-    storages: list[Any] = []
-    if api_storages:
+    storages: list[Any] | None = None
+    if api_storages is not None and (
+        "persistent_storages" in api_storages or "file_storages" in api_storages
+    ):
         from bg_coolify_migrate.domain.manifest import ApiStorage
 
+        storages = []
         for entry in api_storages.get("persistent_storages") or []:
             if isinstance(entry, dict) and entry.get("mount_path"):
                 storages.append(
@@ -695,13 +701,23 @@ async def build_manifest(
         for entry in api_storages.get("file_storages") or []:
             if isinstance(entry, dict) and entry.get("mount_path"):
                 content = entry.get("content")
+                fs_path = entry.get("fs_path")
+                placeholder = isinstance(content, str) and content in binds.CONTENT_PLACEHOLDERS
                 storages.append(
                     ApiStorage(
                         kind="file",
                         mount_path=str(entry["mount_path"]),
                         is_directory=entry.get("is_directory"),
-                        content_is_placeholder=isinstance(content, str)
-                        and content in ("[binary file]", "[file too large to display]"),
+                        content_is_placeholder=placeholder,
+                        fs_path=fs_path if isinstance(fs_path, str) else None,
+                        # Only a file Coolify writes from its row is regenerated
+                        # on the target; a directory, a host file or a row whose
+                        # content we were not shown is data to copy.
+                        has_content=entry.get("is_directory") is not True
+                        and entry.get("is_host_file") is not True
+                        and isinstance(content, str)
+                        and bool(content)
+                        and not placeholder,
                     )
                 )
 
@@ -710,6 +726,8 @@ async def build_manifest(
         api_storages=storages,
         docker_volumes=volumes,
         uuid_prefixes=frozenset({uuid}),
+        resource_uuid=uuid,
+        kind=kind,
     )
 
     if not measure:
@@ -915,6 +933,7 @@ async def build_plan(
             api_storages=api_storages,
             uuid=snapshot.uuid,
             measure=measure,
+            kind=snapshot.kind,
         )
         drift = await assess_drift(source_host, snapshot)
         strategy = select_strategy(

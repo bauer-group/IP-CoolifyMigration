@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, TypeGuard
 
 from bg_coolify_migrate.api.client import CoolifyClient
+from bg_coolify_migrate.domain.binds import KIND_DIR, KIND_FILE, BindPair, normalise
 from bg_coolify_migrate.domain.manifest import DockerMount
 from bg_coolify_migrate.domain.naming import VolumeEndpoint, VolumePair
 from bg_coolify_migrate.domain.plan import HostBaseline, MigrationPlan
@@ -62,6 +63,12 @@ class MigrationContext:
 
     #: source resource uuid -> resolved volume pairs
     volume_pairs: dict[str, list[VolumePair]] = field(default_factory=dict)
+
+    #: source resource uuid -> its bind mounts, each paired with the target path
+    #: read back from the target's own storage rows (domain/binds.py). DISCOVER
+    #: fills it; a resumed COPY or VERIFY reloads it from DISCOVER's journal
+    #: (``steps._bind_pairs``), never reads an empty one as "no binds".
+    bind_pairs: dict[str, list[BindPair]] = field(default_factory=dict)
 
     #: source resource uuid -> container mounts, captured by QUIESCE *before* it
     #: stops anything, and consumed by DISCOVER afterwards.
@@ -202,9 +209,10 @@ def is_volume_row(row: object) -> TypeGuard[dict[str, Any]]:
     """Is this journalled DISCOVER row a docker volume pair? PURE.
 
     DISCOVER journals two shapes under ``volume_pairs``: real pairs, whose
-    ``source`` is a volume NAME, and bind mounts, mirrored path-to-path, whose
-    ``source`` is an absolute host path. Only the first become a
-    :class:`VolumePair`; COPY and VERIFY iterate nothing else.
+    ``source`` is a volume NAME, and bind mounts, whose ``source`` is an
+    absolute host path and ``target`` the target's (:func:`is_bind_row`). Only
+    the first become a :class:`VolumePair`; :func:`deserialise_bind_pairs`
+    rebuilds the second.
     """
     if not isinstance(row, dict):
         return False
@@ -239,7 +247,7 @@ def deserialise_volume_pairs(raw: object) -> dict[str, list[VolumePair]]:
         pairs: list[VolumePair] = []
         for row in rows:
             if not is_volume_row(row):
-                continue  # a bind mount: mirrored path-to-path, never a volume pair
+                continue  # a bind mount: deserialise_bind_pairs, never a volume pair
             target = row.get("target")
             if not isinstance(target, str) or not target:
                 raise ValueError(f"journal: volume_pairs[{uuid!r}] has a row without a target")
@@ -248,6 +256,66 @@ def deserialise_volume_pairs(raw: object) -> dict[str, list[VolumePair]]:
                 VolumePair(
                     source=VolumeEndpoint(name=row["source"], mount_path=mount_path),
                     target=VolumeEndpoint(name=target, mount_path=mount_path),
+                )
+            )
+        out[str(uuid)] = pairs
+    return out
+
+
+def is_bind_row(row: object) -> TypeGuard[dict[str, Any]]:
+    """Is this journalled DISCOVER row a bind mount (``source`` a host path)? PURE."""
+    if not isinstance(row, dict):
+        return False
+    source = row.get("source")
+    return isinstance(source, str) and source.startswith("/")
+
+
+def serialise_bind_pairs(pairs: list[BindPair]) -> list[dict[str, str]]:
+    """Bind pairs as DISCOVER journals them beside the volume pairs. PURE."""
+    return [
+        {
+            "source": p.source_path,
+            "target": p.target_path,
+            "mount_path": p.mount_path,
+            **({"kind": p.kind} if p.kind else {}),
+        }
+        for p in pairs
+    ]
+
+
+def deserialise_bind_pairs(raw: object) -> dict[str, list[BindPair]]:
+    """DISCOVER's journalled bind rows, rebuilt for a resumed COPY or VERIFY. PURE.
+
+    The contract of :func:`deserialise_volume_pairs`: absent gives {}, corrupt
+    raises — a dropped row reads as "nothing to copy", and the target would
+    start with an empty directory where the data belongs. A row's ``kind`` is
+    optional (a journal written before it was recorded): COPY then looks.
+    """
+    if not isinstance(raw, dict):
+        return {}
+
+    out: dict[str, list[BindPair]] = {}
+    for uuid, rows in raw.items():
+        if not isinstance(rows, list):
+            raise ValueError(
+                f"journal: volume_pairs[{uuid!r}] is {type(rows).__name__}, not a list"
+            )
+        pairs: list[BindPair] = []
+        for row in rows:
+            if not is_bind_row(row):
+                continue
+            source, target = normalise(row["source"]), normalise(row.get("target"))
+            if source is None or target is None:
+                raise ValueError(
+                    f"journal: volume_pairs[{uuid!r}] has a bind row without an absolute target"
+                )
+            kind = row.get("kind")
+            pairs.append(
+                BindPair(
+                    source_path=source,
+                    target_path=target,
+                    mount_path=str(row.get("mount_path") or ""),
+                    kind=kind if kind in (KIND_DIR, KIND_FILE) else None,
                 )
             )
         out[str(uuid)] = pairs

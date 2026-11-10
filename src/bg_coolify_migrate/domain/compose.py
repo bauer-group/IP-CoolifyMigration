@@ -32,8 +32,13 @@ from typing import Any
 import yaml
 
 #: Host paths Coolify passes through untouched rather than treating as data.
-#: Mirrors upstream's own special-casing; migrating these would be actively wrong
+#: Mirrors upstream's own special-casing — the parsers keep exactly these as
+#: written and give them no storage row (parsers.php v4.1.2:2162-2171; v4.5.0:1566
+#: and v4.7.2:1614 add '/tmp/'); migrating these would be actively wrong
 #: (the target has its own docker socket, and /tmp is scratch by definition).
+#: Kept to upstream's list on purpose: it also feeds the compose topology
+#: fingerprint. What else the target host supplies (read-only system files, the
+#: socket's /run spelling) is decided per bind in domain/binds.py.
 PASSTHROUGH_HOST_PATHS = frozenset({"/var/run/docker.sock", "/tmp"})
 
 
@@ -48,7 +53,9 @@ class MountClass(StrEnum):
     on the target. Refused by default rather than silently losing the data."""
 
     BIND = "bind"
-    """A host path. Mirrored, but the path may need rewriting if it embeds a uuid."""
+    """A host path. Mirrored onto the path the TARGET's own storage row names at
+    the same mount path — read back, never this path with its uuid rewritten
+    (domain/binds.py)."""
 
     TMPFS = "tmpfs"
     """RAM-backed and empty by contract. Skipped."""

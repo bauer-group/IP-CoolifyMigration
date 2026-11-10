@@ -274,7 +274,7 @@ async def test_discover_pins_a_volume_only_it_sees(
     ctx.pre_stop_mounts = {"db1": []}
     object.__setattr__(ctx.settings, "target_storage_timeout", 0.0)
 
-    async def fake_manifest(host, *, mounts, api_storages, uuid, measure):  # type: ignore[no-untyped-def]
+    async def fake_manifest(host, *, mounts, api_storages, uuid, measure, **_kw):  # type: ignore[no-untyped-def]
         return manifest
 
     async def fake_read(api, *, collection, uuid):  # type: ignore[no-untyped-def]
