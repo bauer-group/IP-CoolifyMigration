@@ -787,6 +787,19 @@ def ancestor_problem(path: str, states: Mapping[str, str]) -> str | None:
 
     ``states`` maps each of :func:`ancestors` to its state. A symlink would
     redirect the write somewhere no check looked at; a file cannot hold one.
+
+    Known limitation, fail-closed: EVERY parent counts, ``/data`` and
+    ``/data/coolify`` too. A target server whose Coolify data was moved to a
+    larger disk behind a symlinked ``/data`` or ``/data/coolify`` therefore
+    refuses every relative bind (``./data``, which resolves under
+    ``/data/coolify/{applications|services}/{uuid}``), and so do the write
+    scripts' own proofs (``transfer/binds.PREPARE_SCRIPT`` and
+    ``REMOVE_SCRIPT`` compare ``pwd -P`` after ``cd -P`` with the path, and a
+    symlinked parent never matches). It refuses at the end of CREATE, while the
+    source still serves, and nothing is written; no data is lost. Allowing it
+    would mean resolving the path (``readlink -f``) and applying every rule of
+    this module again to the result, in the check and in both scripts: not
+    built.
     """
     for parent in ancestors(path):
         state = states.get(parent, STATE_MISSING)

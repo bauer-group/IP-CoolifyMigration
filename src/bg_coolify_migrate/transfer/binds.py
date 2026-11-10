@@ -165,6 +165,10 @@ EXIT_REDIRECTED = 64
 #: every byte of the copy somewhere no check looked at. A file replacing
 #: Coolify's empty default directory removes that directory with ``rmdir``,
 #: which refuses anything that is not empty, relative to the proven parent.
+#: The proof cannot tell an attacker's symlink from an operator's: a target
+#: whose ``/data`` or ``/data/coolify`` is a symlink (Coolify's data moved to
+#: another disk) fails it for every relative bind — as it already failed
+#: ``domain.binds.ancestor_problem`` at the end of CREATE (see there).
 PREPARE_SCRIPT = r"""p=$1; kind=$2; prior=$3
 parent=${p%/*}; [ -n "$parent" ] || parent=/
 if [ "$kind" = dir ]; then

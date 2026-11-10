@@ -2288,6 +2288,15 @@ async def _copy_binds(ctx: MigrationContext) -> list[str]:
     journal, and a run begun under an earlier version had neither its pairs
     nor its end-of-CREATE check vetted by this version's rules. Nothing is
     written, not even for the pairs that pass.
+
+    Known limitation, fail-closed: of two nested binds (``./data`` and
+    ``./data/uploads``, which ``binds.merge_pairs`` allows when the sources nest
+    the same way) a resumed COPY refuses the second when the crash came after
+    the first was journalled and copied but before the second was. The first
+    copy filled the second's target, which the journal does not name as this
+    run's, so it "already holds data". It refuses loudly and nothing is lost:
+    the source's data was only read, the rollback restarts it and deletes the
+    target, and a new run copies both.
     """
     per_resource = [(r, p) for r in ctx.plan.resources for p in _first_sightings(ctx, r)]
     pairs = [p for _, p in per_resource]
