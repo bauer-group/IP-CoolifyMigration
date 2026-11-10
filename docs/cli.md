@@ -114,7 +114,7 @@ These are a stable contract; script against them.
 | `2` | Preflight failed — **nothing was changed** |
 | `3` | DNS gate blocked — resumable |
 | `4` | Drift needs your decision — re-run interactively, or `--accept-drift` |
-| `5` | Quiesce failed — the stack would not stop cleanly, or did not stay stopped (see below) |
+| `5` | The stack was not held still — it would not stop cleanly, a source deployment was still pending at the stop, or something started it again (see below) |
 | `6` | Transfer failed — rolled back |
 | `7` | Verification failed — rolled back, target **not** started |
 | `8` | Rollback itself failed — human attention required |

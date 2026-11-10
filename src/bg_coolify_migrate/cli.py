@@ -12,7 +12,13 @@ Exit codes are a contract (see docs/cli.md). They are stable and scriptable:
   2  preflight failed (nothing was changed)
   3  DNS gate blocked - resumable
   4  drift needs your decision - resumable, or pass --accept-drift
-  5  quiesce failed (the stack would not stop cleanly)
+  5  the stack was not held still (QuiesceError and its subclasses): it would
+     not stop cleanly, a source deployment was still pending when the stop
+     was due (SourceDeploymentPending), or something started a stack the run
+     holds (ContainmentBreach) - rolled back. Once START has asked for a
+     target the same finding blocks instead, resumable, nothing rolled back:
+     a revived source (SourceRevivedAfterStart), or one Coolify's deployment
+     history could not clear (SourceUncheckedAfterStart)
   6  transfer failed (rolled back)
   7  verification failed (rolled back; the target was NOT started)
   8  rollback itself failed - human attention required
