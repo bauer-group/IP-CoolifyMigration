@@ -296,6 +296,11 @@ A custom domain (`shop.example.com`) always has a live holder of this migration:
 * **Source and target are two servers.** A plan whose target is its source's
   own server is refused: the DNS gate places a host by the address only one
   side answers as, and on one server every address is both sides'.
+* **Every resource runs on the source server.** The run discovers, stops and
+  copies an environment on ONE server, its first resource's. A resource on
+  another would be looked for there and not found — nothing copied, an empty
+  container list read as stopped — so the plan refuses it, and one whose server
+  the API does not name.
 * **A rollback before FINALIZE writes nothing to the source's domains**: it never
   lost them. After FINALIZE the source gets them back BEFORE it is restarted, and
   a target that holds them is deleted only once the source holds them again. If

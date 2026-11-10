@@ -203,6 +203,21 @@ def server_uuid_of(resource: dict[str, Any]) -> str | None:
     return None
 
 
+def _uuid_of(server: dict[str, Any] | None) -> str | None:
+    """A server record's uuid, or None."""
+    return str(server["uuid"]) if server and server.get("uuid") else None
+
+
+#: A resource whose GET names no server it could be placed on. Refused when the
+#: plan is built — the plan's own check (plan.foreign_server_refusal) cannot
+#: tell an unknown server from an old plan.json, and refuses neither.
+_UNPLACED_RESOURCE = (
+    "the API did not say which server this resource runs on, so the plan cannot "
+    "tell it runs on the source server, where the run looks for its containers and "
+    "volumes. Check the resource's server in Coolify, then plan again."
+)
+
+
 async def resolve_server(api: CoolifyClient, resource: dict[str, Any]) -> dict[str, Any] | None:
     """The server record a resource runs on, resolving by id if need be."""
     uuid = server_uuid_of(resource)
@@ -878,8 +893,15 @@ async def build_plan(
             environment=environment,
         )
 
+        # The plan's source server is the first resource's, and the run discovers,
+        # stops and copies every resource on it: record where each one runs, so
+        # the plan refuses a resource on another (plan.foreign_server_refusal).
         if source_server is None:
             source_server = await resolve_server(api, full)
+            server_uuid = _uuid_of(source_server)
+        else:
+            server_uuid = server_uuid_of(full) or _uuid_of(await resolve_server(api, full))
+        snapshot = snapshot.model_copy(update={"server_uuid": server_uuid})
 
         api_storages: dict[str, Any] | None = None
         try:
@@ -901,6 +923,8 @@ async def build_plan(
 
         warnings: list[str] = []
         refusals: list[str] = []
+        if server_uuid is None:
+            refusals.append(_UNPLACED_RESOURCE)
         # What holds only while FINALIZE keeps the source (keep, rename): the plan
         # applies these under its policy at read time (ResourcePlan.kept_source_refusals).
         kept_refusals: list[str] = []

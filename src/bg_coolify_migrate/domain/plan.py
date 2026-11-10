@@ -195,6 +195,14 @@ class ResourceSnapshot(BaseModel):
     (StopApplication filters pullRequestId=0), so they would keep writing during
     a 'quiesced' copy. Detected and blocked, never ignored."""
 
+    server_uuid: str | None = None
+    """The server this resource runs on, read off its own GET at PLAN
+    (planner.server_uuid_of, else resolved like the source server). The plan's
+    source server is the server of the FIRST resource it could place, and every
+    resource is discovered, stopped and copied on that one, so a plan refuses a
+    resource on any other (:func:`foreign_server_refusal`). ``None`` for a
+    plan.json from before this field, which then refuses nothing."""
+
     @property
     def running_commit(self) -> str | None:
         """The commit that produced the running image, parsed from its tag."""
@@ -395,8 +403,18 @@ class MigrationPlan(BaseModel):
         return (refusal,) if refusal else ()
 
     def blocking_reasons_of(self, resource: ResourcePlan) -> tuple[str, ...]:
-        """Every reason ``resource`` may not be migrated under THIS plan's policy."""
+        """Every reason ``resource`` may not be migrated by THIS plan.
+
+        Its own (:attr:`ResourcePlan.blocking_reasons`), plus what holds only
+        against the plan's servers (:func:`foreign_server_refusal`) or under its
+        finalize policy (:attr:`ResourcePlan.kept_source_refusals`) — derived on
+        every read, so a policy swapped onto a built plan is judged by its own.
+        """
         out = list(resource.blocking_reasons)
+        if foreign := foreign_server_refusal(
+            resource.snapshot.server_uuid, source=self.source_server, target=self.target_server
+        ):
+            out.append(foreign)
         if self.keeps_source:
             out.extend(resource.kept_source_refusals)
         return tuple(out)
@@ -483,6 +501,40 @@ def same_server_refusal(source: ServerRef, target: ServerRef) -> str | None:
         "--accept-dns-host), labels kept verbatim would declare the source's routers "
         "twice on the same proxy, and bind mounts would be copied onto themselves. "
         "Pick another target server."
+    )
+
+
+def foreign_server_refusal(
+    server_uuid: str | None, *, source: ServerRef, target: ServerRef
+) -> str | None:
+    """A resource that does not run on the plan's source server. PURE, not gated.
+
+    The source server is the first resource's (planner.build_plan), and the
+    whole run works on it: discovery lists containers and volumes through its
+    daemon, QUIESCE polls it, COPY reads from it. An environment that spans
+    servers would put every other resource through all of that on the wrong
+    host — no container found, so no volume migrated (manifest.reconcile only
+    warns about a declared storage nothing mounts), an empty container list
+    reads as stopped, the target comes up empty, and a delete finalize removes
+    the source with its data. A resource on the TARGET server would be moved
+    onto its own server (:func:`same_server_refusal`).
+
+    ``None`` — a plan.json from before the field, or a source of unknown uuid —
+    proves nothing and refuses nothing; the planner refuses a resource whose
+    server it cannot read when it builds the plan.
+    """
+    if not server_uuid or not source.uuid or server_uuid == source.uuid:
+        return None
+    where = (
+        f"the target server {target.name!r}" if server_uuid == target.uuid else f"server {server_uuid}"
+    )
+    return (
+        f"it runs on {where}, not on the source server {source.name!r} this plan "
+        "migrates from: the environment spans servers, and a run discovers, stops and "
+        f"copies every resource on {source.name!r}. Nothing of it would be found there, "
+        "so nothing would be copied, and a delete finalize would remove it with its "
+        "data. Migrate it on its own: `coolify-migrate run <project>/<environment>/"
+        "<resource> --to <server>`, which plans it from its own server."
     )
 
 

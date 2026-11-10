@@ -821,6 +821,23 @@ host would need its own `--accept-dns-host`), labels kept verbatim would declare
 the source's routers twice on the same proxy, and bind mounts would be copied
 onto themselves. Pick another target server with `--to`.
 
+## "it runs on … not on the source server '…' this plan migrates from"
+
+The environment spans servers. A plan migrates from one server, the server of
+its first resource: it discovers the containers and volumes there, stops the
+stack there and copies from there. A resource on another server would be looked
+for in the wrong place — nothing found, so nothing copied, and a delete finalize
+would remove it with its data. Migrate such a resource on its own, which plans
+it from its own server:
+
+```bash
+coolify-migrate run shop/production/database --to <server>
+```
+
+**"the API did not say which server this resource runs on"** is the same
+refusal for a resource whose GET names no server at all. Check the resource's
+server (its destination) in Coolify, then plan again.
+
 ## Coolify 4.6: image names and HTTPS git credentials
 
 **"docker_registry_image_name=… is not carried".** From 4.6 Coolify refuses a second

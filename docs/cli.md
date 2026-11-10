@@ -50,6 +50,12 @@ the source's routers twice on one proxy, and bind mounts would be copied onto
 themselves. When you pick an environment or a resource interactively, the target
 menu leaves the source's server out.
 
+An environment is migrated **from one server**: the server of its first
+resource, where the run discovers, stops and copies every resource. A plan
+refuses each resource that runs on another server (the target included), so an
+environment spread over several servers is migrated one resource at a time, each
+from its own server: `coolify-migrate run <project>/<environment>/<resource>`.
+
 ### Host keys
 
 The first time a command reaches a server, its SSH host key is unknown. In a
