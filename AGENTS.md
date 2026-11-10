@@ -58,6 +58,9 @@ Two prior tools solve this badly, and their bugs are our requirements:
    and `_request_stop` re-asks until the daemon agrees. What stays forbidden is
    concluding anything about the stack from it — the gate below still has to see
    every container exited.
+   Stopped once is not stopped for good: from COPY to FINALIZE the containment
+   checkpoints (`engine/containment.py`) ask both daemons again, and a breach is
+   never a warning and has no flag — before START it rolls back, after it blocks.
 10. **Never string-replace a UUID to derive a volume name.** Pair by
     `mount_path`. This is coolify-mover's silent data-loss bug.
 
@@ -101,10 +104,69 @@ decision, the decision is in the wrong layer.
   the operator's judgement about their stack. Blocking belongs to things that are
   not judgements (a refused volume, live previews, DNS pointing at the source,
   or at something DNS cannot place).
+- **A refusal that holds only under one finalize policy?** Put it on
+  `ResourcePlan.kept_source_refusals` (warnings: `kept_source_warnings`), never
+  in `refusals`: `run` and `plan --finalize` swap the policy onto a built plan
+  (`model_copy`), so the plan derives these lines on every read
+  (`MigrationPlan.blocking_reasons_of`). A refusal of the move as a whole goes in
+  `MigrationPlan.plan_refusals`. `is_blocked`, the report and PREFLIGHT read
+  `MigrationPlan.blocking_reasons`; never judge a plan by `ResourcePlan.is_blocked`.
 - **Touching the transfer?** Every rsync flag in `transfer/rsync.py::BASE_FLAGS`
   is there for a reason documented in the module docstring. Removing one is a
   data-integrity change.
 - **Touching quiesce?** It has no `--force` and must not grow one.
+- **Touching QUIESCE's order?** The sources are disarmed and their queued or
+  running deployments waited out FIRST, then the preview delete, the mount
+  capture, the pins, the deployment record
+  (`containment.deployments_before_stop`) and the stop. A deployment that ends
+  replaces the containers (facts below), so anything that names containers reads
+  them after the wait, or the SIGKILL guard checks names that no longer exist.
+- **Touching what can deploy a source or a target?** `domain/deploy_triggers.py`
+  decides, `engine/deploy_triggers.py` performs. A target is CREATED with
+  auto-deploy off (`TARGET_CREATE`) and without tags — CREATE only reads the
+  source's tag names (`source_tags`), while every source still exists — and
+  FINALIZE arms it, never fatally, with the source's original and attaches the
+  tags. Never move either back into CREATE: a push or a tag deploy would start
+  the target before the DNS gate (invariant 7). QUIESCE switches every source
+  application's auto-deploy off (previews too, where read on), journalling the
+  originals FIRST (`deploy_triggers`), and refuses before the stop
+  (`SourceDeploymentPending`) when a source deployment does not end within
+  `deploy_timeout`; it never cancels one. A kept or renamed source stays
+  disarmed (`kept_source_notice`). `POST /deploy` by uuid or tag, manual, UI and
+  MCP deploys have no switch; the plan says so (`run_note`).
+- **Turning a switch on (or off) on a resource during the run?** Journal it
+  BEFORE the write, and undo exactly that write. FINALIZE journals each target's
+  uuid (`arm_requested`) and tag names (`tags_given`) before the request, and
+  either marker makes a rollback owe FINALIZE's compensations even when FINALIZE
+  never completed (`statemachine.targets_armed`). DISARM_TARGETS leads that
+  tuple, ahead of STOP_TARGET: auto-deploy off (read first, a 404 is done) and
+  exactly the journalled names detached (`deploy_triggers.tags_to_detach`), never
+  a tag someone gave the target since. Switching back ON happens once per
+  disarm: RESTORE_SOURCE_DEPLOY_TRIGGERS (owed to CREATE_TARGET, `_PRECEDENCE`:
+  after RESTORE_SOURCE_FQDN, before RESTART_SOURCE) gives back only what the
+  disarm took, journals `deploy_triggers_restored` per source and skips it on a
+  replay until QUIESCE journals a new disarm record (`restored_since_disarm`) —
+  RESTART_SOURCE's once-per-stop rule. `disarm_sources` journals that record
+  again whenever it switches a source off again.
+- **Adding or moving a step between QUIESCE and FINALIZE?** Two stacks must stay
+  still while it runs; keep the `containment.assert_contained` checkpoints: the
+  start of COPY (target), its end (both; the source alone when there is nothing
+  to copy), the end of VERIFY, the DNS gate on every attempt, START before the
+  first `/start`, and FINALIZE (source) BEFORE its policy is journalled — after
+  it, `rollback_refusal` would answer a revived source under DELETE with "the
+  source is deleted". The rules live in `domain/containment.py`. A check that
+  cannot be answered (the event log, a deployment history) never passes.
+- **A breach?** Before START asked for any target the run rolls back
+  (`SourceRevived`, `TargetStartedEarly`; a target found started is journalled
+  `started_early`, so STOP_TARGET is owed, `statemachine.target_may_run`). Once
+  START asked (`start_requested`, or START completed), a revived source BLOCKS
+  (`SourceRevivedAfterStart`) and so does an unread deployment history
+  (`SourceUncheckedAfterStart`): the executor rolls nothing back, because the
+  target may hold users' writes. Judge revivals from `stopped_clock`, the stop
+  gate's proof (`containment.judged_from`), never from the stop request.
+- **Stopping a target in a rollback?** End its deployments first
+  (`compensations._settle_target_deployments`): an application's `/stop` cancels
+  none, and DeleteResourceJob cancels only a preview's.
 - **Touching a domain of a source or a target?** Make-before-break, always: a
   custom hostname must have a live holder of ours at every instant. The target
   claims it first (scoped `force_domain_override`, `domains.only_own_holders` —
@@ -116,6 +178,27 @@ decision, the decision is in the wrong layer.
   first. Unmounted is what Coolify's `docker volume prune -af` deletes. Never
   flip the server's cleanup setting instead: a crash leaves it flipped, and a
   manual API run overrides it anyway.
+- **Touching a bind mount?** `domain/binds.py` decides; `transfer/binds.py` only
+  asks the servers and writes through fixed scripts that take the path as a
+  quoted argument. A bind is copied to the host path the TARGET's own storage
+  row names at the same mount path, read back after CREATE (invariant 10).
+  Never skip a directory in the resource's own
+  `/data/coolify/{applications|services|databases}/{uuid}` as "regenerated":
+  Coolify only `mkdir -p`s it. Every pair COPY writes first
+  passes `binds.pair_problem` — a journal from 2.14.0 or earlier paired writable
+  `/etc/...` path-to-path, and a resumed COPY reloads it — and only into a target
+  path that is absent or empty. COPY journals each target (`bind_target`) BEFORE
+  it touches it; a rollback deletes only what that record says this run
+  created, only where `binds.removable` allows, each removal journalled the
+  moment it is gone (`binds_removed`). The record also makes COPY owed when COPY
+  failed (`statemachine.owed_states`). A resumed COPY or VERIFY reads the pairs
+  from DISCOVER's journal (`steps._bind_pairs`): an empty `ctx.bind_pairs` is
+  never "no binds". "Nobody else mounts it" must be a fact: `host_binds` fails
+  closed except on containers gone between `docker ps` and the inspect
+  (`vanished_only`). A writable bind of `/` is a host agent and only a warning
+  (`binds.host_wide_writers`); every other writable parent refuses. Two
+  fail-closed limits are pinned in `tests/test_binds_limitations.py`; loosening
+  either is a decision.
 
 ## Verified upstream facts (do not re-derive)
 
@@ -888,10 +971,11 @@ older releases get exactly what they got before.
   173). Volumes nothing mounted before the stop get an `idle` pin, released
   without a wait - awaiting a remount that never comes kept every pin forever.
 - **The source unpin is the LAST compensation** (`RELEASE_SOURCE_PINS`, owed
-  from CREATE_TARGET): ..., RESTORE_SOURCE_FQDN, RESTART_SOURCE,
-  DELETE_TARGET_RESOURCE, RELEASE_SOURCE_PINS. It waits for the restarted source
-  to keep its volumes mounted, so nothing may wait behind it; the domain restore
-  runs before the restart (`/restart` bakes the labels at job time). When a stop
+  from CREATE_TARGET): ..., RESTORE_SOURCE_FQDN, RESTORE_SOURCE_DEPLOY_TRIGGERS,
+  RESTART_SOURCE, DELETE_TARGET_RESOURCE, RELEASE_SOURCE_PINS. It waits for the
+  restarted source to keep its volumes mounted, so nothing may wait behind it;
+  the domain restore runs before the restart (`/restart` bakes the labels at job
+  time). When a stop
   may have been requested (`statemachine.source_was_stopped`) and the restart
   was not accepted, it keeps the pins without a look. A kept pin's way out is
   `coolify-migrate unpin <id>` - never a second `rollback`, which redeploys a
@@ -910,9 +994,15 @@ older releases get exactly what they got before.
   policy; for keep/rename the saga's `guard`
   (`compensations.source_data_refusal`, gated by
   `statemachine.source_copy_unproven`) LOOKS before any compensation: every
-  source resource GETs, every copied volume is in `docker volume ls`, else
-  refuse — STOP_TARGET and DROP_TARGET_VOLUMES run before RESTART_SOURCE, and
-  compose recreates a missing volume EMPTY. Present volumes are re-pinned there,
+  source resource GETs, every copied volume is in `docker volume ls` with the
+  CreatedAt COPY journalled (`source_volumes_created`: one pruned and recreated
+  under its name is new), and every copied bind source is still what was copied
+  (`binds.source_lost`: present, same kind, not empty where DISCOVER saw data),
+  else refuse — STOP_TARGET and DROP_TARGET_VOLUMES run before RESTART_SOURCE,
+  compose recreates a missing volume EMPTY, and DELETE_TARGET_RESOURCE `rm -rf`s
+  the target's directory, where a relative bind's copy lives.
+  DROP_TARGET_VOLUMES' own bind check is a second line only: the saga goes on
+  after a failed compensation. Present volumes are re-pinned there,
   so no cleanup lands between the look and the restart. A guard that cannot
   answer refuses.
 - **The plan reads the setting off `GET /servers/{uuid}`**, whose eager-loaded
@@ -1053,6 +1143,188 @@ why `domain/domains.py` hands every hostname over make-before-break.
   Unit tests never touch the real resolver: `tests/conftest.py::_offline_dns`
   answers "offline" (not definitive) unless a test patches resolution itself.
 
+### Deploy triggers, containment, kept-source routers and bind mounts (release tags v4.1.2 -> v4.7.5)
+
+Read at the tags (moby v27.5.1 and v28.3.3 for the daemon). The modules named
+carry the rest of the evidence.
+
+- **Nothing in Coolify asks whether a migration runs before it deploys.** A push
+  deploys every application with `is_auto_deploy_enabled` on — all isDeployable
+  checks (Application v4.1.2:1106-1113, v4.7.2:1506-1513; column default true,
+  migration 2023_03_27_081717:19) — and a pull request a preview wherever
+  previews are on (isPRDeployable :1115/:1515, default false). A target made
+  from a GitHub App carries the source's repository id, one with manual webhooks
+  its secrets (`??=`, Application v4.1.2:239-242, v4.7.2:334-337): one push
+  deploys both. `POST /deploy` by uuid or tag checks neither flag nor status
+  (DeployController by_tags v4.1.2:444, v4.7.2:488; deploy_resource :496/:540).
+  The stop cancels no deployment (StopApplication v4.7.2:19-102), and
+  queue_next_deployment starts what waits.
+- **The switches.** The shared create array takes `is_auto_deploy_enabled` at
+  every tag (v4.1.2:914 .. v4.7.2:1613); the git routes store it at every tag,
+  dockerfile and dockerimage only from v4.5.1 (:2331/:2466). The update array
+  takes it at every tag (v4.1.2:2368, v4.7.2:3662), `is_preview_deployments_enabled`
+  only from v4.2.0 (:2695), and both are readable only from 4.2 (`settings`,
+  v4.2.0:2277, v4.7.2:2848). A settings-only PATCH deploys nothing, rebuilds no
+  labels and queues no DNS job (v4.1.2:2668/2680, v4.7.2:4107/4130;
+  ResourceDnsRecords v4.7.2:158-163).
+- **The queue.** `GET /deployments` (every tag, `read`) lists the team's queued
+  and in_progress rows — a JSON object once `->sortBy('id')` moved one. Match a
+  row by the application uuid in `deployment_url` (applications.php
+  v4.1.2:19-20, routes/web.php :217-218), never by the hidden `application_id`;
+  drop `logs` in the client. A deployment that ends replaces the containers: a
+  rolling update starts `{uuid}-{Ymd\THis}` (docker.php v4.7.2:670-686) and
+  removes the old one (ApplicationDeploymentJob v4.7.2:3084-3090) before the row
+  reads finished (:718-725).
+- **Tags.** No tag routes on 4.1.x (routes/api.php v4.2.0:158-160). A deleted
+  source has none to read: the routes skip soft-deleted rows (HandlesTagsApi
+  v4.7.2:23-38) and DeleteResourceJob force-deletes (v4.3.10:130, v4.7.2:171).
+  Adding is idempotent (createOrFirst + syncWithoutDetaching, v4.2.0:142), names
+  are stored lowercased and trimmed (normalizeTagNames v4.2.0 .. v4.7.5).
+  `DELETE /{collection}/{uuid}/tags/{tag_uuid}` only detaches (routes/api.php
+  v4.2.0:160, v4.7.5:313); up to 4.4.7 a tag left on nothing is then deleted
+  (deleteIfOrphaned, gone in v4.5.0).
+- **A service's or database's `/start` 400s "already running" off the status
+  column** (ServicesController v4.1.2:1724-1726 .. v4.7.2:2183-2185,
+  DatabasesController v4.1.2:2762-2764 .. v4.7.2:3588-3590). A target this run
+  never started reads 'exited', so for it the 400 means someone else started it:
+  `client.start` raises `AlreadyRunning`, START `TargetStartedEarly` unless its
+  own `start_requested` shows the ask. From 4.6.0 a database `/start` can 409
+  while an operation runs (v4.6.0:3583-3586): a plain API error.
+- **An application `/start` is skipped while a deployment of the same commit is
+  queued or running**: 200, a message, no `deployment_uuid` (applications.php
+  v4.1.2:47-64, v4.7.2:65-78; ApplicationsController v4.1.2:3597-3604,
+  v4.7.2:4970-4977). For a target that is someone else's deploy: refused. And
+  HEALTHCHECK counts a target's containers only once START's own deployment
+  finished: a container someone else deployed is up just as well.
+- **Stopping a never-started target is harmless** (StopApplication
+  v4.1.2:35-36, v4.7.2:43-45; services and databases answer "already stopped"),
+  but an application stop dispatches CleanupDocker on that server
+  (`docker_cleanup` defaults to true, ApplicationsController v4.1.2:3700,
+  v4.7.2:5073). It holds back no deployment: StopApplication runs on 'high' and
+  cancels none (v4.7.2:17), DeleteResourceJob cancels only a preview's
+  (v4.7.2:234-278). The cancel and per-application deployment routes exist on
+  every release (routes/api.php v4.1.2:81-82, v4.7.2:165-166). Not closed: a
+  service's StartService waits on the default queue, and no API cancels a queued
+  job (ServicesController v4.7.2:2186/2283, StopService:18).
+- **Coolify's stop is no single act.** StopApplication stops a compose app's
+  containers one SSH call and one grace period at a time (v4.1.2:38-42,
+  v4.7.2:47-58), QUIESCE stops the resources one after another, and every
+  container runs `restart: unless-stopped` (constants.php v4.1.2:37, v4.7.2:62;
+  parsers.php v4.7.2:1508,2918). So QUIESCE journals the source's clock twice:
+  `stop_clock` before the request (`quiesce.killed_since`'s window) and
+  `stopped_clock` once the gate passed (the revival window).
+- **The daemon's event log is no witness of the stop window.** It keeps its last
+  256 events in memory and none across a restart (daemon/events/events.go
+  v27.5.1:12,26, v28.3.3:13,27); every health probe logs three. The checkpoints
+  warn `containment.event_log_gap` (an empty buffer is a gap) and judge what
+  still exists by its state and `State.StartedAt`. A container that came and
+  went before the window cannot be ruled out: say so, never claim it.
+- **An application's deployment history is the durable witness**
+  (`GET /deployments/applications/{uuid}`; rows kept 60 days, CleanupDatabase
+  v4.1.2:23-26,52-57, v4.7.2:29-31,47; a failed deploy leaves its row).
+  QUIESCE journals each source application's ENDED rows (`source_deployments`)
+  and refuses the stop over one still pending. A checkpoint reports every row
+  queued, running or unread, and every row the record lacks that no recorded row
+  sorts above — by uuid and Coolify's order (created_at desc; the id tiebreak
+  only from v4.7.2:1489-1490), never by time. Coolify's own 404 "Application
+  not found" (DeployController v4.1.2:692-695 .. v4.7.2:754-757) is a source
+  gone, any other 404 an unread history. A block after START journals what it
+  showed (`containment.block_record`: ended rows in `revival_seen_deployments`,
+  pending ones in `revival_pending_deployments`, reported once more after they
+  end) and the source's clock (`revival_seen_clock`). Services and databases
+  have no deployment rows.
+- **Coolify's scheduled volume backup reads a stopped source's volumes**
+  (4.3.0+): `docker run --rm --name volume-backup-<uuid> -v <volume>:/volume:ro`
+  whatever the status — no 'running' skip (VolumeBackupJob v4.3.0:78-87,
+  v4.7.2:101-123; ScheduledJobManager v4.3.0:382-430, v4.7.2:531-600). It has no
+  label and no uuid, so only the migrated-volume probe finds it, and such a
+  container counts only when it mounts a migrated volume writable
+  (`containment.volume_only`, `mounts_writable`; untellable counts). Never extend
+  that to a labelled or uuid-carrying container. Its `stop_during_backup`
+  restarts running containers only (`docker ps -q`, v4.7.2:383-419).
+- **One machine can be two Coolify servers.** One SSH endpoint is one record
+  (ServersController v4.7.2:637, `sshEndpointInUse`), but localhost and the
+  public IP, or two SSH ports, are two, and the source checkpoints would take the
+  running target for the source started again. PREFLIGHT compares moby's engine
+  ID (`docker info --format '{{.ID}}'`, written once into the data root,
+  daemon/id.go v27.5.1:12-35) and refuses equal ones
+  (`containment.shared_daemon_refusal`), nothing when a probe goes unanswered. A
+  machine cloned with its `/var/lib/docker` shares the ID.
+- **A local volume's CreatedAt is the ctime of `/var/lib/docker/volumes/<name>`**
+  (volume/local/local_unix.go v27.5.1:229-236), so a volume pruned and recreated
+  under its name (`external: false`, ApplicationDeploymentJob v4.7.2:5011-5030)
+  reads new. COPY journals `source_volumes_created` once its end checkpoint
+  passed.
+- **Readonly labels off: FINALIZE's release stops nothing the proxy reads.** The
+  domain PATCH rebuilds `custom_labels` only while
+  `is_container_label_readonly_enabled` is on (ApplicationsController
+  v4.1.2:2668 .. v4.7.2:4107), and every non-compose deploy writes the stored
+  labels (ApplicationDeploymentJob v4.1.2:3099-3115, v4.7.2:4740-4763). A
+  dockercompose app's come from `docker_compose_domains` at every parse (its
+  deploy, v4.7.2:876, never reads custom_labels); services have no such column
+  (migration 2023_10_18_072519). So keep and rename are refused for such an
+  application (`fidelity.kept_source_label_refusals`; 4.1.x shows no settings
+  and warns). Switching label management back regenerates the labels (Livewire
+  General v4.1.2:490-491, v4.7.2:567-568).
+- **A compose's own labels outlive every domain write.** Both parsers start a
+  service's labels from its compose `labels:` and merge the generated ones on
+  top, never reading the readonly setting (applicationParser v4.1.2:1311,
+  v4.5.0:2130, v4.7.2:2170; serviceParser v4.1.2:2588, v4.5.0:3447,
+  v4.7.2:3518). Where the proxy serves them they route after the release:
+  Coolify's Traefik runs `--providers.docker.exposedbydefault=false` (proxy.php
+  v4.1.2:351, v4.7.2:809), Coolify writes `traefik.enable=true` only for a
+  compose service with a domain (fqdnLabelsForTraefik, docker.php v4.7.2:1048;
+  parsers v4.7.2:2179,3527), and a Caddy site label always routes. Refused under
+  keep/rename (`fidelity.compose_hosts_routed_after_release`, the one predicate;
+  a service that keeps a domain is `_traefik_serves_after_release`, gated on
+  `compose_blank_domain_regenerated`). What the GET cannot show is a warning
+  (`compose_routes_unexposed`, `compose_routes_unseen`): a Traefik router on a
+  service that neither keeps a domain nor sets `traefik.enable`, a host built
+  from a variable while label escaping is off or unknown (escapeDollarSign,
+  v4.1.2:1313-1316/2590-2593, v4.7.2:2172-2175/3520-3523), a SPECIFIC_SERVICES
+  part's env-row routes. A refusal and a warning never name the same host.
+- **FINALIZE asks both predicates of the GET its release is built from**, against
+  the hosts the source held BEFORE the release (`parked_domains`,
+  `api_resources.held_before_release`, so a resumed FINALIZE still sees them),
+  and never lists such a source as released (`DomainRelease.still_routed`,
+  `compose_routed`).
+- **One server per side.** Source and target are never one server record
+  (`plan.same_server_refusal`); an environment migrates from its first
+  resource's server, so `ResourceSnapshot.server_uuid` and
+  `plan.foreign_server_refusal` refuse every resource elsewhere, and the planner
+  one whose server it cannot read. Both derived on every read: a saved plan.json
+  is judged too.
+- **Every compose bind is a file-storage row** for each local source but
+  `/var/run/docker.sock` and `/tmp`, keyed on `(mount_path, resource)`
+  (parsers.php v4.1.2:774-812/2161-2193 .. v4.7.2:1613-1657/3062-3098). `./x`
+  resolves under the resource's directory (resolveComposeBindSource, shared.php
+  v4.7.2:2124-2132), under `applications/{uuid}` for a service on compose
+  parsing version 3 (parsers.php v4.7.2:138-145).
+- **Only a row WITH content is regenerated.** A directory row is only ever
+  `mkdir -p`'d (LocalFileVolume v4.7.2:333-405), a deploy writes only
+  non-directory rows (ApplicationDeploymentJob v4.7.2:1546-1550), a service start
+  only its compose, `.env` and missing content files (EnsureContentFilesOnServer
+  v4.7.2:51): a new target starts with every such directory EMPTY. A content row
+  is written wherever the compose put it (LocalFileVolume v4.7.2:319-330), so it
+  is judged before the system-path rule.
+- **Which target gets that content** (`binds.StorageCarry`): a plain app's rows
+  are POSTed (`copy_storages`, which skips placeholder content — a binary or
+  over-5-MiB file mount is refused); a git compose app re-reads its compose from
+  git (into `/tmp/{random}`, Application v4.7.2:2772-2810: its directory stays
+  empty until START); a template service gets the catalog's; a raw-compose
+  service's stored `docker_compose_raw` has no `content:`/`isDirectory`
+  (parsers.php v4.1.2:2740, v4.5.0:3638, v4.7.2:3701-3718), so its row is a
+  contentless directory (v4.7.2:3051-3058) and the file is mirrored. A database
+  carries no storage row: its host-path, directory and content mounts are
+  refused, and what Coolify writes from its columns at every start (StartPostgresql
+  v4.7.2:163-190) is skipped. The rest is read back at the end of CREATE
+  (`binds.content_problem`): a catalog or a branch HEAD can drop a file.
+- **Deleting a resource removes its own directory only** (deleteConfigurations,
+  Application v4.7.2:587-594, Service v4.7.2:226-233 via DeleteService
+  v4.7.2:30-32; LocalFileVolume v4.7.2:269-271). A target delete takes a
+  relative bind's copy, never an absolute one's — COPY's rollback removes that —
+  and FINALIZE `delete` leaves the source's absolute bind paths on its server.
+
 ## Supporting a new Coolify release
 
 A release that only ADDS fields is a data change in `domain/coolify_versions.py`
@@ -1116,3 +1388,9 @@ Conventional Commits, **past-tense** subject (`added`, `fixed`, `updated`), max
 | Will Coolify (4.7+) accept this name or description? | `domain/fidelity.py` (names and descriptions) |
 | Did the deploy behind a start or restart actually run? | `domain/deployments.py` |
 | Does Coolify pin its own host's SSH key (F2)? | `domain/host_keys.py` |
+| What can deploy a source or a target, and what does a rollback switch back? | `domain/deploy_triggers.py` (IO: `engine/deploy_triggers.py`) |
+| Did anything start the stopped source or an unstarted target? | `domain/containment.py` (rules), `engine/containment.py` (checkpoints, the stop's deployment record) |
+| Are the source and target one server, or one machine? | `domain/plan.py` (`same_server_refusal`), `domain/containment.py` (`shared_daemon_refusal`) |
+| Which refusals depend on the finalize policy, or on the plan as a whole? | `domain/plan.py` (`MigrationPlan.blocking_reasons_of`, `plan_refusals`) |
+| Does a kept source keep routing its moved hosts? | `domain/fidelity.py` (`hosts_routed_after_release`, `compose_hosts_routed_after_release`) |
+| May a bind mount be copied, shared or removed, and where does it land? | `domain/binds.py` (IO: `transfer/binds.py`) |
