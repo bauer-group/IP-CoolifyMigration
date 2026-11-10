@@ -847,6 +847,20 @@ def belongs_to(
     )
 
 
+def foreign_binds(
+    mounts: Iterable[HostBind],
+    *,
+    uuids: Sequence[str],
+    label_sets: Sequence[Mapping[str, str]],
+) -> list[HostBind]:
+    """The binds of every container that is not one of the plan's own. PURE.
+
+    What QUIESCE does not stop (:func:`belongs_to`): the plan's warning about a
+    host-wide agent and PREFLIGHT's refusal of a sharer both judge only these.
+    """
+    return [b for b in mounts if not belongs_to(b, uuids=uuids, label_sets=label_sets)]
+
+
 #: Coolify's management mounts: its own container binds these roots whole
 #: (docker-compose.prod.yml), and writes into a resource's directory only when
 #: that resource is saved or deployed.
@@ -894,7 +908,8 @@ def shared_with(path: str, binds: Iterable[HostBind]) -> list[HostBind]:
 def host_wide_writers(binds: Iterable[HostBind]) -> list[HostBind]:
     """The containers that mount the whole host writable, once each. PURE.
 
-    :func:`shared_with` leaves them out; the run warns about each instead
+    :func:`shared_with` leaves them out; the plan warns about each on the
+    source before anything runs, and the run again on either server
     (:func:`host_wide_notice`). A read-only ``/`` is no writer.
     """
     seen: dict[str, HostBind] = {}
@@ -905,7 +920,13 @@ def host_wide_writers(binds: Iterable[HostBind]) -> list[HostBind]:
 
 
 def host_wide_notice(bind: HostBind, *, paths: Sequence[str], server: str) -> str:
-    """The run notice for one container that mounts the whole host writable. PURE."""
+    """The warning for one container that mounts the whole host writable. PURE.
+
+    One text for every place that says it: the plan's notes (what the
+    confirmation shows before anything is stopped, engine/planner.py) and the
+    run notices of PREFLIGHT and the end of CREATE. Its remedy is only of use
+    before the stop, which is why the plan says it first.
+    """
     shown = ", ".join(paths[:5]) + (f" and {len(paths) - 5} more" if len(paths) > 5 else "")
     return (
         f"{bind.container} on {server} mounts the whole host writable ({HOST_ROOT}), so it "
@@ -913,8 +934,8 @@ def host_wide_notice(bind: HostBind, *, paths: Sequence[str], server: str) -> st
         "like a host agent (Portainer's agent, a host backup) rather than a resource "
         "sharing that data, so the migration goes on - but what it writes there while "
         "the data is copied and verified can fail VERIFY or go missing from the copy. "
-        "Make that mount read-only, or stop the container until the migration has "
-        "finished."
+        "Make that mount read-only, or stop the container, before the migration starts "
+        "and until it has finished."
     )
 
 

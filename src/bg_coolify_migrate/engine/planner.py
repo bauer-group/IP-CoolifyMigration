@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import structlog
@@ -40,6 +41,7 @@ from bg_coolify_migrate.dns import resolve as dns_resolve
 from bg_coolify_migrate.dns import wildcard as dns_wildcard
 from bg_coolify_migrate.domain import binds, deploy_triggers, domains, fidelity
 from bg_coolify_migrate.domain import compose as compose_mod
+from bg_coolify_migrate.domain.compose import MountClass
 from bg_coolify_migrate.domain.coolify_versions import supports
 from bg_coolify_migrate.domain.deployments import image_scan_gate_warnings
 from bg_coolify_migrate.domain.drift import RebuildDriftReport, assess_rebuild_drift
@@ -80,6 +82,7 @@ from bg_coolify_migrate.errors import (
     PreflightError,
     UnsupportedResource,
 )
+from bg_coolify_migrate.transfer import binds as transfer_binds
 from bg_coolify_migrate.transfer.ssh import RemoteHost
 
 log = structlog.get_logger(__name__)
@@ -1174,6 +1177,12 @@ async def build_plan(
             api, served, source=source_ref, target=target_ref, version=coolify_version
         )
     )
+    # Before the confirmation, while the operator can still act on it.
+    notes.extend(
+        await host_wide_writer_notes(
+            source_host, plans, project=project_name, environment=environment, server=source_ref.name
+        )
+    )
     # What still deploys a source or a target during the run, and what does not.
     if any(p.snapshot.collection == "applications" for p in plans):
         notes.append(deploy_triggers.run_note())
@@ -1194,6 +1203,61 @@ async def build_plan(
         selected_resources=tuple(p.snapshot.name for p in plans) if only_resource else (),
         dns_baseline=baseline,
     )
+
+
+def plan_bind_paths(plans: Iterable[ResourcePlan]) -> list[str]:
+    """Every host path these resources migrate as a bind mount, once, sorted. PURE."""
+    return sorted(
+        {
+            item.source_path
+            for plan in plans
+            for item in plan.manifest.to_migrate
+            if item.mount_class is MountClass.BIND
+        }
+    )
+
+
+async def host_wide_writer_notes(
+    source_host: RemoteHost,
+    plans: Sequence[ResourcePlan],
+    *,
+    project: str,
+    environment: str,
+    server: str,
+) -> list[str]:
+    """Warn of each container that mounts the source host writable (domain/binds.py).
+
+    Such an agent (Portainer's ``-v /:/host``, a host backup's ``/:/source``) is
+    no sharer of a bind path (``binds.shared_with``) and refuses nothing, but
+    QUIESCE stops only the plan's resources, so it can write a migrated path
+    during COPY and VERIFY. Its remedy — make the mount read-only, or stop the
+    container — is of use only before the stop, so it belongs in the plan the
+    confirmation shows, not only in the run report. PREFLIGHT repeats it for the
+    source (a container started since is named there), and the end of CREATE
+    names the target's: no target connection exists while planning.
+
+    Fail-soft, like the other notes: an unreadable listing is a plan without the
+    warning, and PREFLIGHT reads the mounts again and fails closed on it.
+    """
+    paths = plan_bind_paths(plans)
+    if not paths:
+        return []
+    try:
+        mounts = await transfer_binds.host_binds(source_host)
+    except Exception as exc:  # diagnostics only, never fatal
+        log.debug("planner.host_binds_unavailable", error=str(exc)[:120])
+        return []
+    labels = [
+        resource_labels(project=project, environment=environment, name=p.snapshot.name)
+        for p in plans
+    ]
+    others = binds.foreign_binds(
+        mounts, uuids=[p.snapshot.uuid for p in plans], label_sets=labels
+    )
+    return [
+        binds.host_wide_notice(bind, paths=paths, server=server)
+        for bind in binds.host_wide_writers(others)
+    ]
 
 
 async def _elsewhere_note(

@@ -89,6 +89,7 @@ from bg_coolify_migrate.engine.planner import (
     build_manifest,
     inspect_all_mounts,
     observed_labels,
+    plan_bind_paths,
     resource_containers,
     resource_labels,
 )
@@ -1905,8 +1906,8 @@ def _source_binds(manifest: VolumeManifest) -> list[tuple[str, str]]:
 
 
 def _plan_binds(ctx: MigrationContext) -> list[str]:
-    """Every host path the plan migrates as a bind mount, once. PURE."""
-    return sorted({path for r in ctx.plan.resources for path, _ in _source_binds(r.manifest)})
+    """Every host path the plan migrates as a bind mount, once: the plan's own list. PURE."""
+    return plan_bind_paths(ctx.plan.resources)
 
 
 async def _assert_source_binds_safe(ctx: MigrationContext) -> None:
@@ -1919,7 +1920,9 @@ async def _assert_source_binds_safe(ctx: MigrationContext) -> None:
     the cutover it and the target hold two diverging copies of shared state.
 
     A container that mounts the whole host writable (``binds.host_wide_writers``)
-    is an agent, not a sharer, and gets a run notice instead of a refusal.
+    is an agent, not a sharer, and gets a run notice instead of a refusal. The
+    plan already warned about each one it saw (planner.host_wide_writer_notes),
+    before the confirmation; this repeats it, and names one started since.
     """
     paths = _plan_binds(ctx)
     if not paths:
@@ -1932,13 +1935,11 @@ async def _assert_source_binds_safe(ctx: MigrationContext) -> None:
         )
         for r in ctx.plan.resources
     ]
-    others = [
-        bind
-        for bind in await transfer_binds.host_binds(ctx.source_host)
-        if not binds.belongs_to(
-            bind, uuids=[r.snapshot.uuid for r in ctx.plan.resources], label_sets=labels
-        )
-    ]
+    others = binds.foreign_binds(
+        await transfer_binds.host_binds(ctx.source_host),
+        uuids=[r.snapshot.uuid for r in ctx.plan.resources],
+        label_sets=labels,
+    )
     for path in paths:
         problems.extend(
             f"{path} is also mounted by {other.container} ({other.source}"
