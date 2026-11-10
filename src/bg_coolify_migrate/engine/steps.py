@@ -56,7 +56,7 @@ from bg_coolify_migrate.domain.plan import HostBaseline, ResourcePlan, ResourceS
 from bg_coolify_migrate.domain.schedules import armed_task_names
 from bg_coolify_migrate.domain.statemachine import STOP_REQUESTED, FinalizePolicy, State
 from bg_coolify_migrate.domain.versions import parse_version
-from bg_coolify_migrate.engine import compensations, env_recovery, keys
+from bg_coolify_migrate.engine import compensations, deploy_triggers, env_recovery, keys
 from bg_coolify_migrate.engine.context import (
     MigrationContext,
     dns_baseline_of,
@@ -2657,6 +2657,11 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
     domains_released: list[str] = []
     if policy is not FinalizePolicy.DELETE:
         domains_released = await _release_source_domains(ctx)
+
+    # After the cutover, never fatally: each target gets its source's auto-deploy,
+    # kept off it so no push could start it before the DNS gate
+    # (engine/deploy_triggers.py).
+    target_armed = await deploy_triggers.arm_targets(ctx)
     return {
         "policy": policy.value,
         "actions": actions,
@@ -2664,6 +2669,7 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
         "pins_released": released,
         "pins_left": left,
         "domains_released": domains_released,
+        "target_armed": target_armed,
     }
 
 

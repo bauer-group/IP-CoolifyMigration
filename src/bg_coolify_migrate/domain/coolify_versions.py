@@ -554,6 +554,11 @@ _APPLICATION: tuple[Field, ...] = (
         "pre_deployment_command",
         "pre_deployment_command_container",
     ),
+    # NEVER read from the source: every application target is created with
+    # auto-deploy OFF and armed at FINALIZE (domain/deploy_triggers.py), so a push
+    # cannot start it before the DNS gate. In the shared create array at every tag
+    # (v4.1.2:914, v4.5.0:1340, v4.7.2:1613); create_application sets it.
+    Field("is_auto_deploy_enabled"),
     # Settings, sent flat. These were write-only when this list was written;
     # upstream has since added `->with('settings')` to application_by_uuid, so
     # they DO come back on the GET now — but nested under a `settings` object.
@@ -566,7 +571,6 @@ _APPLICATION: tuple[Field, ...] = (
     *_always(
         "is_static",
         "is_spa",
-        "is_auto_deploy_enabled",
         "is_force_https_enabled",
         "connect_to_docker_network",
         "use_build_server",
@@ -997,14 +1001,26 @@ _SERVICE_APPLICATION_UPDATE: tuple[Field, ...] = (
     Field("redirect", Gate(since=(4, 5, 1))),
 )
 
+#: PATCH /v1/applications/{uuid} with these fields ONLY (domain/deploy_triggers.py):
+#: the target's arming at FINALIZE. Such a PATCH deploys nothing without
+#: instant_deploy (ApplicationsController v4.1.2:2680, v4.7.2:4130) and rebuilds no
+#: labels without domains (v4.1.2:2668, v4.7.2:4107).
+_APPLICATION_SETTINGS_UPDATE: tuple[Field, ...] = (
+    # In the update array at every tag (v4.1.2:2368, v4.7.2:3662), applied when
+    # set (v4.1.2:2613/2634-2637, v4.7.2:4008/4036-4039).
+    Field("is_auto_deploy_enabled"),
+)
+
 #: Per follow-up PATCH, the fields this tool sends. ``services.update``: PATCH
 #: /services/{uuid}; ``databases.update``: PATCH /databases/{uuid};
-#: ``service-applications.update``: PATCH /services/{uuid}/applications/{app_uuid}.
+#: ``service-applications.update``: PATCH /services/{uuid}/applications/{app_uuid};
+#: ``applications.settings``: a settings-only PATCH /applications/{uuid}.
 UPDATE_FIELDS: Mapping[str, tuple[Field, ...]] = MappingProxyType(
     {
         "services.update": _SERVICE_UPDATE,
         "databases.update": _DATABASE_UPDATE,
         "service-applications.update": _SERVICE_APPLICATION_UPDATE,
+        "applications.settings": _APPLICATION_SETTINGS_UPDATE,
     }
 )
 

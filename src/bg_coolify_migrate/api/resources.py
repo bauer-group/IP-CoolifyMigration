@@ -51,7 +51,7 @@ from bg_coolify_migrate.dns.extract import (
     normalise_host,
     route_env_keys,
 )
-from bg_coolify_migrate.domain import domains, fidelity
+from bg_coolify_migrate.domain import deploy_triggers, domains, fidelity
 from bg_coolify_migrate.domain.coolify_versions import supports
 from bg_coolify_migrate.domain.kinds import ResourceKind, create_route
 from bg_coolify_migrate.domain.locked_envs import Secrets
@@ -794,6 +794,11 @@ async def create_application(
     body = filter_for({**source, **placement.as_body()}, f"applications/{segment}", version)
     body["name"] = snapshot.name
     body["instant_deploy"] = False
+    # Auto-deploy OFF whatever the source has: a push (the same GitHub App
+    # repository, the same manual webhook secrets) must not start the target
+    # before the DNS gate. FINALIZE gives it the source's value back.
+    allowed = fields_for(f"applications/{segment}", version)
+    body.update(filter_body(dict(deploy_triggers.TARGET_CREATE), allowed))
     _drop_unsendable_description(body, source, version=version)
 
     # Readonly labels OFF (4.5.1+) keeps the source's labels verbatim on the
@@ -2052,4 +2057,24 @@ async def read_volume_endpoints(
 async def rename(api: CoolifyClient, collection: str, uuid: str, name: str) -> None:
     await api.update_resource(collection, uuid, {"name": name})
     log.info("api.renamed", uuid=uuid, name=name)
+
+
+async def update_application_settings(
+    api: CoolifyClient, uuid: str, body: dict[str, bool], *, version: Version | None
+) -> dict[str, bool]:
+    """A settings-only PATCH /applications/{uuid}. Returns what was sent.
+
+    For the deploy switches only (domain/deploy_triggers.py), filtered through
+    the release's ``applications.settings`` whitelist. Without domains or
+    instant_deploy the update writes the settings rows and nothing else: no
+    deploy and no label rebuild (ApplicationsController v4.1.2:2668/2680,
+    v4.7.2:4107/4130), and no DNS job — the 4.6+ record and release jobs act on
+    added or removed hostnames only (ResourceDnsRecords v4.7.2:158-163). Nothing
+    to send sends nothing.
+    """
+    sent = filter_body(body, fields_for("applications.settings", version))
+    if sent:
+        await api.update_resource("applications", uuid, sent)
+        log.info("api.application.deploy_switches", uuid=uuid, settings=sent)
+    return sent
 
