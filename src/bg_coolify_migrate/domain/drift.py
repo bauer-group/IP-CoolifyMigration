@@ -76,7 +76,12 @@ EXPECTED_DIFFERENCES: frozenset[str] = frozenset(
         "fqdn",
         "domains",
         "docker_compose_domains",
-        # Regenerated per resource by Coolify.
+        # Secrets: never diffed, a finding would print their value. They do NOT
+        # differ, though: CREATE carries them (create array v4.1.2:914 ..
+        # v4.7.2:1613), and Coolify generates one only where none was sent
+        # (Application v4.1.2:239-242, v4.7.2:334-337, `??=`) — so both accept the
+        # same signed push, which is why the target is created with auto-deploy
+        # off (domain/deploy_triggers.py).
         "manual_webhook_secret_github",
         "manual_webhook_secret_gitlab",
         "manual_webhook_secret_bitbucket",
@@ -84,9 +89,12 @@ EXPECTED_DIFFERENCES: frozenset[str] = frozenset(
     }
 )
 
-#: ApplicationSetting fields that are settable via POST/PATCH but NOT readable
-#: (GET /v1/applications/{uuid} does not eager-load the `settings` relation).
-#: We cannot diff them, so they are surfaced as known-unknowns.
+#: ApplicationSetting fields that are settable via POST/PATCH but cannot be diffed
+#: here. Before 4.2 the GET does not eager-load `settings` (application_by_uuid
+#: v4.1.2:1973); from 4.2 it does (v4.2.0:2277, v4.7.2:2848), NESTED under
+#: `settings`, which :func:`normalise` compares as one opaque value. So they are
+#: surfaced as known-unknowns. (domain/deploy_triggers.py reads two of them off
+#: that nested object.)
 UNREADABLE_SETTINGS: frozenset[str] = frozenset(
     {
         "is_static",
