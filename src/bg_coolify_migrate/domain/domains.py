@@ -45,9 +45,9 @@ So the rollback planner restores the domains BEFORE it restarts the source
 once its source holds them again. And FINALIZE's release is a break of the
 ROUTING only for the routers Coolify generates: an application with read-only
 labels off, or a router written into a compose, keeps routing the released
-hosts on the source's next deploy. The plan refuses keep and rename for the
-first (fidelity.kept_source_label_refusals) and warns about the second
-(fidelity.kept_source_compose_label_warnings).
+hosts on the source's next deploy. The plan refuses keep and rename for both
+(fidelity.kept_source_label_refusals, kept_source_compose_label_refusals) and
+warns where it cannot read the host (fidelity.compose_routes_unseen).
 """
 
 from __future__ import annotations

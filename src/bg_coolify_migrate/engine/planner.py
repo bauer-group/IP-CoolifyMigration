@@ -1014,7 +1014,13 @@ async def build_plan(
             kept_warnings.extend(
                 fidelity.kept_source_label_warnings(full, source_wildcard=origin_wildcard or None)
             )
-            # ...and so do routers written into a dockercompose app's own compose.
+            # ...and so do routers written into a dockercompose app's own compose:
+            # refused where the plan can read the host, warned about where not.
+            kept_refusals.extend(
+                fidelity.kept_source_compose_label_refusals(
+                    full, collection=collection, source_wildcard=origin_wildcard or None
+                )
+            )
             kept_warnings.extend(
                 fidelity.kept_source_compose_label_warnings(
                     full, collection=collection, source_wildcard=origin_wildcard or None
@@ -1051,6 +1057,11 @@ async def build_plan(
                 )
             )
             # Routers written into the service's compose outlive FINALIZE's release.
+            kept_refusals.extend(
+                fidelity.kept_source_compose_label_refusals(
+                    full, collection=collection, source_wildcard=service_wildcard
+                )
+            )
             kept_warnings.extend(
                 fidelity.kept_source_compose_label_warnings(
                     full, collection=collection, source_wildcard=service_wildcard

@@ -34,7 +34,7 @@ from collections.abc import Collection, Iterable, Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
-from bg_coolify_migrate.dns.extract import normalise_host
+from bg_coolify_migrate.dns.extract import normalise_host, route_env_keys
 from bg_coolify_migrate.domain import compose as compose_mod
 from bg_coolify_migrate.domain import images, locked_envs
 from bg_coolify_migrate.domain.coolify_versions import (
@@ -42,7 +42,12 @@ from bg_coolify_migrate.domain.coolify_versions import (
     every_application_route_carries,
     supports,
 )
-from bg_coolify_migrate.domain.domains import compose_domains, custom_hosts, without_generated
+from bg_coolify_migrate.domain.domains import (
+    compose_domains,
+    custom_hosts,
+    is_custom,
+    without_generated,
+)
 from bg_coolify_migrate.domain.kinds import DatabaseEngine, removed_from_compose
 from bg_coolify_migrate.domain.locked_envs import is_locked
 from bg_coolify_migrate.domain.versions import Version
@@ -876,7 +881,10 @@ def _label_routes(text: str) -> list[str]:
 # v4.5.0:2858,3447,3570, v4.7.2:2930,3518,3641), whatever the readonly
 # setting (the parsers never read it). A router written into the compose by
 # hand therefore outlives the release of the domains on every release:
-# :func:`compose_hosts_routed_after_release`.
+# :func:`compose_hosts_routed_after_release`, refused under keep and rename
+# like hand-kept custom_labels. What the plan cannot read off the GET — a host
+# docker compose fills in from a variable, the env rows a SPECIFIC_SERVICES
+# part is routed from — is warned about instead (:func:`compose_routes_unseen`).
 
 #: The build pack whose deploys never use custom_labels.
 _LABELS_FROM_COMPOSE = "dockercompose"
@@ -1024,6 +1032,26 @@ def _compose_released_hosts(
     return list(dict.fromkeys(hosts))
 
 
+def _compose_label_lines(source: Mapping[str, Any]) -> str:
+    """Every ``labels:`` entry of the source's own compose, one per line. PURE.
+
+    Read off ``docker_compose_raw``, the operator's compose: the parsed
+    ``docker_compose`` holds the generated labels too. Empty when it cannot be
+    read.
+    """
+    services = _parsed_compose_services(source.get("docker_compose_raw"))
+    if not services:
+        return ""
+    return "\n".join(_compose_label_text(body.get("labels")) for body in services.values())
+
+
+def _compose_backed(source: Mapping[str, Any], collection: str) -> bool:
+    """A dockercompose application or a service: what deploys from a compose."""
+    if collection == "applications":
+        return source.get("build_pack") == _LABELS_FROM_COMPOSE
+    return collection == "services"
+
+
 def compose_hosts_routed_after_release(
     source: Mapping[str, Any], *, collection: str, source_wildcard: str | None
 ) -> list[str]:
@@ -1033,62 +1061,220 @@ def compose_hosts_routed_after_release(
     the note above :data:`_LABELS_FROM_COMPOSE`), so releasing the domains of a
     dockercompose application or a service stops only the routers Coolify
     generates from them: one the operator wrote into the compose routes its host
-    again on the kept source's next deploy, next to the target. Read off
-    ``docker_compose_raw``, the operator's compose (the parsed ``docker_compose``
-    holds the generated labels too); only literal hosts are seen — a rule built
-    from a variable (``Host(`${DOMAIN}`)``) is not resolved. A HostRegexp rule
-    is returned like :func:`label_routed_release_hosts` returns it.
+    again on the kept source's next deploy, next to the target. Only literal
+    hosts are seen; a rule built from a variable (``Host(`${DOMAIN}`)``) is
+    what :func:`compose_routes_unseen` reports. A HostRegexp rule is returned
+    like :func:`label_routed_release_hosts` returns it.
 
-    The ONE predicate behind the plan's keep/rename warning
-    (:func:`kept_source_compose_label_warnings`) and FINALIZE's report, which
+    The ONE predicate behind the plan's keep/rename refusal
+    (:func:`kept_source_compose_label_refusals`) and FINALIZE's report, which
     asks it of the GET its release is built from (api/resources). PURE.
     """
+    if not _compose_backed(source, collection):
+        return []
     released = _compose_released_hosts(
         source, collection=collection, source_wildcard=source_wildcard
     )
-    if not released:
+    text = _compose_label_lines(source) if released else ""
+    if not text:
         return []
-    services = _parsed_compose_services(source.get("docker_compose_raw"))
-    if not services:
-        return []
-    text = "\n".join(_compose_label_text(body.get("labels")) for body in services.values())
     return _routed_among(released, _label_routes(text))
 
 
-def kept_source_compose_label_warnings(
+#: A variable reference docker compose fills in: ``$X`` or ``${X...}``.
+_VARIABLE = re.compile(r"\$\{?[A-Za-z_]")
+
+
+def label_escaping(source: Mapping[str, Any], *, collection: str) -> bool | None:
+    """Does Coolify escape ``$`` in this compose-backed source's labels? PURE.
+
+    With escaping on (the column default, migration 2024_05_15_151236, present
+    at v4.1.2) every ``$`` of a compose label becomes ``$$`` before the compose
+    is written (escapeDollarSign, docker.php v4.1.2:1274, v4.7.2:2096; called
+    by applicationParser v4.1.2:1313-1316, v4.5.0:2132-2135, v4.7.2:2172-2175
+    and serviceParser v4.1.2:2590-2593, v4.5.0:3449-3452, v4.7.2:3520-3523), so
+    docker compose fills in no variable there and ``Host(`${DOMAIN}`)`` routes
+    nothing. A service carries the flag at its top level on every release (a
+    column, not in Service's ``$hidden``: v4.1.2:36, v4.7.2:39,86-89); an
+    application in its ``settings``, which the GET nests from 4.2 and leaves
+    out on 4.1.x (``None``). Read by key, never by version.
+    """
+    if collection == "services":
+        value = source.get("is_container_label_escape_enabled")
+    else:
+        settings = source.get("settings")
+        value = (
+            settings.get("is_container_label_escape_enabled")
+            if isinstance(settings, Mapping)
+            else None
+        )
+    return value if isinstance(value, bool) else None
+
+
+def compose_routes_unseen(
+    source: Mapping[str, Any], *, collection: str, source_wildcard: str | None
+) -> tuple[list[str], list[str]]:
+    """What routers written into the compose may route that the plan cannot match.
+
+    ``(variable_rules, unmatched)``, both empty unless FINALIZE has something to
+    release, and never a host :func:`compose_hosts_routed_after_release`
+    returns — that one is refused, these are only warned about:
+
+    * ``variable_rules``: ``Host()``/``HostSNI()`` rules and Caddy site labels
+      built from a variable, which docker compose fills in at every deploy
+      unless Coolify escapes the labels (:func:`label_escaping` known on). The
+      plan does not resolve them.
+    * ``unmatched``: for a service with a SPECIFIC_SERVICES part (minio, logto,
+      garage, silo), which Coolify routes from env rows rather than its fqdn
+      (generateServiceSpecificFqdns, docker.php v4.5.0:660-758,
+      v4.7.2:757-855; serviceParser v4.7.2:3457-3458) and FINALIZE blanks
+      when they hold a custom host
+      (api/resources.release_service_urls): the custom hosts the compose's
+      routers name that are none of its released domains, and every HostRegexp
+      rule the refusal did not take. Those rows are no part of the GET this
+      reads, so the plan cannot tell whether such a host is one of them.
+
+    PURE.
+    """
+    if not _compose_backed(source, collection):
+        return [], []
+    released = _compose_released_hosts(
+        source, collection=collection, source_wildcard=source_wildcard
+    )
+    route_keys = (
+        route_env_keys(source.get("applications")) if collection == "services" else frozenset()
+    )
+    text = _compose_label_lines(source) if released or route_keys else ""
+    if not text:
+        return [], []
+    variables: list[str] = []
+    if label_escaping(source, collection=collection) is not True:
+        rules = {
+            f"{matcher}({args.strip()})"
+            for matcher, args in _TRAEFIK_HOST_RULE.findall(text)
+            if matcher != "HostRegexp" and _VARIABLE.search(args)
+        }
+        sites = {
+            f"caddy {site.strip()}"
+            for site in _CADDY_SITE.findall(text)
+            if _VARIABLE.search(site)
+        }
+        variables = sorted(rules | sites)
+    unmatched: list[str] = []
+    if route_keys:
+        routes = _label_routes(text)
+        unmatched = [
+            h
+            for h in dict.fromkeys(routes)
+            if not h.startswith("HostRegexp(")
+            and h not in released
+            and is_custom(h, source_wildcard=source_wildcard)
+        ]
+        if not released:
+            unmatched.extend(sorted({r for r in routes if r.startswith("HostRegexp(")}))
+    return variables, unmatched
+
+
+_COMPOSE_ROUTER_HARM = (
+    "Coolify adds a compose's own labels to every deploy, whatever its domains say, so "
+    "with --finalize keep or rename the kept source routes those hosts again on its next "
+    "deploy (a restart, a redeploy, a git push), next to the target, and requests their "
+    "certificates."
+)
+
+
+def _compose_router_remedy(collection: str) -> str:
+    """How to clear a compose router refusal, for the source's kind. PURE."""
+    if collection == "applications":
+        # Every deploy of a dockercompose app reloads its compose from git — the
+        # target's too — and the target routes its hosts from the
+        # docker_compose_domains CREATE claimed.
+        return (
+            "Remove those routers from the compose file in git, reload the compose in "
+            "Coolify ('Reload compose' on the source, or a redeploy) so the plan sees it, and "
+            "plan again - Coolify generates the routers for these hosts from the domains, on "
+            "the target as well - or finalize with --finalize delete."
+        )
+    # The target runs a copy of the SOURCE's compose (resources.carry_source_compose).
+    return (
+        "Remove those routers from the source service's compose in Coolify and plan again - "
+        "the target runs a copy of that compose, and Coolify generates the routers for these "
+        "hosts from the domains - or finalize with --finalize delete."
+    )
+
+
+def kept_source_compose_label_refusals(
     source: Mapping[str, Any], *, collection: str, source_wildcard: str | None
 ) -> list[str]:
     """Why a kept (keep or rename) compose-backed source would go on routing moved hosts.
 
-    A warning, held on ``ResourcePlan.kept_source_warnings`` and shown only under
-    keep and rename. Refusing it like :func:`kept_source_label_refusals` is the
-    operator's decision to make, not this tool's: a compose application's
-    compose comes from git, which the target deploys too, so the source cannot
-    be fixed on its own. PURE.
+    A refusal, like :func:`kept_source_label_refusals` and for the same reason:
+    the release is FINALIZE's promise that a kept source cannot claim the
+    hosts twice, and a router written into the compose provably breaks it on
+    the next deploy. Delete removes the source, so the planner stores this on
+    ``ResourcePlan.kept_source_refusals`` and the plan applies it under its
+    policy at read time. PURE.
     """
     hosts = compose_hosts_routed_after_release(
         source, collection=collection, source_wildcard=source_wildcard
     )
     if not hosts:
         return []
-    head = (
-        f"routers written into its compose route {', '.join(hosts)}, which finalize moves "
-        "to the target. Coolify adds a compose's own labels to every deploy, whatever its "
-        "domains say, so with --finalize keep or rename the kept source routes those "
-        "hosts again on its next deploy (a restart, a redeploy), next to the target, and "
-        "requests their certificates. "
-    )
-    if collection == "applications":
-        return [
-            head + "Its compose comes from git, and the target deploys the same file: "
-            "finalize with --finalize delete, or never redeploy the kept source and delete "
-            "it once it is no longer needed as a fallback."
-        ]
     return [
-        head + "Once the run has finalized, remove those routers from the source service's "
-        "compose in Coolify (the target runs its own copy) before anyone redeploys it - "
-        "or finalize with --finalize delete."
+        f"routers written into its compose route {', '.join(hosts)}, which finalize moves "
+        f"to the target. {_COMPOSE_ROUTER_HARM} {_compose_router_remedy(collection)}"
     ]
+
+
+def kept_source_compose_label_warnings(
+    source: Mapping[str, Any], *, collection: str, source_wildcard: str | None
+) -> list[str]:
+    """What a kept compose-backed source's own routers may route that the plan cannot tell.
+
+    :func:`compose_routes_unseen` as warning lines, held on
+    ``ResourcePlan.kept_source_warnings`` and shown only under keep and rename.
+    Never about a host :func:`kept_source_compose_label_refusals` names, so the
+    plan does not show one host as both a refusal and a warning. PURE.
+    """
+    variables, unmatched = compose_routes_unseen(
+        source, collection=collection, source_wildcard=source_wildcard
+    )
+    where = (
+        "the compose file in git"
+        if collection == "applications"
+        else "the source service's compose in Coolify"
+    )
+    tail = (
+        "If one does, a kept or renamed source routes it again on its next deploy, next to "
+        f"the target, and requests its certificate: remove those routers from {where}, or "
+        "finalize with --finalize delete."
+    )
+    out: list[str] = []
+    if variables:
+        if label_escaping(source, collection=collection) is False:
+            escaping = "its label escaping is off"
+        elif collection == "applications":
+            escaping = (
+                "the API does not show whether its label escaping is on (Coolify 4.1 "
+                "returns no application settings)"
+            )
+        else:
+            escaping = "the API does not show whether its label escaping is on"
+        out.append(
+            f"routers written into its compose build their hosts from variables "
+            f"({', '.join(variables)}), and {escaping}, so docker compose fills them in at "
+            "every deploy: the plan cannot tell whether they name a host finalize moves to "
+            f"the target. {tail}"
+        )
+    if unmatched:
+        keys = ", ".join(sorted(route_env_keys(source.get("applications"))))
+        out.append(
+            f"routers written into its compose route {', '.join(unmatched)}, and Coolify "
+            f"routes its parts from env rows ({keys}) the plan does not read, which finalize "
+            "blanks when they hold a custom host: the plan cannot tell whether one of those "
+            f"hosts is among them. {tail}"
+        )
+    return out
 
 
 def hidden_port_overrides(source: dict[str, Any]) -> list[int]:

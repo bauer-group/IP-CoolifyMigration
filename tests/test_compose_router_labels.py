@@ -8,10 +8,10 @@ service's sub-application URLs, therefore stops only the routers Coolify
 generates: a ``Host()`` rule the operator wrote into the compose routes the moved
 host again on the kept source's next deploy, next to the target.
 
-The plan warns about it under keep and rename (refusing is the operator's
-decision, and a compose application's compose is the target's too), and
-FINALIZE asks the same predicate of the GET its release is built from, so such
-a source is never reported as released.
+The plan refuses keep and rename for it, like hand-kept custom_labels (what it
+cannot read off the GET is warned about: tests/test_compose_router_refusals.py),
+and FINALIZE asks the same predicate of the GET its release is built from, so
+such a source is never reported as released.
 """
 
 from __future__ import annotations
@@ -159,30 +159,30 @@ class TestComposeHostsRoutedAfterRelease:
         assert _routed(_compose_app(), "databases") == []
 
 
-class TestKeptSourceComposeLabelWarnings:
-    def test_a_compose_application_cannot_be_fixed_on_the_source(self) -> None:
-        [line] = fidelity.kept_source_compose_label_warnings(
+class TestKeptSourceComposeLabelRefusals:
+    def test_a_compose_application_is_fixed_in_git(self) -> None:
+        [line] = fidelity.kept_source_compose_label_refusals(
             _compose_app(), collection="applications", source_wildcard=WILD
         )
         assert "routers written into its compose route shop.example.com" in line
-        assert "comes from git" in line and "--finalize delete" in line
+        assert "compose file in git" in line and "--finalize delete" in line
 
     def test_a_service_is_fixed_in_its_compose(self) -> None:
-        [line] = fidelity.kept_source_compose_label_warnings(
+        [line] = fidelity.kept_source_compose_label_refusals(
             _service(), collection="services", source_wildcard=WILD
         )
-        assert "remove those routers from the source service's compose" in line
+        assert "Remove those routers from the source service's compose" in line
 
     def test_nothing_routed_nothing_said(self) -> None:
         assert (
-            fidelity.kept_source_compose_label_warnings(
+            fidelity.kept_source_compose_label_refusals(
                 _compose_app(PLAIN_COMPOSE), collection="applications", source_wildcard=WILD
             )
             == []
         )
 
 
-# ── the plan shows it under keep and rename only ─────────────────────────────
+# ── the plan refuses it under keep and rename only ───────────────────────────
 
 
 def _plan(policy: FinalizePolicy) -> MigrationPlan:
@@ -192,7 +192,7 @@ def _plan(policy: FinalizePolicy) -> MigrationPlan:
     resource = ResourcePlan(
         snapshot=snapshot,
         strategy=Strategy.RECREATE_ONLY,
-        kept_source_warnings=("routers written into its compose route shop.example.com",),
+        kept_source_refusals=("routers written into its compose route shop.example.com",),
     )
     return MigrationPlan(
         project="shop",
@@ -206,13 +206,17 @@ def _plan(policy: FinalizePolicy) -> MigrationPlan:
 
 class TestPlan:
     @pytest.mark.parametrize("policy", [FinalizePolicy.KEEP, FinalizePolicy.RENAME])
-    def test_warned_while_the_source_stays(self, policy: FinalizePolicy) -> None:
+    def test_refused_while_the_source_stays(self, policy: FinalizePolicy) -> None:
         plan = _plan(policy)
-        assert not plan.is_blocked
-        assert "shop: routers written into its compose route shop.example.com" in plan.warnings
+        assert plan.is_blocked
+        assert plan.blocking_reasons == (
+            "shop: routers written into its compose route shop.example.com",
+        )
 
     def test_not_under_delete(self) -> None:
-        assert not any("compose route" in w for w in _plan(FinalizePolicy.DELETE).warnings)
+        plan = _plan(FinalizePolicy.DELETE)
+        assert not plan.is_blocked
+        assert not any("compose route" in w for w in plan.warnings)
 
 
 class TestPlannerWiring:
@@ -229,9 +233,11 @@ class TestPlannerWiring:
                 "build_pack": BuildPack.DOCKERCOMPOSE,
             },
         )
-        [line] = plan.resources[0].kept_source_warnings
-        assert "comes from git" in line
-        assert plan.resources[0].kept_source_refusals == ()
+        [line] = plan.resources[0].kept_source_refusals
+        assert "compose file in git" in line
+        assert plan.resources[0].refusals == ()
+        assert plan.is_blocked  # built with the default policy, rename
+        assert not plan.model_copy(update={"finalize_policy": FinalizePolicy.DELETE}).is_blocked
 
     async def test_a_service(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from tests.test_engine_planner import _plan_one_app
@@ -243,9 +249,10 @@ class TestPlannerWiring:
             snapshot={"collection": "services", "kind": ResourceKind.SERVICE_COMPOSE},
         )
         assert any(
-            "remove those routers from the source service's compose" in w
-            for w in plan.resources[0].kept_source_warnings
+            "Remove those routers from the source service's compose" in w
+            for w in plan.resources[0].kept_source_refusals
         )
+        assert plan.resources[0].kept_source_warnings == ()
 
 
 # ── FINALIZE asks the same predicate at release time ─────────────────────────
@@ -393,7 +400,7 @@ class TestFinalizeReport:
         assert result["domains_released"] == []
         [notice] = ctx.notices
         assert "routers written into its compose still route shop.example.com" in notice
-        assert "comes from git" in notice
+        assert "compose file in git" in notice
 
     async def test_a_service_is_not_listed_released(
         self, tmp_path: Path, api: CoolifyClient, respx_mock: respx.Router

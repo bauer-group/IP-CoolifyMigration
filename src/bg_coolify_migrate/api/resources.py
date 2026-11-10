@@ -1454,10 +1454,13 @@ async def release_application_domains(
     check and managed DNS. A dockercompose app's ``domains`` field 422s; it is
     released by resubmitting its docker_compose_domains, from which Coolify
     generates its routers at every deploy — next to the labels its compose
-    declares itself, which no domain write touches: a router written there for a
-    released host is reported in :attr:`DomainRelease.compose_routed`. Never
-    raises: the source is stopped, nothing routes it yet, and the caller reports
-    a failure for the operator to finish by hand.
+    declares itself, which no domain write touches. The plan refuses keep and
+    rename for a router written there for a released host
+    (fidelity.kept_source_compose_label_refusals); one the plan could not see
+    (a variable) or added since is reported in
+    :attr:`DomainRelease.compose_routed`. Never raises: the source is stopped,
+    nothing routes it yet, and the caller reports a failure for the operator to
+    finish by hand.
     """
     try:
         current = await api.get_resource("applications", snapshot.uuid)
@@ -1544,10 +1547,12 @@ async def release_service_urls(
 
     A service has no custom_labels (an applications column only, migration
     2023_10_18_072519), but the parser merges each compose service's own
-    ``labels:`` into every deploy: a router written there for a released host is
-    reported in :attr:`DomainRelease.compose_routed`, read off the same GET.
-    Never raises: the source is stopped, so nothing routes it yet, and the
-    caller reports a failure.
+    ``labels:`` into every deploy. The plan refuses keep and rename for a router
+    written there for a released host (fidelity.kept_source_compose_label_refusals);
+    one it could not see or added since is reported in
+    :attr:`DomainRelease.compose_routed`, read off the same GET. Never raises:
+    the source is stopped, so nothing routes it yet, and the caller reports a
+    failure.
     """
     try:
         source = await api.get_resource("services", uuid)

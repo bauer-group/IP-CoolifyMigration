@@ -3192,9 +3192,9 @@ async def step_finalize(ctx: MigrationContext) -> dict[str, Any]:
     generates its routers: with readonly labels off an application's
     custom_labels stay as stored, and a router written into a compose is merged
     into every deploy, so the next deploy routes those hosts again. PLAN refuses
-    keep and rename for the first (fidelity.kept_source_label_refusals) and
-    warns about the second (fidelity.kept_source_compose_label_warnings); a
-    source either still applies to at release time is not reported as released
+    keep and rename for both (fidelity.kept_source_label_refusals,
+    kept_source_compose_label_refusals) and warns where it cannot read the host;
+    a source either still applies to at release time is not reported as released
     (:func:`_release_source_domains`).
     """
     policy = ctx.plan.finalize_policy
@@ -3288,11 +3288,11 @@ async def _release_source_domains(ctx: MigrationContext) -> list[str]:
     restarts it — and says so in the run report.
 
     So does a release whose source still ROUTES a host: its readonly labels are
-    off (switched since PLAN, which refuses keep and rename for it), so Coolify
-    kept its custom_labels as they were, or a router written into its compose
-    names the host (which PLAN warned about). Its domains are released all the
-    same, but it is not listed as released — its next deploy routes the hosts
-    again.
+    off, so Coolify kept its custom_labels as they were, or a router written
+    into its compose names the host — switched or added since PLAN, which
+    refuses keep and rename for both, or a host PLAN could not read (a
+    variable). Its domains are released all the same, but it is not listed as
+    released — its next deploy routes the hosts again.
     """
     owners = [
         r.snapshot.uuid
@@ -3328,8 +3328,9 @@ async def _release_source_domains(ctx: MigrationContext) -> list[str]:
             )
         if outcome.compose_routed:
             fix = (
-                "Its compose comes from git, which the target deploys too: never redeploy "
-                "the source, and delete it once it is no longer needed as a fallback."
+                "Remove those routers from the compose file in git (its next deploy reloads "
+                "the compose from there; the target routes these hosts from its domains), "
+                "or delete the source, before anyone redeploys it."
                 if snapshot.collection == "applications"
                 else "Remove those routers from the source's compose in Coolify (the target "
                 "runs its own copy), or delete the source, before anyone redeploys it."
