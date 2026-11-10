@@ -2002,12 +2002,12 @@ def _merged_bind_pairs(
 
 async def _source_bind_kinds(
     ctx: MigrationContext, paths: list[str]
-) -> tuple[dict[str, str], list[str]]:
-    """``(path -> dir|file, problems)`` for the source's bind paths."""
+) -> tuple[dict[str, str], list[str], set[str]]:
+    """``(path -> dir|file, problems, empty paths)`` for the source's bind paths."""
     states = await transfer_binds.path_states(ctx.source_host, paths)
     kinds = {path: kind for path in paths if (kind := binds.source_kind(states[path]))}
     problems = [p for path in paths if (p := binds.source_state_problem(path, states[path]))]
-    return kinds, problems
+    return kinds, problems, {path for path in paths if binds.is_empty_state(states[path])}
 
 
 def _target_probe(pairs: list[BindPair]) -> list[str]:
@@ -2035,7 +2035,7 @@ async def _assert_target_binds_safe(ctx: MigrationContext) -> None:
     if not per_resource:
         return
     pairs = _merged_bind_pairs(per_resource, consequence=_NEVER_STOPPED)
-    kinds, problems = await _source_bind_kinds(ctx, [p.source_path for p in pairs])
+    kinds, problems, _ = await _source_bind_kinds(ctx, [p.source_path for p in pairs])
     states = await transfer_binds.path_states(ctx.target_host, _target_probe(pairs))
     in_use = await transfer_binds.host_binds(ctx.target_host)
     for pair in pairs:
@@ -2070,18 +2070,25 @@ async def _record_bind_pairs(
     per_resource: dict[str, list[BindPair]],
     recorded: dict[str, list[dict[str, str]]],
 ) -> None:
-    """DISCOVER's bind pairs, with each payload's kind, into the context and the journal."""
+    """DISCOVER's bind pairs, with each payload's kind, into the context and the journal.
+
+    Whether each source was empty too: after FINALIZE(keep/rename) the rollback
+    guard refuses over a source that is empty now where it held data then
+    (``binds.source_lost``).
+    """
     if not any(per_resource.values()):
         return
     merged = _merged_bind_pairs(per_resource, consequence=_ROLLED_BACK)
-    kinds, problems = await _source_bind_kinds(ctx, [p.source_path for p in merged])
+    kinds, problems, empty = await _source_bind_kinds(ctx, [p.source_path for p in merged])
     if problems:
         raise TransferError(
             "bind mount(s) cannot be copied:\n" + "\n".join(f"  {p}" for p in problems),
             hint=_ROLLED_BACK,
         )
     for uuid, pairs in per_resource.items():
-        with_kind = [replace(p, kind=kinds[p.source_path]) for p in pairs]
+        with_kind = [
+            replace(p, kind=kinds[p.source_path], empty=p.source_path in empty) for p in pairs
+        ]
         ctx.bind_pairs[uuid] = with_kind
         recorded.setdefault(uuid, []).extend(serialise_bind_pairs(with_kind))
 
@@ -2127,7 +2134,7 @@ async def _bind_kinds(
     unknown = [p.source_path for p in pairs if p.kind is None]
     kinds: dict[str, str] = {}
     if unknown:
-        kinds, problems = await _source_bind_kinds(ctx, unknown)
+        kinds, problems, _ = await _source_bind_kinds(ctx, unknown)
         if problems:
             raise TransferError(
                 "bind mount(s) cannot be copied:\n" + "\n".join(f"  {p}" for p in problems),

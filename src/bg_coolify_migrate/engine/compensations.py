@@ -22,6 +22,7 @@ from bg_coolify_migrate.api import resources as api_resources
 from bg_coolify_migrate.discovery import docker, pins
 from bg_coolify_migrate.domain import binds, domains
 from bg_coolify_migrate.domain.containment import unsettled, volume_recreated
+from bg_coolify_migrate.domain.compose import MountClass
 from bg_coolify_migrate.domain.deployments import (
     Deployment,
     Progress,
@@ -1087,6 +1088,14 @@ async def source_data_refusal(ctx: MigrationContext) -> str | None:
     (moby v27.5.1 volume/local/local.go:229-236). A journal without the record
     gets the name check alone. A CreatedAt that cannot be read raises, and the
     saga refuses on that as on any guard that cannot answer.
+
+    The same for every bind mount it copied: its source host path must still
+    be what was copied (``binds.source_lost``). A missing one comes back EMPTY
+    at the restart, and the target delete that follows takes the copy — Coolify
+    ``rm -rf``s the target's directory (DeleteService v4.7.2:30-32,
+    Service::deleteConfigurations v4.7.2:226-233), where a relative bind's copy
+    lives. DROP_TARGET_VOLUMES keeps such a target too, but by then the
+    rollback has already gone on to the restart and the delete.
     """
     if not source_copy_unproven(ctx.journal.details()):
         return None
@@ -1104,13 +1113,27 @@ async def source_data_refusal(ctx: MigrationContext) -> str | None:
         present = {v.name for v in await docker.list_volumes(ctx.source_host)}
         lost.extend(f"volume {name}" for name in sorted(set(volumes) - present))
         lost.extend(await _recreated_volumes(ctx, sorted(set(volumes) & present)))
+    sources = _copied_source_binds(ctx)
+    if sources:
+        # A host that will not answer raises, and the saga refuses on that too.
+        states = await transfer_binds.path_states(ctx.source_host, sorted(sources))
+        lost.extend(
+            problem
+            for path, pair in sorted(sources.items())
+            if (
+                problem := binds.source_lost(
+                    path, states[path], kind=pair.kind, was_empty=pair.empty
+                )
+            )
+        )
     if lost:
         return (
             f"the source no longer holds its data on {ctx.plan.source_server.name}: "
             + ", ".join(lost)
             + " - a server that deletes unused volumes pruned them after FINALIZE released "
-            "their pins, or the kept source was deleted by hand. The target then holds the "
-            "only copy, and a rollback would drop it and restart the source on empty volumes"
+            "their pins, a bind mount's host path was removed, or the kept source was "
+            "deleted by hand. The target then holds the only copy, and a rollback would "
+            "drop it and restart the source on empty volumes and directories"
         )
     if volumes:
         await pins.ensure(
@@ -1149,6 +1172,27 @@ def _copied_source_volumes(ctx: MigrationContext) -> list[str]:
             if item.source_name
         }
     )
+
+
+def _copied_source_binds(ctx: MigrationContext) -> dict[str, binds.BindPair]:
+    """``source path -> pair`` of every bind DISCOVER paired — or, without its record, the plan's.
+
+    Without the record nothing says the source was empty or which kind it was,
+    so an empty source then reads as lost too: the answer that refuses.
+    """
+    raw = ctx.journal.undo_info(State.DISCOVER.value).get("volume_pairs")
+    if isinstance(raw, dict):
+        return {
+            pair.source_path: pair
+            for found in deserialise_bind_pairs(raw).values()
+            for pair in found
+        }
+    return {
+        item.source_path: binds.BindPair(item.source_path, item.source_path, item.mount_path)
+        for resource in ctx.plan.resources
+        for item in resource.manifest.to_migrate
+        if item.mount_class is MountClass.BIND
+    }
 
 
 def build_compensations() -> dict[Any, Any]:

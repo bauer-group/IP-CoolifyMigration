@@ -270,14 +270,20 @@ def is_bind_row(row: object) -> TypeGuard[dict[str, Any]]:
     return isinstance(source, str) and source.startswith("/")
 
 
-def serialise_bind_pairs(pairs: list[BindPair]) -> list[dict[str, str]]:
-    """Bind pairs as DISCOVER journals them beside the volume pairs. PURE."""
+def serialise_bind_pairs(pairs: list[BindPair]) -> list[dict[str, Any]]:
+    """Bind pairs as DISCOVER journals them beside the volume pairs. PURE.
+
+    ``empty`` only where the source held nothing: a row without it says the
+    source held data, the answer that refuses a rollback over an emptied
+    source (:func:`binds.source_lost`).
+    """
     return [
         {
             "source": p.source_path,
             "target": p.target_path,
             "mount_path": p.mount_path,
             **({"kind": p.kind} if p.kind else {}),
+            **({"empty": True} if p.empty else {}),
         }
         for p in pairs
     ]
@@ -316,6 +322,7 @@ def deserialise_bind_pairs(raw: object) -> dict[str, list[BindPair]]:
                     target_path=target,
                     mount_path=str(row.get("mount_path") or ""),
                     kind=kind if kind in (KIND_DIR, KIND_FILE) else None,
+                    empty=row.get("empty") is True,
                 )
             )
         out[str(uuid)] = pairs

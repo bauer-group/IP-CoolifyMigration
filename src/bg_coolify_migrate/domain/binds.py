@@ -458,6 +458,9 @@ class BindPair:
     mount_path: str
     kind: str | None = None
     """:data:`KIND_DIR` or :data:`KIND_FILE`, once the source was looked at."""
+    empty: bool = False
+    """The source held nothing when DISCOVER looked: an empty source later is
+    then no loss (:func:`source_lost`)."""
 
 
 def _location(path: str, uuid: str) -> tuple[str, str]:
@@ -566,6 +569,34 @@ def source_kind(state: str) -> str | None:
         return KIND_DIR
     if state in (STATE_FILE, STATE_EMPTY_FILE):
         return KIND_FILE
+    return None
+
+
+def is_empty_state(state: str) -> bool:
+    """An empty directory or an empty file. PURE."""
+    return state in (STATE_EMPTY_DIR, STATE_EMPTY_FILE)
+
+
+def source_lost(path: str, state: str, *, kind: str | None, was_empty: bool) -> str | None:
+    """Why a copied bind's source no longer holds what was copied, or None. PURE.
+
+    The rollback guard's question once FINALIZE kept or renamed the source
+    (``compensations.source_data_refusal``): every compensation after it aims
+    at the target, and RESTART_SOURCE brings the source up on whatever its host
+    path holds then. A missing path is recreated EMPTY — Coolify ``mkdir -p``s a
+    directory row (LocalFileVolume v4.7.2:333-336), ``docker compose up``
+    creates any missing bind source as a directory (EnsureContentFilesOnServer
+    v4.7.2:11-12) — so the same holds for a path that is empty now where
+    DISCOVER saw data: someone deleted it and a start recreated it. A source of
+    another shape than the one copied is not it either.
+    """
+    found = source_kind(state)
+    if found is None:
+        return f"bind {path} ({'gone' if state == STATE_MISSING else f'now a {state}'})"
+    if kind is not None and found != kind:
+        return f"bind {path} (now a {found}, where a {kind} was copied)"
+    if is_empty_state(state) and not was_empty:
+        return f"bind {path} (empty now, where it held data when it was copied)"
     return None
 
 
