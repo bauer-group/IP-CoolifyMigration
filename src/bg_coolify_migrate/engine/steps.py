@@ -3291,8 +3291,11 @@ async def _release_source_domains(ctx: MigrationContext) -> list[str]:
     off, so Coolify kept its custom_labels as they were, or a router written
     into its compose names the host — switched or added since PLAN, which
     refuses keep and rename for both, or a host PLAN could not read (a
-    variable). Its domains are released all the same, but it is not listed as
-    released — its next deploy routes the hosts again.
+    variable, a route row). Its domains are released all the same, but it is
+    not listed as released — its next deploy routes the hosts again. The hosts
+    asked about are those it held BEFORE the release, read off the restore body
+    CREATE journalled: a FINALIZE resumed after the release finds them gone
+    from the source's domains, never from its labels.
     """
     owners = [
         r.snapshot.uuid
@@ -3303,6 +3306,9 @@ async def _release_source_domains(ctx: MigrationContext) -> list[str]:
         return []
     ctx.journal.append("step_started", state="finalize", detail={"releasing_domains": owners})
     source_wildcard = ctx.plan.source_server.wildcard_domain or None
+    restores: dict[str, dict[str, Any]] = (
+        ctx.journal.undo_info(State.CREATE_TARGET.value).get("parked_domains") or {}
+    )
     released: list[str] = []
     for resource in ctx.plan.resources:
         snapshot = resource.snapshot
@@ -3311,7 +3317,7 @@ async def _release_source_domains(ctx: MigrationContext) -> list[str]:
         if not await _target_still_holds(ctx, snapshot, source_wildcard=source_wildcard):
             continue
         outcome = await api_resources.release_source_domains(
-            ctx.api, snapshot, source_wildcard=source_wildcard
+            ctx.api, snapshot, source_wildcard=source_wildcard, before=restores.get(snapshot.uuid)
         )
         if outcome.released:
             released.append(snapshot.uuid)

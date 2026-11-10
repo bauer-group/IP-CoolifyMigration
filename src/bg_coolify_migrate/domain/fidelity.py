@@ -909,24 +909,45 @@ def readonly_labels(source: Mapping[str, Any]) -> bool | None:
 
 
 def label_routed_release_hosts(
-    source: Mapping[str, Any], *, source_wildcard: str | None
+    source: Mapping[str, Any], *, source_wildcard: str | None, held: Iterable[str] = ()
 ) -> list[str]:
     """The custom hosts FINALIZE releases that this application's stored labels route.
 
     Whatever the readonly setting says — :func:`hosts_routed_after_release`
     adds that. The released hosts are the custom ones of the fqdn
     (domain/domains.custom_hosts: neither generated nor under the source
-    wildcard), in fqdn order. A HostRegexp rule cannot be enumerated: it is
-    returned, after them, whenever there is a host to release. Empty for a
-    dockercompose application, whose deploys never read custom_labels. PURE.
+    wildcard), in fqdn order, then the custom ones of ``held``: the hosts the
+    source held BEFORE the release (:func:`_with_held`). A HostRegexp rule
+    cannot be enumerated: it is returned, after them, whenever there is a host
+    to release. Empty for a dockercompose application, whose deploys never read
+    custom_labels. PURE.
     """
     if source.get("build_pack") == _LABELS_FROM_COMPOSE:
         return []
-    released = custom_hosts(source.get("fqdn"), source_wildcard=source_wildcard)
+    released = _with_held(
+        custom_hosts(source.get("fqdn"), source_wildcard=source_wildcard),
+        held,
+        source_wildcard=source_wildcard,
+    )
     text = _label_text(source.get("custom_labels"))
     if not released or not text:
         return []
     return _routed_among(released, _label_routes(text))
+
+
+def _with_held(
+    released: list[str], held: Iterable[str], *, source_wildcard: str | None
+) -> list[str]:
+    """``released``, then the custom hosts of ``held`` it lacks. PURE.
+
+    ``held`` is what the source held before FINALIZE let go of it (the restore
+    body CREATE journalled, api/resources.release_source_domains). A FINALIZE
+    resumed after its domain PATCH reads a source that no longer holds them, so
+    the current domains alone would find nothing to ask about.
+    """
+    hosts = (normalise_host(raw) for raw in held)
+    extra = (h for h in hosts if h and is_custom(h, source_wildcard=source_wildcard))
+    return list(dict.fromkeys([*released, *extra]))
 
 
 def _routed_among(released: list[str], routes: list[str]) -> list[str]:
@@ -938,19 +959,20 @@ def _routed_among(released: list[str], routes: list[str]) -> list[str]:
 
 
 def hosts_routed_after_release(
-    source: Mapping[str, Any], *, source_wildcard: str | None
+    source: Mapping[str, Any], *, source_wildcard: str | None, held: Iterable[str] = ()
 ) -> list[str]:
     """The released custom hosts this source still routes once FINALIZE let go of them.
 
     Non-empty only when readonly labels is known to be OFF and the stored labels
-    route a host the release removes from the fqdn (:func:`label_routed_release_hosts`).
-    The ONE predicate behind both the plan's keep/rename refusal
+    route a host the release removes from the fqdn — or, with ``held``, one the
+    source held before the release (:func:`label_routed_release_hosts`). The ONE
+    predicate behind both the plan's keep/rename refusal
     (:func:`kept_source_label_refusals`) and FINALIZE's report, which re-reads
     the source at release time (api/resources.release_application_domains). PURE.
     """
     if readonly_labels(source) is not False:
         return []
-    return label_routed_release_hosts(source, source_wildcard=source_wildcard)
+    return label_routed_release_hosts(source, source_wildcard=source_wildcard, held=held)
 
 
 def kept_source_label_refusals(
@@ -1053,7 +1075,11 @@ def _compose_backed(source: Mapping[str, Any], collection: str) -> bool:
 
 
 def compose_hosts_routed_after_release(
-    source: Mapping[str, Any], *, collection: str, source_wildcard: str | None
+    source: Mapping[str, Any],
+    *,
+    collection: str,
+    source_wildcard: str | None,
+    held: Iterable[str] = (),
 ) -> list[str]:
     """The released custom hosts that routers written into the source's compose route.
 
@@ -1064,7 +1090,8 @@ def compose_hosts_routed_after_release(
     again on the kept source's next deploy, next to the target. Only literal
     hosts are seen; a rule built from a variable (``Host(`${DOMAIN}`)``) is
     what :func:`compose_routes_unseen` reports. A HostRegexp rule is returned
-    like :func:`label_routed_release_hosts` returns it.
+    like :func:`label_routed_release_hosts` returns it. ``held``: the hosts the
+    source held before the release (:func:`_with_held`).
 
     The ONE predicate behind the plan's keep/rename refusal
     (:func:`kept_source_compose_label_refusals`) and FINALIZE's report, which
@@ -1072,8 +1099,10 @@ def compose_hosts_routed_after_release(
     """
     if not _compose_backed(source, collection):
         return []
-    released = _compose_released_hosts(
-        source, collection=collection, source_wildcard=source_wildcard
+    released = _with_held(
+        _compose_released_hosts(source, collection=collection, source_wildcard=source_wildcard),
+        held,
+        source_wildcard=source_wildcard,
     )
     text = _compose_label_lines(source) if released else ""
     if not text:
