@@ -116,8 +116,24 @@ from bg_coolify_migrate.domain.versions import Version
 #: limited to projects. Stop/start/restart, labels, volume names, DeleteResourceJob
 #: and the release of DNS records are unchanged. Audited against release tags; the
 #: e2e rig is green on a live 4.6.0 (tests/e2e/test_v4_6_contract.py).
+#:
+#: Re-verified 2026-11-09 for v4.7.0, v4.7.1 and v4.7.2, diffed against v4.6.0 at
+#: the release tags (276 changed files in the paths this tool reads, most of them
+#: inside two squash commits). Carried: four application settings, a task's
+#: use_shell, an empty env value. Answered in code: names and descriptions pass the
+#: UI's rules on every API write, an accepted start/restart is only a queued
+#: deployment (watched, on every release), the deploy image-scan gate, template
+#: targets now run the source's compose (the catalog is the CDN's, not the
+#: release's), parts removed from a compose are flagged, 4.5-4.6's dotted-name
+#: compose corruption, legacy env rows written exact, the permanent lock, server-
+#: scoped shared variables in compose, the failed-request token throttle, Coolify's
+#: authorized_keys lock, pinned SSH host keys (F2), API creates that queue DNS
+#: records, and the shared-image check skipping restarts. Stop/start/restart,
+#: labels, volume names, DeleteResourceJob, CleanupDocker and the DNS release path
+#: are unchanged. v4.7.1 and v4.7.2 touch nothing this tool depends on. The e2e
+#: rig is green on a live 4.7.2 (43 tests, tests/e2e/test_template_service.py new).
 VALIDATED_MIN: Version = (4, 1, 2)
-VALIDATED_MAX: Version = (4, 6, 0)
+VALIDATED_MAX: Version = (4, 7, 2)
 
 
 def format_version(version: Version) -> str:

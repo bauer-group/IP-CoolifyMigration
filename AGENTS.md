@@ -120,8 +120,9 @@ decision, the decision is in the wrong layer.
 ## Verified upstream facts (do not re-derive)
 
 First checked against `coollabsio/coolify@main`; re-checked against the release
-tags v4.1.2 through v4.5.0 (2026-10-26), v4.5.1 against v4.5.0 (2026-10-28), and
-v4.6.0 against v4.5.2 (2026-11-05).
+tags v4.1.2 through v4.5.0 (2026-10-26), v4.5.1 against v4.5.0 (2026-10-28),
+v4.6.0 against v4.5.2 (2026-11-05), and v4.7.0 through v4.7.2 against v4.6.0
+(2026-11-09).
 Read upstream at a **release tag**, never `main` — see the 2.5.6 tags regression.
 What differs between releases lives in `domain/coolify_versions.py`, not here.
 
@@ -148,8 +149,13 @@ What differs between releases lives in `domain/coolify_versions.py`, not here.
 - Standalone DB mount path depends on the image tag (Postgres ≥18 moves to
   `/var/lib/postgresql`). Always pin `image`.
 - Every request body passes `TrimStrings` and **`ConvertEmptyStringsToNull`**
-  (`Kernel.php:61-62`): an empty string we send arrives as `null`. From 4.5 an
-  empty and a null env value render differently, so "send `""`" is never a fix.
+  (Kernel.php v4.5.0:61-62, v4.7.0:65-66): an empty string we send arrives as
+  `null`. From 4.5 an empty and a null env value render differently, so "send
+  `""`" is never a fix. From 4.7.0 an env `value` / `data.*.value` is exempt from
+  TrimStrings (TrimStrings v4.7.0:18-20) and the model trims instead: a
+  single-line value loses its edge whitespace, a multi-line one is kept
+  byte-exact (`withoutEdgeWhitespace`, EnvironmentVariable v4.7.0:889-899). Every
+  other string, task names included, is still trimmed.
 - **Multi-server applications are refused on every release.** Every
   `GET /applications/{uuid}` carries `additional_servers_count` (a global
   `withCount` scope, Application.php v4.1.2:244-249 .. v4.5.0:306-311); the
@@ -163,8 +169,10 @@ What differs between releases lives in `domain/coolify_versions.py`, not here.
   (`steps._refuse_multi_server`) before creating anything.
 - **Scheduled tasks** exist for applications and services only (no database
   route or column), readable and creatable from v4.1.2 with one six-field array
-  (`ScheduledTasksController` v4.1.2:57 = v4.5.0:81). An absent `enabled`
-  defaults to TRUE, so a disabled task is always sent `enabled: false`. From
+  (`ScheduledTasksController` v4.1.2:57 = v4.5.0:81) through 4.6.x; `use_shell`
+  joins it in 4.7.0 together with its column (v4.7.0:81,89,128). An absent
+  `enabled` or `use_shell` defaults to TRUE, so a disabled task is always sent
+  `enabled: false` and a task without a shell `use_shell: false`. From
   4.4.0 `command` is hidden without can_read_sensitive and `timeout` is
   `max:36000`; from 4.5.0 an ENABLED task needs `deploy`, and `container` also
   matches a full container name (it embeds the source uuid, so the plan warns
@@ -174,8 +182,8 @@ What differs between releases lives in `domain/coolify_versions.py`, not here.
   'exited'. That skip is the only thing keeping carried tasks inert before START.
   The UI's "execute now" and `artisan` RunScheduledJobsManually bypass it, and
   before 4.5 the job's app branch also sees stopped containers, so never call
-  either. A template service or a git-compose app takes its sub-service names
-  from the CURRENT catalog or git HEAD, so CREATE checks each task's container
+  either. A git-compose app takes its sub-service names from git HEAD (a template
+  service now runs the source's compose), so CREATE checks each task's container
   against the target. A POST retried on 502/504 can save a task twice, so CREATE
   re-reads and counts the uuids the creates returned, never names: the API trims
   every string (TrimStrings) while Livewire skips it, so a UI-typed "nightly "
@@ -183,9 +191,11 @@ What differs between releases lives in `domain/coolify_versions.py`, not here.
 - **Database backup schedules** (`/databases/{uuid}/backups`, every release)
   create through `$backupConfigFields` (v4.1.2:704, v4.5.0:1057).
   `missing_backup_notification_days` arrives with its column (4.3.18/4.4.0) and
-  `s3_storage_uuids` in 4.5.0, so key presence gates both. The GET filters on
-  `database_id` ONLY: another engine's rows with the same hidden id come back
-  too, so filter on `database_type` (the model FQCN; there is no morph map). It
+  `s3_storage_uuids` in 4.5.0, so key presence gates both. Up to v4.5.0 the GET
+  filters on `database_id` only (v4.5.0:447): another engine's rows with the same
+  hidden id come back too. From v4.5.1 every backup route also filters on
+  `database_type` (fdb77415a, not backported). We filter on `database_type`
+  ourselves on every release (the model FQCN; there is no morph map). It
   also eager-loads every execution, whose `message` is raw dump output before
   4.5; `client.get_backups` drops it at the boundary. Only 4.5 names a
   schedule's S3 storages by uuid. Before that it is a hidden id no API maps, so
@@ -205,7 +215,9 @@ What differs between releases lives in `domain/coolify_versions.py`, not here.
   send `DELETE .../backups/{b}?delete_s3=true`: `rollback` also runs after a
   SUCCEEDED run (it has no is_finished guard), and then those dumps are the last
   copy of post-cutover data. That holds for DATABASE dumps only: the same job
-  deletes every VOLUME-backup archive, local and S3, of the resource it deletes
+  deletes every VOLUME-backup archive, local and on every backup storage it was
+  uploaded to (S3; from 4.7.0 also SFTP, FTPS and WebDAV, which share the
+  s3_storages table: HasS3Replicas v4.7.0:26-47), of the resource it deletes
   (`deleteScheduledVolumeBackups`, v4.3.0:49,123-137, v4.5.0:125,188-209). So
   FINALIZE DELETE destroys the source's volume-backup history; the plan says so
   under a DELETE policy and the typed confirmation repeats it.
@@ -351,10 +363,22 @@ the release it starts in — read that module before adding a rule.
   exact** (`uses_legacy_escaping`, hidden, unsettable). The row's `version` field
   tells which is which. Values with `\ " '`, a ` #` tail or quoted literals reach
   the container differently on the target.
-- **A service is created from the INSTANCE's template catalog**, not the source's
-  compose — 95 templates changed between 4.3.10 and 4.5.0. CREATE therefore
-  rehearses the volume pairing for services while the source still serves, and
-  services pair by compose volume key (`{uuid}_{key}`), like compose apps.
+- **A template service's target runs the SOURCE's compose.** The `type` create
+  builds it from the instance's CURRENT catalog, which the CDN bundle changes for
+  every instance whatever its release (config/constants.php v4.7.0:46) — 95
+  templates changed between 4.3.10 and 4.5.0, and v4.7.0's moved getoutline from
+  postgres:12 to 16 on the same key and mount, so pairing, copy and verify passed
+  and the target refused the data after the stop. So once its uuid is journaled,
+  and before anything reads its part names, env rows or volumes, one
+  `PATCH /services/{target}` carries only the source's `docker_compose_raw`
+  (`resources.carry_source_compose`); the update re-parses on every release
+  (ServicesController v4.1.2:996-1046 .. v4.7.0:1287-1343), a same-named part keeps
+  its row and file contents, and without `urls` no updateCompose runs. CREATE still
+  rehearses the volume pairing while the source serves, as the read-back proof;
+  services pair by compose volume key (`{uuid}_{key}`), like compose apps. PLAN
+  refuses a service of either kind whose GET returned no compose. Not carried: an
+  operator's edited FILE content in a template part (the PATCH keeps the catalog's
+  content found by mount path, and the source's raw compose has `content:` stripped).
 - **DELETE needs `write` AND `deploy` on 4.5, and its own `delete` from 4.6**
   (rollback deletes targets); the token docs say root, or `read` +
   `read:sensitive` + `write` + `deploy` + `delete`. `read:sensitive` does not imply
@@ -377,6 +401,201 @@ the release it starts in — read that module before adding a rule.
   serves TLS on 6379 itself, Redis/KeyDB on an extra 6380. A carried `*_conf` that
   turns TLS on by itself is refused: the target gets the config, not the certs.
 
+### Learned from the v4.6.0 -> v4.7.2 audit (release tags; e2e green on a live 4.7.2)
+
+The canaries went red on five application create fields and one task field; the
+release-tag audit (276 changed files in the paths this tool reads, most of them
+hidden in two squash commits, #12478 and #12460) found the rest. v4.7.1 differs
+from v4.7.0 in 24 files (maintenance-mode routing, image-scan fixes), v4.7.2 from
+v4.7.1 in 27 (a scanner memory setting, UI destination actions limited to the
+application's own servers, the root setup window): neither touches this tool.
+Everything below starts in v4.7.0 unless it says otherwise.
+
+- **Four application settings join APPLICATION_SETTING_FIELDS** (ApplicationsController
+  v4.7.0:55-56,60,83 -> create :1613, update :3662; nested under `settings` in the
+  GET): include_network_hosts_in_build, is_auto_cancel_{queued,building}_deployments_enabled,
+  is_image_scan_enabled. Carried with `read_from="settings"`, `column_gated`. The last
+  is not cosmetic: it decides whether the deploy scan gate applies (below), so a
+  source's opt-out must never be gapped as "the default is as protective".
+- **Gitea App sources stay refused** (`planner._resolve_git_auth`). 4.7.0 adds
+  POST /applications/private-gitea-app (routes/api.php v4.7.0:266); `gitea_app_uuid`
+  is unset before the fill (api.php :522), so no GET carries it (KNOWN_APPLICATION_GAP).
+  If ever wired: GET /gitea-apps returns client_secret, access/refresh tokens and the
+  webhook secret in clear (GiteaController v4.7.0:14-24) — read id/uuid only.
+- **Names and descriptions pass the UI's ValidationPatterns on every API create and
+  update** (32541a32c; ApplicationsController v4.7.0:1616-1617/:3665/:3669,
+  ServicesController :421-422/:647-648/:1253-1254, DatabasesController :2252-2253/:664-665,
+  ValidationPatterns :13,:18,:496-532; `string|max:255` up to 4.6.0). The rule sees
+  the value after `Str::trim` (wider than PHP's trim: `\s` under UCP, 56 invisible
+  characters, NUL) and PHP's `/u` sets UTF **and** UCP. `fidelity.name_rule_problem`
+  mirrors it; a bad NAME refuses at plan for every kind (`api_name_rules`, unknown
+  refuses) and is never sanitised — PREFLIGHT, HEALTHCHECK and discovery find the
+  target by `slugify(source name)`. A bad DESCRIPTION is left out and warned about.
+  Livewire skips TrimStrings, so a UI-saved `"ab "` passes the UI and fails the API.
+  FINALIZE RENAME starts from the name trimmed at both ends and is cut to 255
+  (`fidelity.renamed_source_name`) — a 245+ character name 422'd the rename after
+  the cutover on every release.
+- **An accepted application `/start` or `/restart` is a queued deployment, not a
+  deploy** — 200 with a `deployment_uuid` even when the queue was full and nothing
+  was queued (applications.php v4.1.2:40-44, v4.7.0:58-63). `GET /deployments/{uuid}`
+  (`read`) and its five statuses are identical v4.1.2-v4.7.2, so the watch is
+  UNGATED and a 404 means "no such row". START journals each uuid; HEALTHCHECK fails
+  on a failed/cancelled/missing deployment, but only once every other target's start
+  has landed (`steps._every_other_start_landed`): the rollback's `/stop` cancels no
+  deployment and runs on the 'high' queue while starts wait on deployment_queue(), so
+  an early stop is overtaken and the sibling comes up routing the claimed hosts.
+  RESTART_SOURCE counts an application as restarted only when its deployment
+  FINISHED; failed/cancelled/missing raises (ROLLBACK_FAILED, pins kept), pending at
+  deploy_timeout keeps the old answer with a notice, and the uuid is journalled on
+  accept so a resumed rollback watches it instead of redeploying
+  (`compensations._restart_stands`). `client.get_deployment` keeps `status` and
+  `scan_gate_result` only — `logs` is the full deployment log (`deployments.read_deployment`).
+- **Every application deploy passes Coolify's image-scan gate** — the target's first
+  `/start` and the rollback's `/restart` alike (ApplicationDeploymentJob
+  v4.7.0:3040-3043, :994; DeploymentImageScan :890-892). Off by default (instance
+  policy seeded off/deploy, migration 2026_10_29_100000:35-44); the mode resolves
+  instance -> team -> server -> app and no API reads it. A new target has no
+  baseline, so under On every exploit-signal finding is new (SecurityGate
+  v4.7.0:15-19); Strict, or "If the scan cannot run: Block", can block the source's
+  restart too. A self-hosted v4.7.0 cannot scan at all (fixed in v4.7.1). The plan
+  warns (`deployments.image_scan_gate_warnings`, `deploy_image_scan_gate`); never
+  write the policy or scanning. "Deploy anyway" is UI-only and queues a NEW
+  deployment: after it, `coolify-migrate unpin`, never a second `rollback`.
+- **Scheduled tasks: `use_shell`, and Coolify disables failing tasks.** See the
+  scheduled-task fact for `use_shell`. After 10 failed runs with the first >= 24h old
+  Coolify sets enabled=false and `disabled_reason` (ScheduledTask v4.7.0:99-114),
+  which no array takes; the carried enabled=false is exact and the plan names such
+  tasks.
+- **A template service's target runs the SOURCE's compose** (next fact). Its `type`
+  create still writes the CURRENT catalog's env rows, and the re-parse deletes only
+  keys starting with `$` or ending with `}` (parsers.php v4.7.0:2466-2475), while
+  every row reaches every container through `env_file: .env` (:3664-3670) — v4.7.0's
+  litellm added `LITELLM_SALT_KEY`, which would stop the source's stored credentials
+  decrypting. CREATE deletes each target row whose key the source lacks
+  (`fidelity.leftover_template_envs`), right after the compose PATCH.
+  Before 4.7.0 a catalog-only PART stays too, unflagged and with no container, so the
+  started target reads degraded and the scheduler skips every task of it
+  (ScheduledJobManager v4.6.0:677-678): CREATE refuses when the source has a task
+  Coolify would run (`schedules.armed_task_names`), else a run notice names the
+  parts. Never PATCH such a part (e.g. exclude_from_status): UpdateServiceApplicationFromApi
+  ends in updateCompose, which writes a phantom `services.{name}.image`.
+- **Parts that leave a service's compose are flagged, not deleted**
+  (`is_removed_from_compose`, parsers.php v4.7.0:2425-2438, e29dcf70d). They keep
+  their fqdn and storages, stay in every GET and every domain holder set, and have no
+  container. Read by key presence (`kinds.removed_from_compose`); never carried in
+  `urls`; PLAN refuses one holding a custom host or a migrated volume no live part
+  declares (`fidelity.removed_part_refusals`).
+- **4.5.0-4.6.x split a dotted compose service name on every URL update**:
+  updateCompose writes `services.{$name}.image` through a dotted path (services.php
+  v4.6.0:397-399,:411) and its Stringable `!==` always runs; the urls PATCH reaches it
+  from 4.5.0. The target then fails at START, after the stop. Fixed in 4.7.0
+  (05e52fc41). `service_url_patch_splits_dotted_names` Gate(4.5.0, 4.7.0) refuses a
+  dotted sub-application holding a non-generated host; a rename alone is no way out
+  (the old part keeps its domain).
+- **Env values skip TrimStrings** (see the TrimStrings fact): `" "` arrives and is
+  stored as `""`, so `build_env_entries` sends it for an exactly empty value on a
+  KNOWN 4.7+ (`env_value_untrimmed`) and the empty-value warning stops there; a
+  preserved null still warns. A multi-line value keeps its edge whitespace.
+- **Legacy env rows written exact** (multi-line JSON from 4.7.0, HasSecretManager
+  v4.7.0:179-192; quoted literals from 4.6.0): `locked_envs.written_forms` accepts the
+  exact form for every legacy dotenv row, ungated (no legacy form starts with an
+  unescaped `"`), and the plan's old-escaping warning stops for them
+  (`legacy_unreadable_line_exact`, `legacy_json_multiline_exact`).
+- **A lock is permanent** (EnvironmentVariable v4.7.0:182-186). Every remedy says
+  "delete and re-add it unlocked with the same value", never "unlock".
+- **`{{server.X}}` reads the shared variables of the server the resource runs on** —
+  in env rows since 4.1.2 (EnvironmentVariable v4.1.2:323-330), in every compose
+  environment/build.args value from 4.7.0 (shared.php v4.7.0:6011-6012). We copy the
+  raw value, so the target reads the TARGET server's X; the plan warns with names
+  only (`compose_resolves_server_shared_vars`). GET /servers/{uuid}/envs is not read:
+  its rows carry values.
+- **Plan warnings for state no API carries**: a dockercompose app's security-update
+  `docker_compose_image_overrides` (applied while the compose still names `from`,
+  parsers.php v4.7.0:2305-2308); `git_ssh_known_hosts` (git host keys pinned per app,
+  trusted on first use; the target trusts on first contact — host, type and SHA256
+  only, never the key); a maintenance route, a proxy file neither the stop nor the
+  domain release removes.
+- **The shared image-name check skips restarts** for nixpacks, static and railpack
+  (ApplicationDeploymentJob v4.7.0:2730-2741, :320-323), so `shared_image_refusals`
+  refuses only a dockerfile source from 4.7.0 (`registry_image_check_skips_restarts`).
+- **A token is blocked for 60/300/900 s after 30 counted failures in a minute**, by
+  ANY client using it (ThrottleFailedApiRequests v4.7.0; 401/403, and 404 only without
+  a token). Every request then gets 429 "Too many failed API requests." before the
+  controller. `api/client.py` logs `api.token_blocked` and keeps waiting out
+  Retry-After — a rollback needs the same token.
+- **Coolify edits authorized_keys under its own lock** (AuthorizedKeys::runLocked
+  v4.7.0:164-182, `$HOME/.ssh/.coolify-authorized-keys.lock`); `engine/keys.py` takes
+  the same lock around the ephemeral-key append and revoke, ungated.
+- **Coolify pins every server's SSH host key, its own included** (learnHostKey
+  v4.7.0:731-783; `ssh_host_key_pinning`). F2 moves the pin, not the key: the F2 plan
+  warns (`domain/host_keys.py`). Under enforce the relocated instance cannot reach its
+  own host until the pending key is trusted. Never POST `/host-key/reset` empty: that
+  drops the pin and Coolify trusts the next key it sees.
+
+- **API creates queue DNS records for the target's OWN hosts** (see the managed-DNS
+  facts). The record points at the target server's first public address
+  (ResourceDnsRecords v4.7.0:50-53,158-181), so a DNS-only record reads READY; with
+  the token's opt-in proxied DNS (CloudflareDnsProvider v4.7.0:239) it resolves to
+  Cloudflare and the gate reads ELSEWHERE after the stop. The plan warns when the
+  target's wildcard base lies in exactly one team zone (`dns/managed.target_records_note`,
+  zones from GET /dns/zones, v4.6.0+, whose rows carry no proxied flag).
+- **Registry logins are per server, and no API copies them** (pre-existing, found
+  by this audit). An application's deploy mounts only the SSH user's
+  ~/.docker/config.json into its helper (ApplicationDeploymentJob v4.7.0:3392-3418),
+  so a login made with sudo does not count; host-side pulls use
+  serverDockerConfigPrefix from 4.5.1. CREATE starts nothing, so a private image's
+  first pull on the target is START, after the stop. From 4.4.0 GET
+  /servers/{uuid}/registries (read:sensitive + team admin) lists the logins; the plan
+  compares both servers (`server_registry_logins`, `fidelity.registry_login_warnings`,
+  names only — `client.get_server_registries` drops username, source and used_by).
+  A warning, never a refusal: a public image needs no login.
+
+Unchanged, and re-read at the tags because everything here depends on it: the
+three Stop actions still `docker stop` + `docker rm -f` (they only add
+`NotifyResourceStoppedJob::expectStop`), StopApplication still filters
+`pullRequestId=0`, StopService still names containers from DB rows (removed parts
+included); `defaultLabels`/`defaultDatabaseLabels` and `Str::slug` (Laravel
+12.70.1 at all three tags); volume names, the Postgres >= 18 mount rule and
+POST /storages naming; the `/start` "already running" guard and `/restart`'s lack
+of one (`running:starting` still contains and starts with `running`);
+DeleteResourceJob; CleanupDocker (`volume prune -af` unfiltered, container cleanup
+only for `coolify.managed=true`); the ScheduledJobManager and DatabaseBackupJob
+`running` skips; the DNS release path (ManagedDnsRecordCleanup, holders check);
+the env-file encoders and GENERATED_MAGIC_VARIABLE_COMMANDS; the domain PATCH /
+deploy-bakes-labels split.
+
+Nothing to answer:
+
+- **New default database images** (postgres:18-alpine, valkey/valkey:9-alpine for
+  Redis, mongo:9, mysql:9.7, mariadb:12.3, clickhouse 26.8; migrations
+  2026_11_06_083240, 2026_11_06_113843) apply only to a create without `image`.
+  CREATE always pins the source's image, which every GET carries. Valkey is an
+  image of the redis engine (StandaloneRedis), not a new engine.
+- **The Redis health check pings with the password** (878d77bd6), so the
+  password also sits in the database compose's `healthcheck.test`; the
+  `environment:` list locked recovery reads is unchanged.
+- **Superseded-deployment cancellation** applies to webhook deployments only;
+  API deploys, `/start` and `/restart` cancel nothing (applications.php
+  v4.7.0:196-203).
+- **Access hardening** (placeResource, useTeamCredentials, nested server secrets
+  limited to team-wide tokens, ValidGitRepositoryUrl on a changed repo, rollback
+  and preview restrictions, deploy tag validation) all pass for the team-admin,
+  team-wide token this tool already requires; no PATCH we send carries
+  `git_repository`.
+- **Servers may share an IP with different SSH ports**
+  (Server v4.7.0:2097-2104, ServersController :637-639, :836-842). Nothing
+  assumes a unique IP: known_hosts, the probe and the tunnel use ip+port, and
+  identical address sets fail closed through the shared-address rule
+  (`dns/gate.classify`, every custom host ELSEWHERE).
+- **`RejectPublishedAppKey`** (a global 503 on a published APP_KEY) was added and
+  removed again before the v4.7.0 tag (c75e7078b, 61b10664c): in no release.
+- **A deployment can outlive `deploy_timeout`** on every release
+  (`dynamic_timeout` 3600 s against our 900 s), and a rollback never cancels it;
+  4.7's opt-in scan gate is one more source of delay, not a new class.
+- **`GET /servers/{uuid}/validate` answers 405** ("changed to a POST request")
+  since at least 4.6.0 (routes/api.php v4.6.0:199-200). Only the e2e rig called
+  it, now with POST.
+
 ### Learned from the v4.5.2 -> v4.6.0 audit (release tags; e2e green on a live 4.6.0)
 
 The canary went red on two create fields. Reading the release found what it cannot
@@ -388,8 +607,9 @@ route and the hidden password.
 - **A building application's `docker_registry_image_name` is unique in the team**
   (`otherApplicationBuildingSameImage`, Application v4.6.0:1123-1137; dockerimage
   and dockercompose are exempt). Every create 422s on it (ApplicationsController
-  :1699,1962,2194,2345) and every deploy fails, `/restart` included
-  (ApplicationDeploymentJob :380,:2588-2594). The source still holds the name, so
+  :1699,1962,2194,2345) and every deploy fails, `/restart` included up to 4.6.x
+  (ApplicationDeploymentJob :380,:2588-2594; from 4.7.0 a nixpacks, static or
+  railpack restart skips the check, see the 4.7 audit). The source still holds the name, so
   CREATE leaves it and the tag out and the plan reports that: the target builds
   locally and pushes nothing. Two cases are refused, because they cannot deploy: a
   deployment-only target (`server_refusals`, it needs a name), and a source whose
@@ -411,8 +631,9 @@ route and the hidden password.
 - **A legacy env row can be written exact** (`useExactEscaping`, HasSecretManager
   :153-171): a compose reference like `FOO=${FOO:-}`, or a literal holding a quote.
   Its `real_value` is then the resolved value (EnvironmentVariable :310-314), and
-  the file holds `"value"`. `locked_envs._stale` accepts that form. A LOCKED legacy
-  row in that state still fails the round trip and stays unrecoverable: closed.
+  the file holds `"value"`. `locked_envs._stale` accepts that form, and from the 4.7
+  work `locked_envs.written_forms` accepts it for a LOCKED legacy dotenv row too, so
+  such a row goes through the same byte-for-byte round trip and is read back.
 - **DELETE routes need `api.ability:delete`** (routes/api.php). The migration
   2026_10_25_100000 gives it to every token that has `write`; a NEW token must
   select it. Stop, start, restart and the writes this tool uses keep their abilities.
@@ -505,10 +726,15 @@ older releases get exactly what they got before.
   custom host. FINALIZE releases the source's custom hosts (url `""` -> null)
   under KEEP as well as RENAME, as its last mutation: a kept source holding the
   target's host is a second router the moment someone restarts it.
-- **The conflict check is port-blind against a portless holder (4.3.15+):** the
-  request key keeps its port, the stored fqdn lost it, so a port-bearing URL never
-  409s against the same host saved without one. Do not rely on a 409 to detect a
-  double claim of a port-bearing URL.
+- **The conflict check is port-blind against a portless holder on 4.3.15-4.6.x:**
+  the request key keeps its port, the stored fqdn lost it, so a port-bearing URL
+  never 409s against the same host saved without one. From v4.7.0
+  `domainConflictKey` drops the port on BOTH sides (domains.php v4.7.0:76-86,
+  53e21abe9), so the same host and path on any port, or none, 409s; paths still
+  differ. Every claim and restore already handles a 409 through
+  `only_own_holders`, so an outside holder on another port is now refused at
+  CREATE, before the stop, like an exact-URL holder always was. Do not rely on a
+  409, or on its absence, either way: the read-back is what proves a claim.
 - **From 4.4 a removed hostname queues `ReleaseRemovedDnsHostnamesJob`**, which
   deletes a Coolify-managed DNS record no live resource uses (v4.5.0
   ServicesController:125-145). Removing a host from a live source before the
@@ -705,7 +931,16 @@ why `domain/domains.py` hands every hostname over make-before-break.
   queues ConfigureDnsRecordJob with the resource's server address, when exactly one
   team zone holds the host and its token has automatic DNS on, the default
   (ResourceDnsRecords :158-184, IntegrationToken :129-132; ApplicationsController
-  :3871, ServicesController :1341; a create does not). So OUR CLAIM triggers it.
+  :3871, ServicesController :1341; up to 4.6.x a create does not). So OUR CLAIM
+  triggers it. From v4.7.0 every API create queues records too, for every
+  hostname of the new resource, with the target server's address (b7defddc3;
+  ApplicationsController v4.7.0:2003,2243,2477,2617,2753, ServicesController
+  :617,:809, clones, UpdateServiceApplicationFromApi :140). Harmless here only
+  because CREATE never carries a custom host (`resources.target_domain_values`,
+  `_compose_domains_body(with_custom=False)`, a service create sends no urls):
+  never move a custom host into a create body. With the token's opt-in proxied
+  DNS those target-own records are proxied, which the DNS gate reads as
+  ELSEWHERE; the plan warns (`dns/managed`, `automatic_dns_on_api_create`).
   A host with its own record is left alone: conflict, nothing written
   (CloudflareDnsProvider :183-185), which is why this does not re-point a live
   record. A host that resolves only through a WILDCARD record gets a new record
@@ -741,8 +976,15 @@ why `domain/domains.py` hands every hostname over make-before-break.
   could be deleted before QUIESCE), and a rollback deleted the target before the
   restore. Both orders are races, not certainties — never write a test that
   expects a deletion from them.
-- **Coolify never re-points a record on its own.** Its value is written only on
-  create or a confirmed replace (from 4.6.0 also `POST .../dns/replace`, which
+- **Coolify re-points a record by itself only when nobody holds its hostname.**
+  From v4.7.0 an automatic create REPLACES a conflicting record when Coolify
+  created it (owned, ownership comment intact), no live resource but the claimer
+  references it, and no live application, preview or service application holds
+  the hostname (ConfigureDnsRecordJob v4.7.0:59-76,100-119, c3a21ecee;
+  ManagedDnsRecordCleanup v4.7.0:358-373; a soft-deleted claimer never qualifies,
+  :149-157). Our hand-over keeps the source holding every claimed host until
+  FINALIZE, so a claim still never re-points a live record. Otherwise its value is
+  written only on create or a confirmed replace (from 4.6.0 also `POST .../dns/replace`, which
   needs the record id and current content from a conflict and points only at the
   resource's own server). The UI offers no create/replace for a hostname that
   already has a managed row ("Managed by Coolify" badge only,
@@ -777,10 +1019,12 @@ why `domain/domains.py` hands every hostname over make-before-break.
   plan warnings — never gate on it (vanity nameservers, partial setups and every
   other CDN would slip through). Each server's address set includes its wildcard
   base (and a probe label under it), the public address custom records point at.
-- **Three plan warnings, never refusals.** A custom host whose zone is on
+- **Four plan warnings, never refusals.** A custom host whose zone is on
   Cloudflare (authoritative NS `*.ns.cloudflare.com` or a CNAME into
   `*.cdn.cloudflare.net`) from 4.4.0 (`dns/managed.cloudflare_note`), a claim
-  that can create a record from 4.6.0 (`dns/managed.automatic_dns_note`), and a
+  that can create a record from 4.6.0 (`dns/managed.automatic_dns_note`), the
+  target's own hosts under a wildcard in a team zone from 4.7.0, or 4.6.0 for a
+  service (`dns/managed.target_records_note`), and a
   hostname also held by a resource outside the plan
   (`domains.outside_holders`). REST only: `GET /applications` carries every
   application's `fqdn`/`docker_compose_domains`, but `GET /services` does not
@@ -855,3 +1099,6 @@ Conventional Commits, **past-tense** subject (`added`, `fixed`, `updated`), max
 | Are scheduled tasks and backup schedules carried? | `api/schedules.py`, `domain/schedules.py` |
 | Can a locked variable be carried? | `domain/locked_envs.py` |
 | Is the data safe from Coolify's cleanup? | `discovery/pins.py` |
+| Will Coolify (4.7+) accept this name or description? | `domain/fidelity.py` (names and descriptions) |
+| Did the deploy behind a start or restart actually run? | `domain/deployments.py` |
+| Does Coolify pin its own host's SSH key (F2)? | `domain/host_keys.py` |
