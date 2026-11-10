@@ -473,16 +473,19 @@ async def step_create_target(ctx: MigrationContext) -> dict[str, Any]:
         for full in sources.values():
             own |= api_resources.sub_application_uuids(full)
 
+        # NO TAGS on a target here: POST /deploy?tag deploys every tagged
+        # application and service whatever auto-deploy says (DeployController
+        # v4.7.2:488-538), so a tag CI run would start the target before the DNS
+        # gate. Only their names are read and journalled, now, while every source
+        # exists: FINALIZE adds them after a DELETE policy removed the sources
+        # (engine/deploy_triggers.arm_targets). Never fails the create.
+        await deploy_triggers.read_source_tags(ctx)
+
         for resource in ctx.plan.resources:
             snapshot = resource.snapshot
             source_full = sources[snapshot.uuid]
             if snapshot.collection == "applications":
                 await _refuse_multi_server(ctx, snapshot, source_full)
-
-            # NO TAGS here: POST /deploy?tag deploys every tagged application and
-            # service whatever auto-deploy says (DeployController v4.7.2:488-538),
-            # so a tag CI run would start the target before the DNS gate. FINALIZE
-            # copies them (engine/deploy_triggers.arm_targets).
 
             # The way back for FINALIZE's release, journalled before any write for
             # this resource. A service's includes the route-key rows its images

@@ -1870,20 +1870,48 @@ async def copy_tags(
     once (2.5.6) broke every migration against every instance that existed. This
     shape works on both, and degrades to "no tags" on the version that lacks the
     route instead of taking the resource down with it.
+
+    It reads the source when called. A migration reads at CREATE instead
+    (:func:`read_tag_names`) and adds at FINALIZE (:func:`add_tag_names`): by
+    then a DELETE finalize has removed the source.
+    """
+    names = await read_tag_names(api, collection=collection, uuid=source_uuid)
+    if names is None:
+        return 0
+    return await add_tag_names(api, collection=collection, target_uuid=target_uuid, names=names)
+
+
+async def read_tag_names(api: CoolifyClient, *, collection: str, uuid: str) -> list[str] | None:
+    """A resource's tag names, or ``None`` when they cannot be known. Never raises on the API.
+
+    ``None`` for a route that does not exist (4.1.x: the tag routes arrive in
+    4.2.0, routes/api.php v4.2.0:158-160) and for a resource that is gone — the
+    read looks it up like every API route, and a soft-deleted row is out of that
+    query (HandlesTagsApi v4.7.2:23-38, Application uses SoftDeletes), so a
+    source deleted by FINALIZE answers 404.
     """
     try:
-        names = await api.get_tag_names(collection, source_uuid)
+        names = await api.get_tag_names(collection, uuid)
     except CoolifyApiError as exc:
-        log.warning("api.tags.read_failed", uuid=source_uuid, error=str(exc)[:200])
-        return 0
-
+        log.warning("api.tags.read_failed", uuid=uuid, error=str(exc)[:200])
+        return None
     if names is None:
-        log.debug("api.tags.route_absent", uuid=source_uuid)
-        return 0
+        log.debug("api.tags.route_absent", uuid=uuid)
+    return names
 
+
+async def add_tag_names(
+    api: CoolifyClient, *, collection: str, target_uuid: str, names: list[str]
+) -> int:
+    """Attach tags by name. Returns the count sent. Never raises on the API.
+
+    Idempotent upstream: each name is ``createOrFirst``ed and attached with
+    ``syncWithoutDetaching`` (HandlesTagsApi v4.2.0:142, v4.7.2:130-144), so
+    a replayed FINALIZE attaches nothing twice.
+    """
     usable = [n for n in names if len(n) >= _MIN_TAG_LENGTH]
     if dropped := [n for n in names if len(n) < _MIN_TAG_LENGTH]:
-        log.warning("api.tags.too_short", uuid=source_uuid, names=dropped)
+        log.warning("api.tags.too_short", target=target_uuid, names=dropped)
     if not usable:
         return 0
 

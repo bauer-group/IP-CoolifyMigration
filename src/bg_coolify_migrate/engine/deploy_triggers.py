@@ -9,7 +9,9 @@ IO shell: what to switch, and back to what, is ``domain/deploy_triggers.py``'s.
   before the preview delete, the mount capture and the pins, because a
   deployment that ends replaces the containers those name.
 * :func:`arm_targets` — FINALIZE: each target gets its source's auto-deploy and
-  its tags. :func:`note_kept_sources` says which kept source stays disarmed.
+  the tag names CREATE read (:func:`read_source_tags`) — read there, while every
+  source exists: a DELETE finalize has removed them by now.
+  :func:`note_kept_sources` says which kept source stays disarmed.
 * :func:`restore_sources` — the rollback's RESTORE_SOURCE_DEPLOY_TRIGGERS.
 
 Nothing here is ever logged but booleans, uuids and names: the deployment rows
@@ -186,16 +188,73 @@ async def _original(
         return triggers.Triggers(auto_deploy=None, previews=None)
 
 
+async def read_source_tags(ctx: MigrationContext) -> dict[str, list[str]]:
+    """CREATE: journal every source's tag names for FINALIZE. Returns them. Never raises.
+
+    Only READ here: on the target they would let a tag CI run start it before
+    the DNS gate (:func:`arm_targets`). Read now because FINALIZE gives them to
+    the targets only after a DELETE policy has removed every source, and a
+    deleted source has no tags left to read (:data:`TAGS_JOURNAL_KEY`). A source
+    whose tags cannot be read is left out, and FINALIZE asks it again.
+    """
+    names: dict[str, list[str]] = {}
+    for resource in ctx.plan.resources:
+        snapshot = resource.snapshot
+        try:
+            found = await api_resources.read_tag_names(
+                ctx.api, collection=snapshot.collection, uuid=snapshot.uuid
+            )
+        except Exception as exc:  # tags are never on the critical path (2.5.6)
+            log.warning("create.source_tags_unread", uuid=snapshot.uuid, error=_why(exc))
+            continue
+        if found is not None:
+            names[snapshot.uuid] = found
+    if names:
+        ctx.journal.append(
+            "step_started",
+            state=State.CREATE_TARGET.value,
+            detail={triggers.TAGS_JOURNAL_KEY: names},
+        )
+    return names
+
+
+async def _give_tags(
+    ctx: MigrationContext,
+    snapshot: ResourceSnapshot,
+    target_uuid: str,
+    journalled: dict[str, list[str]],
+) -> None:
+    names = journalled.get(snapshot.uuid)
+    if names is None:
+        # CREATE could not read them, or the journal predates that read (its
+        # CREATE copied them itself; adding twice attaches nothing twice). Ask
+        # the source - which a DELETE finalize has removed by now.
+        await api_resources.copy_tags(
+            ctx.api,
+            collection=snapshot.collection,
+            source_uuid=snapshot.uuid,
+            target_uuid=target_uuid,
+        )
+        return
+    await api_resources.add_tag_names(
+        ctx.api, collection=snapshot.collection, target_uuid=target_uuid, names=names
+    )
+
+
 async def arm_targets(ctx: MigrationContext) -> list[str]:
     """Give every target its source's auto-deploy, then its tags. Returns the armed uuids.
 
     FINALIZE, after the cutover: until now nothing may start a target before
     the DNS gate, and both a push (auto-deploy) and ``POST /deploy?tag`` (tags,
-    whatever auto-deploy says: DeployController v4.7.2:488-538) would. Never
+    whatever auto-deploy says: DeployController v4.7.2:488-538) would. The tag
+    names are the ones CREATE journalled (:func:`read_source_tags`). Never
     raises — the cutover is done, and a target missing a setting or a tag is
     named in a notice instead.
     """
     originals = recorded(ctx)
+    tags = triggers.deserialise_tags(
+        ctx.journal.undo_info(State.CREATE_TARGET.value).get(triggers.TAGS_JOURNAL_KEY)
+    )
     armed: list[str] = []
     for resource in ctx.plan.resources:
         snapshot = resource.snapshot
@@ -217,13 +276,8 @@ async def arm_targets(ctx: MigrationContext) -> list[str]:
                     )
                 )
         try:
-            await api_resources.copy_tags(
-                ctx.api,
-                collection=snapshot.collection,
-                source_uuid=snapshot.uuid,
-                target_uuid=target_uuid,
-            )
-        except Exception as exc:  # copy_tags warns on API errors; nothing else may fail it
+            await _give_tags(ctx, snapshot, target_uuid, tags)
+        except Exception as exc:  # the tag calls warn on API errors; nothing else may fail it
             log.warning("finalize.tags_not_copied", uuid=target_uuid, error=_why(exc))
     return armed
 

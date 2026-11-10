@@ -769,6 +769,103 @@ class TestStepFinalize:
         # The kept source is NOT switched back on.
         assert source.patches == []
 
+    async def test_delete_gives_the_target_the_tags_create_read(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        # The policy loop deletes every source BEFORE the targets get their
+        # tags, and a deleted source has none left to read (soft-deleted, so
+        # its GET .../tags 404s). CREATE's journalled names are what counts.
+        ctx.plan = _plan(_app(), _db(), policy=FinalizePolicy.DELETE)
+        ctx.target_uuids.update({"app1": "appT", "db1": "db2"})
+        _journal_originals(ctx, app1=dt.Triggers(True, False))
+        ctx.journal.append(
+            "step_started",
+            state="create_target",
+            detail={dt.TAGS_JOURNAL_KEY: {"app1": ["prod", "ci-deploy"], "db1": ["prod"]}},
+        )
+        deleted: list[str] = []
+
+        def delete(request: httpx.Request) -> httpx.Response:
+            deleted.append(request.url.path.rsplit("/", 1)[-1])
+            return httpx.Response(200, json={"message": "Deletion request queued."})
+
+        respx_mock.delete(url__regex=r".*/(applications/app1|databases/db1)(\?.*)?$").mock(
+            side_effect=delete
+        )
+        gone = respx_mock.get(url__regex=r".*/(applications/app1|databases/db1)/tags$").mock(
+            return_value=httpx.Response(404, json={"message": "Not found."})
+        )
+        target = App("appT", auto=False).mount(respx_mock)
+        app_tags = respx_mock.post(f"{BASE}/applications/appT/tags").mock(
+            return_value=httpx.Response(201, json=[])
+        )
+        db_tags = respx_mock.post(f"{BASE}/databases/db2/tags").mock(
+            return_value=httpx.Response(201, json=[])
+        )
+
+        result = await steps.step_finalize(ctx)
+
+        assert deleted == ["app1", "db1"]
+        assert result["target_armed"] == ["appT"]
+        assert target.patches == [{"is_auto_deploy_enabled": True}]
+        assert json.loads(app_tags.calls[0].request.read()) == {"tag_names": ["prod", "ci-deploy"]}
+        assert json.loads(db_tags.calls[0].request.read()) == {"tag_names": ["prod"]}
+        assert not gone.called
+        assert result["sources_left_disarmed"] == [] and ctx.notices == []
+
+
+class TestReadSourceTags:
+    """CREATE reads the names - and writes no tag anywhere."""
+
+    async def test_every_sources_names_are_journalled(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        ctx.plan = _plan(_app(), _db())
+        respx_mock.get(f"{BASE}/applications/app1/tags").mock(
+            return_value=httpx.Response(200, json=[{"uuid": "t1", "name": "prod"}])
+        )
+        _no_tags(respx_mock, "databases", "db1")
+
+        names = await engine.read_source_tags(ctx)
+
+        assert names == {"app1": ["prod"], "db1": []}
+        assert ctx.journal.undo_info("create_target")[dt.TAGS_JOURNAL_KEY] == names
+
+    async def test_what_cannot_be_read_is_left_out_and_never_fails_create(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        ctx.plan = _plan(_app(), _app("app2", "api"), _db())
+        # 4.1.x: no tag route. Then an API error, then a shape nobody expected.
+        respx_mock.get(f"{BASE}/applications/app1/tags").mock(
+            return_value=httpx.Response(404, json={"message": "Not found."})
+        )
+        respx_mock.get(f"{BASE}/applications/app2/tags").mock(return_value=httpx.Response(500))
+        respx_mock.get(f"{BASE}/databases/db1/tags").mock(side_effect=RuntimeError("unexpected"))
+
+        assert await engine.read_source_tags(ctx) == {}
+        # Nothing to journal: FINALIZE asks each source again.
+        assert dt.TAGS_JOURNAL_KEY not in ctx.journal.undo_info("create_target")
+
+    async def test_finalize_adds_the_journalled_names_without_reading_the_source(
+        self, ctx: MigrationContext, respx_mock: respx.Router
+    ) -> None:
+        ctx.plan = _plan(_db(), policy=FinalizePolicy.KEEP)
+        ctx.target_uuids["db1"] = "db2"
+        ctx.journal.append(
+            "step_started", state="create_target", detail={dt.TAGS_JOURNAL_KEY: {"db1": []}}
+        )
+        read = respx_mock.get(f"{BASE}/databases/db1/tags").mock(
+            return_value=httpx.Response(200, json=[{"name": "stale"}])
+        )
+        post = respx_mock.post(f"{BASE}/databases/db2/tags").mock(
+            return_value=httpx.Response(201, json=[])
+        )
+
+        assert await engine.arm_targets(ctx) == []
+
+        # CREATE read no tags: nothing to add, and no reason to ask again.
+        assert not read.called and not post.called
+
 
 # ── R7: the rollback gives the switches back ─────────────────────────────────
 

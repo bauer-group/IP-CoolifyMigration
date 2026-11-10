@@ -31,8 +31,9 @@ So this module decides, and the engine performs:
 
 * every TARGET application is created with auto-deploy OFF
   (:data:`TARGET_CREATE`) and armed only at FINALIZE, with the source's original
-  (:func:`target_arm_body`) — its tags are copied there too, since a tag deploy
-  ignores auto-deploy;
+  (:func:`target_arm_body`) — every target gets its tags there too, since a tag
+  deploy ignores auto-deploy; their names are read at CREATE
+  (:data:`TAGS_JOURNAL_KEY`), while every source still exists;
 * every SOURCE application is disarmed at QUIESCE, before the stop: auto-deploy
   off, previews off where on (:func:`disarm_body`), the originals journalled
   first (:data:`JOURNAL_KEY`);
@@ -78,6 +79,15 @@ TARGET_CREATE: Mapping[str, bool] = {AUTO_DEPLOY: False}
 #: before the disarm: ``{source_uuid: {"auto_deploy": bool|None, "previews": ...}}``.
 #: Booleans only: no secret can ride it.
 JOURNAL_KEY = "deploy_triggers"
+
+#: CREATE's journal key holding each source's tag NAMES, for FINALIZE to give its
+#: target: ``{source_uuid: [name, ...]}``. Read at CREATE because a DELETE
+#: finalize removes the sources before the targets get their tags, and a deleted
+#: source's tags go with it: soft-deleted first from 4.3.11, so its GET .../tags
+#: 404s at once, then force-deleted by DeleteResourceJob (v4.3.10:130,
+#: v4.7.2:171; a database's tags detached just before, :127/:168). Names only:
+#: a tag is a label.
+TAGS_JOURNAL_KEY = "source_tags"
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +182,22 @@ def deserialise(raw: object) -> dict[str, Triggers]:
                 auto_deploy=_bool(entry.get("auto_deploy")), previews=_bool(entry.get("previews"))
             )
     return out
+
+
+def deserialise_tags(raw: object) -> dict[str, list[str]]:
+    """Read :data:`TAGS_JOURNAL_KEY` back. PURE, and tolerant.
+
+    A source missing from the result was not read at CREATE (the read failed,
+    or the journal predates it): FINALIZE then asks the source itself. A
+    malformed entry counts as missing; a name that is not a string is left out.
+    """
+    if not isinstance(raw, Mapping):
+        return {}
+    return {
+        uuid: [name for name in names if isinstance(name, str)]
+        for uuid, names in raw.items()
+        if isinstance(uuid, str) and isinstance(names, list)
+    }
 
 
 # ── the deployment queue ─────────────────────────────────────────────────────

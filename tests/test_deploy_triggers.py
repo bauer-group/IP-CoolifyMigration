@@ -138,6 +138,26 @@ class TestJournal:
         assert dt.deserialise(journal.undo_info("quiesce")[dt.JOURNAL_KEY]) == {"a": BOTH}
 
 
+class TestJournalledTags:
+    def test_round_trip_through_the_journal(self, tmp_path: Any) -> None:
+        from bg_coolify_migrate.journal.store import Journal
+
+        journal = Journal.create(tmp_path, "m1")
+        names = {"app1": ["prod", "ci-deploy"], "db1": []}
+        journal.append("step_started", state="create_target", detail={dt.TAGS_JOURNAL_KEY: names})
+        raw = journal.undo_info("create_target")[dt.TAGS_JOURNAL_KEY]
+        assert dt.deserialise_tags(raw) == names
+
+    def test_an_empty_list_is_known_and_a_malformed_entry_is_not(self) -> None:
+        # Known-empty means "add nothing"; missing means "ask the source again".
+        raw = {"app1": [], "app2": "prod", 3: ["x"], "db1": ["prod", 7]}
+        assert dt.deserialise_tags(raw) == {"app1": [], "db1": ["prod"]}
+
+    def test_no_record_is_no_names(self) -> None:
+        assert dt.deserialise_tags(None) == {}
+        assert dt.deserialise_tags(["prod"]) == {}
+
+
 URL = "/project/p1/environment/e1/application/{app}/deployment/{dep}"
 
 

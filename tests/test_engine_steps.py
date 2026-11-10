@@ -1263,16 +1263,18 @@ class TestCreateTarget:
         result = await steps.step_create_target(ctx)
         assert result["target_uuids"] == {"svc1": "tgt1"}
 
-    async def test_create_reads_and_copies_no_tags(
+    async def test_create_reads_the_tag_names_and_copies_no_tags(
         self, ctx: MigrationContext, respx_mock: respx.Router
     ) -> None:
-        """Tags are FINALIZE's now (engine/deploy_triggers.arm_targets).
+        """Tags reach the target at FINALIZE (engine/deploy_triggers.arm_targets).
 
         POST /deploy?tag deploys every tagged application and service whatever
         auto-deploy says (DeployController v4.7.2:488-538), so tags copied at
-        CREATE let a tag CI run start the target before the DNS gate. And still
-        the 2.5.6 lesson: `tags` never enters the create body, where an unlisted
-        field would 422 the whole resource on 4.1.2.
+        CREATE let a tag CI run start the target before the DNS gate. Their
+        NAMES are read and journalled here, while the source exists: a DELETE
+        finalize removes it before the targets get them. And still the 2.5.6
+        lesson: `tags` never enters the create body, where an unlisted field
+        would 422 the whole resource on 4.1.2.
         """
         tags_route = respx_mock.get(f"{BASE}/databases/db1/tags").mock(
             return_value=httpx.Response(
@@ -1305,7 +1307,10 @@ class TestCreateTarget:
         result = await steps.step_create_target(ctx)
 
         assert result["target_uuids"] == {"db1": "db2"}
-        assert not tags_route.called and not tag_post.called
+        assert tags_route.called and not tag_post.called
+        assert ctx.journal.undo_info("create_target")["source_tags"] == {
+            "db1": ["prod", "billing"]
+        }
         assert "tags" not in json.loads(create.calls[0].request.read().decode())
 
 
