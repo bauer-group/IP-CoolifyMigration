@@ -236,24 +236,41 @@ async def read_source_tags(ctx: MigrationContext) -> dict[str, list[str]]:
     return names
 
 
+def given_tags(ctx: MigrationContext) -> dict[str, triggers.GivenTags]:
+    """The tag names FINALIZE has journalled before attaching them, by target uuid."""
+    detail = ctx.journal.undo_info(State.FINALIZE.value)
+    return triggers.deserialise_given(detail.get(triggers.TAGS_GIVEN))
+
+
 async def _give_tags(
     ctx: MigrationContext,
     snapshot: ResourceSnapshot,
     target_uuid: str,
     journalled: dict[str, list[str]],
+    given: dict[str, triggers.GivenTags],
 ) -> None:
     names = journalled.get(snapshot.uuid)
     if names is None:
         # CREATE could not read them, or the journal predates that read (its
         # CREATE copied them itself; adding twice attaches nothing twice). Ask
         # the source - which a DELETE finalize has removed by now.
-        await api_resources.copy_tags(
-            ctx.api,
-            collection=snapshot.collection,
-            source_uuid=snapshot.uuid,
-            target_uuid=target_uuid,
+        names = await api_resources.read_tag_names(
+            ctx.api, collection=snapshot.collection, uuid=snapshot.uuid
         )
+    if not names:
         return
+    # Journalled BEFORE the request, every name ever given to this target, so
+    # DISARM_TARGETS detaches them again - a crash after the POST included. A
+    # record that cannot be written attaches nothing (the caller logs it).
+    before = given.get(target_uuid)
+    union = tuple(dict.fromkeys([*(before.names if before else ()), *names]))
+    if before is None or before.names != union:
+        given[target_uuid] = triggers.GivenTags(snapshot.collection, union)
+        ctx.journal.append(
+            "step_started",
+            state=State.FINALIZE.value,
+            detail={triggers.TAGS_GIVEN: triggers.serialise_given(given)},
+        )
     await api_resources.add_tag_names(
         ctx.api, collection=snapshot.collection, target_uuid=target_uuid, names=names
     )
@@ -270,14 +287,16 @@ async def arm_targets(ctx: MigrationContext) -> list[str]:
     named in a notice instead.
 
     Each application target is journalled BEFORE its PATCH
-    (:data:`triggers.ARM_REQUESTED`), so a rollback that follows — a crash
-    after the PATCH included — switches it off again before it stops the target
-    (:func:`disarm_targets`). A record that cannot be written arms nothing.
+    (:data:`triggers.ARM_REQUESTED`), and every target's tag names before they
+    are attached (:data:`triggers.TAGS_GIVEN`), so a rollback that follows — a
+    crash after the request included — takes both back before it stops the
+    target (:func:`disarm_targets`). A record that cannot be written arms nothing.
     """
     originals = recorded(ctx)
     tags = triggers.deserialise_tags(
         ctx.journal.undo_info(State.CREATE_TARGET.value).get(triggers.TAGS_JOURNAL_KEY)
     )
+    given = given_tags(ctx)
     requested = arm_requested(ctx)
     armed: list[str] = []
     for resource in ctx.plan.resources:
@@ -307,7 +326,7 @@ async def arm_targets(ctx: MigrationContext) -> list[str]:
                     )
                 )
         try:
-            await _give_tags(ctx, snapshot, target_uuid, tags)
+            await _give_tags(ctx, snapshot, target_uuid, tags, given)
         except Exception as exc:  # the tag calls warn on API errors; nothing else may fail it
             log.warning("finalize.tags_not_copied", uuid=target_uuid, error=_why(exc))
     return armed
@@ -345,10 +364,16 @@ async def disarm_targets(ctx: MigrationContext, undo_info: dict[str, Any]) -> li
     read first and PATCHed only where it is not off already
     (:func:`domain.deploy_triggers.target_disarm_body`), so a replay sends
     nothing. A target that is gone (404 — an earlier rollback deleted it) is
-    done. Every target is attempted; the failures are raised together, each
-    named with what to switch off by hand.
+    done. Then every tag name FINALIZE journalled for a target
+    (:data:`triggers.TAGS_GIVEN`) is detached again: ``POST /deploy?tag=``
+    ignores auto-deploy, so a tagged target is a CI run away from a redeploy on
+    the volumes the rollback drops. Only those names: a tag someone gave the
+    target since stays (:func:`domain.deploy_triggers.tags_to_detach`). Every
+    target is attempted; the failures are raised together, each named with what
+    to switch off by hand.
     """
     failures: list[str] = []
+    tag_failures: list[str] = []
     switched: list[str] = []
     for target_uuid in triggers.deserialise_uuids(undo_info.get(triggers.ARM_REQUESTED)):
         try:
@@ -371,15 +396,55 @@ async def disarm_targets(ctx: MigrationContext, undo_info: dict[str, Any]) -> li
         if body:
             log.info("compensate.target_deploys_disarmed", uuid=target_uuid)
             switched.append(target_uuid)
+    for target_uuid, entry in triggers.deserialise_given(undo_info.get(triggers.TAGS_GIVEN)).items():
+        try:
+            detached = await _detach_given_tags(ctx, target_uuid, entry)
+        except Exception as exc:
+            log.error("compensate.target_tags_not_detached", uuid=target_uuid, error=_why(exc))
+            tag_failures.append(
+                f"{_target_name(ctx, target_uuid)} ({target_uuid}: {', '.join(entry.names)}; "
+                f"{_why(exc)})"
+            )
+            continue
+        if detached:
+            log.info("compensate.target_tags_detached", uuid=target_uuid, count=detached)
+    problems: list[str] = []
     if failures:
-        raise RuntimeError(
+        problems.append(
             "auto-deploy NOT switched off for: "
             + "; ".join(failures)
             + " - switch 'Auto Deploy' off on each target's Advanced page in Coolify: "
             "until it is deleted, a push can redeploy it, on empty volumes once the "
             "rollback has dropped them"
         )
+    if tag_failures:
+        problems.append(
+            "tags NOT removed from: "
+            + "; ".join(tag_failures)
+            + " - remove those tags from each target in Coolify: until it is deleted, a "
+            "deploy by tag redeploys it, on empty volumes once the rollback has dropped them"
+        )
+    if problems:
+        raise RuntimeError(". ".join(problems))
     return switched
+
+
+async def _detach_given_tags(
+    ctx: MigrationContext, target_uuid: str, entry: triggers.GivenTags
+) -> int:
+    """Detach the names FINALIZE gave one target. Returns how many were detached.
+
+    A target or route that answers 404 has nothing left to detach (the target
+    is gone, or the release has no tag routes, so FINALIZE attached none).
+    """
+    rows = await ctx.api.get_tags(entry.collection, target_uuid)
+    if rows is None:
+        return 0
+    detached = 0
+    for tag_uuid in triggers.tags_to_detach(rows, entry.names):
+        if await ctx.api.remove_tag(entry.collection, target_uuid, tag_uuid):
+            detached += 1
+    return detached
 
 
 async def restore_sources(ctx: MigrationContext) -> None:

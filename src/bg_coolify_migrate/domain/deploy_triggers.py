@@ -34,8 +34,9 @@ So this module decides, and the engine performs:
   (:func:`target_arm_body`) — every target gets its tags there too, since a tag
   deploy ignores auto-deploy; their names are read at CREATE
   (:data:`TAGS_JOURNAL_KEY`), while every source still exists. Each target is
-  journalled before it is armed (:data:`ARM_REQUESTED`), and a rollback switches
-  its auto-deploy off again before it stops it (:func:`target_disarm_body`);
+  journalled before it is armed (:data:`ARM_REQUESTED`, :data:`TAGS_GIVEN`), and
+  a rollback switches its auto-deploy off and detaches those tags again before
+  it stops it (:func:`target_disarm_body`, :func:`tags_to_detach`);
 * every SOURCE application is disarmed at QUIESCE, before the stop: auto-deploy
   off, previews off where on (:func:`disarm_body`), the originals journalled
   first (:data:`JOURNAL_KEY`);
@@ -59,6 +60,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from bg_coolify_migrate.domain.deployments import IN_PROGRESS, QUEUED
+from bg_coolify_migrate.domain.statemachine import ARM_REQUESTED as _ARM_REQUESTED
+from bg_coolify_migrate.domain.statemachine import TAGS_GIVEN as _TAGS_GIVEN
 from bg_coolify_migrate.domain.statemachine import Compensation, State
 
 #: The two settings, as the GET nests them under ``settings`` and the PATCH takes
@@ -98,8 +101,15 @@ TAGS_JOURNAL_KEY = "source_tags"
 #: uuid FINALIZE is about to give its auto-deploy, written BEFORE the request, so
 #: a crash between the two still leaves the way back. The rollback's
 #: DISARM_TARGETS switches each one off again (:func:`target_disarm_body`).
-#: Uuids only.
-ARM_REQUESTED = "arm_requested"
+#: Uuids only. Defined in ``statemachine`` (``owed_states`` reads it).
+ARM_REQUESTED = _ARM_REQUESTED
+
+#: FINALIZE's journal key, likewise: ``target uuid -> {collection, names}``,
+#: the tag names FINALIZE is about to attach, written BEFORE the request. The
+#: rollback's DISARM_TARGETS detaches exactly those names again
+#: (:func:`tags_to_detach`) — never a tag someone else gave the target since.
+#: Names only. Defined in ``statemachine`` too.
+TAGS_GIVEN = _TAGS_GIVEN
 
 #: RESTORE_SOURCE_DEPLOY_TRIGGERS's mark (a ``rollback_step`` detail,
 #: :func:`restored_detail`): one source uuid that holds its originals again,
@@ -241,6 +251,67 @@ def deserialise_uuids(raw: object) -> list[str]:
     if not isinstance(raw, list):
         return []
     return list(dict.fromkeys(u for u in raw if isinstance(u, str) and u))
+
+
+@dataclass(frozen=True)
+class GivenTags:
+    """The tag names FINALIZE attached to one target, and the target's collection."""
+
+    collection: str
+    names: tuple[str, ...]
+
+
+def serialise_given(given: Mapping[str, GivenTags]) -> dict[str, dict[str, Any]]:
+    """:data:`TAGS_GIVEN`'s journal form. PURE."""
+    return {
+        uuid: {"collection": entry.collection, "names": list(entry.names)}
+        for uuid, entry in given.items()
+    }
+
+
+def deserialise_given(raw: object) -> dict[str, GivenTags]:
+    """Read :data:`TAGS_GIVEN` back. PURE, and tolerant: a malformed entry is left out."""
+    if not isinstance(raw, Mapping):
+        return {}
+    out: dict[str, GivenTags] = {}
+    for uuid, entry in raw.items():
+        if not (isinstance(uuid, str) and uuid and isinstance(entry, Mapping)):
+            continue
+        collection, names = entry.get("collection"), entry.get("names")
+        if not (isinstance(collection, str) and collection and isinstance(names, list)):
+            continue
+        out[uuid] = GivenTags(collection, tuple(n for n in names if isinstance(n, str) and n))
+    return out
+
+
+def _tag_key(name: str) -> str:
+    # Upstream stores a name as strtolower(trim(strip_tags(...))) (HandlesTagsApi
+    # normalizeTagNames v4.2.0 .. v4.7.5); the names we journal were read back
+    # from a GET, so they already are, and this only absorbs case and edges.
+    return name.strip().lower()
+
+
+def tags_to_detach(rows: object, names: Iterable[str]) -> list[str]:
+    """The uuids of the target's tags to detach: those FINALIZE gave it. PURE.
+
+    ``rows`` is ``GET /{collection}/{uuid}/tags`` — ``[{uuid, name, ...}]``
+    (TagsController::serializeTag, v4.2.0 .. v4.7.5). A tag of any other name
+    was given by someone else after FINALIZE and stays.
+    """
+    wanted = {_tag_key(n) for n in names}
+    if not isinstance(rows, list):
+        return []
+    return list(
+        dict.fromkeys(
+            str(row["uuid"])
+            for row in rows
+            if isinstance(row, Mapping)
+            and isinstance(row.get("uuid"), str)
+            and row["uuid"]
+            and isinstance(row.get("name"), str)
+            and _tag_key(row["name"]) in wanted
+        )
+    )
 
 
 def restored_detail(source_uuid: str) -> dict[str, str]:

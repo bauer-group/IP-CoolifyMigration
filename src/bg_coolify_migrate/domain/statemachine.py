@@ -367,6 +367,30 @@ def target_may_run(completed: Collection[str], markers: Mapping[str, Any]) -> bo
     )
 
 
+#: Journalled by FINALIZE (a ``step_started`` detail): every target application
+#: uuid it is about to give its auto-deploy, written BEFORE the PATCH. Defined
+#: here, not in ``domain/deploy_triggers.py`` (which re-exports it), because
+#: :func:`owed_states` reads it and that module imports this one.
+ARM_REQUESTED = "arm_requested"
+
+#: Journalled by FINALIZE, likewise: ``target uuid -> {collection, names}``, the
+#: tag names it is about to attach to that target, written BEFORE the request.
+#: A tag deploy ignores auto-deploy (DeployController::by_tags v4.7.2:488-538).
+TAGS_GIVEN = "tags_given"
+
+
+def targets_armed(markers: Mapping[str, Any]) -> bool:
+    """True if FINALIZE may have armed a target, so a rollback owes DISARM_TARGETS.
+
+    ``markers`` is FINALIZE's merged journal detail. FINALIZE completing is not
+    the only way: a FINALIZE killed after it armed a target and then resumed
+    re-runs from the top, and when that attempt fails before it completes, the
+    automatic rollback would otherwise stop, empty and wait beside a target a
+    push or a tag deploy still redeploys.
+    """
+    return bool(markers.get(ARM_REQUESTED)) or bool(markers.get(TAGS_GIVEN))
+
+
 def owed_states(
     completed: Sequence[str],
     *,
@@ -401,6 +425,11 @@ def owed_states(
     (``binds.BIND_TARGET``) — also when it then FAILED: a bind is copied onto a
     host path outside the target resource, which no target delete removes, so
     only DROP_TARGET_VOLUMES can take back what this run created there.
+
+    FINALIZE is owed, likewise, once it journalled a target it arms
+    (:func:`targets_armed`). Its RESTORE_SOURCE_NAME comes with it and is right
+    then too: it reads the journalled policy, renames back only under RENAME,
+    and renaming a source to the name it still has changes nothing.
     """
     owed = dict.fromkeys(str(s) for s in completed)
     for state in (in_flight, *undo_incomplete):
@@ -412,6 +441,8 @@ def owed_states(
         owed.setdefault(State.START_TARGET.value)
     if ((markers or {}).get(State.COPY.value) or {}).get(BIND_TARGET):
         owed.setdefault(State.COPY.value)
+    if targets_armed((markers or {}).get(State.FINALIZE.value) or {}):
+        owed.setdefault(State.FINALIZE.value)
     return tuple(owed)
 
 

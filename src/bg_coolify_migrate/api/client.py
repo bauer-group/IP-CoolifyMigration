@@ -448,6 +448,39 @@ class CoolifyClient:
             return None
         return [str(t["name"]) for t in _as_list(result) if t.get("name")]
 
+    async def get_tags(self, collection: str, uuid: str) -> list[dict[str, str]] | None:
+        """A resource's tags as ``[{uuid, name}]``. ``None`` when the route 404s.
+
+        A 404 is a release without tag routes (4.1.x) or a resource that is gone
+        (HandlesTagsApi::listTags, v4.2.0 .. v4.7.5): either way nothing is tagged.
+        Each row is reduced to its uuid and name (TagsController::serializeTag).
+        """
+        result = await self._get_optional(f"/{collection}/{uuid}/tags")
+        if result is None:
+            return None
+        return [
+            {"uuid": str(t["uuid"]), "name": str(t["name"])}
+            for t in _as_list(result)
+            if t.get("uuid") and t.get("name")
+        ]
+
+    async def remove_tag(self, collection: str, uuid: str, tag_uuid: str) -> bool:
+        """Detach one tag from a resource. ``False`` when Coolify answers 404.
+
+        ``DELETE /{collection}/{uuid}/tags/{tag_uuid}`` (routes/api.php v4.2.0:160,
+        v4.7.5:313) detaches only; the tag stays for every other resource. Up to
+        4.4.7 a tag no resource uses any more is then deleted (``deleteIfOrphaned``,
+        HandlesTagsApi v4.2.0:125 .. v4.4.7; gone in v4.5.0). A 404 is a resource,
+        tag or link already gone, so a replay is a no-op.
+        """
+        try:
+            await self.delete(f"/{collection}/{uuid}/tags/{tag_uuid}")
+        except CoolifyApiError as exc:
+            if exc.status_code == 404:
+                return False
+            raise
+        return True
+
     async def add_tags(self, collection: str, uuid: str, names: list[str]) -> Any:
         """Attach tags by name. Upstream creates any that do not exist yet.
 
