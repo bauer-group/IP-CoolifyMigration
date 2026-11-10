@@ -49,7 +49,9 @@ class TestRollbackOrder:
 
     def test_full_run_order(self) -> None:
         # Pins last: released only after the source restart AND the target delete.
+        # The targets' auto-deploy goes off first, before anything stops them.
         assert _comps(states_through(State.FINALIZE)) == [
+            Compensation.DISARM_TARGETS,
             Compensation.RESTORE_SOURCE_NAME,
             Compensation.STOP_TARGET,
             Compensation.DROP_TARGET_VOLUMES,

@@ -285,7 +285,9 @@ class TestRollbackOrder:
         ]
 
     def test_full_rollback_order(self) -> None:
+        # The targets FINALIZE armed are disarmed before anything else runs.
         assert self._comps(State.FINALIZE) == [
+            Compensation.DISARM_TARGETS,
             Compensation.RESTORE_SOURCE_NAME,
             Compensation.STOP_TARGET,
             Compensation.DROP_TARGET_VOLUMES,

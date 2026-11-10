@@ -33,7 +33,9 @@ So this module decides, and the engine performs:
   (:data:`TARGET_CREATE`) and armed only at FINALIZE, with the source's original
   (:func:`target_arm_body`) — every target gets its tags there too, since a tag
   deploy ignores auto-deploy; their names are read at CREATE
-  (:data:`TAGS_JOURNAL_KEY`), while every source still exists;
+  (:data:`TAGS_JOURNAL_KEY`), while every source still exists. Each target is
+  journalled before it is armed (:data:`ARM_REQUESTED`), and a rollback switches
+  its auto-deploy off again before it stops it (:func:`target_disarm_body`);
 * every SOURCE application is disarmed at QUIESCE, before the stop: auto-deploy
   off, previews off where on (:func:`disarm_body`), the originals journalled
   first (:data:`JOURNAL_KEY`);
@@ -88,6 +90,13 @@ JOURNAL_KEY = "deploy_triggers"
 #: v4.7.2:171; a database's tags detached just before, :127/:168). Names only:
 #: a tag is a label.
 TAGS_JOURNAL_KEY = "source_tags"
+
+#: FINALIZE's journal key (a ``step_started`` detail): every target application
+#: uuid FINALIZE is about to give its auto-deploy, written BEFORE the request, so
+#: a crash between the two still leaves the way back. The rollback's
+#: DISARM_TARGETS switches each one off again (:func:`target_disarm_body`).
+#: Uuids only.
+ARM_REQUESTED = "arm_requested"
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +175,24 @@ def target_arm_body(original: Triggers) -> dict[str, bool]:
     return {AUTO_DEPLOY: value}
 
 
+def target_disarm_body(current: Triggers) -> dict[str, bool]:
+    """The rollback's PATCH that takes back what FINALIZE armed on a target. PURE.
+
+    A rollback after a SUCCEEDED keep or rename run stops the target, drops its
+    volumes and only then deletes it, with the source's restart (up to the
+    deploy timeout) in between: armed, a push in that window redeploys the target
+    — Compose recreates its volumes empty, and users still sent there by DNS
+    reach an empty instance — and a target the rollback KEEPS stays armed for
+    good. So auto-deploy goes off, unless it is READ off already; an unreadable
+    one (4.1.x, no ``settings``) too, since the update array takes the field at
+    every tag (ApplicationsController v4.1.2:2368,2634; v4.7.2:3662,4036).
+    Previews are left as they are: FINALIZE never armed them
+    (:func:`target_arm_body`). A settings-only PATCH deploys nothing (v4.1.2:2680,
+    v4.7.2:4130), so this is safe to repeat on every replay.
+    """
+    return {} if current.auto_deploy is False else {AUTO_DEPLOY: False}
+
+
 def serialise(originals: Mapping[str, Triggers]) -> dict[str, dict[str, bool | None]]:
     """``{source_uuid: {"auto_deploy": ..., "previews": ...}}`` for the journal."""
     return {uuid: triggers.journal() for uuid, triggers in originals.items()}
@@ -198,6 +225,13 @@ def deserialise_tags(raw: object) -> dict[str, list[str]]:
         for uuid, names in raw.items()
         if isinstance(uuid, str) and isinstance(names, list)
     }
+
+
+def deserialise_uuids(raw: object) -> list[str]:
+    """Read :data:`ARM_REQUESTED` back: each uuid once, in order. PURE, and tolerant."""
+    if not isinstance(raw, list):
+        return []
+    return list(dict.fromkeys(u for u in raw if isinstance(u, str) and u))
 
 
 # ── the deployment queue ─────────────────────────────────────────────────────

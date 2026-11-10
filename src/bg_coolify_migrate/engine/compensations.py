@@ -176,6 +176,20 @@ async def undo_restore_source_deploy_triggers(
     await deploy_triggers.restore_sources(ctx)
 
 
+async def undo_disarm_targets(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
+    """Switch off again the target auto-deploy FINALIZE switched on.
+
+    Owed to FINALIZE, so ``undo_info`` is FINALIZE's merged journal detail — the
+    targets it journalled before arming each (``deploy_triggers.ARM_REQUESTED``).
+    First in every rollback after FINALIZE (``statemachine._COMPENSATION``):
+    STOP_TARGET, DROP_TARGET_VOLUMES and RESTART_SOURCE's wait all come before
+    the target's delete, and a push to an armed target redeploys it in between —
+    or for good, when DELETE_TARGET_RESOURCE keeps it. Idempotent
+    (``deploy_triggers.disarm_targets``), since ``rollback <id>`` replays it.
+    """
+    await deploy_triggers.disarm_targets(ctx, undo_info)
+
+
 async def undo_restore_source_fqdn(ctx: MigrationContext, undo_info: dict[str, Any]) -> None:
     """Give the source back the domains FINALIZE released.
 
@@ -1212,5 +1226,6 @@ def build_compensations() -> dict[Any, Any]:
         Compensation.RESTORE_SOURCE_NAME: undo_restore_source_name,
         Compensation.RESTORE_SOURCE_FQDN: undo_restore_source_fqdn,
         Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS: undo_restore_source_deploy_triggers,
+        Compensation.DISARM_TARGETS: undo_disarm_targets,
         Compensation.RELEASE_SOURCE_PINS: undo_release_source_pins,
     }

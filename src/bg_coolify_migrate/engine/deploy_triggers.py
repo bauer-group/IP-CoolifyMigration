@@ -10,8 +10,10 @@ IO shell: what to switch, and back to what, is ``domain/deploy_triggers.py``'s.
   deployment that ends replaces the containers those name.
 * :func:`arm_targets` — FINALIZE: each target gets its source's auto-deploy and
   the tag names CREATE read (:func:`read_source_tags`) — read there, while every
-  source exists: a DELETE finalize has removed them by now.
-  :func:`note_kept_sources` says which kept source stays disarmed.
+  source exists: a DELETE finalize has removed them by now. Each target is
+  journalled before its PATCH. :func:`note_kept_sources` says which kept source
+  stays disarmed.
+* :func:`disarm_targets` — the rollback's DISARM_TARGETS, its first step.
 * :func:`restore_sources` — the rollback's RESTORE_SOURCE_DEPLOY_TRIGGERS.
 
 Nothing here is ever logged but booleans, uuids and names: the deployment rows
@@ -21,6 +23,7 @@ are reduced in the client, before their logs reach this module.
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import structlog
 
@@ -56,6 +59,17 @@ def recorded(ctx: MigrationContext) -> dict[str, triggers.Triggers]:
     """The originals QUIESCE journalled, by source uuid. Empty when it journalled none."""
     detail = ctx.journal.undo_info(State.QUIESCE.value)
     return triggers.deserialise(detail.get(triggers.JOURNAL_KEY))
+
+
+def arm_requested(ctx: MigrationContext) -> list[str]:
+    """Every target uuid FINALIZE has journalled before arming it, in order."""
+    detail = ctx.journal.undo_info(State.FINALIZE.value)
+    return triggers.deserialise_uuids(detail.get(triggers.ARM_REQUESTED))
+
+
+def _target_name(ctx: MigrationContext, target_uuid: str) -> str:
+    source = next((s for s, t in ctx.target_uuids.items() if t == target_uuid), None)
+    return f"the target of {_name(ctx, source)}" if source else f"target {target_uuid}"
 
 
 async def disarm_sources(ctx: MigrationContext) -> dict[str, dict[str, bool]]:
@@ -250,11 +264,17 @@ async def arm_targets(ctx: MigrationContext) -> list[str]:
     names are the ones CREATE journalled (:func:`read_source_tags`). Never
     raises — the cutover is done, and a target missing a setting or a tag is
     named in a notice instead.
+
+    Each application target is journalled BEFORE its PATCH
+    (:data:`triggers.ARM_REQUESTED`), so a rollback that follows — a crash
+    after the PATCH included — switches it off again before it stops the target
+    (:func:`disarm_targets`). A record that cannot be written arms nothing.
     """
     originals = recorded(ctx)
     tags = triggers.deserialise_tags(
         ctx.journal.undo_info(State.CREATE_TARGET.value).get(triggers.TAGS_JOURNAL_KEY)
     )
+    requested = arm_requested(ctx)
     armed: list[str] = []
     for resource in ctx.plan.resources:
         snapshot = resource.snapshot
@@ -264,6 +284,13 @@ async def arm_targets(ctx: MigrationContext) -> list[str]:
         if snapshot.collection == "applications":
             body = triggers.target_arm_body(await _original(ctx, snapshot, originals))
             try:
+                if target_uuid not in requested:
+                    ctx.journal.append(
+                        "step_started",
+                        state=State.FINALIZE.value,
+                        detail={triggers.ARM_REQUESTED: [*requested, target_uuid]},
+                    )
+                    requested.append(target_uuid)
                 await api_resources.update_application_settings(
                     ctx.api, target_uuid, body, version=ctx.coolify_version
                 )
@@ -301,6 +328,54 @@ def note_kept_sources(ctx: MigrationContext) -> list[str]:
             )
         )
     return kept
+
+
+async def disarm_targets(ctx: MigrationContext, undo_info: dict[str, Any]) -> list[str]:
+    """Switch off the auto-deploy FINALIZE gave each target. Returns the uuids switched.
+
+    The rollback's DISARM_TARGETS, the first compensation of a rollback after
+    FINALIZE (``statemachine._COMPENSATION``): what follows stops the target,
+    drops its volumes and waits for the source's restart before the delete, and
+    an armed target redeploys on the next push in between. ``undo_info`` is
+    FINALIZE's merged journal detail; each uuid :func:`arm_targets` journalled is
+    read first and PATCHed only where it is not off already
+    (:func:`domain.deploy_triggers.target_disarm_body`), so a replay sends
+    nothing. A target that is gone (404 — an earlier rollback deleted it) is
+    done. Every target is attempted; the failures are raised together, each
+    named with what to switch off by hand.
+    """
+    failures: list[str] = []
+    switched: list[str] = []
+    for target_uuid in triggers.deserialise_uuids(undo_info.get(triggers.ARM_REQUESTED)):
+        try:
+            current = triggers.read_triggers(
+                await ctx.api.get_resource("applications", target_uuid)
+            )
+            body = await api_resources.update_application_settings(
+                ctx.api,
+                target_uuid,
+                triggers.target_disarm_body(current),
+                version=ctx.coolify_version,
+            )
+        except Exception as exc:
+            if isinstance(exc, CoolifyApiError) and exc.status_code == 404:
+                log.info("compensate.target_already_gone", uuid=target_uuid)
+                continue
+            log.error("compensate.target_deploys_not_disarmed", uuid=target_uuid, error=_why(exc))
+            failures.append(f"{_target_name(ctx, target_uuid)} ({target_uuid}: {_why(exc)})")
+            continue
+        if body:
+            log.info("compensate.target_deploys_disarmed", uuid=target_uuid)
+            switched.append(target_uuid)
+    if failures:
+        raise RuntimeError(
+            "auto-deploy NOT switched off for: "
+            + "; ".join(failures)
+            + " - switch 'Auto Deploy' off on each target's Advanced page in Coolify: "
+            "until it is deleted, a push can redeploy it, on empty volumes once the "
+            "rollback has dropped them"
+        )
+    return switched
 
 
 async def restore_sources(ctx: MigrationContext) -> None:

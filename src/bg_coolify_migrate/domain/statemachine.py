@@ -109,6 +109,9 @@ class Compensation(StrEnum):
     RESTORE_SOURCE_DEPLOY_TRIGGERS = "restore_source_deploy_triggers"
     """Switch back on the source applications' auto-deploy and preview deployments
     that QUIESCE switched off before the stop (``domain/deploy_triggers.py``)."""
+    DISARM_TARGETS = "disarm_targets"
+    """Switch off again the target applications' auto-deploy that FINALIZE
+    switched on (``domain/deploy_triggers.py``), before anything stops them."""
 
     # ── F2 (instance migration) ──────────────────────────────────────────────
     START_SOURCE_DOCKER = "start_source_docker"
@@ -157,6 +160,18 @@ ORDER: tuple[State, ...] = (
 #: after the disarm — before the stop (a source deployment that does not end) or
 #: after it — and is then never completed. It reads QUIESCE's journal, so it is
 #: a no-op where nothing was switched off.
+#:
+#: DISARM_TARGETS is FINALIZE's, the step that arms the targets, and it leads
+#: FINALIZE's tuple, which a rollback runs first of all: from STOP_TARGET to
+#: DELETE_TARGET_RESOURCE the target is stopped, its volumes dropped, and
+#: RESTART_SOURCE waits up to the deploy timeout in between — an armed target
+#: that a push redeploys there comes back on empty volumes, still holding the
+#: custom hosts DNS may send users to. So it must precede STOP_TARGET, and it
+#: precedes RESTORE_SOURCE_NAME too: a rename back takes one PATCH per source
+#: and can fail (the 4.7 name rule), and neither depends on the other, so the
+#: window is closed first. It runs under keep and rename only — a DELETE refuses
+#: every rollback (:func:`rollback_refusal`) — and it reads what FINALIZE
+#: journalled, so it is a no-op where nothing was armed.
 _COMPENSATION: dict[State, tuple[Compensation, ...]] = {
     State.CREATE_TARGET: (
         Compensation.DELETE_TARGET_RESOURCE,
@@ -167,7 +182,7 @@ _COMPENSATION: dict[State, tuple[Compensation, ...]] = {
     State.QUIESCE: (Compensation.RESTART_SOURCE,),
     State.COPY: (Compensation.DROP_TARGET_VOLUMES, Compensation.REVOKE_EPHEMERAL_KEY),
     State.START_TARGET: (Compensation.STOP_TARGET,),
-    State.FINALIZE: (Compensation.RESTORE_SOURCE_NAME,),
+    State.FINALIZE: (Compensation.DISARM_TARGETS, Compensation.RESTORE_SOURCE_NAME),
 }
 
 #: ``{first: then}`` — when both are due, ``first`` runs immediately before
