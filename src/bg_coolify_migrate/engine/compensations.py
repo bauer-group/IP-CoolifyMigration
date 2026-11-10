@@ -170,8 +170,10 @@ async def undo_restore_source_deploy_triggers(
     QUIESCE's journal itself (``undo_info`` is CREATE's) and is a no-op when that
     holds no originals. ``statemachine._PRECEDENCE`` runs it after the domain
     restore and before RESTART_SOURCE. A rollback after a SUCCEEDED keep or rename
-    run owes it too: FINALIZE left that source disarmed on purpose. Idempotent
-    (``deploy_triggers.restore_sources``), since ``rollback <id>`` replays it.
+    run owes it too: FINALIZE left that source disarmed on purpose. Once per
+    disarm, like RESTART_SOURCE once per stop (``deploy_triggers.restore_sources``):
+    ``rollback <id>`` replays it, and a replay must not switch back on what the
+    operator switched off since.
     """
     await deploy_triggers.restore_sources(ctx)
 

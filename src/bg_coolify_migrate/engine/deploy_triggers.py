@@ -81,6 +81,10 @@ async def disarm_sources(ctx: MigrationContext) -> dict[str, dict[str, bool]]:
     — and journalled BEFORE the PATCH, so a crash between the two still leaves
     the way back (RESTORE_SOURCE_DEPLOY_TRIGGERS). A resumed QUIESCE keeps the
     originals already journalled: read now, they would be what this run wrote.
+    It journals them again before it switches a source off again — after an
+    interrupted rollback gave the switches back — because that record is what
+    makes the next rollback owe them once more
+    (:func:`domain.deploy_triggers.restored_since_disarm`).
 
     A failure here refuses before anything is stopped; the rollback switches
     back on what was already switched off.
@@ -91,18 +95,18 @@ async def disarm_sources(ctx: MigrationContext) -> dict[str, dict[str, bool]]:
         try:
             full = await ctx.api.get_resource("applications", snapshot.uuid)
             current = triggers.read_triggers(full)
-            if snapshot.uuid not in originals:
+            first = snapshot.uuid not in originals
+            if first:
                 originals[snapshot.uuid] = current
+            wanted = triggers.disarm_body(originals[snapshot.uuid], current)
+            if first or wanted:
                 ctx.journal.append(
                     "step_started",
                     state=State.QUIESCE.value,
                     detail={triggers.JOURNAL_KEY: triggers.serialise(originals)},
                 )
             body = await api_resources.update_application_settings(
-                ctx.api,
-                snapshot.uuid,
-                triggers.disarm_body(originals[snapshot.uuid], current),
-                version=ctx.coolify_version,
+                ctx.api, snapshot.uuid, wanted, version=ctx.coolify_version
             )
         except CoolifyApiError as exc:
             raise QuiesceError(
@@ -381,15 +385,24 @@ async def disarm_targets(ctx: MigrationContext, undo_info: dict[str, Any]) -> li
 async def restore_sources(ctx: MigrationContext) -> None:
     """Give every disarmed source back what QUIESCE switched off. Loud, and idempotent.
 
-    Each source is read first and PATCHed only where it still differs
-    (:func:`domain.deploy_triggers.restore_body`), because ``rollback <id>``
-    replays every compensation. A no-op when QUIESCE journalled nothing. Every
-    source is attempted; the failures are raised together, each naming what to
-    switch back on by hand.
+    Once per disarm: ``rollback <id>`` replays every compensation, so each
+    source that holds its originals again is journalled
+    (:func:`domain.deploy_triggers.restored_detail`), and a replay leaves it as
+    it finds it — a switch the operator turned off since stays off
+    (:func:`domain.deploy_triggers.restored_since_disarm`). A source not yet
+    restored is read first and PATCHed only where it still differs
+    (:func:`domain.deploy_triggers.restore_body`). A no-op when QUIESCE
+    journalled nothing. Every source is attempted; the failures are raised
+    together, each naming what to switch back on by hand, and are tried again
+    on the next replay.
     """
+    done = triggers.restored_since_disarm((r.event, r.state, r.detail) for r in ctx.journal.read())
     failures: list[str] = []
     for uuid, original in recorded(ctx).items():
         if not triggers.disarm_body(original):
+            continue
+        if uuid in done:
+            log.info("compensate.source_deploys_already_restored", uuid=uuid)
             continue
         try:
             current = triggers.read_triggers(await ctx.api.get_resource("applications", uuid))
@@ -400,6 +413,9 @@ async def restore_sources(ctx: MigrationContext) -> None:
             log.error("compensate.source_deploys_not_restored", uuid=uuid, error=_why(exc))
             failures.append(f"{_name(ctx, uuid)} ({_why(exc)})")
             continue
+        ctx.journal.append(
+            "rollback_step", state=State.CREATE_TARGET.value, detail=triggers.restored_detail(uuid)
+        )
         if body:
             log.info("compensate.source_deploys_restored", uuid=uuid, settings=body)
     if failures:

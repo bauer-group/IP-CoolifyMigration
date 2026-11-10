@@ -39,8 +39,10 @@ So this module decides, and the engine performs:
 * every SOURCE application is disarmed at QUIESCE, before the stop: auto-deploy
   off, previews off where on (:func:`disarm_body`), the originals journalled
   first (:data:`JOURNAL_KEY`);
-* a rollback gives back only what the disarm took, and only where it is still
-  missing (:func:`restore_body`) — so replaying it changes nothing;
+* a rollback gives back only what the disarm took, only where it is still
+  missing (:func:`restore_body`), and once per disarm
+  (:func:`restored_since_disarm`) — so replaying it changes nothing, not even a
+  switch the operator turned off again since;
 * FINALIZE under keep or rename leaves the source disarmed for good
   (:func:`kept_source_notice`).
 
@@ -57,6 +59,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from bg_coolify_migrate.domain.deployments import IN_PROGRESS, QUEUED
+from bg_coolify_migrate.domain.statemachine import Compensation, State
 
 #: The two settings, as the GET nests them under ``settings`` and the PATCH takes
 #: them flat.
@@ -97,6 +100,11 @@ TAGS_JOURNAL_KEY = "source_tags"
 #: DISARM_TARGETS switches each one off again (:func:`target_disarm_body`).
 #: Uuids only.
 ARM_REQUESTED = "arm_requested"
+
+#: RESTORE_SOURCE_DEPLOY_TRIGGERS's mark (a ``rollback_step`` detail,
+#: :func:`restored_detail`): one source uuid that holds its originals again,
+#: journalled once its restore has landed (:func:`restored_since_disarm`).
+RESTORED_KEY = "deploy_triggers_restored"
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,7 +160,8 @@ def restore_body(original: Triggers, current: Triggers) -> dict[str, bool]:
     (read now) does not hold the original again: a rollback is replayed by
     ``rollback <id>``, and a switch the operator changed on a setting this run
     never touched is not ours to revert. An unreadable original was disarmed as
-    if on, so it comes back as Coolify's default (on).
+    if on, so it comes back as Coolify's default (on). A source an earlier
+    rollback already restored is not asked at all (:func:`restored_since_disarm`).
     """
     taken = disarm_body(original)
     body: dict[str, bool] = {}
@@ -232,6 +241,44 @@ def deserialise_uuids(raw: object) -> list[str]:
     if not isinstance(raw, list):
         return []
     return list(dict.fromkeys(u for u in raw if isinstance(u, str) and u))
+
+
+def restored_detail(source_uuid: str) -> dict[str, str]:
+    """The ``rollback_step`` detail that marks one source restored."""
+    return {
+        "compensation": Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS.value,
+        RESTORED_KEY: source_uuid,
+    }
+
+
+def restored_since_disarm(
+    records: Iterable[tuple[str, str | None, Mapping[str, Any]]],
+) -> set[str]:
+    """The sources a rollback already gave their switches back since the last disarm. PURE.
+
+    ``records`` are the journal's ``(event, state, detail)``, in order. A
+    :data:`RESTORED_KEY` mark counts until QUIESCE journals a disarm record
+    (:data:`JOURNAL_KEY`) after it: that QUIESCE switched the sources off again
+    (a resume after an interrupted rollback can), so a rollback owes them their
+    switches once more.
+
+    RESTART_SOURCE's once-per-stop rule (``compensations._restarted_since_stop``),
+    for the same reason: the remedies of a KEPT target or a failed restart say
+    ``rollback <id>`` again, which replays every compensation — and switched
+    back on a source the operator had switched off since, say to freeze it
+    before a second attempt.
+    """
+    restored: set[str] = set()
+    for event, state, detail in records:
+        if event == "step_started" and state == State.QUIESCE.value and JOURNAL_KEY in detail:
+            restored.clear()
+        elif (
+            event == "rollback_step"
+            and detail.get("compensation") == Compensation.RESTORE_SOURCE_DEPLOY_TRIGGERS.value
+            and isinstance(uuid := detail.get(RESTORED_KEY), str)
+        ):
+            restored.add(uuid)
+    return restored
 
 
 # ── the deployment queue ─────────────────────────────────────────────────────
