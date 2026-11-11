@@ -1,6 +1,181 @@
 # CHANGELOG
 
 
+## v2.15.0 (2026-11-11)
+
+### Bug Fixes
+
+- **binds**: Checked content files on the target
+  ([`aa4b9b6`](https://github.com/bauer-group/IP-CoolifyMigration/commit/aa4b9b648d158f47644b75db2d33883564fb8612))
+
+- **binds**: Copied and verified bind mounts
+  ([`4700cb9`](https://github.com/bauer-group/IP-CoolifyMigration/commit/4700cb9ab46c1be329b9c81947ad0fe07c37b669))
+
+- **binds**: Hardened the container mount listing
+  ([`fec9b21`](https://github.com/bauer-group/IP-CoolifyMigration/commit/fec9b21c8bed092ffb0a72b7aef3751ec29200f1))
+
+- **binds**: Refused symlinked parents at writes
+  ([`719a256`](https://github.com/bauer-group/IP-CoolifyMigration/commit/719a25654a78279ebd9e0fb2f30a8e6103a67507))
+
+- **binds**: Skipped a database's TLS certificates
+  ([`8bff06f`](https://github.com/bauer-group/IP-CoolifyMigration/commit/8bff06f987a4d26b693b24257e4c39159e0fe6f9))
+
+- **binds**: Vetted bind pairs before COPY writes
+  ([`656542a`](https://github.com/bauer-group/IP-CoolifyMigration/commit/656542a4db5dccbf2b1ac5e05c5042d6f0787c93))
+
+- **binds**: Warned about host agents in the plan
+  ([`7f133a7`](https://github.com/bauer-group/IP-CoolifyMigration/commit/7f133a748d32908ec52ab146d5b9438946e0e4d9))
+
+- **binds**: Warned about host-wide agents
+  ([`c199c37`](https://github.com/bauer-group/IP-CoolifyMigration/commit/c199c37f79ff615d56e9c6a4877ca3958f8497ca))
+
+- **cli**: Promised a source restart only when owed
+  ([`25969d8`](https://github.com/bauer-group/IP-CoolifyMigration/commit/25969d8827de35140f15be677077fbd78b98b060))
+
+- **cli**: Restarted what the run never stopped
+  ([`59c2370`](https://github.com/bauer-group/IP-CoolifyMigration/commit/59c23707d7330de74616b3b7a4abee0bf81fbaee))
+
+- **containment**: Blocked on failed daemon reads
+  ([`1e1159f`](https://github.com/bauer-group/IP-CoolifyMigration/commit/1e1159f6e83b00b30d1887f7ca6b02e559fe6559))
+
+- **engine**: Blocked a revival found after START
+  ([`3fa6212`](https://github.com/bauer-group/IP-CoolifyMigration/commit/3fa62121feb513b964fc31b18332b96d454899ea))
+
+- **engine**: Checked the source's deploy history
+  ([`cf7909e`](https://github.com/bauer-group/IP-CoolifyMigration/commit/cf7909ec730c154d3fbc6bdbfc06ba491ba059b8))
+
+- **engine**: Checked the stacks stay stopped
+  ([`f2214bc`](https://github.com/bauer-group/IP-CoolifyMigration/commit/f2214bc3bebfff99b2d919c214384c46e9b5903f))
+
+- **engine**: Copied tags to targets at finalize
+  ([`81f3d7c`](https://github.com/bauer-group/IP-CoolifyMigration/commit/81f3d7cb9c774ed4a42fdb121fdd528c565eb8cc))
+
+- **engine**: Created targets with auto-deploy off
+  ([`149aaf7`](https://github.com/bauer-group/IP-CoolifyMigration/commit/149aaf71fed9a11ef797a25c4860484c3e802c40))
+
+- **engine**: Disarmed sources before the capture
+  ([`64c3a62`](https://github.com/bauer-group/IP-CoolifyMigration/commit/64c3a6248171a44561f8bbe1ee7e940cb372098e))
+
+- **engine**: Hardened the deploy history witness
+  ([`12c6d59`](https://github.com/bauer-group/IP-CoolifyMigration/commit/12c6d593d0accd26a6ce8fff8e780b40c628c1dc))
+
+- **engine**: Ignored read-only volume readers
+  ([`0debcac`](https://github.com/bauer-group/IP-CoolifyMigration/commit/0debcaccfb5d9caaf810a37769e858f807183acd))
+
+- **engine**: Journalled source tags at create
+  ([`da5157c`](https://github.com/bauer-group/IP-CoolifyMigration/commit/da5157c1ba8627c5ecb3cb98a8042c75a35e9c0e))
+
+- **engine**: Judged revivals from the stop proof
+  ([`ce20d2c`](https://github.com/bauer-group/IP-CoolifyMigration/commit/ce20d2c902b37377d0584d1d7361ccebee14a5a9))
+
+- **engine**: Required START's own deployment
+  ([`ba3c69f`](https://github.com/bauer-group/IP-CoolifyMigration/commit/ba3c69f3dc9b34bfb18115bb79e8127907386642))
+
+- **finalize**: Checked labels against held hosts
+  ([`e806b2e`](https://github.com/bauer-group/IP-CoolifyMigration/commit/e806b2e841f4776012c84290004637f1acd89fb1))
+
+- **finalize**: Flagged sources still routing hosts
+  ([`113a1f1`](https://github.com/bauer-group/IP-CoolifyMigration/commit/113a1f1abca1504d3e8da37a500390fcfe713922))
+
+- **plan**: Refused only routers the proxy serves
+  ([`b3cc560`](https://github.com/bauer-group/IP-CoolifyMigration/commit/b3cc560f9ee692ea03249c5c32e20bca38e753ea))
+
+- **plan**: Refused resources on another server
+  ([`b887564`](https://github.com/bauer-group/IP-CoolifyMigration/commit/b887564143876d46b7f2ccf0e0f48152ed78e18a))
+
+- **plan**: Stated what a revived source does
+  ([`88f6eb8`](https://github.com/bauer-group/IP-CoolifyMigration/commit/88f6eb82a3c87d1f8e4a258e0b0591720b1b064c))
+
+- **preflight**: Refused one daemon as two servers
+  ([`b8cb49b`](https://github.com/bauer-group/IP-CoolifyMigration/commit/b8cb49bba5190b9c53688dfe10db90e8ef3d121d))
+
+- **quiesce**: Read the deployment record first
+  ([`f29d326`](https://github.com/bauer-group/IP-CoolifyMigration/commit/f29d3269eae6ead1a5a3f8ed5d305fadc160f8c6))
+
+- **rollback**: Cancelled deployments before stop
+  ([`dd235f2`](https://github.com/bauer-group/IP-CoolifyMigration/commit/dd235f20b2c3f6edc280ce9d61b05625eae06a85))
+
+- **rollback**: Disarmed the targets finalize armed
+  ([`5196fad`](https://github.com/bauer-group/IP-CoolifyMigration/commit/5196fad0f84f33fcdf18a534d00fe5f97eefaf56))
+
+- **rollback**: Guarded the source's bind mounts
+  ([`43626a5`](https://github.com/bauer-group/IP-CoolifyMigration/commit/43626a546019ea34259b7c48a6f295ee9c7db6b6))
+
+- **rollback**: Journalled each bind removal
+  ([`8dc1275`](https://github.com/bauer-group/IP-CoolifyMigration/commit/8dc12752c41baead959ebecece76347209475675))
+
+- **rollback**: Refused volumes recreated empty
+  ([`2dd37d1`](https://github.com/bauer-group/IP-CoolifyMigration/commit/2dd37d15f270d3a0d7b235dec462354166c8e4b8))
+
+- **rollback**: Restored deploys once per disarm
+  ([`e442040`](https://github.com/bauer-group/IP-CoolifyMigration/commit/e442040d9616934b2f4494d87e4c78d18682202c))
+
+- **rollback**: Took back the tags finalize gave
+  ([`5c06ba0`](https://github.com/bauer-group/IP-CoolifyMigration/commit/5c06ba0421535e428c4234cfa6662418cf8ce834))
+
+- **ui**: Stated what a blocked run has touched
+  ([`6897f85`](https://github.com/bauer-group/IP-CoolifyMigration/commit/6897f852c11af3ece6de4d5c42b448387b6b119f))
+
+### Documentation
+
+- Documented deploy containment for operators
+  ([`238b8f9`](https://github.com/bauer-group/IP-CoolifyMigration/commit/238b8f9538580eef117732314e30b0bf64dce573))
+
+- Update README.MD [automated]
+  ([`6135d13`](https://github.com/bauer-group/IP-CoolifyMigration/commit/6135d133f347456c52530209c9cde595ffe62aa6))
+
+- **agents**: Documented deploy containment rules
+  ([`6b95693`](https://github.com/bauer-group/IP-CoolifyMigration/commit/6b95693fc92abac2c7d27a4132780e77c9e9c6fa))
+
+- **binds**: Noted two fail-closed limitations
+  ([`58706b9`](https://github.com/bauer-group/IP-CoolifyMigration/commit/58706b9103be029eb0ea9552e507e3e342cc83a7))
+
+- **cli**: Described every case of exit code 5
+  ([`d9536c8`](https://github.com/bauer-group/IP-CoolifyMigration/commit/d9536c8e36e0c356803b3fb6145a1e32a84a41a3))
+
+- **drift**: Corrected settings and secret notes
+  ([`f2e831f`](https://github.com/bauer-group/IP-CoolifyMigration/commit/f2e831f0ac31358ddd9402c117f667b95c4b0158))
+
+- **settings**: Described all deploy_timeout waits
+  ([`db1c5ba`](https://github.com/bauer-group/IP-CoolifyMigration/commit/db1c5bad6a8b3fbdfff6d62b026fe322b594ac2e))
+
+### Features
+
+- **engine**: Disarmed source deploys at quiesce
+  ([`4b88cd5`](https://github.com/bauer-group/IP-CoolifyMigration/commit/4b88cd5238d27731184d9972cf94863480fe6a9b))
+
+- **plan**: Refused keep for compose routers
+  ([`cddaa0e`](https://github.com/bauer-group/IP-CoolifyMigration/commit/cddaa0eba4ca12a780b067c87b4b7833cb7f1b25))
+
+- **plan**: Refused keep with hand-kept labels
+  ([`be011ce`](https://github.com/bauer-group/IP-CoolifyMigration/commit/be011ce6e9157ace963aa2ed4a0e014b3ece408e))
+
+- **plan**: Refused same-server migrations
+  ([`fcdb9ed`](https://github.com/bauer-group/IP-CoolifyMigration/commit/fcdb9ed5a9f396311ffc4d0873c282182b066fc5))
+
+- **versions**: Validated Coolify 4.7.5
+  ([`fb6ae0b`](https://github.com/bauer-group/IP-CoolifyMigration/commit/fb6ae0be49708b787ecc013e6f6652d50807f135))
+
+### Refactoring
+
+- **domain**: Removed requires_source_restart
+  ([`32ecb98`](https://github.com/bauer-group/IP-CoolifyMigration/commit/32ecb98258c71ca10ce5989c8b4888a6f3d7cb14))
+
+### Testing
+
+- Aligned finalize tests with target arming
+  ([`b304118`](https://github.com/bauer-group/IP-CoolifyMigration/commit/b304118a2941e5e51813d1194e106e9fb5404b98))
+
+- **cli**: Proved run refuses policy-only plans
+  ([`7103891`](https://github.com/bauer-group/IP-CoolifyMigration/commit/71038913452517b1de6a5dbee06dd2b89dcc1925))
+
+- **e2e**: Added bind-mount migration test
+  ([`53693f9`](https://github.com/bauer-group/IP-CoolifyMigration/commit/53693f941efe35ba6db9b84fc793aa6a20a8ee6b))
+
+- **plan**: Reset logging after the cli tests
+  ([`43591dd`](https://github.com/bauer-group/IP-CoolifyMigration/commit/43591dd3f40fac90303808ce182392ea56c909f3))
+
+
 ## v2.14.0 (2026-11-10)
 
 ### Bug Fixes
